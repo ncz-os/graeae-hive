@@ -1,8 +1,17 @@
 """Plain-python tests for queue_logic (pure stdlib; run: python3 test_queue_logic.py)."""
 import sys
 import importlib.util
+from pathlib import Path
 
-spec = importlib.util.spec_from_file_location("queue_logic", sys.argv[1] if len(sys.argv) > 1 else "queue_logic.py")
+# pytest's own command-line options are present in sys.argv while this module is
+# collected.  Only accept an override when the file is run as a script; during
+# collection, load queue_logic.py relative to this test file.
+module_path = (
+    Path(sys.argv[1])
+    if __name__ == "__main__" and len(sys.argv) > 1
+    else Path(__file__).with_name("queue_logic.py")
+)
+spec = importlib.util.spec_from_file_location("queue_logic", module_path)
 m = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = m
 spec.loader.exec_module(m)
