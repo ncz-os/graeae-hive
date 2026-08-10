@@ -34,6 +34,10 @@ from sse_starlette.sse import EventSourceResponse
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
+HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+# Administrative mutations use a distinct credential; startup refuses an
+# ambiguous single-token configuration.
+HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
@@ -624,7 +628,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   max_retries INTEGER NOT NULL DEFAULT 2,
   retry_backoff_until REAL,
   last_update_at REAL,
-  claim_lease_expires_at REAL
+  claim_lease_expires_at REAL,
+  dedup_hash TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status            ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter         ON jobs(submitter_urn);
@@ -1707,6 +1712,24 @@ async def reaper_task(app: FastAPI):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    if not HIVE_BUS_TOKEN:
+        raise RuntimeError("HIVE_BUS_TOKEN must be configured")
+    if not HIVE_BUS_ADMIN_TOKEN:
+        raise RuntimeError("HIVE_BUS_ADMIN_TOKEN must be configured")
+    # Db2 owns native DDL; SQLite init is idempotent and creates its active-job
+    # dedup index. Oracle deployments continue to use external migrations.
+    await hive_repo().init(SCHEMA if HIVE_BACKEND == "sqlite" else None)
+    if HIVE_BACKEND == "db2":
+        task = asyncio.create_task(reaper_task(app))
+        app.state.reaper_task = task
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            await hive_repo().close()
+        return
     async with connect_db() as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
@@ -1834,6 +1857,7 @@ async def lifespan(app: FastAPI):
             ("jobs", "retry_backoff_until", "retry_backoff_until REAL"),
             ("jobs", "last_update_at", "last_update_at REAL"),
             ("jobs", "claim_lease_expires_at", "claim_lease_expires_at REAL"),
+            ("jobs", "dedup_hash", "dedup_hash TEXT"),
             # Thrash fix (2026-06-02): per-job count of worker-decline requeues.
             ("jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0"),
         )
@@ -1908,6 +1932,8 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_jobs_claimed_tier      ON jobs(claimed_cost_tier)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_backoff           ON jobs(retry_backoff_until)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_claim_lease       ON jobs(claim_lease_expires_at)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedup_uq ON jobs(dedup_hash) "
+            "WHERE dedup_hash IS NOT NULL AND status IN ('queued','offered','claimed','running')",
             "CREATE TABLE IF NOT EXISTS job_audit_log ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, ts REAL NOT NULL, "
             "actor_urn TEXT, old_status TEXT, new_status TEXT, old_claimed_by TEXT, "
@@ -1918,22 +1944,68 @@ async def lifespan(app: FastAPI):
             await db.execute(stmt)
         await db.commit()
     task = asyncio.create_task(reaper_task(app))
+    app.state.reaper_task = task
     try:
         yield
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        await hive_repo().close()
 
 
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
+
+
+def _request_token(request: Request) -> str:
+    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not credential:
+        return ""
+    return credential
+
+
+@app.middleware("http")
+async def require_bus_auth(request: Request, call_next):
+    path = request.url.path
+    if path == "/mcp" or path.startswith("/v1/"):
+        expected = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") else HIVE_BUS_TOKEN
+        supplied = _request_token(request)
+        if not expected:
+            return JSONResponse({"detail": "bus authentication is not configured"}, status_code=503)
+        if not supplied or not secrets.compare_digest(supplied, expected):
+            return JSONResponse(
+                {"detail": "invalid or missing bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return await call_next(request)
 
 
 # ---------- endpoints ----------
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
+    detail = None
+    try:
+        async def _probe() -> None:
+            async with connect_db() as db:
+                # Probe a required queue table, not merely the server/session:
+                # SQLite would otherwise recreate a deleted DB file and pass.
+                async with db.execute("SELECT COUNT(*) FROM jobs") as cur:
+                    if await cur.fetchone() is None:
+                        raise RuntimeError("database probe returned no row")
+        await asyncio.wait_for(_probe(), timeout=5.0)
+        reaper = getattr(app.state, "reaper_task", None)
+        if reaper is None or reaper.done():
+            detail = "reaper task is not running"
+    except Exception as exc:
+        detail = f"database probe failed: {type(exc).__name__}: {exc}"
+    body = {"status": "healthy" if detail is None else "unhealthy", "ts": time.time(),
+            "service": "graeae-hive-mind", "version": "0.1.0"}
+    if detail is not None:
+        body["detail"] = detail
+        return JSONResponse(body, status_code=503)
+    return body
 
 
 @app.get("/")
@@ -3507,9 +3579,15 @@ def oauth_cap_state() -> dict:
         return {"capped": now < until, "capped_until": until, "hit_at": d.get("hit_at"),
                 "model": d.get("model"), "reporter": d.get("reporter"),
                 "verified": False, "remaining_sec": max(0, int(until - now))}
-    except Exception:
+    except FileNotFoundError:
         return {"capped": False, "capped_until": None, "hit_at": None,
                 "model": None, "reporter": None, "verified": False, "remaining_sec": 0}
+    except Exception as exc:
+        # A corrupt or unreadable breaker file is not evidence that the usage
+        # cap cleared. Fail closed and surface the storage fault to operators.
+        return {"capped": True, "capped_until": None, "hit_at": None,
+                "model": None, "reporter": None, "verified": False,
+                "remaining_sec": 0, "storage_error": f"{type(exc).__name__}: {exc}"}
 
 
 def clear_oauth_cap() -> Optional[str]:

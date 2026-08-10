@@ -23,6 +23,7 @@ from pathlib import Path
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 STATE_DIR = Path("/var/lib/hive-auto-restore")
 STATE_FILE = STATE_DIR / "retry_counts.json"
 LOG_FILE = "/var/log/hive-auto-restore.log"
@@ -58,8 +59,9 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
-    if HIVE_BUS_TOKEN:
-        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    token = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") else HIVE_BUS_TOKEN
+    if token:
+        headers["authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         url,
         data=data,
@@ -90,21 +92,12 @@ def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
     return jobs
 
 def restore_job(jid: str) -> tuple[bool, str]:
-    body = {
-        "status": "queued",
-        "claimed_by": None,
-        "claimed_at": None,
-        "claimed_runtime": None,
-        "claimed_model": None,
-        "claimed_provider": None,
-        "claimed_cost_tier": None,
-        "claim_lease_expires_at": None,
-        "ended_at": None,
-        "retry_backoff_until": None,
-    }
-    code, resp = _http("PATCH", f"/v1/jobs/{urllib.parse.quote(jid, safe='')}", body, timeout=15.0)
+    body = {"job_ids": [jid], "reason": "auto-restore"}
+    code, resp = _http("POST", "/v1/admin/jobs/requeue", body, timeout=15.0)
     if code in (200, 204):
-        return True, ""
+        if isinstance(resp, dict) and jid in (resp.get("ok") or []):
+            return True, ""
+        return False, f"requeue not acknowledged resp={str(resp)[:200]}"
     return False, f"http={code} resp={str(resp)[:200]}"
 
 def main():

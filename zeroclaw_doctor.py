@@ -60,8 +60,9 @@ from collections import deque
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
 # C1: bus transport auth bearer token (env-sourced). The doctor SUBMITS jobs
 # (dispatch_codex_fix), so this token must satisfy the bus admin tier if one is
-# configured (HIVE_BUS_ADMIN_TOKENS); otherwise worker-tier auth suffices.
+# configured (HIVE_BUS_ADMIN_TOKEN); otherwise worker-tier auth suffices.
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
@@ -208,8 +209,9 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
-    if HIVE_BUS_TOKEN:
-        headers["authorization"] = f"Bearer {HIVE_BUS_TOKEN}"
+    token = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") else HIVE_BUS_TOKEN
+    if token:
+        headers["authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
