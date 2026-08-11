@@ -15,6 +15,36 @@ from urllib.parse import unquote, urlparse
 from .sqlite import SqliteHiveRepository
 
 
+_TABLE_MAP = {
+    "agents": "hive_agents",
+    "jobs": "hive_jobs",
+    "messages": "hive_messages",
+    "events": "hive_events",
+    "hive_cache": "hive_cache",
+    "scheduled_jobs": "hive_scheduled_jobs",
+    "worker_kind_stats": "hive_worker_kind_stats",
+    "job_audit_log": "hive_job_audit_log",
+}
+
+
+def _rewrite_tables(sql: str) -> str:
+    names = "|".join(sorted(map(re.escape, _TABLE_MAP), key=len, reverse=True))
+
+    def repl(match: re.Match) -> str:
+        return f"{match.group(1)} {_TABLE_MAP[match.group(2).lower()]}"
+
+    sql = re.sub(
+        rf"\b(FROM|INTO|UPDATE|DELETE\s+FROM|JOIN)\s+({names})\b",
+        repl, sql, flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        rf"\b(ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE)\s+({names})\b",
+        repl, sql, flags=re.IGNORECASE,
+    )
+    sql = re.sub(rf"\b(ON)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
+    return sql
+
+
 DB2_DDL = """
 CREATE TABLE agents (
   urn VARCHAR(512) PRIMARY KEY,
@@ -178,7 +208,7 @@ CREATE TABLE hive_schema_migrations (
 
 
 _DB2_ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
-    "AGENTS": (
+    "HIVE_AGENTS": (
         ("RUNTIME", "runtime VARCHAR(64)"),
         ("MODEL", "model VARCHAR(255)"),
         ("PROVIDER", "provider VARCHAR(255)"),
@@ -190,7 +220,7 @@ _DB2_ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("PLAN_PERIOD_USED_USD", "plan_period_used_usd DOUBLE DEFAULT 0"),
         ("SUBSCRIPTION_POOLS", "subscription_pools CLOB"),
     ),
-    "JOBS": (
+    "HIVE_JOBS": (
         ("ELIGIBLE_HOSTS", "eligible_hosts CLOB"),
         ("PROJECT", "project VARCHAR(255)"),
         ("REQUIRED_AUTONOMY", "required_autonomy VARCHAR(64)"),
@@ -223,11 +253,11 @@ _DB2_ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 _DB2_REQUIRED_BASE_COLUMNS = {
-    "AGENTS": {
+    "HIVE_AGENTS": {
         "URN", "KIND", "HOST", "SESSION_ID", "PID", "CAPABILITIES", "VERSION",
         "STARTED_AT", "LAST_HEARTBEAT", "STATUS", "METADATA",
     },
-    "JOBS": {
+    "HIVE_JOBS": {
         "ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION", "PRIORITY",
         "DEADLINE", "REQUIRED_CAPABILITIES", "ELIGIBLE_KINDS", "STATUS", "CLAIMED_BY",
         "CLAIMED_AT", "STARTED_AT", "ENDED_AT", "RESULT",
@@ -275,7 +305,8 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
         return None, values
     if upper.startswith("PRAGMA TABLE_INFO"):
         table = re.search(r"\((\w+)\)", stripped, flags=re.IGNORECASE)
-        name = table.group(1).upper() if table else ""
+        logical_name = table.group(1).lower() if table else ""
+        name = _TABLE_MAP.get(logical_name, logical_name).upper()
         return (
             "SELECT colno, LOWER(colname), typename, NULL, NULL, NULL "
             "FROM syscat.columns WHERE tabschema = CURRENT SCHEMA AND tabname = ? "
@@ -286,14 +317,14 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
     cache_upsert = re.search(r"INSERT INTO hive_cache .* ON CONFLICT\(cache_key\) DO UPDATE SET", " ".join(stripped.split()), re.IGNORECASE)
     if cache_upsert:
         return (
-            "MERGE INTO hive_cache t USING (VALUES (?, ?, ?, ?, ?, ?, ?)) "
+            _rewrite_tables("MERGE INTO hive_cache t USING (VALUES (?, ?, ?, ?, ?, ?, ?)) "
             "s(cache_key, result_json, source_job_id, result_mnemos_id, model, provider, cached_at) "
             "ON t.cache_key = s.cache_key "
             "WHEN MATCHED THEN UPDATE SET result_json=s.result_json, source_job_id=s.source_job_id, "
             "result_mnemos_id=s.result_mnemos_id, cached_at=s.cached_at, model=s.model, provider=s.provider "
             "WHEN NOT MATCHED THEN INSERT "
             "(cache_key, result_json, source_job_id, result_mnemos_id, hit_count, cost_saved_usd, model, provider, cached_at, last_hit_at) "
-            "VALUES (s.cache_key, s.result_json, s.source_job_id, s.result_mnemos_id, 0, 0, s.model, s.provider, s.cached_at, NULL)",
+            "VALUES (s.cache_key, s.result_json, s.source_job_id, s.result_mnemos_id, 0, 0, s.model, s.provider, s.cached_at, NULL)"),
             values,
         )
 
@@ -305,7 +336,7 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
     if stats_match:
         col = stats_match.group(1)
         return (
-            "MERGE INTO worker_kind_stats t USING (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)) "
+            _rewrite_tables("MERGE INTO worker_kind_stats t USING (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)) "
             "s(urn, kind, ins_tokens_in, ins_tokens_out, ins_cost, ins_duration, ins_last_run, "
             "upd_tokens_in, upd_tokens_out, upd_cost, upd_duration, upd_last_run) "
             "ON t.urn = s.urn AND t.kind = s.kind "
@@ -313,7 +344,7 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
             "total_tokens_in=total_tokens_in+s.upd_tokens_in, total_tokens_out=total_tokens_out+s.upd_tokens_out, "
             "total_cost_usd=total_cost_usd+s.upd_cost, total_duration_sec=total_duration_sec+s.upd_duration, last_run=s.upd_last_run "
             f"WHEN NOT MATCHED THEN INSERT (urn, kind, {col}, total_tokens_in, total_tokens_out, total_cost_usd, total_duration_sec, last_run) "
-            "VALUES (s.urn, s.kind, 1, s.ins_tokens_in, s.ins_tokens_out, s.ins_cost, s.ins_duration, s.ins_last_run)",
+            "VALUES (s.urn, s.kind, 1, s.ins_tokens_in, s.ins_tokens_out, s.ins_cost, s.ins_duration, s.ins_last_run)"),
             values,
         )
 
@@ -325,7 +356,7 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
         stripped = re.sub(r"\s+LIMIT\s+\?\s*$", f" FETCH FIRST {limit} ROWS ONLY", stripped, flags=re.IGNORECASE)
         values = values[:-1]
     stripped = re.sub(r"\s+LIMIT\s+(\d+)\s*$", r" FETCH FIRST \1 ROWS ONLY", stripped, flags=re.IGNORECASE)
-    return stripped, values
+    return _rewrite_tables(stripped), values
 
 
 class _Db2Cursor:
@@ -603,6 +634,19 @@ class Db2HiveRepository(SqliteHiveRepository):
         ) as cur:
             return {str(row[0]).strip().upper() for row in await cur.fetchall()}
 
+    @staticmethod
+    async def _status_checks(db: Any, table: str) -> dict[str, str]:
+        async with db.execute(
+            "SELECT checkname, text FROM syscat.checks "
+            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            (table.upper(),),
+        ) as cur:
+            return {
+                str(row[0]).strip().upper(): str(row[1]).upper()
+                for row in await cur.fetchall()
+                if "STATUS" in str(row[1]).upper()
+            }
+
     async def _apply_migrations(self, db: Any) -> None:
         async with db.execute("SELECT version FROM hive_schema_migrations") as cur:
             applied = {int(row[0]) for row in await cur.fetchall()}
@@ -610,13 +654,34 @@ class Db2HiveRepository(SqliteHiveRepository):
         # Version 1 converges every additive runtime column. It is safe for a
         # populated database because nullable columns and non-null counters with
         # defaults do not rewrite or discard existing rows.
+        # Always converge the canonical tables. Older releases could record
+        # versions 1/2 after migrating their parallel AGENTS/JOBS tables; those
+        # markers must not suppress migration of MNEMOS' HIVE_* tables.
+        for table, definitions in _DB2_ADDITIVE_COLUMNS.items():
+            columns = await self._columns(db, table)
+            for name, fragment in definitions:
+                if name not in columns:
+                    await db.execute(f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}")
+                    columns.add(name)
+
+        # Core's original checks predate the stale/failed_completion/
+        # dead-letter/needs-review states used by the current service.
+        for table, values, constraint in (
+            ("HIVE_AGENTS", "'online','idle','stale','offline','error'", "ck_hive_agents_status_runtime"),
+            ("HIVE_JOBS", "'queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review'", "ck_hive_jobs_status_runtime"),
+        ):
+            checks = await self._status_checks(db, table)
+            required_values = {value.strip("'") for value in values.split(",")}
+            if not any(all(value.upper() in text for value in required_values)
+                       for text in checks.values()):
+                for old_constraint in checks:
+                    await db.execute(f"ALTER TABLE {table.lower()} DROP CHECK {old_constraint}")
+                await db.execute(
+                    f"ALTER TABLE {table.lower()} ADD CONSTRAINT {constraint} "
+                    f"CHECK (status IN ({values}))"
+                )
+
         if 1 not in applied:
-            for table, definitions in _DB2_ADDITIVE_COLUMNS.items():
-                columns = await self._columns(db, table)
-                for name, fragment in definitions:
-                    if name not in columns:
-                        await db.execute(f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}")
-                        columns.add(name)
             await db.execute(
                 "INSERT INTO hive_schema_migrations (version, applied_at) VALUES (?, ?)",
                 (1, _dt.datetime.now(tz=_dt.timezone.utc).timestamp()),
@@ -625,40 +690,40 @@ class Db2HiveRepository(SqliteHiveRepository):
         # Version 2 supplies the concurrency guarantee used by create_job.
         # EXCLUDE NULL KEYS permits any number of terminal jobs while the
         # generated value makes active jobs unique by dedup_hash.
+        # Pre-constraint deployments may already contain duplicate active
+        # rows. Lock submissions out, preserve the oldest row for each hash,
+        # and dead-letter later duplicates before creating the index.
+        await db.execute("LOCK TABLE hive_jobs IN EXCLUSIVE MODE")
+        async with db.execute(
+            "SELECT id, dedup_hash FROM jobs "
+            "WHERE dedup_hash IS NOT NULL "
+            "AND status IN ('queued', 'offered', 'claimed', 'running') "
+            "ORDER BY dedup_hash, started_at, id"
+        ) as cur:
+            active = await cur.fetchall()
+        seen_hashes: set[str] = set()
+        now = _dt.datetime.now(tz=_dt.timezone.utc).timestamp()
+        migration_result = _json.dumps({
+            "dead_letter": True,
+            "reason": "db2_migration:duplicate_active_dedup_hash",
+        })
+        for job_id, dedup_hash in active:
+            if dedup_hash not in seen_hashes:
+                seen_hashes.add(dedup_hash)
+                continue
+            await db.execute(
+                "UPDATE jobs SET status='dead-letter', ended_at=?, last_update_at=?, "
+                "result=COALESCE(result, ?) WHERE id=? "
+                "AND status IN ('queued', 'offered', 'claimed', 'running')",
+                (now, now, migration_result, job_id),
+            )
+        indexes = await self._indexes(db, "HIVE_JOBS")
+        if "JOBS_ACTIVE_DEDUP_UQ" not in indexes:
+            await db.execute(
+                "CREATE UNIQUE INDEX jobs_active_dedup_uq "
+                "ON jobs(dedup_active_hash) EXCLUDE NULL KEYS"
+            )
         if 2 not in applied:
-            # Pre-constraint deployments may already contain duplicate active
-            # rows. Lock submissions out, preserve the oldest row for each
-            # hash, and dead-letter later duplicates before creating the index.
-            await db.execute("LOCK TABLE jobs IN EXCLUSIVE MODE")
-            async with db.execute(
-                "SELECT id, dedup_hash FROM jobs "
-                "WHERE dedup_hash IS NOT NULL "
-                "AND status IN ('queued', 'offered', 'claimed', 'running') "
-                "ORDER BY dedup_hash, started_at, id"
-            ) as cur:
-                active = await cur.fetchall()
-            seen_hashes: set[str] = set()
-            now = _dt.datetime.now(tz=_dt.timezone.utc).timestamp()
-            migration_result = _json.dumps({
-                "dead_letter": True,
-                "reason": "db2_migration:duplicate_active_dedup_hash",
-            })
-            for job_id, dedup_hash in active:
-                if dedup_hash not in seen_hashes:
-                    seen_hashes.add(dedup_hash)
-                    continue
-                await db.execute(
-                    "UPDATE jobs SET status='dead-letter', ended_at=?, last_update_at=?, "
-                    "result=COALESCE(result, ?) WHERE id=? "
-                    "AND status IN ('queued', 'offered', 'claimed', 'running')",
-                    (now, now, migration_result, job_id),
-                )
-            indexes = await self._indexes(db, "JOBS")
-            if "JOBS_ACTIVE_DEDUP_UQ" not in indexes:
-                await db.execute(
-                    "CREATE UNIQUE INDEX jobs_active_dedup_uq "
-                    "ON jobs(dedup_active_hash) EXCLUDE NULL KEYS"
-                )
             await db.execute(
                 "INSERT INTO hive_schema_migrations (version, applied_at) VALUES (?, ?)",
                 (2, _dt.datetime.now(tz=_dt.timezone.utc).timestamp()),
@@ -670,7 +735,7 @@ class Db2HiveRepository(SqliteHiveRepository):
             missing = expected - await self._columns(db, table)
             if missing:
                 raise RuntimeError(f"Db2 schema verification failed: {table} missing {sorted(missing)}")
-        if "JOBS_ACTIVE_DEDUP_UQ" not in await self._indexes(db, "JOBS"):
+        if "JOBS_ACTIVE_DEDUP_UQ" not in await self._indexes(db, "HIVE_JOBS"):
             raise RuntimeError("Db2 schema verification failed: jobs_active_dedup_uq is missing")
 
     async def close(self) -> None:

@@ -1,7 +1,11 @@
-import json, urllib.request, re, time
+import json, os, urllib.request, re, time
 B="http://192.0.2.67:5005"
+TOKEN=os.environ.get("HIVE_BUS_TOKEN", "")
 def api(path):
-    return json.load(urllib.request.urlopen(B+path,timeout=30))
+    if not TOKEN:
+        raise RuntimeError("HIVE_BUS_TOKEN must be configured before running bs_audit.py")
+    req=urllib.request.Request(B+path,headers={"Authorization":f"Bearer {TOKEN}"})
+    return json.load(urllib.request.urlopen(req,timeout=30))
 
 STOP=set("the a an and or of to in on for with is are was were be been do does did this that it as at by from we you i your our their них a job task repo code fix build run file files use using make sure need needs should will can could would please reply exactly word single no commits change required".split())
 CONFAB=("i don't have the ability","i do not have the ability","yes gemini is available","no code change required","no code change needed","here's what was built","i've now fetched","i have now fetched","as an ai","i cannot access","looks like a slack","i'm unable to")

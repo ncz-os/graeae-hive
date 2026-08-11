@@ -60,6 +60,7 @@ HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
 # C1: bus transport auth bearer token (env-sourced). Injected only on bus calls
 # (_hive), kept separate from the MNEMOS token used by _mnemos.
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
+HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.0.2.67:5002")
 # MNEMOS bearer token comes from env. No source-baked default — having a
 # token literal in source meant every clone of this repo carried a working
@@ -102,9 +103,19 @@ async def lifespan(app):
 
 
 async def _hive(method: str, path: str, **kw) -> dict:
-    if HIVE_BUS_TOKEN:
+    body = kw.get("json")
+    registering_orchestrator = (
+        path == "/v1/agents/register"
+        and isinstance(body, dict)
+        and str(body.get("runtime") or body.get("kind") or "").lower() in {
+            "claude-code", "claude-cli", "claude", "human", "mnemos",
+            "doctor", "dream-walker", "unknown",
+        }
+    )
+    token = HIVE_BUS_ADMIN_TOKEN if registering_orchestrator else HIVE_BUS_TOKEN
+    if token:
         headers = dict(kw.pop("headers", {}) or {})
-        headers.setdefault("Authorization", f"Bearer {HIVE_BUS_TOKEN}")
+        headers.setdefault("Authorization", f"Bearer {token}")
         kw["headers"] = headers
     r = await client.request(method, f"{HIVE_URL}{path}", **kw)
     r.raise_for_status()

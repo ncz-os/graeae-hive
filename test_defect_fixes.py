@@ -2,8 +2,10 @@
 
 import asyncio
 import importlib.util
+import io
 import json
 import os
+import runpy
 import tempfile
 import time
 import unittest
@@ -16,7 +18,8 @@ os.environ["HIVE_BUS_ADMIN_TOKEN"] = "test-admin-token"
 os.environ.setdefault("AGENT_BUS_DB", str(Path(tempfile.gettempdir()) / "hive-defect-tests.db"))
 
 import agent_bus
-from hive.persistence.db2 import DB2_DDL, Db2HiveRepository
+from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
+from hive.persistence.oracle import _translate_sql as _translate_oracle_sql
 from hive.persistence.sqlite import SqliteHiveRepository
 from starlette.requests import Request
 from starlette.responses import Response
@@ -60,6 +63,58 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([path for _method, path, _kwargs in seen], [
             "/v1/memories/search", "/v1/memories", "/v1/memories/mem_1",
         ])
+        await bridge.client.aclose()
+
+    async def test_orchestrator_registration_uses_admin_token(self):
+        bridge = load_script("mcp_bridge_admin_auth_under_test", "mcp_bridge.py")
+        seen = []
+
+        class Reply:
+            status_code = 200
+            def raise_for_status(self): return None
+            def json(self): return {"urn": "urn:agent:human:test:1"}
+
+        async def request(method, url, **kwargs):
+            seen.append((method, url, kwargs))
+            return Reply()
+
+        with mock.patch.object(bridge.client, "request", request):
+            for runtime in sorted(agent_bus.ORCHESTRATOR_RUNTIMES):
+                await bridge._hive(
+                    "POST", "/v1/agents/register",
+                    json={"kind": runtime, "runtime": runtime},
+                )
+        self.assertEqual(len(seen), len(agent_bus.ORCHESTRATOR_RUNTIMES))
+        self.assertTrue(all(
+            kwargs["headers"]["Authorization"] == "Bearer test-admin-token"
+            for _method, _url, kwargs in seen
+        ))
+        await bridge.client.aclose()
+
+    async def test_worker_registration_still_uses_worker_token(self):
+        bridge = load_script("mcp_bridge_worker_auth_under_test", "mcp_bridge.py")
+        seen = []
+
+        class Reply:
+            status_code = 200
+            def raise_for_status(self): return None
+            def json(self): return {"urn": "urn:agent:codex:test:1"}
+
+        async def request(_method, _url, **kwargs):
+            seen.append(kwargs)
+            return Reply()
+
+        with mock.patch.object(bridge.client, "request", request):
+            for runtime in sorted(agent_bus.WORKER_ONLY_RUNTIMES):
+                await bridge._hive(
+                    "POST", "/v1/agents/register",
+                    json={"kind": runtime, "runtime": runtime},
+                )
+        self.assertEqual(len(seen), len(agent_bus.WORKER_ONLY_RUNTIMES))
+        self.assertTrue(all(
+            kwargs["headers"]["Authorization"] == "Bearer test-bus-token"
+            for kwargs in seen
+        ))
         await bridge.client.aclose()
 
 
@@ -227,14 +282,16 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         class FakeDb:
             def __init__(self):
                 self.columns = {
-                    "AGENTS": {"URN", "KIND", "HOST", "SESSION_ID", "PID", "CAPABILITIES",
+                    "HIVE_AGENTS": {"URN", "KIND", "HOST", "SESSION_ID", "PID", "CAPABILITIES",
                                "VERSION", "STARTED_AT", "LAST_HEARTBEAT", "STATUS", "METADATA"},
-                    "JOBS": {"ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION",
+                    "HIVE_JOBS": {"ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION",
                              "PRIORITY", "DEADLINE", "REQUIRED_CAPABILITIES", "ELIGIBLE_KINDS",
                              "STATUS", "CLAIMED_BY", "CLAIMED_AT", "STARTED_AT", "ENDED_AT", "RESULT"},
                 }
-                self.indexes = {"JOBS": set()}
-                self.versions = set()
+                self.indexes = {"HIVE_JOBS": set()}
+                # Simulate an installation whose old parallel tables already
+                # recorded both local migration versions.
+                self.versions = {1, 2}
                 self.active_jobs = [("job-old", "same-hash"), ("job-new", "same-hash")]
                 self.retired = []
                 self.sql = []
@@ -250,12 +307,14 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                     return Result([(v,) for v in sorted(self.columns[params[0]])])
                 if "FROM SYSCAT.INDEXES" in upper:
                     return Result([(v,) for v in sorted(self.indexes.get(params[0], set()))])
-                if upper.startswith("ALTER TABLE"):
+                if "FROM SYSCAT.CHECKS" in upper:
+                    return Result([("CK_OLD_STATUS", "CHECK (status IN ('online'))")])
+                if upper.startswith("ALTER TABLE") and "ADD COLUMN" in upper:
                     table = upper.split()[2]
                     name = upper.split("ADD COLUMN", 1)[1].strip().split()[0]
                     self.columns[table].add(name)
                 elif upper.startswith("CREATE UNIQUE INDEX"):
-                    self.indexes["JOBS"].add("JOBS_ACTIVE_DEDUP_UQ")
+                    self.indexes["HIVE_JOBS"].add("JOBS_ACTIVE_DEDUP_UQ")
                 elif upper.startswith("UPDATE JOBS SET STATUS='DEAD-LETTER'"):
                     self.retired.append(params[-1])
                 elif upper.startswith("INSERT INTO HIVE_SCHEMA_MIGRATIONS"):
@@ -267,17 +326,114 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         await repo._apply_migrations(db)
         await repo._verify_schema(db)
         self.assertTrue({1, 2}.issubset(db.versions))
-        self.assertIn("DEDUP_HASH", db.columns["JOBS"])
-        self.assertIn("DECLINE_COUNT", db.columns["JOBS"])
-        self.assertIn("DEDUP_ACTIVE_HASH", db.columns["JOBS"])
-        self.assertIn("JOBS_ACTIVE_DEDUP_UQ", db.indexes["JOBS"])
+        self.assertIn("DEDUP_HASH", db.columns["HIVE_JOBS"])
+        self.assertIn("DECLINE_COUNT", db.columns["HIVE_JOBS"])
+        self.assertIn("DEDUP_ACTIVE_HASH", db.columns["HIVE_JOBS"])
+        self.assertIn("JOBS_ACTIVE_DEDUP_UQ", db.indexes["HIVE_JOBS"])
         self.assertEqual(db.retired, ["job-new"])
+        self.assertTrue(any("DROP CHECK CK_OLD_STATUS" in sql for sql, _params in db.sql))
         catalog_sql = [sql for sql, params in db.sql if params]
         self.assertTrue(all("?" in sql for sql in catalog_sql))
 
     async def test_fresh_db2_ddl_has_active_only_generated_key(self):
         self.assertIn("dedup_active_hash VARCHAR(64) GENERATED ALWAYS", DB2_DDL)
         self.assertIn("hive_schema_migrations", DB2_DDL)
+
+    async def test_db2_adapter_targets_canonical_mnemos_hive_tables(self):
+        cases = {
+            "SELECT * FROM jobs WHERE id=?": "FROM hive_jobs",
+            "INSERT INTO agents (urn) VALUES (?)": "INTO hive_agents",
+            "UPDATE scheduled_jobs SET enabled=0": "UPDATE hive_scheduled_jobs",
+            "DELETE FROM messages WHERE id=?": "FROM hive_messages",
+            "CREATE INDEX idx_test ON worker_kind_stats(kind)": "ON hive_worker_kind_stats",
+        }
+        for source, expected in cases.items():
+            with self.subTest(source=source):
+                adapted, _ = _adapt_sql(source, ("x",) if "?" in source else ())
+                self.assertIn(expected, adapted)
+        pragma, params = _adapt_sql("PRAGMA table_info(jobs)")
+        self.assertIn("syscat.columns", pragma)
+        self.assertEqual(params, ("HIVE_JOBS",))
+        cache_sql, _ = _adapt_sql(
+            "INSERT INTO hive_cache (cache_key) VALUES (?) "
+            "ON CONFLICT(cache_key) DO UPDATE SET result_json=excluded.result_json",
+            ("k",),
+        )
+        self.assertIn("MERGE INTO hive_cache", cache_sql)
+
+    async def test_admin_requeue_clears_stale_execution_and_result_fields(self):
+        seen = []
+
+        class Cursor:
+            def __init__(self, row=None): self.row = row
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): return None
+            async def fetchone(self): return self.row
+
+        class Db:
+            def execute(self, sql, params=None):
+                seen.append((sql, tuple(params or ())))
+                cursor = Cursor(("failed",) if sql.startswith("SELECT status") else None)
+                if sql.startswith("SELECT status"):
+                    return cursor
+                async def executed(): return cursor
+                return executed()
+            async def commit(self): return None
+
+        @asynccontextmanager
+        async def connection():
+            yield Db()
+
+        with mock.patch.object(agent_bus, "connect_db", connection):
+            result = await agent_bus.admin_requeue_jobs(
+                agent_bus.RequeueRequest(job_ids=["job-1"]),
+            )
+        self.assertEqual(result["ok"], ["job-1"])
+        update = next(sql for sql, _params in seen if sql.lstrip().startswith("UPDATE jobs"))
+        for fragment in (
+            "ended_at=NULL", "result=NULL", "claimed_runtime=NULL",
+            "claimed_host_caps=NULL", "claim_lease_expires_at=NULL",
+            "tokens_in=NULL", "tokens_out=NULL", "estimated_cost_usd=NULL",
+            "result_mnemos_id=NULL",
+        ):
+            self.assertIn(fragment, update)
+        oracle_sql, oracle_params = _translate_oracle_sql(update, seen[-1][1])
+        db2_sql, db2_params = _adapt_sql(update, seen[-1][1])
+        self.assertIn("UPDATE hive_jobs", oracle_sql)
+        self.assertIn(":1", oracle_sql)
+        self.assertEqual(oracle_params, seen[-1][1])
+        self.assertIn("UPDATE hive_jobs", db2_sql)
+        self.assertIn("?", db2_sql)
+        self.assertEqual(db2_params, seen[-1][1])
+
+    async def test_admin_requeue_resets_real_default_sqlite_row(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "requeue.db"))
+            await repo.init(agent_bus.SCHEMA)
+            async with repo.connection() as db:
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, status, started_at, "
+                    "claimed_by, ended_at, result, claimed_runtime, tokens_in, "
+                    "estimated_cost_usd, result_mnemos_id, claim_lease_expires_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("job-real", "urn:submitter", "fix:test", "failed", 1.0,
+                     "urn:worker", 2.0, "{}", "zeroclaw", 10, 1.25, "mem-1", 3.0),
+                )
+                await db.commit()
+            with mock.patch.object(agent_bus, "connect_db", repo.connection):
+                result = await agent_bus.admin_requeue_jobs(
+                    agent_bus.RequeueRequest(job_ids=["job-real"]),
+                )
+            self.assertEqual(result["ok"], ["job-real"])
+            async with repo.connection() as db:
+                async with db.execute(
+                    "SELECT status, claimed_by, ended_at, result, claimed_runtime, "
+                    "tokens_in, estimated_cost_usd, result_mnemos_id, claim_lease_expires_at "
+                    "FROM jobs WHERE id=?",
+                    ("job-real",),
+                ) as cur:
+                    row = await cur.fetchone()
+            self.assertEqual(row, ("queued", None, None, None, None, None, None, None, None))
 
 
 class ServiceTests(unittest.TestCase):
@@ -300,6 +456,14 @@ class ServiceTests(unittest.TestCase):
                 mock.patch.object(auto_restore, "log"):
             self.assertEqual(auto_restore.main(), 2)
         fetch.assert_not_called()
+
+    def test_auto_restore_queue_read_failure_is_fatal(self):
+        with mock.patch.object(auto_restore, "HIVE_BUS_TOKEN", "worker"), \
+                mock.patch.object(auto_restore, "HIVE_BUS_ADMIN_TOKEN", "admin"), \
+                mock.patch.object(auto_restore, "load_state", return_value={}), \
+                mock.patch.object(auto_restore, "fetch_failed_jobs", side_effect=RuntimeError("HTTP 503")), \
+                mock.patch.object(auto_restore, "log"):
+            self.assertEqual(auto_restore.main(), 1)
 
     def test_auto_restore_unit_loads_required_root_managed_environment(self):
         unit = Path("hive-auto-restore.service").read_text()
@@ -327,10 +491,70 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("ALTER TABLE HIVE_JOBS", oracle)
         self.assertIn("ON HIVE_JOBS", oracle)
 
-    def test_doctor_selects_admin_credential_for_requeue(self):
-        source = Path("zeroclaw_doctor.py").read_text()
-        self.assertIn('path.startswith("/v1/admin/")', source)
-        self.assertIn("HIVE_BUS_ADMIN_TOKEN", source)
+    def test_doctor_selects_admin_credential_for_registration(self):
+        doctor = load_script("zeroclaw_doctor_auth_under_test", "zeroclaw_doctor.py")
+        seen = {}
+
+        class Reply(io.BytesIO):
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+
+        def urlopen(request, timeout=0):
+            seen["authorization"] = request.get_header("Authorization")
+            return Reply(b'{"urn":"urn:agent:doctor:test:1"}')
+
+        with mock.patch.object(doctor.urllib.request, "urlopen", urlopen):
+            code, _ = doctor._http(
+                "POST", "/v1/agents/register",
+                {"kind": "doctor", "runtime": "doctor"},
+            )
+        self.assertEqual(code, 200)
+        self.assertEqual(seen["authorization"], "Bearer test-admin-token")
+
+    def test_bundled_audit_script_sends_bus_bearer(self):
+        seen = {}
+
+        class Reply(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *_args): return None
+
+        def urlopen(request, timeout=0):
+            seen["authorization"] = request.get_header("Authorization")
+            return Reply(b'{"jobs":[]}')
+
+        with mock.patch.dict(os.environ, {"HIVE_BUS_TOKEN": "audit-token"}), \
+                mock.patch("urllib.request.urlopen", urlopen), \
+                mock.patch("builtins.open", mock.mock_open()):
+            runpy.run_path("bs_audit.py", run_name="bs_audit_under_test")
+        self.assertEqual(seen["authorization"], "Bearer audit-token")
+
+    def test_worker_authorized_valid_oauth_probe_closes_breaker(self):
+        async def run():
+            body = json.dumps({
+                "success": True, "model": "hive_codex", "reporter": "worker-1",
+            }).encode()
+            sent = False
+
+            async def receive():
+                nonlocal sent
+                if sent:
+                    return {"type": "http.disconnect"}
+                sent = True
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            request = Request({
+                "type": "http", "method": "POST", "path": "/v1/knemon/cap",
+                "raw_path": b"/v1/knemon/cap", "query_string": b"", "headers": [],
+                "scheme": "http", "server": ("test", 80),
+            }, receive)
+            request.state.auth_role = "worker"
+            with mock.patch.object(agent_bus, "clear_oauth_cap", return_value=None), \
+                    mock.patch.object(agent_bus, "oauth_cap_state", return_value={"capped": False}):
+                return await agent_bus.knemon_cap_set(request)
+
+        result = asyncio.run(run())
+        self.assertTrue(result["cleared"])
 
 
 class WorkerTests(unittest.TestCase):
@@ -383,6 +607,23 @@ class WorkerTests(unittest.TestCase):
         source = Path("zeroclaw_wss_worker_v2.py").read_text()
         self.assertIn('hive_completion_outbox.{INSTANCE}.json', source)
         self.assertIn("fcntl.LOCK_EX", source)
+
+    def test_failed_completion_acknowledges_exact_server_retry_transition(self):
+        with mock.patch.object(worker, "http", return_value=(200, {
+            "status": "queued", "claimed_by": None, "retry_count": 4,
+        })):
+            self.assertTrue(worker._completion_is_acknowledged(
+                "job-1", "urn-1", "failed", claimed_retry_count=3,
+            ))
+            self.assertFalse(worker._completion_is_acknowledged(
+                "job-1", "urn-1", "failed", claimed_retry_count=2,
+            ))
+
+    def test_worker_refuses_to_start_without_mnemos_token(self):
+        with mock.patch.object(worker, "MNEMOS_TOKEN", ""):
+            with self.assertRaises(SystemExit) as raised:
+                worker.main()
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

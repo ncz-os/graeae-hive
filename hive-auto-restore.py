@@ -85,8 +85,7 @@ def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
     query = urllib.parse.urlencode({"status": "failed", "limit": str(limit)})
     code, resp = _http("GET", f"/v1/jobs?{query}", timeout=15.0)
     if code != 200 or not resp:
-        log(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")
-        return []
+        raise RuntimeError(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")
     jobs = resp.get("jobs", []) or []
     jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return jobs
@@ -115,7 +114,11 @@ def main():
     skipped_backoff = 0
     skipped_too_fresh = 0
 
-    failed = fetch_failed_jobs()
+    try:
+        failed = fetch_failed_jobs()
+    except Exception as exc:
+        log(f"fatal: cannot read failed-job queue: {exc}")
+        return 1
     log(f"poll: {len(failed)} failed jobs to consider")
 
     for job in failed:

@@ -3318,9 +3318,14 @@ async def admin_requeue_jobs(req: RequeueRequest):
                 continue
             await db.execute(
                 """UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL,
-                   retry_count=0, retry_backoff_until=NULL
+                   claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL,
+                   claimed_cost_tier=NULL, claimed_host_caps=NULL,
+                   claim_lease_expires_at=NULL, ended_at=NULL, result=NULL,
+                   tokens_in=NULL, tokens_out=NULL, estimated_cost_usd=NULL,
+                   result_mnemos_id=NULL, retry_count=0, retry_backoff_until=NULL,
+                   decline_count=0, last_update_at=?
                    WHERE id=?""",
-                (job_id,),
+                (now, job_id),
             )
             await db.commit()
             results["ok"].append(job_id)
@@ -3836,7 +3841,12 @@ async def knemon_cap_set(req: Request):
     if not isinstance(body, dict):
         body = {}
     if body.get("success") is True:
-        _require_admin_request(req)
+        model = str(body.get("model") or "")
+        reporter = str(body.get("reporter") or "").strip()
+        if model not in {"hive_codex", "hive_gpt", "hive_gpt_mini", "hive_gpt_heavy"}:
+            raise HTTPException(422, "successful OAuth probe must identify a supported OAuth model")
+        if not reporter:
+            raise HTTPException(422, "successful OAuth probe must identify its reporter")
         err = clear_oauth_cap()
         if err:
             return {"ok": False, "error": err}
@@ -4169,7 +4179,7 @@ async def get_job(job_id: str):
         async with db.execute(
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-            "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE id=?",
+            "required_capabilities, eligible_kinds, eligible_hosts, retry_count FROM jobs WHERE id=?",
             (job_id,)) as cur:
             r = await cur.fetchone()
     if not r:
@@ -4184,6 +4194,7 @@ async def get_job(job_id: str):
         "required_capabilities": json.loads(r[12]) if r[12] else None,
         "eligible_kinds": json.loads(r[13]) if r[13] else None,
         "eligible_hosts": json.loads(r[14]) if r[14] else None,
+        "retry_count": r[15],
     }
 
 

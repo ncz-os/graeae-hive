@@ -209,7 +209,15 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
-    token = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") else HIVE_BUS_TOKEN
+    registering_orchestrator = (
+        path == "/v1/agents/register"
+        and isinstance(body, dict)
+        and str(body.get("runtime") or "").lower() in {
+            "claude-code", "claude-cli", "claude", "human", "mnemos",
+            "doctor", "dream-walker", "unknown",
+        }
+    )
+    token = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") or registering_orchestrator else HIVE_BUS_TOKEN
     if token:
         headers["authorization"] = f"Bearer {token}"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
