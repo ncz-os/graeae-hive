@@ -83,7 +83,9 @@ CREATE TABLE jobs (
   last_update_at DOUBLE,
   claim_lease_expires_at DOUBLE,
   decline_count INTEGER NOT NULL DEFAULT 0,
-  dedup_hash VARCHAR(64)
+  dedup_hash VARCHAR(64),
+  dedup_active_hash VARCHAR(64) GENERATED ALWAYS AS
+    (CASE WHEN status IN ('queued', 'offered', 'claimed', 'running') THEN dedup_hash ELSE NULL END)
 );
 CREATE INDEX idx_jobs_status ON jobs(status);
 CREATE INDEX idx_jobs_submitter ON jobs(submitter_urn);
@@ -167,7 +169,70 @@ CREATE TABLE scheduled_jobs (
   fire_count INTEGER NOT NULL DEFAULT 0,
   created_at DOUBLE NOT NULL
 );
+
+CREATE TABLE hive_schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at DOUBLE NOT NULL
+);
 """
+
+
+_DB2_ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
+    "AGENTS": (
+        ("RUNTIME", "runtime VARCHAR(64)"),
+        ("MODEL", "model VARCHAR(255)"),
+        ("PROVIDER", "provider VARCHAR(255)"),
+        ("AUTONOMY_LEVEL", "autonomy_level VARCHAR(64)"),
+        ("COST_TIER", "cost_tier VARCHAR(8)"),
+        ("CURRENT_LOAD", "current_load CLOB"),
+        ("AUTH_METHOD", "auth_method VARCHAR(64)"),
+        ("PLAN_CAP_USD", "plan_cap_usd DOUBLE"),
+        ("PLAN_PERIOD_USED_USD", "plan_period_used_usd DOUBLE DEFAULT 0"),
+        ("SUBSCRIPTION_POOLS", "subscription_pools CLOB"),
+    ),
+    "JOBS": (
+        ("ELIGIBLE_HOSTS", "eligible_hosts CLOB"),
+        ("PROJECT", "project VARCHAR(255)"),
+        ("REQUIRED_AUTONOMY", "required_autonomy VARCHAR(64)"),
+        ("MAX_COST_TIER", "max_cost_tier VARCHAR(8)"),
+        ("PREFERRED_PROVIDERS", "preferred_providers CLOB"),
+        ("PREFERRED_MODELS", "preferred_models CLOB"),
+        ("CLAIMED_RUNTIME", "claimed_runtime VARCHAR(64)"),
+        ("CLAIMED_MODEL", "claimed_model VARCHAR(255)"),
+        ("CLAIMED_PROVIDER", "claimed_provider VARCHAR(255)"),
+        ("CLAIMED_COST_TIER", "claimed_cost_tier VARCHAR(8)"),
+        ("TOKENS_IN", "tokens_in INTEGER"),
+        ("TOKENS_OUT", "tokens_out INTEGER"),
+        ("ESTIMATED_COST_USD", "estimated_cost_usd DOUBLE"),
+        ("MNEMOS_REFS", "mnemos_refs CLOB"),
+        ("RESULT_MNEMOS_ID", "result_mnemos_id VARCHAR(128)"),
+        ("REQUIRED_RESOURCES", "required_resources CLOB"),
+        ("CLAIMED_HOST_CAPS", "claimed_host_caps CLOB"),
+        ("TAGS", "tags CLOB"),
+        ("DEPENDS_ON", "depends_on CLOB"),
+        ("RETRY_COUNT", "retry_count INTEGER NOT NULL DEFAULT 0"),
+        ("MAX_RETRIES", "max_retries INTEGER NOT NULL DEFAULT 2"),
+        ("RETRY_BACKOFF_UNTIL", "retry_backoff_until DOUBLE"),
+        ("LAST_UPDATE_AT", "last_update_at DOUBLE"),
+        ("CLAIM_LEASE_EXPIRES_AT", "claim_lease_expires_at DOUBLE"),
+        ("DECLINE_COUNT", "decline_count INTEGER NOT NULL DEFAULT 0"),
+        ("DEDUP_HASH", "dedup_hash VARCHAR(64)"),
+        ("DEDUP_ACTIVE_HASH", "dedup_active_hash VARCHAR(64) GENERATED ALWAYS AS "
+         "(CASE WHEN status IN ('queued', 'offered', 'claimed', 'running') THEN dedup_hash ELSE NULL END)"),
+    ),
+}
+
+_DB2_REQUIRED_BASE_COLUMNS = {
+    "AGENTS": {
+        "URN", "KIND", "HOST", "SESSION_ID", "PID", "CAPABILITIES", "VERSION",
+        "STARTED_AT", "LAST_HEARTBEAT", "STATUS", "METADATA",
+    },
+    "JOBS": {
+        "ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION", "PRIORITY",
+        "DEADLINE", "REQUIRED_CAPABILITIES", "ELIGIBLE_KINDS", "STATUS", "CLAIMED_BY",
+        "CLAIMED_AT", "STARTED_AT", "ENDED_AT", "RESULT",
+    },
+}
 
 
 def _parse_db2_dsn(dsn: str) -> dict[str, str]:
@@ -512,7 +577,101 @@ class Db2HiveRepository(SqliteHiveRepository):
             raise RuntimeError("HIVE_BACKEND=db2 requires DB2_DSN or HIVE_DB2_DSN")
         async with self.connection() as db:
             await db.executescript(DB2_DDL)
-            await db.commit()
+            try:
+                await self._apply_migrations(db)
+                await self._verify_schema(db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    @staticmethod
+    async def _columns(db: Any, table: str) -> set[str]:
+        async with db.execute(
+            "SELECT colname FROM syscat.columns "
+            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            (table.upper(),),
+        ) as cur:
+            return {str(row[0]).strip().upper() for row in await cur.fetchall()}
+
+    @staticmethod
+    async def _indexes(db: Any, table: str) -> set[str]:
+        async with db.execute(
+            "SELECT indname FROM syscat.indexes "
+            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            (table.upper(),),
+        ) as cur:
+            return {str(row[0]).strip().upper() for row in await cur.fetchall()}
+
+    async def _apply_migrations(self, db: Any) -> None:
+        async with db.execute("SELECT version FROM hive_schema_migrations") as cur:
+            applied = {int(row[0]) for row in await cur.fetchall()}
+
+        # Version 1 converges every additive runtime column. It is safe for a
+        # populated database because nullable columns and non-null counters with
+        # defaults do not rewrite or discard existing rows.
+        if 1 not in applied:
+            for table, definitions in _DB2_ADDITIVE_COLUMNS.items():
+                columns = await self._columns(db, table)
+                for name, fragment in definitions:
+                    if name not in columns:
+                        await db.execute(f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}")
+                        columns.add(name)
+            await db.execute(
+                "INSERT INTO hive_schema_migrations (version, applied_at) VALUES (?, ?)",
+                (1, _dt.datetime.now(tz=_dt.timezone.utc).timestamp()),
+            )
+
+        # Version 2 supplies the concurrency guarantee used by create_job.
+        # EXCLUDE NULL KEYS permits any number of terminal jobs while the
+        # generated value makes active jobs unique by dedup_hash.
+        if 2 not in applied:
+            # Pre-constraint deployments may already contain duplicate active
+            # rows. Lock submissions out, preserve the oldest row for each
+            # hash, and dead-letter later duplicates before creating the index.
+            await db.execute("LOCK TABLE jobs IN EXCLUSIVE MODE")
+            async with db.execute(
+                "SELECT id, dedup_hash FROM jobs "
+                "WHERE dedup_hash IS NOT NULL "
+                "AND status IN ('queued', 'offered', 'claimed', 'running') "
+                "ORDER BY dedup_hash, started_at, id"
+            ) as cur:
+                active = await cur.fetchall()
+            seen_hashes: set[str] = set()
+            now = _dt.datetime.now(tz=_dt.timezone.utc).timestamp()
+            migration_result = _json.dumps({
+                "dead_letter": True,
+                "reason": "db2_migration:duplicate_active_dedup_hash",
+            })
+            for job_id, dedup_hash in active:
+                if dedup_hash not in seen_hashes:
+                    seen_hashes.add(dedup_hash)
+                    continue
+                await db.execute(
+                    "UPDATE jobs SET status='dead-letter', ended_at=?, last_update_at=?, "
+                    "result=COALESCE(result, ?) WHERE id=? "
+                    "AND status IN ('queued', 'offered', 'claimed', 'running')",
+                    (now, now, migration_result, job_id),
+                )
+            indexes = await self._indexes(db, "JOBS")
+            if "JOBS_ACTIVE_DEDUP_UQ" not in indexes:
+                await db.execute(
+                    "CREATE UNIQUE INDEX jobs_active_dedup_uq "
+                    "ON jobs(dedup_active_hash) EXCLUDE NULL KEYS"
+                )
+            await db.execute(
+                "INSERT INTO hive_schema_migrations (version, applied_at) VALUES (?, ?)",
+                (2, _dt.datetime.now(tz=_dt.timezone.utc).timestamp()),
+            )
+
+    async def _verify_schema(self, db: Any) -> None:
+        for table, base in _DB2_REQUIRED_BASE_COLUMNS.items():
+            expected = base | {name for name, _fragment in _DB2_ADDITIVE_COLUMNS[table]}
+            missing = expected - await self._columns(db, table)
+            if missing:
+                raise RuntimeError(f"Db2 schema verification failed: {table} missing {sorted(missing)}")
+        if "JOBS_ACTIVE_DEDUP_UQ" not in await self._indexes(db, "JOBS"):
+            raise RuntimeError("Db2 schema verification failed: jobs_active_dedup_uq is missing")
 
     async def close(self) -> None:
         if self._pool is not None:

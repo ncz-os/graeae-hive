@@ -17,23 +17,42 @@ Tools:
   hive.job_update           -> PATCH /v1/jobs/{id}
   hive.message_publish      -> POST /v1/messages
   hive.message_list         -> GET /v1/messages
-  mnemos.memory_search      -> POST /memories/search on PYTHIA
-  mnemos.memory_create      -> POST /memories
-  mnemos.memory_get         -> GET /memories/{id}
+  mnemos.memory_search      -> POST /v1/memories/search on PYTHIA
+  mnemos.memory_create      -> POST /v1/memories
+  mnemos.memory_get         -> GET /v1/memories/{id}
 """
 from __future__ import annotations
 import json
 import os
 import sys
 from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
 import httpx
 import uvicorn
+
+try:
+    MCP_VERSION = version("mcp")
+except PackageNotFoundError as exc:
+    raise RuntimeError("mcp_bridge requires mcp>=2,<3") from exc
+if MCP_VERSION.split(".", 1)[0] != "2":
+    raise RuntimeError(f"mcp_bridge requires mcp>=2,<3; found {MCP_VERSION}")
+
 from mcp.server import Server, NotificationOptions
-from mcp.server.models import InitializationOptions
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent, Resource, Prompt
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    Tool,
+    TextContent,
+    Resource,
+    Prompt,
+)
 from starlette.applications import Starlette
 from starlette.routing import Mount, Route
 
@@ -52,6 +71,26 @@ MNEMOS_TOKEN = os.environ.get("MNEMOS_TOKEN", "")
 
 server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
+
+
+def _mcp_handler(method: str, params_type: type):
+    """Register a typed request callback on the supported MCP 2.x server."""
+    def decorate(fn):
+        async def adapter(_context, params):
+            if method == "tools/list":
+                return ListToolsResult(tools=await fn())
+            if method == "tools/call":
+                content = await fn(params.name, params.arguments or {})
+                return CallToolResult(content=content)
+            if method == "resources/list":
+                return ListResourcesResult(resources=await fn())
+            if method == "prompts/list":
+                return ListPromptsResult(prompts=await fn())
+            raise RuntimeError(f"unsupported MCP method registration: {method}")
+
+        server.add_request_handler(method, params_type, adapter)
+        return fn
+    return decorate
 
 
 @asynccontextmanager
@@ -91,7 +130,7 @@ async def _mnemos(method: str, path: str, **kw) -> dict:
 
 # ---------- tool definitions ----------
 
-@server.list_tools()
+@_mcp_handler("tools/list", PaginatedRequestParams)
 async def handle_list_tools() -> list[Tool]:
     return [
         Tool(name="hive_agent_list", description="List registered agents in the GRAEAE Hive Mind.",
@@ -216,7 +255,7 @@ async def handle_list_tools() -> list[Tool]:
     ]
 
 
-@server.call_tool()
+@_mcp_handler("tools/call", CallToolRequestParams)
 async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
     try:
         if name == "hive_agent_list":
@@ -254,11 +293,11 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
         elif name == "hive_message_list":
             r = await _hive("GET", "/v1/messages", params={k: v for k, v in args.items() if v})
         elif name == "mnemos_memory_search":
-            r = await _mnemos("POST", "/memories/search", json=args)
+            r = await _mnemos("POST", "/v1/memories/search", json=args)
         elif name == "mnemos_memory_create":
-            r = await _mnemos("POST", "/memories", json=args)
+            r = await _mnemos("POST", "/v1/memories", json=args)
         elif name == "mnemos_memory_get":
-            r = await _mnemos("GET", f"/memories/{args['id']}")
+            r = await _mnemos("GET", f"/v1/memories/{args['id']}")
         elif name == "graeae_consult":
             r = await _mnemos("POST", "/v1/consultations", json=args)
         elif name == "graeae_muses":
@@ -277,12 +316,12 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
 
 
 # Silence -32601 method-not-found warnings on opencode boot.
-@server.list_resources()
+@_mcp_handler("resources/list", PaginatedRequestParams)
 async def _list_resources() -> list[Resource]:
     return []
 
 
-@server.list_prompts()
+@_mcp_handler("prompts/list", PaginatedRequestParams)
 async def _list_prompts() -> list[Prompt]:
     return []
 
@@ -294,17 +333,11 @@ sse = SseServerTransport("/messages/")
 
 async def handle_sse(request):
     async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-        await server.run(
-            read_stream, write_stream,
-            InitializationOptions(
-                server_name="graeae-hive-mind",
-                server_version="0.1.0",
-                capabilities=server.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
+        options = server.create_initialization_options(
+            notification_options=NotificationOptions(),
+            experimental_capabilities={},
         )
+        await server.run(read_stream, write_stream, options)
 
 
 app = Starlette(

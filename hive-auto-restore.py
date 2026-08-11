@@ -101,6 +101,13 @@ def restore_job(jid: str) -> tuple[bool, str]:
     return False, f"http={code} resp={str(resp)[:200]}"
 
 def main():
+    missing = [name for name, value in (
+        ("HIVE_BUS_TOKEN", HIVE_BUS_TOKEN),
+        ("HIVE_BUS_ADMIN_TOKEN", HIVE_BUS_ADMIN_TOKEN),
+    ) if not value]
+    if missing:
+        log(f"fatal: required credential(s) missing: {', '.join(missing)}")
+        return 2
     state = load_state()
     now = time.time()
     restored = 0

@@ -9,6 +9,8 @@ Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central 
 """
 from __future__ import annotations
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -38,6 +40,7 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 # Administrative mutations use a distinct credential; startup refuses an
 # ambiguous single-token configuration.
 HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
+HIVE_DASHBOARD_SESSION_TTL = int(os.environ.get("HIVE_DASHBOARD_SESSION_TTL", "3600"))
 ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
@@ -461,7 +464,10 @@ async def connect_db():
 def _is_dedup_violation(exc: BaseException) -> bool:
     """Unique-violation from the active-only dedup index ONLY (never another PK/unique)."""
     m = str(exc)
-    return "HIVE_JOBS_ACTIVE_DEDUP_UQ" in m.upper() or (
+    return any(name in m.upper() for name in (
+        "HIVE_JOBS_ACTIVE_DEDUP_UQ",  # Oracle physical-table index
+        "JOBS_ACTIVE_DEDUP_UQ",       # SQLite and Db2 index
+    )) or (
         "unique constraint failed" in m.lower() and "dedup_hash" in m.lower()
     )
 
@@ -1964,24 +1970,99 @@ def _request_token(request: Request) -> str:
     return credential
 
 
+def _session_cookie(role: str, expires: int) -> str:
+    secret = HIVE_BUS_ADMIN_TOKEN if role == "admin" else HIVE_BUS_TOKEN
+    payload = f"{role}.{expires}"
+    signature = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def _cookie_role(request: Request) -> str:
+    value = request.cookies.get("hive_session", "")
+    try:
+        role, expires_text, signature = value.split(".", 2)
+        expires = int(expires_text)
+    except (TypeError, ValueError):
+        return ""
+    if role not in {"worker", "admin"} or expires < int(time.time()):
+        return ""
+    expected = _session_cookie(role, expires).rsplit(".", 1)[1]
+    return role if secrets.compare_digest(signature, expected) else ""
+
+
+def _bearer_role(request: Request) -> str:
+    supplied = _request_token(request)
+    if not supplied:
+        return ""
+    if HIVE_BUS_ADMIN_TOKEN and secrets.compare_digest(supplied, HIVE_BUS_ADMIN_TOKEN):
+        return "admin"
+    if HIVE_BUS_TOKEN and secrets.compare_digest(supplied, HIVE_BUS_TOKEN):
+        return "worker"
+    return ""
+
+
+def _admin_route(method: str, path: str) -> bool:
+    if path.startswith("/v1/admin/"):
+        return True
+    if method == "POST" and re.fullmatch(r"/v1/agents/.+/plan-reset", path):
+        return True
+    if path == "/v1/schedules" and method == "POST":
+        return True
+    if path.startswith("/v1/schedules/") and method in {"PATCH", "DELETE"}:
+        return True
+    if method == "POST" and path in {
+        "/v1/knemon/bypass",
+        "/v1/knemon/cap/clear",
+        "/v1/knemon/cap/probe-ok",
+    }:
+        return True
+    return False
+
+
+def _require_admin_request(request: Request) -> None:
+    if getattr(request.state, "auth_role", "") != "admin":
+        raise HTTPException(403, "administrator credential required")
+
+
 @app.middleware("http")
 async def require_bus_auth(request: Request, call_next):
     path = request.url.path
     if path == "/mcp" or path.startswith("/v1/"):
-        expected = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") else HIVE_BUS_TOKEN
-        supplied = _request_token(request)
-        if not expected:
+        admin_required = _admin_route(request.method.upper(), path)
+        if not HIVE_BUS_TOKEN or (admin_required and not HIVE_BUS_ADMIN_TOKEN):
             return JSONResponse({"detail": "bus authentication is not configured"}, status_code=503)
-        if not supplied or not secrets.compare_digest(supplied, expected):
+        role = _bearer_role(request) or _cookie_role(request)
+        if not role or (admin_required and role != "admin"):
             return JSONResponse(
-                {"detail": "invalid or missing bearer token"},
+                {"detail": "invalid or missing administrator credential" if admin_required
+                           else "invalid or missing bus credential"},
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        request.state.auth_role = role
     return await call_next(request)
 
 
 # ---------- endpoints ----------
+
+@app.post("/v1/auth/session")
+async def create_browser_session(request: Request):
+    """Exchange an authenticated bearer request for a short-lived HttpOnly session."""
+    role = getattr(request.state, "auth_role", "")
+    if role not in {"worker", "admin"}:
+        raise HTTPException(401, "authenticated bearer credential required")
+    expires = int(time.time()) + max(60, min(HIVE_DASHBOARD_SESSION_TTL, 86400))
+    response = JSONResponse({"ok": True, "role": role, "expires_at": expires})
+    response.set_cookie(
+        "hive_session",
+        _session_cookie(role, expires),
+        max_age=expires - int(time.time()),
+        httponly=True,
+        secure=request.url.scheme == "https",
+        samesite="strict",
+        path="/",
+    )
+    return response
 
 @app.get("/health")
 async def health():
@@ -2021,7 +2102,7 @@ async def dashboard():
 
 
 @app.post("/v1/agents/register")
-async def register(req: AgentRegister):
+async def register(req: AgentRegister, request: Request):
     # #5 FIX (review 2026-05-23): reject minimally-incomplete registrations with 422 so
     # callers see the error instead of getting a null URN that bricks their session.
     if (req.host or "").lower().strip() in HOST_DENYLIST:
@@ -2054,6 +2135,8 @@ async def register(req: AgentRegister):
                 f"runtime. Provide an explicit runtime from "
                 f"{sorted(RUNTIME_KIND_MAP.keys())}.",
             )
+    if runtime in ORCHESTRATOR_RUNTIMES:
+        _require_admin_request(request)
     allowed = RUNTIME_KIND_MAP.get(runtime, {runtime, "unknown"})
     if runtime != "unknown" and kind not in allowed and kind != runtime:
         raise HTTPException(
@@ -3753,6 +3836,7 @@ async def knemon_cap_set(req: Request):
     if not isinstance(body, dict):
         body = {}
     if body.get("success") is True:
+        _require_admin_request(req)
         err = clear_oauth_cap()
         if err:
             return {"ok": False, "error": err}

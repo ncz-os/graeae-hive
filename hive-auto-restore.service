@@ -6,6 +6,9 @@ After=multi-user.target
 Type=oneshot
 User=graeae-hive
 Group=graeae-hive
+# Provision as root:graeae-hive mode 0640. A missing file is a hard unit error.
+EnvironmentFile=/etc/graeae-hive/auto-restore.env
+UMask=0077
 ExecStart=/opt/agent-bus-venv/bin/python /opt/hive-auto-restore.py
 StandardOutput=journal
 StandardError=journal
