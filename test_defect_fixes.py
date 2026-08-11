@@ -8,6 +8,7 @@ import os
 import runpy
 import tempfile
 import time
+import types
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,11 +16,18 @@ from unittest import mock
 
 os.environ["HIVE_BUS_TOKEN"] = "test-bus-token"
 os.environ["HIVE_BUS_ADMIN_TOKEN"] = "test-admin-token"
+os.environ["MCP_BRIDGE_TOKEN"] = "test-mcp-token"
+os.environ["MCP_BRIDGE_ADMIN_TOKEN"] = "test-mcp-admin-token"
 os.environ.setdefault("AGENT_BUS_DB", str(Path(tempfile.gettempdir()) / "hive-defect-tests.db"))
 
 import agent_bus
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
-from hive.persistence.oracle import _translate_sql as _translate_oracle_sql
+from hive.persistence.oracle import (
+    OracleHiveRepository,
+    _ORACLE_JOB_ADDITIONS,
+    _ORACLE_REQUIRED_JOB_COLUMNS,
+    _translate_sql as _translate_oracle_sql,
+)
 from hive.persistence.sqlite import SqliteHiveRepository
 from starlette.requests import Request
 from starlette.responses import Response
@@ -83,12 +91,90 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
                 await bridge._hive(
                     "POST", "/v1/agents/register",
                     json={"kind": runtime, "runtime": runtime},
+                    admin_authorized=True,
                 )
         self.assertEqual(len(seen), len(agent_bus.ORCHESTRATOR_RUNTIMES))
         self.assertTrue(all(
             kwargs["headers"]["Authorization"] == "Bearer test-admin-token"
             for _method, _url, kwargs in seen
         ))
+        await bridge.client.aclose()
+
+    async def test_bridge_requires_inbound_bearer_and_has_admin_scope(self):
+        bridge = load_script("mcp_bridge_inbound_auth_under_test", "mcp_bridge.py")
+        self.assertTrue(bridge.app.user_middleware)
+
+        async def request(token=None):
+            headers = [] if token is None else [(b"authorization", f"Bearer {token}".encode())]
+            scope = {"type": "http", "method": "POST", "path": "/messages/",
+                     "raw_path": b"/messages/", "query_string": b"", "headers": headers,
+                     "scheme": "http", "server": ("test", 80), "client": ("test", 1)}
+            sent = []
+            async def receive(): return {"type": "http.request", "body": b"", "more_body": False}
+            async def send(message): sent.append(message)
+            await bridge.app(scope, receive, send)
+            return next(message["status"] for message in sent if message["type"] == "http.response.start")
+
+        self.assertEqual(await request(), 401)
+        self.assertEqual(await request("wrong"), 401)
+        self.assertEqual(await request("test-mcp-token"), 400)
+        await bridge.client.aclose()
+
+    async def test_bridge_rejects_reused_downstream_credential(self):
+        bridge = load_script("mcp_bridge_distinct_auth_under_test", "mcp_bridge.py")
+        bridge.MCP_BRIDGE_TOKEN = bridge.HIVE_BUS_TOKEN
+        with self.assertRaisesRegex(RuntimeError, "must be distinct"):
+            async with bridge.lifespan(bridge.app):
+                pass
+        await bridge.client.aclose()
+
+    async def test_tool_failures_set_mcp_is_error(self):
+        bridge = load_script("mcp_bridge_error_result_under_test", "mcp_bridge.py")
+        from mcp.server.auth.middleware.auth_context import AuthenticatedUser
+        from mcp.server.auth.provider import AccessToken
+        from mcp.types import CallToolRequestParams
+
+        request = Request({"type": "http", "method": "POST", "path": "/messages/",
+                           "raw_path": b"/messages/", "query_string": b"", "headers": [],
+                           "scheme": "http", "server": ("test", 80)})
+        request.scope["user"] = AuthenticatedUser(AccessToken(
+            token="test-mcp-token", client_id="client", scopes=["bridge:use"],
+        ))
+        context = types.SimpleNamespace(request=request)
+        handler = bridge.server._request_handlers["tools/call"].handler
+        with mock.patch.object(bridge, "_mnemos", side_effect=OSError("down")):
+            result = await handler(context, CallToolRequestParams(
+                name="mnemos_memory_search", arguments={"query": "q"},
+            ))
+        self.assertTrue(result.is_error)
+        self.assertTrue(result.model_dump(by_alias=True)["isError"])
+        await bridge.client.aclose()
+
+    async def test_memory_tags_are_nested_in_metadata(self):
+        bridge = load_script("mcp_bridge_tags_under_test", "mcp_bridge.py")
+        seen = {}
+
+        async def fake_mnemos(_method, _path, **kwargs):
+            seen.update(kwargs["json"])
+            return {"ok": True}
+
+        with mock.patch.object(bridge, "_mnemos", fake_mnemos):
+            outcome = await bridge.handle_call_tool(
+                "mnemos_memory_create",
+                {"content": "c", "category": "test", "tags": ["release"]},
+            )
+        self.assertFalse(outcome.is_error)
+        self.assertNotIn("tags", seen)
+        self.assertEqual(seen["metadata"]["tags"], ["release"])
+        await bridge.client.aclose()
+
+    async def test_ordinary_bridge_scope_cannot_borrow_admin_bus_token(self):
+        bridge = load_script("mcp_bridge_tool_auth_under_test", "mcp_bridge.py")
+        outcome = await bridge.handle_call_tool(
+            "hive_agent_register", {"kind": "human", "host": "test"},
+        )
+        self.assertTrue(outcome.is_error)
+        self.assertIn("administrator MCP bridge credential required", outcome.content[0].text)
         await bridge.client.aclose()
 
     async def test_worker_registration_still_uses_worker_token(self):
@@ -173,11 +259,34 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self._request("/v1/events", cookie=cookie)).status_code, 204)
         self.assertEqual((await self._request("/v1/schedules", method="POST", cookie=cookie)).status_code, 204)
         https_request = Request({"type": "http", "method": "POST", "path": "/v1/auth/session",
-                                 "raw_path": b"/v1/auth/session", "query_string": b"", "headers": [],
+                                 "raw_path": b"/v1/auth/session", "query_string": b"",
+                                 "headers": [(b"authorization", b"Bearer test-admin-token")],
                                  "scheme": "https", "server": ("test", 443)})
         https_request.state.auth_role = "admin"
         https_response = await agent_bus.create_browser_session(https_request)
         self.assertIn("Secure", https_response.headers["set-cookie"])
+
+    async def test_browser_session_cookie_cannot_renew_itself(self):
+        request = Request({"type": "http", "method": "POST", "path": "/v1/auth/session",
+                           "raw_path": b"/v1/auth/session", "query_string": b"", "headers": [],
+                           "scheme": "http", "server": ("test", 80)})
+        request._cookies = {"hive_session": agent_bus._session_cookie(
+            "admin", int(time.time()) + 120,
+        )}
+        request.state.auth_role = "admin"
+        with self.assertRaises(agent_bus.HTTPException) as raised:
+            await agent_bus.create_browser_session(request)
+        self.assertEqual(raised.exception.status_code, 401)
+
+    async def test_startup_rejects_equal_worker_and_admin_tokens(self):
+        old_worker, old_admin = agent_bus.HIVE_BUS_TOKEN, agent_bus.HIVE_BUS_ADMIN_TOKEN
+        agent_bus.HIVE_BUS_TOKEN = agent_bus.HIVE_BUS_ADMIN_TOKEN = "same-secret"
+        try:
+            with self.assertRaisesRegex(RuntimeError, "must be distinct"):
+                async with agent_bus.lifespan(agent_bus.app):
+                    pass
+        finally:
+            agent_bus.HIVE_BUS_TOKEN, agent_bus.HIVE_BUS_ADMIN_TOKEN = old_worker, old_admin
 
     async def test_worker_role_cannot_register_synthetic_orchestrator(self):
         request = Request({"type": "http", "method": "POST", "path": "/v1/agents/register",
@@ -229,6 +338,79 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(fake.closed)
         finally:
             agent_bus.HIVE_BACKEND = old_backend
+
+    async def test_oracle_populated_core_schema_is_converged_and_verified(self):
+        repo = OracleHiveRepository("oracle://user:pass@db/TEST")
+        columns = {
+            name: ("CLOB", None) for name in _ORACLE_REQUIRED_JOB_COLUMNS - set(_ORACLE_JOB_ADDITIONS)
+        }
+        columns["STATUS"] = ("VARCHAR2", 16)
+        indexes = set()
+        checks = [("CK_HIVE_JOBS_STATUS", "status IN ('queued','done')")]
+        active = [("job-old", "same-hash"), ("job-new", "same-hash")]
+        sql_seen = []
+
+        async def fake_execute(_raw, sql, params=()):
+            sql_seen.append((sql, params))
+            upper = sql.upper()
+            if "SELECT COLUMN_NAME, DATA_TYPE, DATA_LENGTH" in upper:
+                return [(name, data_type, length) for name, (data_type, length) in columns.items()]
+            if "SELECT INDEX_NAME FROM USER_INDEXES" in upper:
+                return [(name,) for name in indexes]
+            if "SELECT CONSTRAINT_NAME, SEARCH_CONDITION_VC" in upper:
+                # A NOT NULL check must never be mistaken for the status enum.
+                return checks + [("SYS_C_STATUS_NN", '"STATUS" IS NOT NULL')]
+            if upper.startswith("ALTER TABLE HIVE_JOBS ADD ("):
+                for name in _ORACLE_JOB_ADDITIONS:
+                    if name in upper:
+                        data_type = (
+                            "NUMBER" if name in {
+                                "RETRY_COUNT", "MAX_RETRIES", "RETRY_BACKOFF_UNTIL",
+                                "LAST_UPDATE_AT", "CLAIM_LEASE_EXPIRES_AT", "DECLINE_COUNT",
+                            } else "CLOB"
+                        )
+                        length = None
+                        if name in {"REQUIRED_AUTONOMY", "PROJECT", "DEDUP_HASH"}:
+                            data_type = "VARCHAR2"
+                            length = {"REQUIRED_AUTONOMY": 32, "PROJECT": 120, "DEDUP_HASH": 64}[name]
+                        columns[name] = (data_type, length)
+                        break
+            elif "MODIFY (STATUS VARCHAR2(32))" in upper:
+                columns["STATUS"] = ("VARCHAR2", 32)
+            elif "DROP CONSTRAINT" in upper:
+                checks.clear()
+            elif "ADD CONSTRAINT CK_HIVE_JOBS_STATUS_RUNTIME" in upper:
+                checks.append(("CK_HIVE_JOBS_STATUS_RUNTIME", sql))
+            elif "SELECT ID, DEDUP_HASH FROM HIVE_JOBS" in upper:
+                return active
+            elif "SET DEDUP_HASH=NULL" in upper:
+                active[:] = [row for row in active if row[0] != params[0]]
+            elif "CREATE INDEX IDX_HIVE_JOBS_CLAIM_LEASE" in upper:
+                indexes.add("IDX_HIVE_JOBS_CLAIM_LEASE")
+            elif "CREATE UNIQUE INDEX JOBS_ACTIVE_DEDUP_UQ" in upper:
+                indexes.add("JOBS_ACTIVE_DEDUP_UQ")
+            return []
+
+        with mock.patch("hive.persistence.oracle._raw_execute", side_effect=fake_execute):
+            await repo._apply_migrations(object())
+            await repo._verify_schema(object())
+        self.assertTrue(_ORACLE_JOB_ADDITIONS.keys() <= columns.keys())
+        self.assertEqual(columns["STATUS"], ("VARCHAR2", 32))
+        self.assertEqual(active, [("job-old", "same-hash")])
+        self.assertIn("JOBS_ACTIVE_DEDUP_UQ", indexes)
+        self.assertFalse(any("DROP CONSTRAINT SYS_C_STATUS_NN" in sql for sql, _ in sql_seen))
+
+    async def test_oracle_repository_init_runs_migration_and_verification(self):
+        repo = OracleHiveRepository("oracle://user:pass@db/TEST")
+        raw = mock.AsyncMock()
+        fake_driver = types.SimpleNamespace(connect_async=mock.AsyncMock(return_value=raw))
+        with mock.patch.dict("sys.modules", {"oracledb": fake_driver}), \
+                mock.patch.object(repo, "_apply_migrations", mock.AsyncMock()) as migrate, \
+                mock.patch.object(repo, "_verify_schema", mock.AsyncMock()) as verify:
+            await repo.init()
+        migrate.assert_awaited_once_with(raw)
+        verify.assert_awaited_once_with(raw)
+        raw.commit.assert_awaited_once()
 
     async def test_health_returns_503_when_database_probe_fails(self):
         @asynccontextmanager
@@ -295,6 +477,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 self.active_jobs = [("job-old", "same-hash"), ("job-new", "same-hash")]
                 self.retired = []
                 self.sql = []
+                self.lengths = {"HIVE_AGENTS": {"STATUS": 32}, "HIVE_JOBS": {"STATUS": 16}}
 
             def execute(self, sql, params=None):
                 self.sql.append((sql, tuple(params or ())))
@@ -304,6 +487,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 if "SELECT ID, DEDUP_HASH FROM JOBS" in upper:
                     return Result(self.active_jobs)
                 if "FROM SYSCAT.COLUMNS" in upper:
+                    if "COLNAME, LENGTH" in upper:
+                        return Result(list(self.lengths[params[0]].items()))
                     return Result([(v,) for v in sorted(self.columns[params[0]])])
                 if "FROM SYSCAT.INDEXES" in upper:
                     return Result([(v,) for v in sorted(self.indexes.get(params[0], set()))])
@@ -313,6 +498,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                     table = upper.split()[2]
                     name = upper.split("ADD COLUMN", 1)[1].strip().split()[0]
                     self.columns[table].add(name)
+                elif "ALTER COLUMN STATUS SET DATA TYPE VARCHAR(32)" in upper:
+                    self.lengths["HIVE_JOBS"]["STATUS"] = 32
                 elif upper.startswith("CREATE UNIQUE INDEX"):
                     self.indexes["HIVE_JOBS"].add("JOBS_ACTIVE_DEDUP_UQ")
                 elif upper.startswith("UPDATE JOBS SET STATUS='DEAD-LETTER'"):
@@ -332,6 +519,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("JOBS_ACTIVE_DEDUP_UQ", db.indexes["HIVE_JOBS"])
         self.assertEqual(db.retired, ["job-new"])
         self.assertTrue(any("DROP CHECK CK_OLD_STATUS" in sql for sql, _params in db.sql))
+        self.assertEqual(db.lengths["HIVE_JOBS"]["STATUS"], 32)
+        self.assertTrue(any("ALTER COLUMN status SET DATA TYPE VARCHAR(32)" in sql for sql, _ in db.sql))
         catalog_sql = [sql for sql, params in db.sql if params]
         self.assertTrue(all("?" in sql for sql in catalog_sql))
 

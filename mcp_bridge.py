@@ -24,6 +24,7 @@ Tools:
 from __future__ import annotations
 import json
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
@@ -40,6 +41,8 @@ if MCP_VERSION.split(".", 1)[0] != "2":
     raise RuntimeError(f"mcp_bridge requires mcp>=2,<3; found {MCP_VERSION}")
 
 from mcp.server import Server, NotificationOptions
+from mcp.server.auth.middleware.auth_context import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from mcp.server.sse import SseServerTransport
 from mcp.types import (
     CallToolRequestParams,
@@ -54,6 +57,8 @@ from mcp.types import (
     Prompt,
 )
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
@@ -61,6 +66,8 @@ HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
 # (_hive), kept separate from the MNEMOS token used by _mnemos.
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
+MCP_BRIDGE_TOKEN = os.environ.get("MCP_BRIDGE_TOKEN", "")
+MCP_BRIDGE_ADMIN_TOKEN = os.environ.get("MCP_BRIDGE_ADMIN_TOKEN", "")
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.0.2.67:5002")
 # MNEMOS bearer token comes from env. No source-baked default — having a
 # token literal in source meant every clone of this repo carried a working
@@ -74,6 +81,55 @@ server = Server("graeae-hive-mind")
 client = httpx.AsyncClient(timeout=15.0)
 
 
+class ToolCallOutcome:
+    def __init__(self, content: list[TextContent], is_error: bool = False) -> None:
+        self.content = content
+        self.is_error = is_error
+
+
+def _bridge_scopes(context: Any) -> set[str]:
+    request = getattr(context, "request", None)
+    user = request.scope.get("user") if request is not None else None
+    return set(getattr(user, "scopes", ()))
+
+
+class BridgeBearerAuth:
+    """Authenticate both halves of every MCP SSE session."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        if not MCP_BRIDGE_TOKEN:
+            await JSONResponse({"detail": "MCP bridge authentication is not configured"}, status_code=503)(
+                scope, receive, send,
+            )
+            return
+        headers = {key.lower(): value for key, value in scope.get("headers", ())}
+        scheme, _, supplied = headers.get(b"authorization", b"").decode("latin-1").partition(" ")
+        scopes: list[str] = []
+        client_id = ""
+        if scheme.lower() == "bearer" and supplied:
+            if MCP_BRIDGE_ADMIN_TOKEN and secrets.compare_digest(supplied, MCP_BRIDGE_ADMIN_TOKEN):
+                client_id, scopes = "mcp-bridge-admin", ["bridge:use", "bridge:admin"]
+            elif secrets.compare_digest(supplied, MCP_BRIDGE_TOKEN):
+                client_id, scopes = "mcp-bridge-client", ["bridge:use"]
+        if not scopes:
+            await JSONResponse(
+                {"detail": "invalid or missing MCP bridge credential"},
+                status_code=401,
+                headers={"WWW-Authenticate": "Bearer"},
+            )(scope, receive, send)
+            return
+        scope["user"] = AuthenticatedUser(
+            AccessToken(token=supplied, client_id=client_id, scopes=scopes),
+        )
+        await self.app(scope, receive, send)
+
+
 def _mcp_handler(method: str, params_type: type):
     """Register a typed request callback on the supported MCP 2.x server."""
     def decorate(fn):
@@ -81,8 +137,9 @@ def _mcp_handler(method: str, params_type: type):
             if method == "tools/list":
                 return ListToolsResult(tools=await fn())
             if method == "tools/call":
-                content = await fn(params.name, params.arguments or {})
-                return CallToolResult(content=content)
+                is_admin = "bridge:admin" in _bridge_scopes(_context)
+                outcome = await fn(params.name, params.arguments or {}, admin_authorized=is_admin)
+                return CallToolResult(content=outcome.content, is_error=outcome.is_error)
             if method == "resources/list":
                 return ListResourcesResult(resources=await fn())
             if method == "prompts/list":
@@ -96,13 +153,26 @@ def _mcp_handler(method: str, params_type: type):
 
 @asynccontextmanager
 async def lifespan(app):
+    if not MCP_BRIDGE_TOKEN:
+        raise RuntimeError("MCP_BRIDGE_TOKEN must be configured")
+    if MCP_BRIDGE_ADMIN_TOKEN and secrets.compare_digest(MCP_BRIDGE_TOKEN, MCP_BRIDGE_ADMIN_TOKEN):
+        raise RuntimeError("MCP_BRIDGE_TOKEN and MCP_BRIDGE_ADMIN_TOKEN must be distinct")
+    for name, downstream in (
+        ("HIVE_BUS_TOKEN", HIVE_BUS_TOKEN),
+        ("HIVE_BUS_ADMIN_TOKEN", HIVE_BUS_ADMIN_TOKEN),
+        ("MNEMOS_TOKEN", MNEMOS_TOKEN),
+    ):
+        if downstream and secrets.compare_digest(MCP_BRIDGE_TOKEN, downstream):
+            raise RuntimeError(f"MCP_BRIDGE_TOKEN and {name} must be distinct")
+        if MCP_BRIDGE_ADMIN_TOKEN and downstream and secrets.compare_digest(MCP_BRIDGE_ADMIN_TOKEN, downstream):
+            raise RuntimeError(f"MCP_BRIDGE_ADMIN_TOKEN and {name} must be distinct")
     try:
         yield
     finally:
         await client.aclose()
 
 
-async def _hive(method: str, path: str, **kw) -> dict:
+async def _hive(method: str, path: str, *, admin_authorized: bool = False, **kw) -> dict:
     body = kw.get("json")
     registering_orchestrator = (
         path == "/v1/agents/register"
@@ -112,7 +182,11 @@ async def _hive(method: str, path: str, **kw) -> dict:
             "doctor", "dream-walker", "unknown",
         }
     )
+    if registering_orchestrator and not admin_authorized:
+        raise PermissionError("administrator MCP bridge credential required for orchestrator registration")
     token = HIVE_BUS_ADMIN_TOKEN if registering_orchestrator else HIVE_BUS_TOKEN
+    if registering_orchestrator and not token:
+        raise RuntimeError("HIVE_BUS_ADMIN_TOKEN is not configured")
     if token:
         headers = dict(kw.pop("headers", {}) or {})
         headers.setdefault("Authorization", f"Bearer {token}")
@@ -267,7 +341,9 @@ async def handle_list_tools() -> list[Tool]:
 
 
 @_mcp_handler("tools/call", CallToolRequestParams)
-async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]:
+async def handle_call_tool(
+    name: str, args: dict[str, Any], *, admin_authorized: bool = False,
+) -> ToolCallOutcome:
     try:
         if name == "hive_agent_list":
             r = await _hive("GET", "/v1/agents", params={k: v for k, v in args.items() if v})
@@ -281,15 +357,17 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
             args.setdefault("provider", "unknown")
             args.setdefault("autonomy_level", "unknown")
             args.setdefault("auth_method", "unknown")
-            r = await _hive("POST", "/v1/agents/register", json=args)
+            r = await _hive(
+                "POST", "/v1/agents/register", json=args,
+                admin_authorized=admin_authorized,
+            )
             # Defensive: if response somehow lacks urn (server bug / proxy
             # truncation), surface as explicit error rather than letting
             # the client cache urn=None and brick the session.
             if not isinstance(r, dict) or not r.get("urn"):
-                r = {
-                    "error": "register-incomplete: agent_bus returned response without urn",
-                    "raw_response": r,
-                }
+                raise RuntimeError(
+                    f"register-incomplete: agent_bus returned response without urn: {r!r}"
+                )
         elif name == "hive_job_create":
             r = await _hive("POST", "/v1/jobs", json=args)
         elif name == "hive_job_next":
@@ -306,7 +384,13 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
         elif name == "mnemos_memory_search":
             r = await _mnemos("POST", "/v1/memories/search", json=args)
         elif name == "mnemos_memory_create":
-            r = await _mnemos("POST", "/v1/memories", json=args)
+            payload = dict(args)
+            tags = payload.pop("tags", None)
+            if tags is not None:
+                metadata = dict(payload.get("metadata") or {})
+                metadata["tags"] = tags
+                payload["metadata"] = metadata
+            r = await _mnemos("POST", "/v1/memories", json=payload)
         elif name == "mnemos_memory_get":
             r = await _mnemos("GET", f"/v1/memories/{args['id']}")
         elif name == "graeae_consult":
@@ -318,12 +402,21 @@ async def handle_call_tool(name: str, args: dict[str, Any]) -> list[TextContent]
         elif name == "graeae_get":
             r = await _mnemos("GET", f"/v1/consultations/{args['consultation_id']}")
         else:
-            return [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))]
-        return [TextContent(type="text", text=json.dumps(r, default=str))]
+            return ToolCallOutcome(
+                [TextContent(type="text", text=json.dumps({"error": f"unknown tool: {name}"}))],
+                is_error=True,
+            )
+        return ToolCallOutcome([TextContent(type="text", text=json.dumps(r, default=str))])
     except httpx.HTTPStatusError as e:
-        return [TextContent(type="text", text=json.dumps({"error": str(e), "status": e.response.status_code, "body": e.response.text[:500]}))]
+        return ToolCallOutcome(
+            [TextContent(type="text", text=json.dumps({"error": str(e), "status": e.response.status_code, "body": e.response.text[:500]}))],
+            is_error=True,
+        )
     except Exception as e:
-        return [TextContent(type="text", text=json.dumps({"error": type(e).__name__, "msg": str(e)}))]
+        return ToolCallOutcome(
+            [TextContent(type="text", text=json.dumps({"error": type(e).__name__, "msg": str(e)}))],
+            is_error=True,
+        )
 
 
 # Silence -32601 method-not-found warnings on opencode boot.
@@ -358,6 +451,7 @@ app = Starlette(
         Route("/sse", endpoint=handle_sse),
         Mount("/messages/", app=sse.handle_post_message),
     ],
+    middleware=[Middleware(BridgeBearerAuth)],
 )
 
 

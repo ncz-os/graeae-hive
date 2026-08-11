@@ -1722,8 +1722,10 @@ async def lifespan(app: FastAPI):
         raise RuntimeError("HIVE_BUS_TOKEN must be configured")
     if not HIVE_BUS_ADMIN_TOKEN:
         raise RuntimeError("HIVE_BUS_ADMIN_TOKEN must be configured")
-    # Db2 owns native DDL; SQLite init is idempotent and creates its active-job
-    # dedup index. Oracle deployments continue to use external migrations.
+    if secrets.compare_digest(HIVE_BUS_TOKEN, HIVE_BUS_ADMIN_TOKEN):
+        raise RuntimeError("HIVE_BUS_TOKEN and HIVE_BUS_ADMIN_TOKEN must be distinct")
+    # Each repository owns its startup convergence: SQLite creates its local
+    # schema, while Oracle and Db2 migrate and verify their canonical tables.
     await hive_repo().init(SCHEMA if HIVE_BACKEND == "sqlite" else None)
     if HIVE_BACKEND == "db2":
         task = asyncio.create_task(reaper_task(app))
@@ -1878,50 +1880,8 @@ async def lifespan(app: FastAPI):
             await _ensure_column(db, table, col, ddl_fragment)
         await _ensure_agents_status_allows_stale(db)
 
-        # Thrash fix (2026-06-02) — Oracle backend equivalents. The live hive
-        # runs HIVE_BACKEND=oracle; the SQLite executescript/ALTER paths above
-        # are no-ops there, so add decline_count + relax CK_HIVE_JOBS_STATUS to
-        # include 'dead-letter' (and 'failed_completion') directly via the Oracle
-        # connection. Both steps are idempotent and guarded by existence checks.
-        # DDL on the Oracle adapter is intentionally a no-op (translate returns
-        # None for ALTER/CREATE/DROP), so run these on the RAW oracledb connection
-        # (db._conn) to actually apply them. Idempotent + existence-guarded.
-        if HIVE_BACKEND == "oracle" and getattr(db, "_conn", None) is not None:
-            try:
-                raw = db._conn
-                rcur = raw.cursor()
-                rcur.execute(
-                    "SELECT COUNT(*) FROM user_tab_columns "
-                    "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
-                )
-                has_col = (rcur.fetchone())[0]
-                if not has_col:
-                    rcur.execute(
-                        "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
-                    )
-                rcur.execute(
-                    "SELECT search_condition_vc FROM user_constraints "
-                    "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
-                )
-                crow = rcur.fetchone()
-                cond = str(crow[0]) if crow and crow[0] is not None else ""
-                if crow is not None and "dead-letter" not in cond:
-                    rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
-                    rcur.execute(
-                        "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
-                        "CHECK (status IN ('queued','offered','claimed','running',"
-                        "'done','failed','failed_completion','cancelled','dead-letter'))"
-                    )
-                rcur.close()
-                db._conn.commit()
-            except Exception as e:
-                # FATAL: the runtime decline/dead-letter path REQUIRES both the
-                # decline_count column and the relaxed status CHECK. If this DDL
-                # fails, every subsequent decline PATCH would error (invalid
-                # identifier / CHECK violation), so refuse to start rather than
-                # serve a half-migrated bus.
-                print(f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True)
-                # non-fatal: runtime dead-letter UPDATE falls back to requeue if CHECK not relaxed
+        # Oracle schema convergence and verification run in OracleHiveRepository.init
+        # before this connection and before the reaper is started.
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
             "CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status)",
@@ -2048,7 +2008,7 @@ async def require_bus_auth(request: Request, call_next):
 @app.post("/v1/auth/session")
 async def create_browser_session(request: Request):
     """Exchange an authenticated bearer request for a short-lived HttpOnly session."""
-    role = getattr(request.state, "auth_role", "")
+    role = _bearer_role(request)
     if role not in {"worker", "admin"}:
         raise HTTPException(401, "authenticated bearer credential required")
     expires = int(time.time()) + max(60, min(HIVE_DASHBOARD_SESSION_TTL, 86400))

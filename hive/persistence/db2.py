@@ -626,6 +626,18 @@ class Db2HiveRepository(SqliteHiveRepository):
             return {str(row[0]).strip().upper() for row in await cur.fetchall()}
 
     @staticmethod
+    async def _column_lengths(db: Any, table: str) -> dict[str, int]:
+        async with db.execute(
+            "SELECT colname, length FROM syscat.columns "
+            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            (table.upper(),),
+        ) as cur:
+            return {
+                str(row[0]).strip().upper(): int(row[1])
+                for row in await cur.fetchall()
+            }
+
+    @staticmethod
     async def _indexes(db: Any, table: str) -> set[str]:
         async with db.execute(
             "SELECT indname FROM syscat.indexes "
@@ -663,6 +675,13 @@ class Db2HiveRepository(SqliteHiveRepository):
                 if name not in columns:
                     await db.execute(f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}")
                     columns.add(name)
+
+        # Core created HIVE_JOBS.STATUS as VARCHAR(16), but failed_completion
+        # needs 17 characters. Widen before allowing that value in the check.
+        if (await self._column_lengths(db, "HIVE_JOBS")).get("STATUS", 0) < 32:
+            await db.execute(
+                "ALTER TABLE hive_jobs ALTER COLUMN status SET DATA TYPE VARCHAR(32)"
+            )
 
         # Core's original checks predate the stale/failed_completion/
         # dead-letter/needs-review states used by the current service.
@@ -737,6 +756,11 @@ class Db2HiveRepository(SqliteHiveRepository):
                 raise RuntimeError(f"Db2 schema verification failed: {table} missing {sorted(missing)}")
         if "JOBS_ACTIVE_DEDUP_UQ" not in await self._indexes(db, "HIVE_JOBS"):
             raise RuntimeError("Db2 schema verification failed: jobs_active_dedup_uq is missing")
+        status_length = (await self._column_lengths(db, "HIVE_JOBS")).get("STATUS", 0)
+        if status_length < 17:
+            raise RuntimeError(
+                f"Db2 schema verification failed: HIVE_JOBS.STATUS length is {status_length}, expected at least 17"
+            )
 
     async def close(self) -> None:
         if self._pool is not None:

@@ -8,6 +8,7 @@ uses the repository factory instead of branching on HIVE_BACKEND.
 from __future__ import annotations
 
 import datetime as _dt
+import inspect
 import json as _json
 import re
 import uuid as _uuid
@@ -17,6 +18,58 @@ from typing import Any, AsyncIterator
 from urllib.parse import unquote, urlparse
 
 from .sqlite import SqliteHiveRepository
+
+
+_ORACLE_JOB_ADDITIONS = {
+    "REQUIRED_AUTONOMY": "required_autonomy VARCHAR2(32)",
+    "REQUIRED_RESOURCES": "required_resources CLOB CHECK (required_resources IS JSON)",
+    "CLAIMED_HOST_CAPS": "claimed_host_caps CLOB CHECK (claimed_host_caps IS JSON)",
+    "PROJECT": "project VARCHAR2(120)",
+    "TAGS": "tags CLOB CHECK (tags IS JSON)",
+    "DEPENDS_ON": "depends_on CLOB CHECK (depends_on IS JSON)",
+    "RETRY_COUNT": "retry_count NUMBER(5) DEFAULT 0 NOT NULL",
+    "MAX_RETRIES": "max_retries NUMBER(5) DEFAULT 2 NOT NULL",
+    "RETRY_BACKOFF_UNTIL": "retry_backoff_until NUMBER",
+    "LAST_UPDATE_AT": "last_update_at NUMBER",
+    "ELIGIBLE_HOSTS": "eligible_hosts CLOB CHECK (eligible_hosts IS JSON)",
+    "CLAIM_LEASE_EXPIRES_AT": "claim_lease_expires_at NUMBER",
+    "DECLINE_COUNT": "decline_count NUMBER(5) DEFAULT 0 NOT NULL",
+    "DEDUP_HASH": "dedup_hash VARCHAR2(64)",
+}
+_ORACLE_REQUIRED_JOB_COLUMNS = {
+    "ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION", "PRIORITY",
+    "DEADLINE", "REQUIRED_CAPABILITIES", "ELIGIBLE_KINDS", "ELIGIBLE_HOSTS",
+    "PROJECT", "STATUS", "CLAIMED_BY", "CLAIMED_AT", "STARTED_AT", "ENDED_AT",
+    "RESULT", "REQUIRED_AUTONOMY", "MAX_COST_TIER", "PREFERRED_PROVIDERS",
+    "PREFERRED_MODELS", "CLAIMED_RUNTIME", "CLAIMED_MODEL", "CLAIMED_PROVIDER",
+    "CLAIMED_COST_TIER", "TOKENS_IN", "TOKENS_OUT", "ESTIMATED_COST_USD",
+    "MNEMOS_REFS", "RESULT_MNEMOS_ID", "REQUIRED_RESOURCES", "CLAIMED_HOST_CAPS",
+    "TAGS", "DEPENDS_ON", "RETRY_COUNT", "MAX_RETRIES", "RETRY_BACKOFF_UNTIL",
+    "LAST_UPDATE_AT", "CLAIM_LEASE_EXPIRES_AT", "DECLINE_COUNT", "DEDUP_HASH",
+}
+_ORACLE_JOB_STATUSES = (
+    "queued", "offered", "claimed", "running", "done", "failed",
+    "failed_completion", "cancelled", "dead-letter", "needs-review",
+)
+
+
+async def _await_if_needed(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
+async def _raw_execute(raw: Any, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
+    cursor = raw.cursor()
+    try:
+        if params:
+            await _await_if_needed(cursor.execute(sql, params))
+        else:
+            await _await_if_needed(cursor.execute(sql))
+        fetchall = getattr(cursor, "fetchall", None)
+        if fetchall is None or getattr(cursor, "description", None) is None:
+            return []
+        return list(await _await_if_needed(fetchall()))
+    finally:
+        await _await_if_needed(cursor.close())
 
 
 def _parse_oracle_url(url: str) -> tuple[str, str, str]:
@@ -344,9 +397,131 @@ class OracleHiveRepository(SqliteHiveRepository):
         self.dsn = dsn
 
     async def init(self, schema: str | None = None) -> None:
-        # Oracle deployments are migrated separately; the connection adapter
-        # treats SQLite DDL scripts as no-ops just like the pre-refactor bus.
-        return None
+        try:
+            import oracledb
+        except Exception as exc:
+            raise RuntimeError(f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}") from exc
+        user, password, dsn = _parse_oracle_url(self.dsn)
+        raw = await oracledb.connect_async(user=user, password=password, dsn=dsn)
+        try:
+            await self._apply_migrations(raw)
+            await self._verify_schema(raw)
+            await _await_if_needed(raw.commit())
+        except Exception:
+            await _await_if_needed(raw.rollback())
+            raise
+        finally:
+            await _await_if_needed(raw.close())
+
+    @staticmethod
+    async def _job_columns(raw: Any) -> dict[str, tuple[str, int | None]]:
+        rows = await _raw_execute(
+            raw,
+            "SELECT column_name, data_type, data_length FROM user_tab_columns "
+            "WHERE table_name = 'HIVE_JOBS'",
+        )
+        return {
+            str(name).strip().upper(): (str(data_type).strip().upper(), int(length) if length is not None else None)
+            for name, data_type, length in rows
+        }
+
+    @staticmethod
+    async def _indexes(raw: Any) -> set[str]:
+        rows = await _raw_execute(
+            raw,
+            "SELECT index_name FROM user_indexes WHERE table_name = 'HIVE_JOBS'",
+        )
+        return {str(row[0]).strip().upper() for row in rows}
+
+    async def _apply_migrations(self, raw: Any) -> None:
+        columns = await self._job_columns(raw)
+        if not columns:
+            raise RuntimeError(
+                "Oracle schema migration failed: HIVE_JOBS is missing; apply the canonical MNEMOS Oracle schema first"
+            )
+        for name, definition in _ORACLE_JOB_ADDITIONS.items():
+            if name not in columns:
+                await _raw_execute(raw, f"ALTER TABLE HIVE_JOBS ADD ({definition})")
+        columns = await self._job_columns(raw)
+        status_type, status_length = columns.get("STATUS", ("", 0))
+        if status_type not in {"VARCHAR2", "VARCHAR"} or (status_length or 0) < 32:
+            await _raw_execute(raw, "ALTER TABLE HIVE_JOBS MODIFY (status VARCHAR2(32))")
+
+        checks = await _raw_execute(
+            raw,
+            "SELECT constraint_name, search_condition_vc FROM user_constraints "
+            "WHERE table_name = 'HIVE_JOBS' AND constraint_type = 'C'",
+        )
+        status_checks = [
+            (str(name).strip().upper(), str(condition or ""))
+            for name, condition in checks
+            if re.search(r"\bSTATUS\b\s+IN\s*\(", str(condition or ""), flags=re.IGNORECASE)
+        ]
+        if not any(all(value.upper() in condition.upper() for value in _ORACLE_JOB_STATUSES)
+                   for _name, condition in status_checks):
+            for name, _condition in status_checks:
+                await _raw_execute(raw, f"ALTER TABLE HIVE_JOBS DROP CONSTRAINT {name}")
+            values = ",".join(f"'{value}'" for value in _ORACLE_JOB_STATUSES)
+            await _raw_execute(
+                raw,
+                "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS_RUNTIME "
+                f"CHECK (status IN ({values}))",
+            )
+
+        indexes = await self._indexes(raw)
+        if "IDX_HIVE_JOBS_CLAIM_LEASE" not in indexes:
+            await _raw_execute(
+                raw,
+                "CREATE INDEX IDX_HIVE_JOBS_CLAIM_LEASE ON HIVE_JOBS(CLAIM_LEASE_EXPIRES_AT)",
+            )
+        if not ({"JOBS_ACTIVE_DEDUP_UQ", "HIVE_JOBS_ACTIVE_DEDUP_UQ"} & indexes):
+            await _raw_execute(raw, "LOCK TABLE HIVE_JOBS IN EXCLUSIVE MODE")
+            active = await _raw_execute(
+                raw,
+                "SELECT id, dedup_hash FROM HIVE_JOBS WHERE dedup_hash IS NOT NULL "
+                "AND status IN ('queued','offered','claimed','running') "
+                "ORDER BY dedup_hash, started_at, id",
+            )
+            seen_hashes: set[str] = set()
+            for job_id, dedup_hash in active:
+                if dedup_hash in seen_hashes:
+                    await _raw_execute(
+                        raw,
+                        "UPDATE HIVE_JOBS SET dedup_hash=NULL WHERE id=:1",
+                        (job_id,),
+                    )
+                else:
+                    seen_hashes.add(dedup_hash)
+            await _raw_execute(
+                raw,
+                "CREATE UNIQUE INDEX JOBS_ACTIVE_DEDUP_UQ ON HIVE_JOBS "
+                "(CASE WHEN status IN ('queued','offered','claimed','running') THEN dedup_hash END)",
+            )
+
+    async def _verify_schema(self, raw: Any) -> None:
+        columns = await self._job_columns(raw)
+        missing = _ORACLE_REQUIRED_JOB_COLUMNS - set(columns)
+        if missing:
+            raise RuntimeError(f"Oracle schema verification failed: HIVE_JOBS missing {sorted(missing)}")
+        status_type, status_length = columns["STATUS"]
+        if status_type not in {"VARCHAR2", "VARCHAR"} or (status_length or 0) < 17:
+            raise RuntimeError(
+                f"Oracle schema verification failed: HIVE_JOBS.STATUS is {status_type}({status_length}), expected VARCHAR2(>=17)"
+            )
+        dedup_type, dedup_length = columns["DEDUP_HASH"]
+        if dedup_type not in {"VARCHAR2", "VARCHAR"} or (dedup_length or 0) < 64:
+            raise RuntimeError(
+                f"Oracle schema verification failed: HIVE_JOBS.DEDUP_HASH is {dedup_type}({dedup_length}), expected VARCHAR2(>=64)"
+            )
+        if columns["CLAIM_LEASE_EXPIRES_AT"][0] != "NUMBER":
+            raise RuntimeError("Oracle schema verification failed: HIVE_JOBS.CLAIM_LEASE_EXPIRES_AT must be NUMBER")
+        if columns["ELIGIBLE_HOSTS"][0] not in {"CLOB", "JSON"}:
+            raise RuntimeError("Oracle schema verification failed: HIVE_JOBS.ELIGIBLE_HOSTS must be CLOB or JSON")
+        indexes = await self._indexes(raw)
+        if "IDX_HIVE_JOBS_CLAIM_LEASE" not in indexes:
+            raise RuntimeError("Oracle schema verification failed: claim lease index is missing")
+        if not ({"JOBS_ACTIVE_DEDUP_UQ", "HIVE_JOBS_ACTIVE_DEDUP_UQ"} & indexes):
+            raise RuntimeError("Oracle schema verification failed: active dedup index is missing")
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Any]:
