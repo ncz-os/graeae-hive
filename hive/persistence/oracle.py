@@ -483,15 +483,25 @@ class OracleHiveRepository(SqliteHiveRepository):
                 "ORDER BY dedup_hash, started_at, id",
             )
             seen_hashes: set[str] = set()
+            migration_result = _json.dumps({
+                "reason": "oracle_migration:duplicate_active_dedup_hash",
+            })
             for job_id, dedup_hash in active:
-                if dedup_hash in seen_hashes:
-                    await _raw_execute(
-                        raw,
-                        "UPDATE HIVE_JOBS SET dedup_hash=NULL WHERE id=:1",
-                        (job_id,),
-                    )
-                else:
+                if dedup_hash not in seen_hashes:
                     seen_hashes.add(dedup_hash)
+                    continue
+                # Only nulling dedup_hash satisfied the unique index while
+                # leaving the duplicate ACTIVE, so a worker still claimed and
+                # ran it -- the exact double-execution the index exists to
+                # prevent. Db2 dead-letters these (db2.py); match that.
+                await _raw_execute(
+                    raw,
+                    "UPDATE HIVE_JOBS SET status='dead-letter', dedup_hash=NULL, "
+                    "ended_at=SYSTIMESTAMP, last_update_at=SYSTIMESTAMP, "
+                    "result=COALESCE(result, :1) WHERE id=:2 "
+                    "AND status IN ('queued','offered','claimed','running')",
+                    (migration_result, job_id),
+                )
             await _raw_execute(
                 raw,
                 "CREATE UNIQUE INDEX JOBS_ACTIVE_DEDUP_UQ ON HIVE_JOBS "

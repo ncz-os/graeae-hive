@@ -578,10 +578,24 @@ class _Db2Pool:
         try:
             yield conn
         finally:
+            # ibm_db_dbi connections are autocommit-off, so a borrower that
+            # raised leaves an OPEN transaction. Returning that connection to
+            # _idle hands its uncommitted state -- and its locks -- to the next
+            # borrower. Roll back first, and discard the connection entirely if
+            # the rollback itself fails, rather than pooling a poisoned handle.
+            reusable = True
+            if not self._closed:
+                try:
+                    await conn.rollback()
+                except Exception:
+                    reusable = False
             async with self._lock:
                 self._in_use.discard(conn)
-                if self._closed:
-                    await conn.close()
+                if self._closed or not reusable:
+                    try:
+                        await conn.close()
+                    except Exception:
+                        pass
                 else:
                     self._idle.append(conn)
                 self._not_full.notify()

@@ -350,6 +350,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         active = [("job-old", "same-hash"), ("job-new", "same-hash")]
         sql_seen = []
 
+        dead_lettered: list = []
+
         async def fake_execute(_raw, sql, params=()):
             sql_seen.append((sql, params))
             upper = sql.upper()
@@ -383,8 +385,14 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 checks.append(("CK_HIVE_JOBS_STATUS_RUNTIME", sql))
             elif "SELECT ID, DEDUP_HASH FROM HIVE_JOBS" in upper:
                 return active
-            elif "SET DEDUP_HASH=NULL" in upper:
-                active[:] = [row for row in active if row[0] != params[0]]
+            elif "DEDUP_HASH=NULL" in upper:
+                # The migration now dead-letters the duplicate as well as
+                # clearing its dedup_hash, so the id is the LAST bind, not the
+                # first (:1 carries the migration result JSON).
+                job_id = params[-1]
+                active[:] = [row for row in active if row[0] != job_id]
+                if "DEAD-LETTER" in upper:
+                    dead_lettered.append(job_id)
             elif "CREATE INDEX IDX_HIVE_JOBS_CLAIM_LEASE" in upper:
                 indexes.add("IDX_HIVE_JOBS_CLAIM_LEASE")
             elif "CREATE UNIQUE INDEX JOBS_ACTIVE_DEDUP_UQ" in upper:
@@ -397,6 +405,10 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(_ORACLE_JOB_ADDITIONS.keys() <= columns.keys())
         self.assertEqual(columns["STATUS"], ("VARCHAR2", 32))
         self.assertEqual(active, [("job-old", "same-hash")])
+        # Nulling dedup_hash alone satisfied the unique index while leaving the
+        # duplicate claimable, so a worker still ran it -- the double execution
+        # the index exists to prevent. It must be dead-lettered too.
+        self.assertEqual(dead_lettered, ["job-new"])
         self.assertIn("JOBS_ACTIVE_DEDUP_UQ", indexes)
         self.assertFalse(any("DROP CONSTRAINT SYS_C_STATUS_NN" in sql for sql, _ in sql_seen))
 
