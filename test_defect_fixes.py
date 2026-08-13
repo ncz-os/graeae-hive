@@ -301,6 +301,80 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_job_list_result_projection_is_opt_in_without_breaking_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "jobs.db"))
+            await repo.init(agent_bus.SCHEMA)
+            await repo.submit_job(
+                id="job-result", submitter_urn="urn:submitter", kind="test",
+                started_at=1.0,
+            )
+            async with repo.connection() as db:
+                await db.execute(
+                    "UPDATE jobs SET status='done', ended_at=?, result=? WHERE id=?",
+                    (2.0, json.dumps({"payload": "large"}), "job-result"),
+                )
+                await db.commit()
+
+            with mock.patch.object(agent_bus, "connect_db", repo.connection):
+                historical = await agent_bus.list_jobs(status="done")
+                compact = await agent_bus.list_jobs(status="done", include_result=False)
+
+            self.assertEqual(historical["jobs"][0]["result"], {"payload": "large"})
+            self.assertNotIn("result", compact["jobs"][0])
+
+    async def test_claim_resolves_candidate_dependencies_in_one_query(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "claims.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            async with repo.connection() as db:
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, started_at, "
+                    "last_heartbeat, status, runtime, cost_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("urn:agent:zeroclaw:host:session", "zeroclaw", "host", "session", "[]",
+                     now, now, "online", "zeroclaw", "B"),
+                )
+                for job_id, status in (("dep-done", "done"), ("dep-pending", "queued")):
+                    await db.execute(
+                        "INSERT INTO jobs (id, submitter_urn, kind, priority, eligible_kinds, status, started_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (job_id, "urn:submitter", "dependency", 0, '["other"]', status, now),
+                    )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, depends_on, status, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+                    ("blocked", "urn:submitter", "test", 10, '["dep-pending"]', now),
+                )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, depends_on, status, started_at) "
+                    "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+                    ("ready", "urn:submitter", "test", 9, '["dep-done"]', now),
+                )
+                await db.commit()
+
+            dependency_queries = []
+
+            @asynccontextmanager
+            async def traced_connection():
+                async with repo.connection() as db:
+                    original_execute = db.execute
+
+                    def traced_execute(sql, parameters=None):
+                        if "SELECT id FROM jobs WHERE id IN" in sql and "status='done'" in sql:
+                            dependency_queries.append(sql)
+                        return original_execute(sql, parameters) if parameters is not None else original_execute(sql)
+
+                    db.execute = traced_execute
+                    yield db
+
+            with mock.patch.object(agent_bus, "connect_db", traced_connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                claimed = await agent_bus.dequeue_next_job("urn:agent:zeroclaw:host:session")
+
+            self.assertEqual(claimed["id"], "ready")
+            self.assertEqual(len(dependency_queries), 1)
+
     async def test_fresh_sqlite_has_dedup_column_and_active_unique_index(self):
         with tempfile.TemporaryDirectory() as td:
             repo = SqliteHiveRepository(str(Path(td) / "fresh.db"))
@@ -638,6 +712,19 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ServiceTests(unittest.TestCase):
+    def test_auto_restore_requests_result_free_server_sorted_projection(self):
+        seen = {}
+        server_order = [{"id": "new"}, {"id": "old"}]
+
+        def fake_http(method, path, body=None, timeout=0):
+            seen.update(method=method, path=path)
+            return 200, {"jobs": server_order}
+
+        with mock.patch.object(auto_restore, "_http", fake_http):
+            self.assertEqual(auto_restore.fetch_failed_jobs(limit=25), server_order)
+        self.assertIn("include_result=false", seen["path"])
+        self.assertIn("limit=25", seen["path"])
+
     def test_auto_restore_calls_admin_requeue(self):
         seen = {}
 
@@ -759,6 +846,25 @@ class ServiceTests(unittest.TestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_completion_outbox_flush_is_bounded(self):
+        entries = {
+            f"job-{index}": {
+                "jid": f"job-{index}", "urn": "urn-1", "status": "done", "result": {},
+            }
+            for index in range(5)
+        }
+        flushed = []
+        with mock.patch.object(worker, "COMPLETION_OUTBOX_BATCH_SIZE", 2), \
+                mock.patch.object(worker, "_COMPLETION_OUTBOX_CURSOR", 0), \
+                mock.patch.object(worker, "_read_completion_outbox", return_value=entries), \
+                mock.patch.object(
+                    worker, "persist_terminal_job",
+                    side_effect=lambda jid, *_args, **_kwargs: flushed.append(jid),
+                ):
+            worker.flush_completion_outbox()
+            worker.flush_completion_outbox()
+        self.assertEqual(flushed, ["job-0", "job-1", "job-2", "job-3"])
+
     def test_failed_terminal_write_is_retained_and_later_flushed(self):
         with tempfile.TemporaryDirectory() as td:
             outbox = Path(td) / "outbox.json"

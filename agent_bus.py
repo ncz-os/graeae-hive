@@ -2744,22 +2744,34 @@ async def dequeue_next_job(agent_urn: str):
                 )
             ]
 
+            # Resolve DAG dependencies set-wise.  The previous implementation
+            # issued one COUNT query per candidate, turning a claim poll into
+            # as many as 100 database round trips.  Chunking keeps this safe on
+            # backends with an IN-list limit while reducing the normal path to
+            # one query (and the pathological path to a small bounded number).
+            candidate_dependencies = [json_list(r[15]) for r in candidates]
+            dependency_ids = list(dict.fromkeys(
+                dep for dependencies in candidate_dependencies for dep in dependencies
+            ))
+            completed_dependency_ids: set[str] = set()
+            for offset in range(0, len(dependency_ids), 900):
+                dependency_batch = dependency_ids[offset:offset + 900]
+                placeholders = ",".join("?" * len(dependency_batch))
+                async with db.execute(
+                    f"SELECT id FROM jobs WHERE id IN ({placeholders}) AND status='done'",
+                    tuple(dependency_batch),
+                ) as dep_cur:
+                    async for row in dep_cur:
+                        completed_dependency_ids.add(row[0])
+
             claimed = None
-            for r in candidates:
+            for r, deps in zip(candidates, candidate_dependencies):
                 (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
                  j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
                  j_pref_providers, j_pref_models, j_mnemos_refs, j_deps_json,
                  _j_retry_backoff_until, j_started_at) = r
-                deps = json_list(j_deps_json)
-                if deps:
-                    ph = ",".join("?" * len(deps))
-                    async with db.execute(
-                        f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
-                        tuple(deps),
-                    ) as dc:
-                        done_count = (await dc.fetchone())[0]
-                    if done_count < len(deps):
-                        continue
+                if deps and len(completed_dependency_ids.intersection(deps)) < len(deps):
+                    continue
                 job = {
                     "id": j_id,
                     "kind": j_kind,
@@ -4057,6 +4069,7 @@ async def list_jobs(
     parent_job_id: Optional[str] = None,
     since: Optional[float] = None,
     limit: int = 100,
+    include_result: bool = True,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
     if status:
@@ -4073,8 +4086,12 @@ async def list_jobs(
                 400,
                 f"unknown status {status!r}; valid: {sorted(VALID_JOB_STATUSES)}",
             )
+    # Keep the historical response as the default.  Callers that only need
+    # queue metadata can opt out before SQLite/DB2/Oracle materializes and the
+    # API decodes potentially large result JSON blobs.
+    result_projection = "result" if include_result else "NULL"
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-           "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
+           f"claimed_by, started_at, ended_at, {result_projection}, estimated_cost_usd, "
            "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
@@ -4117,17 +4134,19 @@ async def list_jobs(
             total = row[0] if row else 0
         async with db.execute(sql, args) as cur:
             async for r in cur:
-                rows.append({
+                job = {
                     "id": r[0], "submitter_urn": r[1], "parent_job_id": r[2],
                     "kind": r[3], "description": r[4], "priority": r[5],
                     "status": r[6], "claimed_by": r[7],
                     "started_at": r[8], "ended_at": r[9],
-                    "result": json.loads(r[10]) if r[10] else None,
                     "estimated_cost_usd": r[11],
                     "required_capabilities": json.loads(r[12]) if r[12] else None,
                     "eligible_kinds": json.loads(r[13]) if r[13] else None,
                     "eligible_hosts": json.loads(r[14]) if r[14] else None,
-                })
+                }
+                if include_result:
+                    job["result"] = json.loads(r[10]) if r[10] else None
+                rows.append(job)
     return {"count": len(rows), "total": total, "jobs": rows}
 
 

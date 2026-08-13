@@ -82,13 +82,15 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
         return 0, None
 
 def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
-    query = urllib.parse.urlencode({"status": "failed", "limit": str(limit)})
+    query = urllib.parse.urlencode({
+        "status": "failed", "limit": str(limit), "include_result": "false",
+    })
     code, resp = _http("GET", f"/v1/jobs?{query}", timeout=15.0)
     if code != 200 or not resp:
         raise RuntimeError(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")
-    jobs = resp.get("jobs", []) or []
-    jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
-    return jobs
+    # The terminal-status list endpoint already returns newest completions
+    # first, so avoid a redundant client-side sort.
+    return resp.get("jobs", []) or []
 
 def restore_job(jid: str) -> tuple[bool, str]:
     body = {"job_ids": [jid], "reason": "auto-restore"}
