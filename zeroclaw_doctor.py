@@ -931,7 +931,10 @@ def _build_token_fix_codex_task(offending_host: str) -> str:
 DIAGNOSIS: Worker on {offending_host} is failing with 'no token for host' / 'pair gateway first via POST /pair'.
 The gateway-tokens.json 127.0.0.1 entry has drifted from the gateway's paired_tokens in config.toml.
 
-FLEET LAN TOKEN: {FLEET_LAN_TOKEN}
+FLEET LAN TOKEN: taken from $FLEET_LAN_TOKEN on the executing host.
+This job description is persisted in the jobs table and the event log, so the
+token value is deliberately NOT written here -- export it in the shell that
+runs the steps below:  export FLEET_LAN_TOKEN=<value from ~/.api_keys_master.json>
 
 FIX STEPS — execute in order via SSH to {offending_host} ({ip}):
 
@@ -941,8 +944,8 @@ STEP 1 — SSH to host:
 STEP 2 — Fix gateway-tokens.json (MUST have both 127.0.0.1 AND hostname entries):
   cat > /tmp/gateway-tokens-fix.json << 'TOKENS_EOF'
 {{
-  "127.0.0.1": "{FLEET_LAN_TOKEN}",
-  "{host_upper}": "{FLEET_LAN_TOKEN}"
+  "127.0.0.1": "'"$FLEET_LAN_TOKEN"'",
+  "{host_upper}": "'"$FLEET_LAN_TOKEN"'"
 }}
 TOKENS_EOF
   # Merge with existing entries (preserve other host tokens already in file)
@@ -970,14 +973,14 @@ with open(path) as f:
     content = f.read()
 # Ensure [gateway] section exists with paired_tokens
 if '[gateway]' not in content:
-    content += '\\n[gateway]\\npaired_tokens = [\\'{FLEET_LAN_TOKEN}\\']\\n'
+    content += '\\n[gateway]\\npaired_tokens = [\\'' + os.environ['FLEET_LAN_TOKEN'] + '\\']\\n'
 elif 'paired_tokens' not in content.split('[gateway]')[1].split('[')[0] if '[gateway]' in content else '':
-    content = content.replace('[gateway]', '[gateway]\\npaired_tokens = [\\'{FLEET_LAN_TOKEN}\\']')
+    content = content.replace('[gateway]', '[gateway]\\npaired_tokens = [\\'' + os.environ['FLEET_LAN_TOKEN'] + '\\']')
 else:
     import re
     content = re.sub(
         r'paired_tokens\\s*=\\s*\\[.*?\\]',
-        'paired_tokens = [\\'{FLEET_LAN_TOKEN}\\']',
+        'paired_tokens = [\\'' + os.environ['FLEET_LAN_TOKEN'] + '\\']',
         content
     )
 with open(path, 'w') as f:
