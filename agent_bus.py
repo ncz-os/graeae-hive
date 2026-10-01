@@ -29,6 +29,12 @@ except ModuleNotFoundError:
 
 import queue_logic
 from hive.persistence.factory import get_hive_repository
+from hive.scheduler import (
+    MINIMAX_MODEL as _SCHED_MINIMAX_MODEL,
+    MINIMAX_PROVIDER as _SCHED_MINIMAX_PROVIDER,
+    order_candidates_for_worker,
+    worker_profile_from_metadata,
+)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -852,6 +858,7 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "ollama-cerberus": "A",
     "local":           "A",
     "pantheon":        "A",
+    "minimax":         "B",   # MiniMax-M3 capacity pool — paid metered mid-tier (5-slot global cap)
 
     # Tier B = MID (cheap paid commercial)
     "groq":            "B",
@@ -1262,6 +1269,8 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
     ("deepseek-direct", "*"):               (0.435, 0.87),
     ("deepseek",        "*"):               (0.435, 0.87),
     ("together",  "minimax-m2.7"):          (0.40,  1.20),
+    ("minimax",   "minimax-m3"):            (0.30,  0.90),  # MiniMax-M3 capacity pool (5 global / 1 per worker)
+    ("minimax",   "*"):                     (0.30,  0.90),
     ("together",  "deepseek-v4-pro"):       (2.10,  4.40),
     ("together",  "kimi-k2.6"):             (1.20,  4.40),
     ("together",  "glm-3.5-90"):            (0.10,  0.15),
@@ -2726,22 +2735,79 @@ async def dequeue_next_job(agent_urn: str):
                 (now,),
             ) as cur:
                 candidates = [tuple(r) async for r in cur]
+            # ── Scheduler: role + utilization + deficit ordering ──
+            # Replace the legacy "first-priority-wins" sort with a role/util/
+            # deficit-aware re-scoring (deterministic, starvation-protected).
+            # The SQL ``ORDER BY priority DESC, started_at ASC LIMIT 100``
+            # above still bounds the candidate set to a stable top-100; this
+            # block re-orders THOSE 100 for THIS specific worker so the worker
+            # gets the BEST-FIT job it can actually serve (not merely the
+            # highest-priority job it's eligible for). Hard eligibility is
+            # still checked one candidate at a time below; scoring never
+            # overrides ``job_agent_eligible``.
+            try:
+                _capabilities_list = list(agent_caps)
+            except Exception:
+                _capabilities_list = []
+            _raw_load_json = None
+            async with db.execute(
+                "SELECT current_load FROM agents WHERE urn=?",
+                (agent_urn,),
+            ) as _cl_cur:
+                _cl_row = await _cl_cur.fetchone()
+            if _cl_row and _cl_row[0]:
+                try:
+                    _raw_load_json = json.loads(_cl_row[0])
+                except Exception:
+                    _raw_load_json = None
+            # Identify the worker's currently-active MiniMax lease (if any).
+            # Active = claimed/running AND model is MiniMax-M3 AND lease not
+            # expired. Stale leases do not count against the global pool cap
+            # (see test_scheduler.py ``lease_expiry`` block).
+            _held_mx_lease: str | None = None
+            async with db.execute(
+                "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('claimed','running') "
+                "AND claimed_provider=? AND claimed_model=? "
+                "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
+                (agent_urn, _SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
+            ) as _mx_cur:
+                _mx_row = await _mx_cur.fetchone()
+            if _mx_row and _mx_row[0]:
+                _held_mx_lease = _mx_row[0]
+            _worker_profile = worker_profile_from_metadata(
+                urn=agent_urn,
+                host=agent_host,
+                capabilities=_capabilities_list,
+                current_load=_raw_load_json,
+                active_minimax_lease=_held_mx_lease,
+            )
+            # Project the rows into the lightweight shape the scheduler
+            # scoring function expects, then re-rank by the scheduler key.
+            # ``order_candidates_for_worker`` is stable for equal sort keys
+            # (input order is preserved via the trailing tie-break), so the
+            # final iterate stays deterministic across runs without an extra
+            # DB round-trip.
+            _projected = [
+                {
+                    "id": r[0],
+                    "submitter_urn": r[1],
+                    "kind": r[3],
+                    "priority": r[5] or 0,
+                    "required_capabilities": json_list(r[7]),
+                }
+                for r in candidates
+            ]
+            _ranked_projected = order_candidates_for_worker(
+                candidates=_projected, worker=_worker_profile, now=now,
+            )
+            _by_id = {c["id"]: c for c in _projected}
+            # Re-index original rows by job id, then walk the scheduler order.
+            _orig_by_id: dict[str, tuple] = {}
+            for r in candidates:
+                _orig_by_id[r[0]] = r
             candidates = [
-                r for _idx, r in sorted(
-                    enumerate(candidates),
-                    key=lambda item: (
-                        item[1][5] or 0,
-                        job_agent_preference_score(
-                            {
-                                "preferred_providers": json_list(item[1][12]),
-                                "preferred_models": json_list(item[1][13]),
-                            },
-                            agent,
-                        ),
-                        -item[0],
-                    ),
-                    reverse=True,
-                )
+                _orig_by_id[c["id"]] for c in _ranked_projected
+                if c["id"] in _orig_by_id
             ]
 
             # Resolve DAG dependencies set-wise.  The previous implementation
@@ -2765,6 +2831,31 @@ async def dequeue_next_job(agent_urn: str):
                         completed_dependency_ids.add(row[0])
 
             claimed = None
+            # ── MiniMax-M3 capacity pool pre-flight ──
+            # If this worker is about to take a job whose dispatched route is
+            # the MiniMax-M3 pool, we must enforce BOTH:
+            #   (1) per-worker cap (1 active MiniMax lease per worker urn)
+            #   (2) global cap (5 active MiniMax leases fleet-wide)
+            # The snapshot below counts only ACTIVE leases (status
+            # claimed/running AND lease not expired). Stale leases are
+            # filtered out so a worker whose claim crashed without releasing
+            # its lease does NOT permanently reduce pool capacity.
+            _minimax_pool_active = 0
+            _minimax_pool_holders: set[str] = set()
+            async with db.execute(
+                "SELECT claimed_by FROM jobs "
+                "WHERE status IN ('claimed','running') "
+                "AND claimed_provider=? AND claimed_model=? "
+                "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
+                (_SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
+            ) as _mx_pool_cur:
+                async for _mx_pool_row in _mx_pool_cur:
+                    _minimax_pool_holders.add(_mx_pool_row[0])
+                    _minimax_pool_active += 1
+            _worker_is_minimax_route = (
+                (a_model or "").lower() == _SCHED_MINIMAX_MODEL
+                and (a_provider or "").lower() == _SCHED_MINIMAX_PROVIDER
+            )
             for r, deps in zip(candidates, candidate_dependencies):
                 (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
                  j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
@@ -2786,6 +2877,25 @@ async def dequeue_next_job(agent_urn: str):
                 eligible, _reason = job_agent_eligible(job, agent)
                 if not eligible:
                     continue
+                # MiniMax-M3 pool gate: applied only when this claim would
+                # actually take a MiniMax lease (route chain's leaf is the
+                # MiniMax-M3 model). When the worker is on a non-MiniMax
+                # route, no pool check is performed — a worker may hold a
+                # MiniMax lease AND a non-MiniMax job simultaneously (the
+                # lease is exclusive to the MiniMax model, not to the
+                # worker). Fail-closed semantics: a denied MiniMax claim
+                # is logged + emitted on the response header but the
+                # candidate loop continues so the worker can fall through
+                # to a non-MiniMax eligible job instead of starving.
+                if _worker_is_minimax_route:
+                    if agent_urn in _minimax_pool_holders:
+                        # Already holds an active MiniMax lease — per-worker cap.
+                        continue
+                    if _minimax_pool_active >= 5:
+                        # Global saturation — pool is at hard cap.
+                        continue
+                    _minimax_pool_active += 1
+                    _minimax_pool_holders.add(agent_urn)
                 cur2 = await db.execute(
                     "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                     "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
@@ -2841,12 +2951,24 @@ async def dequeue_next_job(agent_urn: str):
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
     # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
     # contract and triggers h11 LocalProtocolError. Use Response (no body).
+    # If the loop ended specifically because the MiniMax-M3 pool was at the
+    # 5/5 global cap and the requesting worker is itself a MiniMax-M3 route
+    # worker, surface the pool reason so the worker can fall through to a
+    # non-MiniMax chain instead of retrying against a saturated pool.
     from fastapi.responses import Response as _Response
+    _claim_detail = "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier"
+    _claim_result = "no_jobs_available"
+    if _worker_is_minimax_route and _minimax_pool_active >= 5:
+        _claim_result = "minimax_pool_saturated"
+        _claim_detail = (
+            f"minimax:global cap reached ({_minimax_pool_active}/5); "
+            "fall through to a non-minimax chain"
+        )
     return _Response(
         status_code=204,
         headers={
-            "X-Hive-Claim-Result": "no_jobs_available",
-            "X-Hive-Claim-Detail": "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier",
+            "X-Hive-Claim-Result": _claim_result,
+            "X-Hive-Claim-Detail": _claim_detail,
         },
     )
 
@@ -3550,6 +3672,11 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # {"provider": "siliconflow","model": "qwen2.5-coder-32b",   "alias": "hive_siliconflow_1", "tier": "B"},
     {"provider": "deepseek-direct","model": "deepseek-v4-flash","alias": "hive_deepseek_1",   "tier": "B"},
     {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
+    # MiniMax-M3 capacity pool (worker-agnostic, 5-slot global cap, 1 per worker).
+    # Host-independent: any worker on the bus may take this lease as long as
+    # the global pool has headroom. The dequeue flow enforces the cap at
+    # claim time (see dequeue_next_job MiniMax pre-flight block).
+    {"provider": "minimax",   "model": "minimax-m3",            "alias": "hive_minimax_1",     "tier": "B"},
     {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
     {"provider": "deepseek-direct","model": "deepseek-v4-pro", "alias": "hive_deepseek_pro_1","tier": "B"},
     # NGC Enterprise Inference Hub via the .4 LiteLLM gateway (PYTHIA:4100

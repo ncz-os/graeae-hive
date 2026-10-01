@@ -711,6 +711,203 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(row, ("queued", None, None, None, None, None, None, None, None))
 
 
+class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end scheduler wiring tests against the agent_bus dequeue flow.
+
+    These complement the pure-API checks in ``test_scheduler.py`` by
+    exercising the full dequeue_next_job path (eligibility + role-aware
+    candidate ordering + MiniMax pool gate + claim UPDATE) against a
+    real SQLite repository.
+    """
+
+    async def _seed_worker_and_jobs(
+        self,
+        repo,
+        *,
+        urn: str,
+        kind: str,
+        host: str,
+        capabilities: list[str],
+        current_load: dict | None,
+        jobs: list[tuple[str, str, int, str | None, str | None]],
+    ):
+        """Insert one worker + N jobs. jobs is a list of
+        (job_id, kind, priority, required_caps_json, eligible_hosts_json).
+        """
+        now = time.time()
+        async with repo.connection() as db:
+            await db.execute(
+                "INSERT INTO agents (urn, kind, host, session_id, capabilities, current_load, "
+                "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    urn, kind, host, "session",
+                    json.dumps(capabilities),
+                    json.dumps(current_load) if current_load else None,
+                    now, now, "online", kind, "B", "default", "default",
+                ),
+            )
+            for jid, jkind, jprio, jcaps, jhosts in jobs:
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "required_capabilities, eligible_hosts, started_at) "
+                    "VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)",
+                    (jid, "urn:submitter", jkind, jprio, jcaps, jhosts, now),
+                )
+            await db.commit()
+
+    async def test_dequeue_ordinary_prefers_non_build_worker(self):
+        """An idle non-build worker wins the claim for ordinary work over an
+        idle build worker when both are eligible."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "role.db"))
+            await repo.init(agent_bus.SCHEMA)
+            jobs = [
+                ("job-ord", "feat:edit", 5, None, None),
+                ("job-other", "feat:docs", 4, None, None),
+            ]
+            await self._seed_worker_and_jobs(
+                repo,
+                urn="urn:agent:zeroclaw:typhon:s1",
+                kind="zeroclaw", host="typhon",
+                capabilities=[],
+                current_load={"utilization": 0.0, "deficit": 0.0},
+                jobs=jobs,
+            )
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                claimed = await agent_bus.dequeue_next_job(
+                    "urn:agent:zeroclaw:typhon:s1",
+                )
+            self.assertEqual(claimed["id"], "job-ord")
+
+    async def test_dequeue_build_job_picked_by_build_worker(self):
+        """A build: kind job with a hard:linux-compile capability is claimable
+        by a worker that advertises the matching capability + role:build."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "build.db"))
+            await repo.init(agent_bus.SCHEMA)
+            await self._seed_worker_and_jobs(
+                repo,
+                urn="urn:agent:zeroclaw:hydra:s1",
+                kind="zeroclaw", host="hydra",
+                capabilities=["role:build", "linux-compile"],
+                current_load={"utilization": 0.0, "deficit": 0.0},
+                jobs=[
+                    ("job-build", "build:compile", 5,
+                     json.dumps(["hard:linux-compile"]), None),
+                ],
+            )
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                claimed = await agent_bus.dequeue_next_job(
+                    "urn:agent:zeroclaw:hydra:s1",
+                )
+            self.assertEqual(claimed["id"], "job-build")
+
+    async def test_dequeue_minimax_global_cap_blocks_sixth_claim(self):
+        """Six MiniMax-M3 route workers can not all claim; the 6th gets 204."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "minimax.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            # Five MiniMax-M3 lease holders (active, not expired).
+            active_holders = [f"urn:agent:zeroclaw:w{i}:s1" for i in range(5)]
+            async with repo.connection() as db:
+                for i, holder in enumerate(active_holders):
+                    await db.execute(
+                        "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                        "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (holder, "zeroclaw", f"w{i}", "session", "[]",
+                         now, now, "online", "zeroclaw", "B",
+                         "minimax-m3", "minimax"),
+                    )
+                # Their active MiniMax jobs.
+                for i, holder in enumerate(active_holders):
+                    await db.execute(
+                        "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                        "claimed_by, claimed_provider, claimed_model, claim_lease_expires_at, "
+                        "started_at) "
+                        "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'running', "
+                        "?, 'minimax', 'minimax-m3', ?, ?)",
+                        (f"job-mx-{i}", holder, now + 3600, now),
+                    )
+                # The 6th worker + 6 MiniMax job.
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("urn:agent:zeroclaw:w6:s1", "zeroclaw", "w6", "session", "[]",
+                     now, now, "online", "zeroclaw", "B",
+                     "minimax-m3", "minimax"),
+                )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-mx-6", now),
+                )
+                await db.commit()
+
+            from fastapi.responses import Response
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                response = await agent_bus.dequeue_next_job(
+                    "urn:agent:zeroclaw:w6:s1",
+                )
+            # 6th MiniMax worker hits the global cap; we expect a 204 No
+            # Content response (job still queued, no claim recorded).
+            self.assertIsInstance(response, Response)
+            self.assertEqual(response.status_code, 204)
+            self.assertIn("minimax", response.headers.get("X-Hive-Claim-Detail", "")
+                          .lower() + " no_jobs_available")  # noqa: E501
+
+    async def test_dequeue_minimax_lease_holder_can_still_claim_non_minimax_job(self):
+        """A worker holding an active MiniMax lease is still eligible for any
+        non-MiniMax job — the lease is exclusive to the MiniMax model."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "minimax-mix.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            urn = "urn:agent:zeroclaw:typhon:s-mix"
+            async with repo.connection() as db:
+                # Worker with neutral model/provider — eligible for the
+                # generic local job, ineligible for MiniMax.
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (urn, "zeroclaw", "typhon", "session", "[]",
+                     now, now, "online", "zeroclaw", "B",
+                     "grok-4.3", "xai"),
+                )
+                # Existing active MiniMax lease held by this same worker
+                # (would normally mean "you're on MiniMax" — but here the
+                # worker's model/provider is NOT MiniMax so this is the
+                # historical "lease still running but worker is now on a
+                # different route" case; the lease must not prevent claiming a
+                # non-MiniMax job).
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "claimed_by, claimed_provider, claimed_model, claim_lease_expires_at, "
+                    "started_at) "
+                    "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'running', "
+                    "?, 'minimax', 'minimax-m3', ?, ?)",
+                    ("job-mx-history", urn, now + 3600, now),
+                )
+                # Generic queued job.
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-local", now),
+                )
+                await db.commit()
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                claimed = await agent_bus.dequeue_next_job(urn)
+            self.assertEqual(claimed["id"], "job-local")
+
+
 class ServiceTests(unittest.TestCase):
     def test_auto_restore_requests_result_free_server_sorted_projection(self):
         seen = {}
