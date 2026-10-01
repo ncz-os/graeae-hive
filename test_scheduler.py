@@ -430,14 +430,16 @@ check(
 check(state.active_assignments == 5, "pool is saturated at 5/5 (no overflow)")
 
 # Per-worker cap: the same worker trying to claim a second MiniMax job is
-# rejected, regardless of global headroom.
+# rejected, regardless of global headroom. The constant MINIMAX_PER_WORKER_MAX
+# is the source of truth — the reason mentions per-worker cap so any future
+# bump to that constant is reflected here too.
 held_worker_state = state.assign("urn:agent:zeroclaw:typhon:s5", "job-mx-dup")
 # (state is unchanged because can_assign would have failed; we test via the
 # can_assign check directly.)
 ok, reason = state.can_assign("urn:agent:zeroclaw:typhon:s5")
 check(
-    not ok and "already holds lease" in reason,
-    "per-worker MiniMax cap is enforced (worker holds a lease)",
+    not ok and "per-worker cap" in reason,
+    f"per-worker MiniMax cap (={sched.MINIMAX_PER_WORKER_MAX}) is enforced; got reason={reason!r}",
 )
 del held_worker_state  # keep test scope tidy
 
@@ -682,6 +684,185 @@ for declared in sched.VALID_ROLES:
     check(
         w.role == declared,
         f"role:{declared} capability wins over proteus build-host hint",
+    )
+
+
+# ── Defensive: malformed current_load values are clamped, not raised ──────
+# A misreported worker (e.g. NaN, infinity, out-of-range float, non-numeric)
+# must NOT crash the scheduler. The bus trusts the worker to send JSON, but
+# a buggy client should never wedge the claim loop.
+malformed_cases = [
+    {"utilization": float("nan")},          # NaN -> default 0
+    {"utilization": float("inf")},          # inf -> clamped to 1
+    {"utilization": -0.5},                  # negative -> clamped to 0
+    {"utilization": 7.3},                   # over-range -> clamped to 1
+    {"utilization": "0.42"},                # numeric string -> parsed
+    {"utilization": "bogus"},               # non-numeric string -> default 0
+    {"utilization": None},                  # None -> default 0
+    {"deficit": float("nan")},              # NaN deficit -> default 0
+    {"deficit": "huge"},                    # non-numeric -> default 0
+    {"last_served_at": "not-a-timestamp"},  # malformed last_served_at -> None
+    {"last_served_at": None},               # None last_served_at -> None
+]
+for i, load in enumerate(malformed_cases):
+    w = sched.worker_profile_from_metadata(
+        urn=f"urn:test:malformed:{i}",
+        host="typhon",
+        capabilities=[],
+        current_load=load,
+    )
+    # Every profile must come back with utilization clamped to [0,1] and
+    # the never-crash invariant: it must be a finite float.
+    check(
+        isinstance(w.utilization, float) and 0.0 <= w.utilization <= 1.0,
+        f"malformed load {load!r} yields a sane utilization (got {w.utilization!r})",
+    )
+    check(
+        isinstance(w.deficit, float),
+        f"malformed load {load!r} yields a finite deficit (got {w.deficit!r})",
+    )
+    check(
+        w.last_served_at is None or isinstance(w.last_served_at, float),
+        f"malformed load {load!r} yields a sane last_served_at (got {w.last_served_at!r})",
+    )
+
+# worker_profile_from_metadata with a flat float (legacy current_load) works.
+flat_low = sched.worker_profile_from_metadata(
+    urn="urn:flat:low", host="typhon", capabilities=[], current_load=0.25
+)
+flat_high = sched.worker_profile_from_metadata(
+    urn="urn:flat:high", host="typhon", capabilities=[], current_load=0.75
+)
+check(
+    flat_low.utilization == 0.25 and flat_high.utilization == 0.75,
+    "flat-float current_load is honoured for legacy heartbeat payloads",
+)
+# Flat-float NaN -> defaults to 0 (defensive).
+flat_nan = sched.worker_profile_from_metadata(
+    urn="urn:flat:nan", host="typhon", capabilities=[], current_load=float("nan")
+)
+check(
+    flat_nan.utilization == 0.0,
+    "flat-float NaN utilization defaults to 0 (never wedges the claim loop)",
+)
+
+
+# ── MiniMax-M3 pool: explicit per-worker cap is consulted, not implied ─────
+# The constant MINIMAX_PER_WORKER_MAX is the source of truth for the cap. Bumping
+# the constant relaxes the cap; the can_assign check uses the live value, not
+# a hardcoded threshold. We verify by checking the reason string mentions
+# the per-worker cap rather than just "already holds lease".
+ps = sched.MiniMaxPoolState()
+ps = ps.assign("urn:w1", "j1")
+ok, reason = ps.can_assign("urn:w1")
+check(
+    not ok and f"per-worker cap={sched.MINIMAX_PER_WORKER_MAX}" in reason,
+    f"per-worker cap reason mentions the live MINIMAX_PER_WORKER_MAX constant (got {reason!r})",
+)
+
+# After release, the same worker can take a fresh one (per-worker cap=1).
+ps = ps.release("urn:w1")
+ok, _ = ps.can_assign("urn:w1")
+check(ok, "after release, per-worker cap permits a new MiniMax lease")
+
+
+# ── build_pool_snapshot: input normalisation ────────
+# Empty-string worker urns and empty-string job ids are dropped (defensive
+# against malformed SQL projections). Case is normalised to lower; whitespace
+# is stripped. Mixed-case duplicates collapse to last-write-wins.
+snap_norm = sched.build_pool_snapshot([
+    ("  URN:W1 ", "  JOB-1  "),
+    ("URN:w1", "JOB-2"),
+    ("urn:w2", "JOB-3"),
+])
+check(
+    snap_norm.active_assignments == 2
+    and snap_norm.leases_by_worker == {
+        "urn:w1": "job-2",
+        "urn:w2": "job-3",
+    },
+    "build_pool_snapshot lowercases+strips input fields and de-dupes by normalised worker urn",
+)
+
+
+# ── select_best_job: starved worker's deficit boost doesn't change pick order
+# when jobs differ on priority. The starvation boost only affects candidates
+# tied at (priority, role-penalty). Higher-priority jobs still win.
+starved_high_prio = sched.select_best_job(
+    candidates=[
+        make_job(jid="job-low", kind="feat:edit", priority=1),
+        make_job(jid="job-high", kind="feat:edit", priority=10),
+    ],
+    worker=make_worker(
+        urn="urn:starved:boost",
+        host="typhon",
+        role=None,
+        util=0.0,
+        last_served_at=NOW - (sched.STARVATION_AGE_SECONDS + 60),
+        deficit=0.0,
+    ),
+    now=NOW,
+)
+check(
+    starved_high_prio["id"] == "job-high",
+    "starvation boost does NOT override priority ordering",
+)
+
+
+# ── Job without an id still scores deterministically (job_id falls back to "")
+# A malformed job without an id should not crash the scheduler; it just gets
+# the empty-string tie-break (lexicographically first).
+no_id_job = {
+    "submitter_urn": "sub-x",
+    "kind": "feat:edit",
+    "priority": 5,
+    "required_capabilities": [],
+}
+scored_no_id = sched.score_candidate(
+    job=no_id_job, worker=make_worker(urn="urn:w", host="typhon"), now=NOW,
+)
+check(
+    scored_no_id.score is not None and scored_no_id.job_id == "",
+    "score_candidate tolerates a job without an id field",
+)
+
+
+# ── MiniMaxPoolState.assign idempotence: assigning the same (urn, job) twice
+# is the responsibility of can_assign (which would block the second attempt).
+# The assign method itself does NOT guard against double-assignment; we rely on
+# can_assign being called first. Verify that calling assign twice with the
+# same urn does inflate the counter (the bug class to guard against is
+# accidentally calling can_assign and then NOT honoring its deny).
+s2 = sched.MiniMaxPoolState()
+s2 = s2.assign("urn:w", "j1")
+s2_double = s2.assign("urn:w", "j1-again")
+check(
+    s2_double.active_assignments == 2,
+    "MiniMaxPoolState.assign is pure-state (does not self-check per-worker cap; "
+    "callers MUST consult can_assign first)",
+)
+
+
+# ── Determinism across worker instantiations: same inputs yield same outputs
+# across fresh worker profile objects (regression guard against any hidden
+# global state in the scheduler module).
+for _ in range(3):
+    w1 = sched.worker_profile_from_metadata(
+        urn="urn:det",
+        host="typhon",
+        capabilities=[],
+        current_load={"utilization": 0.4, "last_served_at": NOW - 5, "deficit": 1.5},
+    )
+    w2 = sched.worker_profile_from_metadata(
+        urn="urn:det",
+        host="typhon",
+        capabilities=[],
+        current_load={"utilization": 0.4, "last_served_at": NOW - 5, "deficit": 1.5},
+    )
+    check(
+        sched.score_candidate(job=make_job(jid="det"), worker=w1, now=NOW).score
+        == sched.score_candidate(job=make_job(jid="det"), worker=w2, now=NOW).score,
+        "identical worker profiles yield identical scores (no hidden globals)",
     )
 
 

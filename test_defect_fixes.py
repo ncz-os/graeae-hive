@@ -21,6 +21,7 @@ os.environ["MCP_BRIDGE_ADMIN_TOKEN"] = "test-mcp-admin-token"
 os.environ.setdefault("AGENT_BUS_DB", str(Path(tempfile.gettempdir()) / "hive-defect-tests.db"))
 
 import agent_bus
+from hive import scheduler as sched
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
 from hive.persistence.oracle import (
     OracleHiveRepository,
@@ -1028,6 +1029,133 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
                 claimed = await agent_bus.dequeue_next_job(urn_starved)
             self.assertIn(claimed["id"], ("job-aa", "job-bb"))
+
+    async def test_dequeue_local_eih_routes_share_pool_with_general_workers(self):
+        """Local (local-llamacpp) and EIH (ngc-proxy) jobs are general-pool
+        work — they do NOT consume a MiniMax-M3 lease and a general worker
+        (grok-4.3 / xai) is free to claim them even when 5 MiniMax leases
+        are active elsewhere in the fleet. Only MiniMax-route workers
+        themselves are gated by the pool; the MiniMax cap is a route-class
+        cap, not a worker cap.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "local-eih.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            urn = "urn:agent:zeroclaw:typhon:s-local"
+            async with repo.connection() as db:
+                # Five MiniMax-M3 lease holders, pool saturated.
+                for i in range(5):
+                    holder = f"urn:agent:zeroclaw:w{i}:s1"
+                    await db.execute(
+                        "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                        "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (holder, "zeroclaw", f"w{i}", "session", "[]",
+                         now, now, "online", "zeroclaw", "B",
+                         "minimax-m3", "minimax"),
+                    )
+                    await db.execute(
+                        "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                        "claimed_by, claimed_provider, claimed_model, claim_lease_expires_at, "
+                        "started_at) "
+                        "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'running', "
+                        "?, 'minimax', 'minimax-m3', ?, ?)",
+                        (f"job-mx-{i}", holder, now + 3600, now),
+                    )
+                # General (grok-4.3) worker — would be on a local/EIH route.
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (urn, "zeroclaw", "typhon", "session", "[]",
+                     now, now, "online", "zeroclaw", "B",
+                     "grok-4.3", "xai"),
+                )
+                # Local job + EIH job queued (both general pool, not MiniMax).
+                for jid in ("job-local-1", "job-eih-1"):
+                    await db.execute(
+                        "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                        "started_at) "
+                        "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                        (jid, now),
+                    )
+                await db.commit()
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                claimed = await agent_bus.dequeue_next_job(urn)
+            # Pool saturated (5/5 MiniMax leases) but a general worker on
+            # the grok-4.3/xai route is unaffected — it claims the highest-
+            # priority queued job from the local/EIH pool.
+            self.assertIn(claimed["id"], ("job-local-1", "job-eih-1"))
+
+    async def test_dequeue_minimax_pool_observability_event_is_emitted(self):
+        """When the MiniMax pool denies a claim, ``minimax.pool.denied`` is
+        emitted on the bus with the reason + pool counts so fleet operators
+        can grep the events table (NOT stderr) for saturation signals."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "mx-deny.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            urn = "urn:agent:zeroclaw:typhon:s-deny"
+            async with repo.connection() as db:
+                # Five MiniMax-M3 lease holders (saturated pool).
+                for i in range(5):
+                    holder = f"urn:agent:zeroclaw:w{i}:s1"
+                    await db.execute(
+                        "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                        "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (holder, "zeroclaw", f"w{i}", "session", "[]",
+                         now, now, "online", "zeroclaw", "B",
+                         "minimax-m3", "minimax"),
+                    )
+                    await db.execute(
+                        "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                        "claimed_by, claimed_provider, claimed_model, claim_lease_expires_at, "
+                        "started_at) "
+                        "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'running', "
+                        "?, 'minimax', 'minimax-m3', ?, ?)",
+                        (f"job-mx-{i}", holder, now + 3600, now),
+                    )
+                # 6th MiniMax-M3 worker (will be denied).
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (urn, "zeroclaw", "typhon", "session", "[]",
+                     now, now, "online", "zeroclaw", "B",
+                     "minimax-m3", "minimax"),
+                )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) "
+                    "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-mx-6", now),
+                )
+                await db.commit()
+            # Capture emitted events.
+            from fastapi.responses import Response
+            captured_events = []
+
+            async def fake_emit(db, kind, payload):
+                captured_events.append((kind, payload))
+
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", fake_emit):
+                response = await agent_bus.dequeue_next_job(urn)
+            self.assertIsInstance(response, Response)
+            self.assertEqual(response.status_code, 204)
+            denied = [e for e in captured_events if e[0] == "minimax.pool.denied"]
+            self.assertEqual(
+                len(denied), 1,
+                f"exactly one minimax.pool.denied event must be emitted; got {captured_events!r}",
+            )
+            _kind, payload = denied[0]
+            self.assertEqual(payload["urn"], urn)
+            self.assertEqual(payload["pool_active"], sched.MINIMAX_GLOBAL_MAX)
+            self.assertEqual(payload["pool_cap"], sched.MINIMAX_GLOBAL_MAX)
+            self.assertIn("global cap", payload["reason"])
 
 
 class ServiceTests(unittest.TestCase):

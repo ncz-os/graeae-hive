@@ -160,14 +160,26 @@ class MiniMaxPoolState:
         """Return ``(ok, reason)`` for an attempt to assign MiniMax to worker.
 
         Fail-closed: if the worker already holds a lease OR the global cap
-        would be exceeded, the lease is denied.
+        would be exceeded, the lease is denied. The per-worker cap is
+        consulted explicitly so the constant is the source of truth (not
+        the held-lease check alone — that would silently change if we ever
+        allowed a worker to hold multiple leases).
         """
         urn = _norm_str(worker_urn)
         if not urn:
             return False, "minimax:empty worker urn"
-        held = self.leases_by_worker.get(urn)
-        if held:
-            return False, f"minimax:worker {urn!r} already holds lease {held!r}"
+        # Per-worker cap: count how many leases this worker holds (a single
+        # worker is allowed MINIMAX_PER_WORKER_MAX concurrent leases).
+        held_for_worker = sum(
+            1 for u, jid in self.leases_by_worker.items()
+            if u == urn and jid is not None
+        )
+        if held_for_worker >= MINIMAX_PER_WORKER_MAX:
+            return False, (
+                f"minimax:worker {urn!r} already holds "
+                f"{held_for_worker} lease(s) "
+                f"(per-worker cap={MINIMAX_PER_WORKER_MAX})"
+            )
         if self.active_assignments >= MINIMAX_GLOBAL_MAX:
             return False, (
                 f"minimax:global cap reached "
@@ -475,41 +487,36 @@ def select_best_job(
 ) -> dict[str, Any] | None:
     """Pick the single best job for ``worker`` from a candidate list.
 
-    Returns ``None`` when the list is empty. Starved workers are boosted
-    to the head among equally-priority candidates; otherwise the candidate
-    sort key (``role penalty + utilization + deficit + age + tie-break``)
-    decides.
+    Returns ``None`` when the list is empty. Starved workers get their
+    ``deficit`` boosted to +inf for the sort so they win any tie-break with
+    an equally-eligible fresh worker; otherwise the candidate sort key
+    (priority DESC → role penalty ASC → utilization ASC → deficit DESC →
+    age DESC → deterministic id/submitter/urn tie-break) decides. The
+    scoring itself is the starvation guarantee — we don't separately
+    "prefer" certain jobs here, we just promote the starved worker's
+    deficit so the same scoring key naturally prefers the same worker for
+    any equally-priority+role candidate. This means the starved boost is
+    structurally idempotent: a non-starved worker takes the same pick.
     """
     if not candidates:
         return None
+    effective_worker = worker
+    if is_starved(worker, now=now):
+        effective_worker = WorkerProfile(
+            urn=worker.urn,
+            host=worker.host,
+            role=worker.role,
+            utilization=worker.utilization,
+            last_served_at=worker.last_served_at,
+            deficit=float("inf"),  # starvation boost: win all deficit ties
+            active_minimax_lease=worker.active_minimax_lease,
+        )
     ordered = order_candidates_for_worker(
         candidates=candidates,
-        worker=worker,
+        worker=effective_worker,
         now=now,
     )
-    if not is_starved(worker, now=now):
-        return ordered[0]
-    # Starved boost: among candidates tied at the top priority + role
-    # penalty, prefer the starved worker's pick — which by construction
-    # IS ordered[0]. The starvation guarantee here is structural: a
-    # starved worker's role-penalty is unchanged, but their deficit is
-    # treated as effectively saturated (set to +inf below) so they win
-    # any tie-break with an equally-eligible worker.
-    boosted = WorkerProfile(
-        urn=worker.urn,
-        host=worker.host,
-        role=worker.role,
-        utilization=worker.utilization,
-        last_served_at=worker.last_served_at,
-        deficit=float("inf"),  # starvation boost: win all deficit ties
-        active_minimax_lease=worker.active_minimax_lease,
-    )
-    boosted_ordered = order_candidates_for_worker(
-        candidates=candidates,
-        worker=boosted,
-        now=now,
-    )
-    return boosted_ordered[0]
+    return ordered[0]
 
 
 __all__ = [

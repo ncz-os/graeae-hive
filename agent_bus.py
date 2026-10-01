@@ -30,6 +30,7 @@ except ModuleNotFoundError:
 import queue_logic
 from hive.persistence.factory import get_hive_repository
 from hive.scheduler import (
+    MINIMAX_GLOBAL_MAX as _SCHED_MINIMAX_GLOBAL_MAX,
     MINIMAX_MODEL as _SCHED_MINIMAX_MODEL,
     MINIMAX_PROVIDER as _SCHED_MINIMAX_PROVIDER,
     MiniMaxPoolState as _MiniMaxPoolState,
@@ -2916,7 +2917,7 @@ async def dequeue_next_job(agent_urn: str):
                             "job_id": j_id,
                             "reason": _mx_reason,
                             "pool_active": _minimax_pool.active_assignments,
-                            "pool_cap": 5,
+                            "pool_cap": _SCHED_MINIMAX_GLOBAL_MAX,
                         })
                         continue
                 cur2 = await db.execute(
@@ -2986,10 +2987,11 @@ async def dequeue_next_job(agent_urn: str):
     from fastapi.responses import Response as _Response
     _claim_detail = "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier"
     _claim_result = "no_jobs_available"
-    if _worker_is_minimax_route and _minimax_pool.active_assignments >= 5:
+    if _worker_is_minimax_route and _minimax_pool.active_assignments >= _SCHED_MINIMAX_GLOBAL_MAX:
         _claim_result = "minimax_pool_saturated"
         _claim_detail = (
-            f"minimax:global cap reached ({_minimax_pool.active_assignments}/5); "
+            f"minimax:global cap reached "
+            f"({_minimax_pool.active_assignments}/{_SCHED_MINIMAX_GLOBAL_MAX}); "
             "fall through to a non-minimax chain"
         )
     return _Response(

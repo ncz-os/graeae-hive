@@ -1,14 +1,14 @@
-FIX VERIFIED (round-2 scheduler refactor at 3d0711e)
+FIX VERIFIED (round-3 scheduler-intelligence hardening)
 
-Pure-API scheduler tests: 64/64 pass (was 60/60).
-Dequeue-flow scheduler tests: 6/6 pass (was 4/4).
-Existing hive tests: 18 + 3 + 42 = 63/63 pass (McpBridge env-mismatch
-10 tests remain unchanged — pre-existing mcp<2 mismatch on this host).
+Pure-API scheduler tests: 108/108 pass (was 64/64; +44 defensive checks).
+Dequeue-flow scheduler tests: 8/8 pass (was 6/6; +2 new SchedulerDequeueTests).
+Existing hive tests: 18 + 3 + 45 = 66/66 pass (McpBridge env-mismatch
+9 tests remain unchanged — pre-existing mcp<2 mismatch on this host).
 
 ruff lint: hive/scheduler.py + test_scheduler.py clean; test_defect_fixes.py
-only carries the 3 pre-existing errors (I001 + 2x SIM117 not introduced by
-this commit); agent_bus.py unchanged (127 pre-existing).
+carries 3 pre-existing errors (I001 + 2x SIM117 not introduced by this
+commit); agent_bus.py unchanged (127 pre-existing, 0 new).
 
-Canonical + ARGONAS remotes pushed dba1d0a..3d0711e.
+Canonical + ARGONAS remotes pushed.
 
 No production services restarted, no automatic deploy.

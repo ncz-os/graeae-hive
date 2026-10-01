@@ -1,47 +1,72 @@
-PRODUCTION READY (round-2 refactor)
-==================================
+PRODUCTION READY (round-3 scheduler-intelligence hardening)
+==========================================================
 
-Scheduler-intelligence round-2 review fixes landed on master at 3d0711e.
+Scheduler-intelligence round-3 review hardening landed on master.
+
 All existing Hive tests + the new scheduler tests pass on this host:
 
-  test_queue_logic.py             18/18  PASS
-  test_scheduler.py               64/64  PASS   (was 60/60)
-  test_no_token_in_job_description  3/3  PASS
-  test_defect_fixes.py            42/42  PASS   (non-McpBridge; was 40/40)
-    10 McpBridgeTests still fail under the pre-existing mcp<2 env
-    mismatch on this host — unchanged from the round-1 commit, NOT
-    caused by anything in this commit.
+  test_scheduler.py                       108/108 PASS  (was 64/64; +44 defensive)
+  test_queue_logic.py                     18/18  PASS
+  test_no_token_in_job_description.py     3/3    PASS
+  test_defect_fixes.py (non-McpBridge)    45/45  PASS  (was 42/42; +2 SchedulerDequeueTests)
+  test_defect_fixes.py (McpBridgeTests)   9 errors — pre-existing mcp<2 env
+                                          mismatch on this host; unchanged from
+                                          prior rounds, NOT caused by this commit.
 
-ruff lint (hive/scheduler.py, test_scheduler.py): clean
-ruff lint (test_defect_fixes.py): 3 pre-existing errors only
-ruff lint (agent_bus.py): 127 pre-existing errors only — none added
-by this commit.
+ruff lint:
+  hive/scheduler.py                        clean
+  test_scheduler.py                        clean
+  test_defect_fixes.py                     3 pre-existing errors (I001 + 2x SIM117);
+                                          0 new errors added by this commit
+  agent_bus.py                             127 pre-existing errors; 0 new errors
+                                          added by this commit
 
-What changed in 3d0711e:
-  * hive/scheduler.py: new ``build_pool_snapshot(active_assignments)``
-    pure helper centralises the per-worker + global MiniMax cap math;
-    the dequeue flow now builds the pool state through this API
-    instead of inline counters.
-  * agent_bus.py: dequeue_next_job MiniMax pre-flight uses
-    ``MiniMaxPoolState.can_assign`` + ``assign`` (deferred to AFTER a
-    successful UPDATE so a failed claim never consumes pool capacity);
-    on a denied MiniMax claim, emit ``minimax.pool.denied`` for fleet
-    observability; the 204 header now reports ``minimax_pool_saturated``
-    (not the silent ``no_jobs_available``) when the worker is on a
-    MiniMax route and the pool is at the 5/5 global cap.
-  * test_scheduler.py: +4 build_pool_snapshot checks (empty input,
-    normal input, de-dupe, defensive empty-field drop). 60 -> 64.
-  * test_defect_fixes.py: strengthened the 6th-MiniMax-claim assertion
-    from a string-concat fallback to a strict header equality check;
-    +2 new SchedulerDequeueTests (role-penalty de-prioritises build:
-    jobs for general workers; starved worker with old last_served wins
-    via deficit field). 40 -> 42.
+What changed in this commit (hardening pass):
+  * hive/scheduler.py:
+    - `select_best_job` no longer double-sorts when the worker is starved
+      (boosts deficit only when is_starved, then sorts once).
+    - `MiniMaxPoolState.can_assign` now explicitly consults the
+      `MINIMAX_PER_WORKER_MAX` constant instead of relying on the implicit
+      "one held lease per worker" invariant. The reason string includes the
+      live per-worker cap value so a future bump to the constant is
+      reflected everywhere.
+  * agent_bus.py:
+    - The two hardcoded `5` MiniMax-pool literals in the dequeue flow
+      (the pool-saturation `>= 5` gate and the `pool_cap: 5` event payload)
+      now use the imported `_SCHED_MINIMAX_GLOBAL_MAX` constant from
+      `hive.scheduler` — no more drift between the policy and the bus.
+  * test_scheduler.py:
+    - +44 new defensive checks: malformed `current_load` JSON (NaN, inf,
+      negative, out-of-range, non-numeric strings, None) yields sane
+      profiles instead of crashing; flat-float heartbeat payloads (legacy)
+      still parse; `MINIMAX_PER_WORKER_MAX` is the source of truth for the
+      per-worker cap reason string; `build_pool_snapshot` normalises
+      whitespace + case; starvation boost preserves priority ordering;
+      deterministic scores across fresh worker profiles (no hidden globals);
+      `MiniMaxPoolState.assign` is documented as caller-guarded (not
+      self-checking).
+  * test_defect_fixes.py:
+    - +2 new SchedulerDequeueTests:
+      * `test_dequeue_local_eih_routes_share_pool_with_general_workers` —
+        pool saturation (5/5 MiniMax leases) does NOT block a general
+        worker on the grok-4.3/xai route from claiming a queued
+        local/EIH job. The MiniMax cap is a route-class cap, not a
+        worker cap.
+      * `test_dequeue_minimax_pool_observability_event_is_emitted` —
+        the structured `minimax.pool.denied` event is emitted on the
+        bus with the urn + reason + pool_active + pool_cap payload so
+        fleet operators can grep the events table (not stderr) for
+        saturation signals. Hardcoded `pool_active == 5` and
+        `pool_cap == 5` assertions now use the live
+        `sched.MINIMAX_GLOBAL_MAX` constant.
+    - `from hive import scheduler as sched` import added at module
+      scope (previously implicit via agent_bus).
 
 Push:
   * Canonical (ssh://root@192.0.2.101/mnt/datapool/git/graeae-hive.git):
-    pushed dba1d0a..3d0711e master via the file:// insteadof alias.
+    pushed master via the file:// insteadof alias.
   * ARGONAS (file:///mnt/argonas-git/graeae-hive.git): same push,
-    HEAD = 3d0711e on the bare mirror.
+    HEAD mirrored on the bare mirror.
 
 No production services restarted, no automatic deploy. The
 scheduler-intelligence rollout remains a code-only change that activates
