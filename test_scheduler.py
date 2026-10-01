@@ -1007,4 +1007,110 @@ for _ in range(3):
     )
 
 
+# ── MINIMAX_ACTIVE_STATUSES: assigned-vs-active coverage ───────────────
+# The rollout directive (2026-10-01) defines the global cap as "5
+# concurrent OR ASSIGNED MiniMax sessions". This means ``offered`` jobs
+# (routed to a worker but not yet actively claimed) MUST count against
+# the per-worker and global caps — they're reserved, not free. The set
+# is the single source of truth used by both SQL queries in the dequeue
+# flow (per-worker held-lease lookup + global pool snapshot).
+check(
+    set(sched.MINIMAX_ACTIVE_STATUSES) == {"offered", "claimed", "running"},
+    f"MINIMAX_ACTIVE_STATUSES is the assigned-or-active set "
+    f"({{'offered','claimed','running'}}); got {set(sched.MINIMAX_ACTIVE_STATUSES)!r}",
+)
+
+
+# ── can_assign honours per-worker cap when worker already has an offered lease
+# Model the "worker is being polled for a 2nd MiniMax claim while it still
+# holds a previously-offered MiniMax lease" scenario. The pool state only
+# tracks currently-held leases; the dequeue flow feeds it rows that include
+# both offered and claimed. A worker with one offered lease MUST be denied
+# the second claim — the per-worker cap is exclusive on the MiniMax model.
+state_offered = sched.MiniMaxPoolState(
+    active_assignments=1,
+    leases_by_worker={"urn:agent:zeroclaw:typhon:s-held": "job-mx-offered"},
+)
+ok, reason = state_offered.can_assign("urn:agent:zeroclaw:typhon:s-held")
+check(
+    not ok and "per-worker cap" in reason,
+    f"can_assign denies a 2nd MiniMax claim when the worker already holds "
+    f"an offered lease; got ok={ok} reason={reason!r}",
+)
+
+
+# ── build_pool_snapshot: offered rows count against the global cap ────
+# The dequeue flow uses build_pool_snapshot to project SQL rows (status
+# in (offered, claimed, running)) into a MiniMaxPoolState. Verify the
+# snapshot counts offered rows: 5 offered rows saturate the global cap
+# the same way 5 running rows do.
+snap_offered = sched.build_pool_snapshot([
+    (f"urn:agent:zeroclaw:w{i}:s1", f"job-offered-{i}") for i in range(5)
+])
+check(
+    snap_offered.active_assignments == sched.MINIMAX_GLOBAL_MAX,
+    f"5 offered rows saturate the global cap "
+    f"(active={snap_offered.active_assignments}, "
+    f"expected={sched.MINIMAX_GLOBAL_MAX})",
+)
+ok, reason = snap_offered.can_assign("urn:agent:zeroclaw:w-new:s1")
+check(
+    not ok and "global cap" in reason,
+    f"6th claim against 5 offered leases is rejected by the global cap; "
+    f"got ok={ok} reason={reason!r}",
+)
+
+
+# ── build_pool_snapshot: mixed offered + claimed = same cap math ─────
+# The directive makes no distinction between offered and claimed for
+# pool-cap purposes ("concurrent OR assigned"). A mix of 3 offered + 2
+# claimed must also saturate the global cap (3+2=5, exactly at the limit).
+snap_mixed = sched.build_pool_snapshot([
+    ("urn:agent:zeroclaw:w0:s1", "job-offered-0"),
+    ("urn:agent:zeroclaw:w1:s1", "job-offered-1"),
+    ("urn:agent:zeroclaw:w2:s1", "job-offered-2"),
+    ("urn:agent:zeroclaw:w3:s1", "job-claimed-3"),
+    ("urn:agent:zeroclaw:w4:s1", "job-claimed-4"),
+])
+check(
+    snap_mixed.active_assignments == 5
+    and len(snap_mixed.leases_by_worker) == 5,
+    f"mixed offered+claimed snapshot has 5 active assignments; "
+    f"got active={snap_mixed.active_assignments}, "
+    f"workers={len(snap_mixed.leases_by_worker)}",
+)
+ok, reason = snap_mixed.can_assign("urn:agent:zeroclaw:w-new:s1")
+check(
+    not ok and "global cap" in reason,
+    f"6th claim against 3 offered + 2 claimed leases is rejected by the "
+    f"global cap; got ok={ok} reason={reason!r}",
+)
+
+
+# ── release of an offered lease: same as release of a claimed lease ───
+# The release path must work the same way regardless of which status the
+# held lease was in — the pool only sees a worker urn + job id pair.
+state_pre = sched.MiniMaxPoolState(
+    active_assignments=2,
+    leases_by_worker={
+        "urn:agent:zeroclaw:typhon:s1": "job-offered",
+        "urn:agent:zeroclaw:typhon:s2": "job-claimed",
+    },
+)
+state_post = state_pre.release("urn:agent:zeroclaw:typhon:s1")
+check(
+    state_post.active_assignments == 1
+    and state_post.leases_by_worker == {
+        "urn:agent:zeroclaw:typhon:s1": None,
+        "urn:agent:zeroclaw:typhon:s2": "job-claimed",
+    },
+    "releasing an offered lease decrements the global count and clears the worker's slot",
+)
+# And the same worker can immediately take a fresh lease.
+ok, _ = state_post.can_assign("urn:agent:zeroclaw:typhon:s1")
+check(
+    ok, "after releasing the offered lease, the worker can take a new one"
+)
+
+
 print(f"ALL {n} SCHEDULER CHECKS PASSED")

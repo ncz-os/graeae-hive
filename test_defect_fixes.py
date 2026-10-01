@@ -1215,6 +1215,172 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(row[0], (urn_a, urn_b),
                           f"claimed_by must be one of the two pollers; got {row[0]!r}")
 
+    async def test_dequeue_minimax_offered_state_counts_against_global_cap(self):
+        """Per the rollout directive (2026-10-01): "a hard global maximum
+        of 5 concurrent OR ASSIGNED MiniMax sessions". An ``offered`` job
+        has been routed to a worker (``claimed_by`` is set) but the worker
+        hasn't yet actively claimed it — it's ASSIGNED, so it MUST count
+        against the global pool cap. Five offered MiniMax jobs (none yet
+        active) + a 6th polling MiniMax-M3 worker → the 6th is denied
+        with ``X-Hive-Claim-Result: minimax_pool_saturated``."""
+        from fastapi.responses import Response as _Response
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "minimax-offered.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            active_holders = [f"urn:agent:zeroclaw:w{i}:s1" for i in range(5)]
+            async with repo.connection() as db:
+                for i, holder in enumerate(active_holders):
+                    await db.execute(
+                        "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                        "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (holder, "zeroclaw", f"w{i}", "session", "[]",
+                         now, now, "online", "zeroclaw", "B",
+                         "minimax-m3", "minimax"),
+                    )
+                # Five OFFERED (not claimed, not running) MiniMax jobs —
+                # assigned to workers but not yet actively claimed. These
+                # count as ASSIGNED sessions per the directive.
+                for i, holder in enumerate(active_holders):
+                    await db.execute(
+                        "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                        "claimed_by, claimed_provider, claimed_model, claim_lease_expires_at, "
+                        "started_at) "
+                        "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'offered', "
+                        "?, 'minimax', 'minimax-m3', ?, ?)",
+                        (f"job-mx-offered-{i}", holder, now + 3600, now),
+                    )
+                # The 6th worker + 1 queued MiniMax job.
+                urn_6 = "urn:agent:zeroclaw:w6:s1"
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (urn_6, "zeroclaw", "w6", "session", "[]",
+                     now, now, "online", "zeroclaw", "B",
+                     "minimax-m3", "minimax"),
+                )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-mx-6-queued", now),
+                )
+                await db.commit()
+
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                response = await agent_bus.dequeue_next_job(urn_6)
+            self.assertIsInstance(response, _Response)
+            self.assertEqual(response.status_code, 204)
+            self.assertEqual(
+                response.headers.get("X-Hive-Claim-Result"),
+                "minimax_pool_saturated",
+                "5 offered MiniMax jobs must count as ASSIGNED and saturate the global pool",
+            )
+            detail = response.headers.get("X-Hive-Claim-Detail", "").lower()
+            self.assertIn("global cap", detail,
+                          f"denial detail must reference the global cap; got {detail!r}")
+
+    async def test_dequeue_minimax_offered_state_counts_against_per_worker_cap(self):
+        """A worker that already holds an OFFERED (not yet actively
+        claimed) MiniMax job must NOT be allowed to take another MiniMax
+        job — the per-worker cap of 1 covers concurrent AND assigned
+        leases. The denial reason is the per-worker cap, not the global
+        cap (the global pool has plenty of headroom here)."""
+        from fastapi.responses import Response as _Response
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "minimax-offered-perw.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            urn = "urn:agent:zeroclaw:typhon:s-offered-perw"
+            async with repo.connection() as db:
+                # Worker holding one OFFERED MiniMax lease.
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (urn, "zeroclaw", "typhon", "session", "[]",
+                     now, now, "online", "zeroclaw", "B",
+                     "minimax-m3", "minimax"),
+                )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "claimed_by, claimed_provider, claimed_model, claim_lease_expires_at, "
+                    "started_at) "
+                    "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'offered', "
+                    "?, 'minimax', 'minimax-m3', ?, ?)",
+                    ("job-mx-offered-already", urn, now + 3600, now),
+                )
+                # A second queued MiniMax job the same worker tries to claim.
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-mx-second-attempt", now),
+                )
+                await db.commit()
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                response = await agent_bus.dequeue_next_job(urn)
+            self.assertIsInstance(response, _Response)
+            self.assertEqual(response.status_code, 204)
+            # Per-worker cap is the reason (not global cap — only 1
+            # assignment exists fleet-wide).
+            self.assertEqual(
+                response.headers.get("X-Hive-Claim-Result"),
+                "minimax_pool_saturated",
+                "an offered MiniMax lease must count against the per-worker cap",
+            )
+            detail = response.headers.get("X-Hive-Claim-Detail", "").lower()
+            self.assertIn("per-worker cap", detail,
+                          f"denial detail must reference the per-worker cap; got {detail!r}")
+
+    async def test_dequeue_minimax_stale_offered_lease_does_not_count(self):
+        """A MiniMax lease whose ``claim_lease_expires_at`` is in the past
+        does NOT count against the pool — even if the job is still in
+        ``offered`` status. The pool math filters by lease expiry so a
+        crashed worker doesn't permanently reduce capacity. A new MiniMax
+        worker can claim even when an expired offered lease exists."""
+        from fastapi.responses import Response as _Response
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "minimax-stale-offered.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            urn = "urn:agent:zeroclaw:typhon:s-stale-offered"
+            async with repo.connection() as db:
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (urn, "zeroclaw", "typhon", "session", "[]",
+                     now, now, "online", "zeroclaw", "B",
+                     "minimax-m3", "minimax"),
+                )
+                # Stale offered MiniMax job — lease expired 1 hour ago.
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "claimed_by, claimed_provider, claimed_model, claim_lease_expires_at, "
+                    "started_at) "
+                    "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'offered', "
+                    "?, 'minimax', 'minimax-m3', ?, ?)",
+                    ("job-mx-stale-offered", "urn:stale:worker:s1", now - 3600, now),
+                )
+                # Fresh queued MiniMax job.
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-mx-fresh", now),
+                )
+                await db.commit()
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                claimed = await agent_bus.dequeue_next_job(urn)
+            # Stale offered lease does NOT count — worker claims the fresh
+            # MiniMax job. The claim must succeed (return a dict, not a
+            # 204 Response with minimax_pool_saturated).
+            self.assertNotIsInstance(claimed, _Response)
+            self.assertEqual(claimed["id"], "job-mx-fresh")
+
 
 class ServiceTests(unittest.TestCase):
     def test_auto_restore_requests_result_free_server_sorted_projection(self):

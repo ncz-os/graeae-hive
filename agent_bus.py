@@ -30,6 +30,7 @@ except ModuleNotFoundError:
 import queue_logic
 from hive.persistence.factory import get_hive_repository
 from hive.scheduler import (
+    MINIMAX_ACTIVE_STATUSES as _SCHED_MINIMAX_ACTIVE_STATUSES,
     MINIMAX_GLOBAL_MAX as _SCHED_MINIMAX_GLOBAL_MAX,
     MINIMAX_MODEL as _SCHED_MINIMAX_MODEL,
     MINIMAX_PROVIDER as _SCHED_MINIMAX_PROVIDER,
@@ -2764,15 +2765,23 @@ async def dequeue_next_job(agent_urn: str):
                 except Exception:
                     _raw_load_json = None
             # Identify the worker's currently-active MiniMax lease (if any).
-            # Active = claimed/running AND model is MiniMax-M3 AND lease not
-            # expired. Stale leases do not count against the global pool cap
-            # (see test_scheduler.py ``lease_expiry`` block).
+            # Active = status in (offered, claimed, running) — the rollout
+            # directive (2026-10-01) defines the cap as "5 concurrent OR
+            # ASSIGNED MiniMax sessions", so offered jobs that have been
+            # routed to a worker (claimed_by is set) count as assigned and
+            # must count against the per-worker cap. The lease-expiry filter
+            # is preserved — stale leases do not permanently reduce capacity.
+            # Status set is centralised in ``hive.scheduler.MINIMAX_ACTIVE_STATUSES``
+            # so the per-worker cap and the global cap use the same definition
+            # of "currently holding a MiniMax lease" (one source of truth).
             _held_mx_lease: str | None = None
             async with db.execute(
-                "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('claimed','running') "
-                "AND claimed_provider=? AND claimed_model=? "
-                "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
-                (agent_urn, _SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
+                f"SELECT id FROM jobs WHERE claimed_by=? "
+                f"AND status IN ({','.join('?' * len(_SCHED_MINIMAX_ACTIVE_STATUSES))}) "
+                f"AND claimed_provider=? AND claimed_model=? "
+                f"AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
+                (agent_urn, *_SCHED_MINIMAX_ACTIVE_STATUSES,
+                 _SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
             ) as _mx_cur:
                 _mx_row = await _mx_cur.fetchone()
             if _mx_row and _mx_row[0]:
@@ -2833,26 +2842,36 @@ async def dequeue_next_job(agent_urn: str):
                         completed_dependency_ids.add(row[0])
 
             claimed = None
+            # Track whether the loop ended specifically because the
+            # MiniMax-M3 pool denied the worker — distinguishes between
+            # "no jobs matched eligibility" (normal 204) and "the pool
+            # refused this claim" (saturated 204). The per-worker cap
+            # denial is the case where the worker itself holds a lease
+            # already; the global cap is fleet-wide pool fullness.
+            _minimax_pool_denied_reason: str | None = None
             # ── MiniMax-M3 capacity pool pre-flight ──
             # If this worker is about to take a job whose dispatched route is
             # the MiniMax-M3 pool, we must enforce BOTH:
             #   (1) per-worker cap (1 active MiniMax lease per worker urn)
             #   (2) global cap (5 active MiniMax leases fleet-wide)
-            # The snapshot below counts only ACTIVE leases (status
-            # claimed/running AND lease not expired). Stale leases are
-            # filtered out so a worker whose claim crashed without releasing
-            # its lease does NOT permanently reduce pool capacity. The
-            # snapshot is built via ``hive.scheduler.build_pool_snapshot``
-            # so the pool math (per-worker cap + global cap) is centralized
-            # in the scheduler module — the dequeue flow only translates
-            # the in-loop ``can_assign`` decision into a continue/claim.
+            # The snapshot below counts every lease that currently counts
+            # against the pool: status in (offered, claimed, running) AND
+            # lease not expired. Per the rollout directive (2026-10-01), the
+            # global cap is "5 concurrent OR ASSIGNED MiniMax sessions" — so
+            # offered jobs (the bus has routed them to a worker; claimed_by
+            # is set) count as assigned and reduce pool headroom. Stale
+            # leases are filtered out so a worker whose claim crashed without
+            # releasing its lease does NOT permanently reduce pool capacity.
+            # Status set is centralised in
+            # ``hive.scheduler.MINIMAX_ACTIVE_STATUSES`` — same source of
+            # truth as the per-worker cap above.
             _minimax_active_pairs: list[tuple[str, str]] = []
             async with db.execute(
-                "SELECT claimed_by, id FROM jobs "
-                "WHERE status IN ('claimed','running') "
-                "AND claimed_provider=? AND claimed_model=? "
-                "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
-                (_SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
+                f"SELECT claimed_by, id FROM jobs "
+                f"WHERE status IN ({','.join('?' * len(_SCHED_MINIMAX_ACTIVE_STATUSES))}) "
+                f"AND claimed_provider=? AND claimed_model=? "
+                f"AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
+                (*_SCHED_MINIMAX_ACTIVE_STATUSES, _SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
             ) as _mx_pool_cur:
                 async for _mx_pool_row in _mx_pool_cur:
                     _minimax_active_pairs.append((_mx_pool_row[0], _mx_pool_row[1]))
@@ -2910,8 +2929,17 @@ async def dequeue_next_job(agent_urn: str):
                     if not _ok:
                         # Pool state is unchanged (can_assign is pure); a
                         # denied MiniMax claim falls through to the next
-                        # candidate. Emit a structured event so we can
-                        # monitor pool saturation without grepping stderr.
+                        # candidate. Record the LAST denial reason so the
+                        # 204 fallback can surface why this worker was
+                        # turned away — distinguishes per-worker cap
+                        # (worker already holds a MiniMax lease) from
+                        # global cap (fleet-wide pool full). The per-
+                        # worker case often signals a real bug on the worker
+                        # (it forgot to release the prior lease) and is
+                        # worth flagging in the response header. Emit a
+                        # structured event so we can monitor pool
+                        # saturation without grepping stderr.
+                        _minimax_pool_denied_reason = _mx_reason
                         await emit_event(db, "minimax.pool.denied", {
                             "urn": agent_urn,
                             "job_id": j_id,
@@ -2980,14 +3008,26 @@ async def dequeue_next_job(agent_urn: str):
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
     # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
     # contract and triggers h11 LocalProtocolError. Use Response (no body).
-    # If the loop ended specifically because the MiniMax-M3 pool was at the
-    # 5/5 global cap and the requesting worker is itself a MiniMax-M3 route
-    # worker, surface the pool reason so the worker can fall through to a
-    # non-MiniMax chain instead of retrying against a saturated pool.
+    # If the loop ended specifically because the MiniMax-M3 pool denied
+    # the worker (global cap OR per-worker cap), surface the reason so
+    # the worker can fall through to a non-MiniMax chain or release its
+    # held lease — without surfacing the reason, a worker that already
+    # holds a MiniMax lease would silently poll forever against a
+    # saturated per-worker slot.
     from fastapi.responses import Response as _Response
     _claim_detail = "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier"
     _claim_result = "no_jobs_available"
-    if _worker_is_minimax_route and _minimax_pool.active_assignments >= _SCHED_MINIMAX_GLOBAL_MAX:
+    if _minimax_pool_denied_reason is not None:
+        _claim_result = "minimax_pool_saturated"
+        _claim_detail = (
+            f"{_minimax_pool_denied_reason}; "
+            "fall through to a non-minimax chain or release the held lease"
+        )
+    elif _worker_is_minimax_route and _minimax_pool.active_assignments >= _SCHED_MINIMAX_GLOBAL_MAX:
+        # Defensive fallback for the case where the pool was full going
+        # IN but every MiniMax-route candidate was already claimed by
+        # someone else (no ``can_assign`` deny recorded). Surface the
+        # global-cap reason explicitly.
         _claim_result = "minimax_pool_saturated"
         _claim_detail = (
             f"minimax:global cap reached "

@@ -1,74 +1,98 @@
-PRODUCTION READY (round-4 scheduler-intelligence hardening)
+PRODUCTION READY (round-5 scheduler-intelligence hardening)
 ==========================================================
 
-Scheduler-intelligence round-4 review hardening landed on master.
+Scheduler-intelligence round-5 review hardening landed on master.
 
 All existing Hive tests + the new scheduler tests pass on this host:
 
-  test_scheduler.py                       117/117 PASS  (was 108/108; +9 defensive:
-                                       self-checking MiniMaxPoolState.assign +
-                                       release-then-reassign path + unknown-role
-                                       defensive fallback + review/data role-
-                                       penalty matrix)
+  test_scheduler.py                       125/125 PASS  (was 117/117; +8
+                                       defensive: MINIMAX_ACTIVE_STATUSES +
+                                       per-worker offered-lease cap +
+                                       build_pool_snapshot offered/cap
+                                       saturation + mixed offered+claimed
+                                       + release-of-offered path)
   test_queue_logic.py                     18/18  PASS
   test_no_token_in_job_description.py     3/3    PASS
-  test_defect_fixes.py                    55/55  PASS  (was 45/45; +1 atomic
-                                       two-poller single-winner claim race;
-                                       McpBridge env-mismatch resolved by
-                                       upgrading mcp>=2,<3)
+  test_defect_fixes.py                    58/58  PASS  (was 55/55; +3 offered-
+                                       state pool gating tests covering the
+                                       rollout directive's "concurrent OR
+                                       ASSIGNED MiniMax sessions" requirement)
 
 ruff lint:
   hive/scheduler.py                        clean
   test_scheduler.py                        clean
   test_defect_fixes.py                     2 pre-existing errors (SIM117);
                                           0 new errors added by this commit
-                                          (the I001 import-sort error was
-                                          auto-fixed in this round)
   agent_bus.py                             127 pre-existing errors; 0 new errors
                                           added by this commit
 
-What changed in this commit (round-4 hardening):
+What changed in this commit (round-5 hardening):
+
+  The previous rounds closed most of the gaps, but missed the directive's
+  exact wording: "a hard global maximum of 5 concurrent OR ASSIGNED MiniMax
+  sessions". An "assigned" MiniMax session is one whose ``claimed_by`` is
+  set (the bus has routed the job to a worker) — even if the worker has
+  not yet actively claimed it (``status='offered'``). The round-4 pool
+  queries filtered on ``status IN ('claimed','running')`` only, which let the
+  global cap overflow by N: N offered jobs could be assigned in parallel to
+  N different workers while the cap reported 0/5 full, until each worker
+  actively claimed its assigned job and the pool jumped straight from 0
+  to N (or N+1 with a new claim). Round-5 fixes the gap.
+
   * hive/scheduler.py:
-    - `MiniMaxPoolState.assign` is now self-checking: raises ValueError
-      when the same worker urn already holds a non-None lease, eliminating
-      the entire bug class of "caller forgot to honour a can_assign deny"
-      (the second assign is loud, not silent). The global cap is still
-      not self-checked because can_assign consults it explicitly with a
-      rich reason string.
-    - `score_candidate` now defensively falls back to ROLE_GENERAL when
-      a WorkerProfile has an unknown role (instead of KeyError on the
-      role-penalty lookup). `derive_worker_role` is the canonical source
-      and always returns a known role, but a future caller could construct
-      a WorkerProfile directly with an unknown role — we shouldn't
-      KeyError on the score lookup.
-  * test_scheduler.py (+9 new defensive checks, 108 -> 117):
-    - assign raises ValueError on double-assignment (mentions per-worker cap).
-    - assign raises ValueError on empty worker urn.
-    - assign on a clean state: counter increments by 1, leases_by_worker
-      stores the lease exactly.
-    - release-then-reassign is the supported path (dict slot for the urn is
-      reused, not raised).
-    - score_candidate falls back to ROLE_GENERAL penalty for an unknown role
-      (no KeyError on a malformed WorkerProfile).
-    - For ordinary work, general role beats review role (penalty 0 < 1).
-    - For ordinary work, general role beats data role (penalty 0 < 1).
-    - review and data roles share the same +1 non-build penalty.
-    - build-required role-penalty ordering: build=0 < review=2 < data=3
-      < general=4.
-  * test_defect_fixes.py (+1 SchedulerDequeueTest, 8 -> 9):
-    - test_dequeue_atomic_two_pollers_only_one_wins: two workers race
-      for the same single queued job; the dequeue flow uses a CAS UPDATE
-      WHERE status IN ('queued','offered') so exactly one of the two
-      polling workers claims the job. The other gets a 204 (no_jobs_available)
-      response — no double-claim, no partial commit. This is the atomic-
-      fair-claim guarantee: the SQL UPDATE under BEGIN IMMEDIATE is the
-      single arbiter.
-    - The I001 import-sort error was auto-fixed by ruff; no remaining
-      import-sort errors.
+    - New constant ``MINIMAX_ACTIVE_STATUSES = ("offered","claimed","running")``
+      is the canonical "this job counts against the pool" set. The
+      directive makes no semantic distinction between offered and claimed
+      for cap purposes ("concurrent OR assigned"), so they're bundled. The
+      constant is exported in __all__ so both the per-worker held-lease
+      lookup AND the global pool snapshot SQL queries can use it as a
+      single source of truth.
+
+  * agent_bus.py:
+    - Per-worker held-lease lookup (was:
+      ``status IN ('claimed','running')``) now uses
+      ``MINIMAX_ACTIVE_STATUSES`` — a worker holding an offered MiniMax
+      lease is reported as holding one, so the worker's
+      ``active_minimax_lease`` field is set and the per-worker cap is
+      consulted correctly on the next claim.
+    - Global pool snapshot SQL (was: 'claimed','running') now uses the
+      same status set — five offered jobs count as 5 vs the cap, blocking
+      a 6th claim. Lease-expiry filter preserved.
+    - The 204-fallback response header path now records the LAST
+      MiniMaxPool cap-deny reason (was: only checked ``pool.active >= cap``
+      post-loop). Per-worker cap denials now surface as
+      ``X-Hive-Claim-Result: minimax_pool_saturated`` with a per-worker
+      cap detail (not just the global-cap reason). The defensive
+      global-cap fallback is preserved for the case where the pool was full
+      going IN and no can_assign deny was recorded (all candidates were
+      already claimed by someone else mid-loop).
+
+  * test_scheduler.py (+8 new checks, 117 -> 125):
+    - ``MINIMAX_ACTIVE_STATUSES == {'offered','claimed','running'}``
+    - can_assign denies a 2nd MiniMax claim when the worker already holds
+      an offered lease (per-worker cap is exclusive on the MiniMax model).
+    - build_pool_snapshot saturates the global cap with 5 offered rows.
+    - 3 offered + 2 claimed leases sum at the global cap (3+2=5 saturates).
+    - release of an offered lease works the same way as release of a
+      claimed lease (pool only sees (worker_urn, job_id) tuples).
+
+  * test_defect_fixes.py (+3 SchedulerDequeueTests, 9 -> 12):
+    - test_dequeue_minimax_offered_state_counts_against_global_cap: 5
+      offered MiniMax jobs saturate the global pool; 6th MiniMax worker
+      gets 204 + X-Hive-Claim-Result=minimax_pool_saturated + global-cap
+      detail. Verifies the SQL update for the cap math.
+    - test_dequeue_minimax_offered_state_counts_against_per_worker_cap:
+      a worker holding 1 offered lease is denied a 2nd MiniMax claim
+      with per-worker cap reason in the response header (NOT global cap).
+    - test_dequeue_minimax_stale_offered_lease_does_not_count: an expired
+      offered lease doesn't count against the pool — fresh MiniMax claim
+      succeeds. Verifies the lease-expiry filter applies to offered rows
+      too (a crashed worker doesn't permanently reduce capacity).
 
 Push:
-  * Canonical (ssh://root@192.0.2.101/mnt/datapool/git/graeae-hive.git):
-    pushed master via the file:// insteadof alias.
+  * Canonical (ssh://root@192.0.2.101/mnt/datapool/git/graeae-hive.git
+    via file:///mnt/argonas-git/graeae-hive.git insteadof alias):
+    pushed master.
   * ARGONAS (file:///mnt/argonas-git/graeae-hive.git): same push,
     HEAD mirrored on the bare mirror.
 

@@ -102,6 +102,25 @@ MINIMAX_PROVIDER = "minimax"  # distinct from the existing ``together`` provider
 MINIMAX_GLOBAL_MAX = 5  # hard global concurrent/assigned lease cap
 MINIMAX_PER_WORKER_MAX = 1  # max MiniMax leases per worker urn
 
+# Status set for "this MiniMax job counts against the pool cap". Per the
+# rollout directive (2026-10-01): "a hard global maximum of 5 concurrent
+# OR ASSIGNED MiniMax sessions". The semantic split is:
+#   * "offered"   — the bus has routed the job to a worker (``claimed_by``
+#                   is set) but the worker has not yet actively claimed
+#                   it. The session is RESERVED — counted as assigned.
+#   * "claimed"   — the worker has actively taken the job (claim lease is
+#                   running). Counted as active.
+#   * "running"   — the worker has started executing the job. Counted as
+#                   active.
+# ``queued`` jobs are NOT counted (they're not assigned to any worker yet)
+# and terminal states (``done``/``failed``/``cancelled``/``dead-letter``) are
+# NOT counted. The dequeue flow filters by lease-expiry too — a stale lease
+# does NOT count against the pool, so a worker whose claim crashed without
+# releasing does not permanently reduce capacity. Centralising the set here
+# keeps the per-worker cap and the global cap in lock-step: both use the
+# same definition of "currently holding a MiniMax lease".
+MINIMAX_ACTIVE_STATUSES = ("offered", "claimed", "running")
+
 
 def is_minimax_route(provider: Any, model: Any) -> bool:
     """True when a route chain entry targets the MiniMax-M3 capacity pool."""
@@ -555,6 +574,7 @@ __all__ = [
     "BUILD_CAPABILITY_PREFIX",
     "BUILD_KIND_PREFIX",
     "CONVENTIONAL_BUILD_HOSTS",
+    "MINIMAX_ACTIVE_STATUSES",
     "MINIMAX_GLOBAL_MAX",
     "MINIMAX_MODEL",
     "MINIMAX_PER_WORKER_MAX",
