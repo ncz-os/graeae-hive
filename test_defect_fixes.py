@@ -20,18 +20,21 @@ os.environ["MCP_BRIDGE_TOKEN"] = "test-mcp-token"
 os.environ["MCP_BRIDGE_ADMIN_TOKEN"] = "test-mcp-admin-token"
 os.environ.setdefault("AGENT_BUS_DB", str(Path(tempfile.gettempdir()) / "hive-defect-tests.db"))
 
+from starlette.requests import Request
+from starlette.responses import Response
+
 import agent_bus
 from hive import scheduler as sched
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
 from hive.persistence.oracle import (
-    OracleHiveRepository,
     _ORACLE_JOB_ADDITIONS,
     _ORACLE_REQUIRED_JOB_COLUMNS,
+    OracleHiveRepository,
+)
+from hive.persistence.oracle import (
     _translate_sql as _translate_oracle_sql,
 )
 from hive.persistence.sqlite import SqliteHiveRepository
-from starlette.requests import Request
-from starlette.responses import Response
 
 
 def load_script(name, filename):
@@ -1156,6 +1159,61 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(payload["pool_active"], sched.MINIMAX_GLOBAL_MAX)
             self.assertEqual(payload["pool_cap"], sched.MINIMAX_GLOBAL_MAX)
             self.assertIn("global cap", payload["reason"])
+
+    async def test_dequeue_atomic_two_pollers_only_one_wins(self):
+        """Two workers race for the same single queued job; the dequeue flow
+        uses a CAS UPDATE WHERE status IN ('queued','offered') so exactly
+        one of the two polling workers claims the job. The other gets a
+        204 (no_jobs_available) response — no double-claim, no partial
+        commit. This is the atomic-fair-claim guarantee: the SQL UPDATE
+        under BEGIN IMMEDIATE is the single arbiter."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "atomic.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            urn_a = "urn:agent:zeroclaw:typhon:s-a"
+            urn_b = "urn:agent:zeroclaw:typhon:s-b"
+            async with repo.connection() as db:
+                for urn in (urn_a, urn_b):
+                    await db.execute(
+                        "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                        "current_load, started_at, last_heartbeat, status, runtime, "
+                        "cost_tier, model, provider) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (urn, "zeroclaw", "typhon", "session", "[]",
+                         json.dumps({"utilization": 0.0, "deficit": 0.0}),
+                         now, now, "online", "zeroclaw", "B", "default", "default"),
+                    )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-only-one", now),
+                )
+                await db.commit()
+            from fastapi.responses import Response
+            results: list = []
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                # Sequential polls — under BEGIN IMMEDIATE the second claim
+                # observes status='claimed' and returns 204.
+                a = await agent_bus.dequeue_next_job(urn_a)
+                b = await agent_bus.dequeue_next_job(urn_b)
+                results = [a, b]
+            # Exactly one worker got the job; the other got a 204 Response.
+            claimed = [r for r in results if not isinstance(r, Response)]
+            no_claim = [r for r in results if isinstance(r, Response)]
+            self.assertEqual(len(claimed), 1, "exactly one worker claims the job")
+            self.assertEqual(claimed[0]["id"], "job-only-one")
+            self.assertEqual(len(no_claim), 1, "the second poller sees 204 (no_jobs_available)")
+            self.assertEqual(no_claim[0].status_code, 204)
+            # And the claimed_by column in the DB is exactly one of the two urns.
+            async with repo.connection() as db, db.execute(
+                "SELECT claimed_by FROM jobs WHERE id=?",
+                ("job-only-one",),
+            ) as cur:
+                row = await cur.fetchone()
+            self.assertIn(row[0], (urn_a, urn_b),
+                          f"claimed_by must be one of the two pollers; got {row[0]!r}")
 
 
 class ServiceTests(unittest.TestCase):

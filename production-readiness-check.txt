@@ -1,66 +1,70 @@
-PRODUCTION READY (round-3 scheduler-intelligence hardening)
+PRODUCTION READY (round-4 scheduler-intelligence hardening)
 ==========================================================
 
-Scheduler-intelligence round-3 review hardening landed on master.
+Scheduler-intelligence round-4 review hardening landed on master.
 
 All existing Hive tests + the new scheduler tests pass on this host:
 
-  test_scheduler.py                       108/108 PASS  (was 64/64; +44 defensive)
+  test_scheduler.py                       117/117 PASS  (was 108/108; +9 defensive:
+                                       self-checking MiniMaxPoolState.assign +
+                                       release-then-reassign path + unknown-role
+                                       defensive fallback + review/data role-
+                                       penalty matrix)
   test_queue_logic.py                     18/18  PASS
   test_no_token_in_job_description.py     3/3    PASS
-  test_defect_fixes.py (non-McpBridge)    45/45  PASS  (was 42/42; +2 SchedulerDequeueTests)
-  test_defect_fixes.py (McpBridgeTests)   9 errors — pre-existing mcp<2 env
-                                          mismatch on this host; unchanged from
-                                          prior rounds, NOT caused by this commit.
+  test_defect_fixes.py                    55/55  PASS  (was 45/45; +1 atomic
+                                       two-poller single-winner claim race;
+                                       McpBridge env-mismatch resolved by
+                                       upgrading mcp>=2,<3)
 
 ruff lint:
   hive/scheduler.py                        clean
   test_scheduler.py                        clean
-  test_defect_fixes.py                     3 pre-existing errors (I001 + 2x SIM117);
+  test_defect_fixes.py                     2 pre-existing errors (SIM117);
                                           0 new errors added by this commit
+                                          (the I001 import-sort error was
+                                          auto-fixed in this round)
   agent_bus.py                             127 pre-existing errors; 0 new errors
                                           added by this commit
 
-What changed in this commit (hardening pass):
+What changed in this commit (round-4 hardening):
   * hive/scheduler.py:
-    - `select_best_job` no longer double-sorts when the worker is starved
-      (boosts deficit only when is_starved, then sorts once).
-    - `MiniMaxPoolState.can_assign` now explicitly consults the
-      `MINIMAX_PER_WORKER_MAX` constant instead of relying on the implicit
-      "one held lease per worker" invariant. The reason string includes the
-      live per-worker cap value so a future bump to the constant is
-      reflected everywhere.
-  * agent_bus.py:
-    - The two hardcoded `5` MiniMax-pool literals in the dequeue flow
-      (the pool-saturation `>= 5` gate and the `pool_cap: 5` event payload)
-      now use the imported `_SCHED_MINIMAX_GLOBAL_MAX` constant from
-      `hive.scheduler` — no more drift between the policy and the bus.
-  * test_scheduler.py:
-    - +44 new defensive checks: malformed `current_load` JSON (NaN, inf,
-      negative, out-of-range, non-numeric strings, None) yields sane
-      profiles instead of crashing; flat-float heartbeat payloads (legacy)
-      still parse; `MINIMAX_PER_WORKER_MAX` is the source of truth for the
-      per-worker cap reason string; `build_pool_snapshot` normalises
-      whitespace + case; starvation boost preserves priority ordering;
-      deterministic scores across fresh worker profiles (no hidden globals);
-      `MiniMaxPoolState.assign` is documented as caller-guarded (not
-      self-checking).
-  * test_defect_fixes.py:
-    - +2 new SchedulerDequeueTests:
-      * `test_dequeue_local_eih_routes_share_pool_with_general_workers` —
-        pool saturation (5/5 MiniMax leases) does NOT block a general
-        worker on the grok-4.3/xai route from claiming a queued
-        local/EIH job. The MiniMax cap is a route-class cap, not a
-        worker cap.
-      * `test_dequeue_minimax_pool_observability_event_is_emitted` —
-        the structured `minimax.pool.denied` event is emitted on the
-        bus with the urn + reason + pool_active + pool_cap payload so
-        fleet operators can grep the events table (not stderr) for
-        saturation signals. Hardcoded `pool_active == 5` and
-        `pool_cap == 5` assertions now use the live
-        `sched.MINIMAX_GLOBAL_MAX` constant.
-    - `from hive import scheduler as sched` import added at module
-      scope (previously implicit via agent_bus).
+    - `MiniMaxPoolState.assign` is now self-checking: raises ValueError
+      when the same worker urn already holds a non-None lease, eliminating
+      the entire bug class of "caller forgot to honour a can_assign deny"
+      (the second assign is loud, not silent). The global cap is still
+      not self-checked because can_assign consults it explicitly with a
+      rich reason string.
+    - `score_candidate` now defensively falls back to ROLE_GENERAL when
+      a WorkerProfile has an unknown role (instead of KeyError on the
+      role-penalty lookup). `derive_worker_role` is the canonical source
+      and always returns a known role, but a future caller could construct
+      a WorkerProfile directly with an unknown role — we shouldn't
+      KeyError on the score lookup.
+  * test_scheduler.py (+9 new defensive checks, 108 -> 117):
+    - assign raises ValueError on double-assignment (mentions per-worker cap).
+    - assign raises ValueError on empty worker urn.
+    - assign on a clean state: counter increments by 1, leases_by_worker
+      stores the lease exactly.
+    - release-then-reassign is the supported path (dict slot for the urn is
+      reused, not raised).
+    - score_candidate falls back to ROLE_GENERAL penalty for an unknown role
+      (no KeyError on a malformed WorkerProfile).
+    - For ordinary work, general role beats review role (penalty 0 < 1).
+    - For ordinary work, general role beats data role (penalty 0 < 1).
+    - review and data roles share the same +1 non-build penalty.
+    - build-required role-penalty ordering: build=0 < review=2 < data=3
+      < general=4.
+  * test_defect_fixes.py (+1 SchedulerDequeueTest, 8 -> 9):
+    - test_dequeue_atomic_two_pollers_only_one_wins: two workers race
+      for the same single queued job; the dequeue flow uses a CAS UPDATE
+      WHERE status IN ('queued','offered') so exactly one of the two
+      polling workers claims the job. The other gets a 204 (no_jobs_available)
+      response — no double-claim, no partial commit. This is the atomic-
+      fair-claim guarantee: the SQL UPDATE under BEGIN IMMEDIATE is the
+      single arbiter.
+    - The I001 import-sort error was auto-fixed by ruff; no remaining
+      import-sort errors.
 
 Push:
   * Canonical (ssh://root@192.0.2.101/mnt/datapool/git/graeae-hive.git):

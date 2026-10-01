@@ -188,11 +188,37 @@ class MiniMaxPoolState:
         return True, "ok"
 
     def assign(self, worker_urn: str, job_id: str) -> MiniMaxPoolState:
-        """Return a new state with the lease recorded. Caller must have already
-        verified via ``can_assign`` that the assignment is allowed."""
+        """Return a new state with the lease recorded.
+
+        Self-checks the per-worker cap: callers MUST still consult
+        ``can_assign`` first, but ``assign`` raises ``ValueError`` if the
+        contract is broken (same worker, same urn, already holding a
+        non-None lease). This eliminates the entire bug class of
+        "caller forgot to honour a can_assign deny" — the second assign
+        is loud, not silent. The global cap is NOT self-checked here
+        because ``can_assign`` consults it explicitly with a rich reason
+        string; we don't want to duplicate that surface in two places.
+        Fail-closed semantics: an empty worker urn raises.
+        """
         urn = _norm_str(worker_urn)
+        jid = _norm_str(job_id)
+        if not urn:
+            raise ValueError(
+                f"minimax:assign rejected: empty worker urn (job_id={jid!r})"
+            )
+        existing = self.leases_by_worker.get(urn)
+        if existing is not None:
+            # The worker already holds a MiniMax lease. This is a contract
+            # breach — ``can_assign`` would have denied the call. Raise so
+            # the caller can't silently inflate the counter or shadow a
+            # live lease.
+            raise ValueError(
+                f"minimax:assign rejected: worker {urn!r} already holds "
+                f"lease {existing!r} (per-worker cap={MINIMAX_PER_WORKER_MAX}); "
+                f"callers MUST consult can_assign first"
+            )
         new_leases = dict(self.leases_by_worker)
-        new_leases[urn] = _norm_str(job_id)
+        new_leases[urn] = jid
         return MiniMaxPoolState(
             active_assignments=self.active_assignments + 1,
             leases_by_worker=new_leases,
@@ -410,7 +436,13 @@ def score_candidate(
     submitter = _norm_str(job.get("submitter_urn"))
     priority = int(job.get("priority") or 0)
     build_required = job_requires_build(job)
-    role_penalty = _ROLE_PENALTY[(worker.role, build_required)]
+    # Fallback to ROLE_GENERAL if the worker's role is not one of the four
+    # canonical roles (defensive — `derive_worker_role` is the canonical
+    # source and always returns a known role, but a future caller could
+    # construct a WorkerProfile with an unknown role and we shouldn't
+    # KeyError on the score lookup that wasn't there before).
+    role = worker.role if worker.role in VALID_ROLES else ROLE_GENERAL
+    role_penalty = _ROLE_PENALTY[(role, build_required)]
     util = worker.utilization
     deficit = worker.deficit
     # Age = how long since the worker last served; None means "never".

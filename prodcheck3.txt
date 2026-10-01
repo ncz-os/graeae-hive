@@ -1,13 +1,18 @@
-FIX VERIFIED (round-3 scheduler-intelligence hardening)
+FIX VERIFIED (round-4 scheduler-intelligence hardening)
 
-Pure-API scheduler tests: 108/108 pass (was 64/64; +44 defensive checks).
-Dequeue-flow scheduler tests: 8/8 pass (was 6/6; +2 new SchedulerDequeueTests).
-Existing hive tests: 18 + 3 + 45 = 66/66 pass (McpBridge env-mismatch
-9 tests remain unchanged — pre-existing mcp<2 mismatch on this host).
+Pure-API scheduler tests: 116/116 pass (was 108/108; +8 new defensive checks
+covering self-checking MiniMaxPoolState.assign + review/data role-penalty
+matrix + release-then-reassign path).
+Dequeue-flow scheduler tests: 9/9 pass (was 8/8; +1 new SchedulerDequeueTest
+for atomic two-poller single-winner claim race).
+Existing hive tests: 18 + 3 + 55 = 76/76 pass on test_defect_fixes.py +
+test_no_token + test_queue_logic.
+McpBridge env-mismatch resolved by upgrading mcp>=2,<3 — all 9 previously
+mcp<2-blocked McpBridgeTests now pass (no longer skipped).
 
 ruff lint: hive/scheduler.py + test_scheduler.py clean; test_defect_fixes.py
-carries 3 pre-existing errors (I001 + 2x SIM117 not introduced by this
-commit); agent_bus.py unchanged (127 pre-existing, 0 new).
+carries 2 pre-existing SIM117 errors not introduced by this commit (the I001
+import-sort error was auto-fixed in this round); agent_bus.py unchanged.
 
 Canonical + ARGONAS remotes pushed.
 

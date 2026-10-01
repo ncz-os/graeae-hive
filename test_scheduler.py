@@ -242,6 +242,36 @@ check(
     "hosts when they are eligible and available')",
 )
 
+# Among non-build roles for a non-build job, general is the canonical pick;
+# review/data workers have a small +1 penalty so general workers win ties.
+typhon_general_idle = make_worker(
+    urn="urn:agent:zeroclaw:typhon:s-gen", host="typhon", role="general", util=0.0
+)
+typhon_review_idle = make_worker(
+    urn="urn:agent:zeroclaw:typhon:s-rev", host="typhon", role="review", util=0.0
+)
+typhon_data_idle = make_worker(
+    urn="urn:agent:zeroclaw:typhon:s-data", host="typhon", role="data", util=0.0
+)
+scored_general = sched.score_candidate(job=job_ordinary, worker=typhon_general_idle, now=NOW)
+scored_review = sched.score_candidate(job=job_ordinary, worker=typhon_review_idle, now=NOW)
+scored_data = sched.score_candidate(job=job_ordinary, worker=typhon_data_idle, now=NOW)
+check(
+    scored_general.score < scored_review.score,
+    "for ordinary work, general role beats review role (general is the canonical non-build pick)",
+)
+check(
+    scored_general.score < scored_data.score,
+    "for ordinary work, general role beats data role",
+)
+# review and data share the same role_penalty for non-build work; the
+# tie-break that decides among them is the worker urn (deterministic,
+# lexicographic), NOT the role. Verify the penalty slot is identical.
+check(
+    scored_general.score[1] == 0 and scored_data.score[1] == 1 and scored_review.score[1] == 1,
+    "review and data roles share the same +1 non-build penalty; general is 0",
+)
+
 # Utilization dominance — same role, different utilization.
 hydra_60 = make_worker(
     urn="urn:agent:zeroclaw:hydra:s2", host="hydra", role="general", util=0.6
@@ -279,6 +309,34 @@ scored_hydra_buildcap = sched.score_candidate(
 check(
     scored_hydra_buildcap.score < scored_minos_buildcap.score,
     "build worker is preferred for hard:build capability",
+)
+
+# Among non-build roles for a build-required job, build is preferred; review
+# and data are penalized MORE than general (we don't want data workers running
+# build jobs). Verify the role-penalty slot is monotonically:
+#   build(0) < review(2) < data(3) < general(4)
+review_worker = make_worker(
+    urn="urn:agent:zeroclaw:review:s1", host="review-host", role="review", util=0.0
+)
+data_worker = make_worker(
+    urn="urn:agent:zeroclaw:data:s1", host="data-host", role="data", util=0.0
+)
+build_worker = make_worker(
+    urn="urn:agent:zeroclaw:hydra:s-build", host="hydra", role="build", util=0.0
+)
+general_worker = make_worker(
+    urn="urn:agent:zeroclaw:typhon:s-gen", host="typhon", role="general", util=0.0
+)
+scored_build_on_build = sched.score_candidate(job=job_build, worker=build_worker, now=NOW)
+scored_review_on_build = sched.score_candidate(job=job_build, worker=review_worker, now=NOW)
+scored_data_on_build = sched.score_candidate(job=job_build, worker=data_worker, now=NOW)
+scored_general_on_build = sched.score_candidate(job=job_build, worker=general_worker, now=NOW)
+check(
+    scored_build_on_build.score[1] == 0
+    and scored_review_on_build.score[1] == 2
+    and scored_data_on_build.score[1] == 3
+    and scored_general_on_build.score[1] == 4,
+    "build-required role-penalty ordering: build=0 < review=2 < data=3 < general=4",
 )
 
 # Even though build workers are preferred, general workers MUST remain
@@ -432,16 +490,22 @@ check(state.active_assignments == 5, "pool is saturated at 5/5 (no overflow)")
 # Per-worker cap: the same worker trying to claim a second MiniMax job is
 # rejected, regardless of global headroom. The constant MINIMAX_PER_WORKER_MAX
 # is the source of truth — the reason mentions per-worker cap so any future
-# bump to that constant is reflected here too.
-held_worker_state = state.assign("urn:agent:zeroclaw:typhon:s5", "job-mx-dup")
-# (state is unchanged because can_assign would have failed; we test via the
-# can_assign check directly.)
+# bump to that constant is reflected here too. Round-4 hardening: the
+# assign() guard is self-checking, so the second call raises ValueError
+# rather than silently inflating the counter.
+try:
+    state.assign("urn:agent:zeroclaw:typhon:s5", "job-mx-dup")
+    check(False, "MiniMaxPoolState.assign MUST raise on a second lease by the same worker")
+except ValueError as exc:
+    check(
+        "per-worker cap" in str(exc),
+        f"MiniMaxPoolState.assign raises on the per-worker cap; got {exc!r}",
+    )
 ok, reason = state.can_assign("urn:agent:zeroclaw:typhon:s5")
 check(
     not ok and "per-worker cap" in reason,
     f"per-worker MiniMax cap (={sched.MINIMAX_PER_WORKER_MAX}) is enforced; got reason={reason!r}",
 )
-del held_worker_state  # keep test scope tidy
 
 # Release unblocks a slot AND frees that worker.
 released = state.release("urn:agent:zeroclaw:typhon:s5")
@@ -827,19 +891,96 @@ check(
 )
 
 
-# ── MiniMaxPoolState.assign idempotence: assigning the same (urn, job) twice
-# is the responsibility of can_assign (which would block the second attempt).
-# The assign method itself does NOT guard against double-assignment; we rely on
-# can_assign being called first. Verify that calling assign twice with the
-# same urn does inflate the counter (the bug class to guard against is
-# accidentally calling can_assign and then NOT honoring its deny).
+# ── MiniMaxPoolState.assign is self-checking ──────────────────────────────
+# Round-4 hardening: assign raises ValueError when the same worker urn
+# already holds a non-None lease. This eliminates the entire bug class of
+# "caller forgot to honour a can_assign deny" — the second assign is loud
+# (raises) rather than silently overwriting the lease + inflating the
+# counter. The previous implementation was a documented weakness (the
+# caller contract could be forgotten); this is a hard guard.
 s2 = sched.MiniMaxPoolState()
 s2 = s2.assign("urn:w", "j1")
-s2_double = s2.assign("urn:w", "j1-again")
+try:
+    s2.assign("urn:w", "j1-again")
+    check(False, "MiniMaxPoolState.assign MUST raise on double-assignment")
+except ValueError as exc:
+    check(
+        "per-worker cap" in str(exc),
+        f"MiniMaxPoolState.assign raises ValueError mentioning per-worker cap; got {exc!r}",
+    )
+# Empty urns raise too (defensive — caller passed a malformed urn).
+try:
+    sched.MiniMaxPoolState().assign("", "j1")
+    check(False, "MiniMaxPoolState.assign MUST raise on empty worker urn")
+except ValueError as exc:
+    check(
+        "empty worker urn" in str(exc),
+        f"MiniMaxPoolState.assign raises ValueError on empty urn; got {exc!r}",
+    )
+# A new (urn, jid) on a fresh state: counter increments by exactly 1 and
+# the leases_by_worker map holds exactly one entry for that urn.
+s3 = sched.MiniMaxPoolState()
+s3 = s3.assign("urn:w", "j1")
 check(
-    s2_double.active_assignments == 2,
-    "MiniMaxPoolState.assign is pure-state (does not self-check per-worker cap; "
-    "callers MUST consult can_assign first)",
+    s3.active_assignments == 1 and s3.leases_by_worker == {"urn:w": "j1"},
+    "MiniMaxPoolState.assign on a clean state increments counter by 1 and stores the lease",
+)
+# Release-then-reassign: a worker that previously held a lease (now released
+# to None) can take a fresh one without raising — the dict slot for the urn
+# is preserved (still keyed) so the new lease replaces the None. This is the
+# common path: a worker finishes its MiniMax job, the lease is released,
+# and the same worker takes a different MiniMax job.
+s3_released = s3.release("urn:w")
+s3_reassigned = s3_released.assign("urn:w", "j2")
+check(
+    s3_reassigned.active_assignments == 1
+    and s3_reassigned.leases_by_worker == {"urn:w": "j2"},
+    "release-then-reassign is the supported path (dict slot for the urn is reused, "
+    "not raised)",
+)
+
+
+# ── score_candidate defensive role fallback ───────────────────────────────
+# If a WorkerProfile is constructed directly with an unknown role (e.g.
+# test fixture bug, or future caller forgets to use derive_worker_role), the
+# score_candidate MUST NOT raise KeyError on the role-penalty lookup.
+# The fallback treats an unknown role as ROLE_GENERAL (the canonical
+# non-build fallback), preserving the dequeue loop's stability.
+unknown_role_worker = sched.WorkerProfile(
+    urn="urn:unknown-role",
+    host="typhon",
+    role="unknown-role-from-test",  # not in VALID_ROLES
+    utilization=0.0,
+    last_served_at=None,
+    deficit=0.0,
+    active_minimax_lease=None,
+)
+scored_unknown_role = sched.score_candidate(
+    job=make_job(jid="job-ur", kind="feat:edit"),
+    worker=unknown_role_worker,
+    now=NOW,
+)
+# The unknown-role worker is treated as a general-role worker for both
+# build-required and non-build work. Verify the role_penalty slot (index 1)
+# matches ROLE_GENERAL's expected values.
+general_worker_profile = sched.WorkerProfile(
+    urn="urn:general",
+    host="typhon",
+    role=sched.ROLE_GENERAL,
+    utilization=0.0,
+    last_served_at=None,
+    deficit=0.0,
+    active_minimax_lease=None,
+)
+scored_general = sched.score_candidate(
+    job=make_job(jid="job-ur-g", kind="feat:edit"),
+    worker=general_worker_profile,
+    now=NOW,
+)
+check(
+    scored_unknown_role.score[1] == scored_general.score[1] == 0,
+    "score_candidate falls back to ROLE_GENERAL penalty for an unknown role "
+    "(no KeyError on a malformed WorkerProfile)",
 )
 
 
