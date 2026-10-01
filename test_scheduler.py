@@ -466,6 +466,50 @@ ok5, _ = sat.can_assign("urn:w-new")
 check(not ok5, "with 5 active assignments, the next assignment is rejected")
 
 
+# ── build_pool_snapshot: from a list of (worker_urn, job_id) pairs ──────
+# The dequeue flow feeds raw SQL rows through build_pool_snapshot to get a
+# MiniMaxPoolState. Verify the snapshot handles empty input, de-duplication,
+# and normalisation correctly.
+snap_empty = sched.build_pool_snapshot([])
+check(
+    snap_empty.active_assignments == 0 and not snap_empty.leases_by_worker,
+    "build_pool_snapshot([]) yields an empty pool",
+)
+snap_two = sched.build_pool_snapshot([
+    ("urn:agent:zeroclaw:typhon:s1", "job-mx-0"),
+    ("urn:agent:zeroclaw:forge:s2", "job-mx-1"),
+])
+check(
+    snap_two.active_assignments == 2
+    and snap_two.leases_by_worker == {
+        "urn:agent:zeroclaw:typhon:s1": "job-mx-0",
+        "urn:agent:zeroclaw:forge:s2": "job-mx-1",
+    },
+    "build_pool_snapshot builds leases dict keyed by worker urn",
+)
+# De-duplicate by worker urn (last entry wins; same SQL row counts once).
+snap_dup = sched.build_pool_snapshot([
+    ("urn:agent:zeroclaw:w0:s1", "job-mx-old"),
+    ("urn:agent:zeroclaw:w0:s1", "job-mx-new"),
+])
+check(
+    snap_dup.active_assignments == 1
+    and snap_dup.leases_by_worker["urn:agent:zeroclaw:w0:s1"] == "job-mx-new",
+    "build_pool_snapshot de-duplicates by worker urn (last entry wins)",
+)
+# Drop empty urns / empty job ids (defensive against malformed SQL).
+snap_empty_fields = sched.build_pool_snapshot([
+    ("", "job-x"),
+    ("urn:w1", ""),
+    ("urn:w2", "job-y"),
+])
+check(
+    snap_empty_fields.active_assignments == 1
+    and snap_empty_fields.leases_by_worker == {"urn:w2": "job-y"},
+    "build_pool_snapshot drops rows with empty urn or empty job id",
+)
+
+
 # ── Retry: failed jobs retain their role/build semantics ──────────────────
 # A retry does NOT demote the job's role requirement. We verify by feeding
 # the same job dict (with retry_count > 0) into the scorer and comparing

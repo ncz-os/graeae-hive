@@ -108,6 +108,41 @@ def is_minimax_route(provider: Any, model: Any) -> bool:
     return _norm_str(provider) == MINIMAX_PROVIDER and _norm_str(model) == MINIMAX_MODEL
 
 
+def build_pool_snapshot(
+    active_assignments: Iterable[tuple[str, str]],
+) -> MiniMaxPoolState:
+    """Construct a pool snapshot from a list of ``(worker_urn, job_id)`` pairs.
+
+    The dequeue flow builds the active-assignments list from
+    ``SELECT claimed_by FROM jobs WHERE status IN ('claimed','running')
+    AND claimed_provider=? AND claimed_model=? AND
+    (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)``.
+    The list is normalised (lower/strip), de-duplicated by worker urn
+    (last write wins — the bus treats the most recent claim as canonical),
+    and assigned to ``MiniMaxPoolState``. Fail-closed semantics: an empty
+    worker urn or empty job id is silently dropped (the caller has already
+    filtered those out).
+    """
+    leases: dict[str, str] = {}
+    count = 0
+    for worker_urn, job_id in active_assignments:
+        urn = _norm_str(worker_urn)
+        jid = _norm_str(job_id)
+        if not urn or not jid:
+            continue
+        if urn in leases:
+            # De-duplicate: keep the last entry. This handles the rare case
+            # where the SQL query returns the same worker twice (e.g. two
+            # active claims on the same worker — should not happen, but
+            # we belt-and-suspender because the count would otherwise be
+            # inflated).
+            leases[urn] = jid
+            continue
+        leases[urn] = jid
+        count += 1
+    return MiniMaxPoolState(active_assignments=count, leases_by_worker=leases)
+
+
 @dataclass(frozen=True)
 class MiniMaxPoolState:
     """Snapshot of the MiniMax capacity pool for one decision.
@@ -494,6 +529,7 @@ __all__ = [
     "MiniMaxPoolState",
     "ScoredCandidate",
     "WorkerProfile",
+    "build_pool_snapshot",
     "derive_worker_role",
     "is_minimax_route",
     "is_starved",

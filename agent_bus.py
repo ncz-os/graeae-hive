@@ -32,6 +32,8 @@ from hive.persistence.factory import get_hive_repository
 from hive.scheduler import (
     MINIMAX_MODEL as _SCHED_MINIMAX_MODEL,
     MINIMAX_PROVIDER as _SCHED_MINIMAX_PROVIDER,
+    MiniMaxPoolState as _MiniMaxPoolState,
+    build_pool_snapshot as _build_minimax_pool,
     order_candidates_for_worker,
     worker_profile_from_metadata,
 )
@@ -2800,7 +2802,6 @@ async def dequeue_next_job(agent_urn: str):
             _ranked_projected = order_candidates_for_worker(
                 candidates=_projected, worker=_worker_profile, now=now,
             )
-            _by_id = {c["id"]: c for c in _projected}
             # Re-index original rows by job id, then walk the scheduler order.
             _orig_by_id: dict[str, tuple] = {}
             for r in candidates:
@@ -2839,19 +2840,24 @@ async def dequeue_next_job(agent_urn: str):
             # The snapshot below counts only ACTIVE leases (status
             # claimed/running AND lease not expired). Stale leases are
             # filtered out so a worker whose claim crashed without releasing
-            # its lease does NOT permanently reduce pool capacity.
-            _minimax_pool_active = 0
-            _minimax_pool_holders: set[str] = set()
+            # its lease does NOT permanently reduce pool capacity. The
+            # snapshot is built via ``hive.scheduler.build_pool_snapshot``
+            # so the pool math (per-worker cap + global cap) is centralized
+            # in the scheduler module — the dequeue flow only translates
+            # the in-loop ``can_assign`` decision into a continue/claim.
+            _minimax_active_pairs: list[tuple[str, str]] = []
             async with db.execute(
-                "SELECT claimed_by FROM jobs "
+                "SELECT claimed_by, id FROM jobs "
                 "WHERE status IN ('claimed','running') "
                 "AND claimed_provider=? AND claimed_model=? "
                 "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
                 (_SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
             ) as _mx_pool_cur:
                 async for _mx_pool_row in _mx_pool_cur:
-                    _minimax_pool_holders.add(_mx_pool_row[0])
-                    _minimax_pool_active += 1
+                    _minimax_active_pairs.append((_mx_pool_row[0], _mx_pool_row[1]))
+            _minimax_pool: _MiniMaxPoolState = _build_minimax_pool(
+                _minimax_active_pairs,
+            )
             _worker_is_minimax_route = (
                 (a_model or "").lower() == _SCHED_MINIMAX_MODEL
                 and (a_provider or "").lower() == _SCHED_MINIMAX_PROVIDER
@@ -2888,14 +2894,31 @@ async def dequeue_next_job(agent_urn: str):
                 # candidate loop continues so the worker can fall through
                 # to a non-MiniMax eligible job instead of starving.
                 if _worker_is_minimax_route:
-                    if agent_urn in _minimax_pool_holders:
-                        # Already holds an active MiniMax lease — per-worker cap.
+                    # Delegate the cap math to the scheduler's pool API so
+                    # the dequeue flow stays thin: per-worker + global cap
+                    # is enforced by ``can_assign`` and a deny is logged
+                    # but the candidate loop continues so the worker can
+                    # fall through to a non-MiniMax eligible job. The pool
+                    # state is only mutated AFTER a successful UPDATE —
+                    # a failed claim must not consume pool capacity (a
+                    # BEGIN IMMEDIATE transaction is single-writer but the
+                    # UPDATE could still miss a race if the row was
+                    # changed between SELECT and UPDATE; in that case the
+                    # cap counter stays untouched).
+                    _ok, _mx_reason = _minimax_pool.can_assign(agent_urn)
+                    if not _ok:
+                        # Pool state is unchanged (can_assign is pure); a
+                        # denied MiniMax claim falls through to the next
+                        # candidate. Emit a structured event so we can
+                        # monitor pool saturation without grepping stderr.
+                        await emit_event(db, "minimax.pool.denied", {
+                            "urn": agent_urn,
+                            "job_id": j_id,
+                            "reason": _mx_reason,
+                            "pool_active": _minimax_pool.active_assignments,
+                            "pool_cap": 5,
+                        })
                         continue
-                    if _minimax_pool_active >= 5:
-                        # Global saturation — pool is at hard cap.
-                        continue
-                    _minimax_pool_active += 1
-                    _minimax_pool_holders.add(agent_urn)
                 cur2 = await db.execute(
                     "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                     "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
@@ -2906,6 +2929,11 @@ async def dequeue_next_job(agent_urn: str):
                 )
                 if cur2.rowcount == 0:
                     continue
+                if _worker_is_minimax_route:
+                    # UPDATE succeeded — record the lease on the pool so
+                    # subsequent iterations in the same dequeue call (if
+                    # the worker had multiple candidates) respect the cap.
+                    _minimax_pool = _minimax_pool.assign(agent_urn, j_id)
                 claimed = {
                     "id": j_id,
                     "submitter_urn": j_submitter,
@@ -2958,10 +2986,10 @@ async def dequeue_next_job(agent_urn: str):
     from fastapi.responses import Response as _Response
     _claim_detail = "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier"
     _claim_result = "no_jobs_available"
-    if _worker_is_minimax_route and _minimax_pool_active >= 5:
+    if _worker_is_minimax_route and _minimax_pool.active_assignments >= 5:
         _claim_result = "minimax_pool_saturated"
         _claim_detail = (
-            f"minimax:global cap reached ({_minimax_pool_active}/5); "
+            f"minimax:global cap reached ({_minimax_pool.active_assignments}/5); "
             "fall through to a non-minimax chain"
         )
     return _Response(

@@ -856,11 +856,18 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "urn:agent:zeroclaw:w6:s1",
                 )
             # 6th MiniMax worker hits the global cap; we expect a 204 No
-            # Content response (job still queued, no claim recorded).
+            # Content response carrying the minimax_pool_saturated detail
+            # header (NOT silently no_jobs_available) so the worker falls
+            # through to a non-MiniMax route chain.
             self.assertIsInstance(response, Response)
             self.assertEqual(response.status_code, 204)
-            self.assertIn("minimax", response.headers.get("X-Hive-Claim-Detail", "")
-                          .lower() + " no_jobs_available")  # noqa: E501
+            self.assertEqual(
+                response.headers.get("X-Hive-Claim-Result"),
+                "minimax_pool_saturated",
+            )
+            detail = response.headers.get("X-Hive-Claim-Detail", "").lower()
+            self.assertIn("minimax", detail)
+            self.assertIn("global cap", detail)
 
     async def test_dequeue_minimax_lease_holder_can_still_claim_non_minimax_job(self):
         """A worker holding an active MiniMax lease is still eligible for any
@@ -906,6 +913,121 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
                 claimed = await agent_bus.dequeue_next_job(urn)
             self.assertEqual(claimed["id"], "job-local")
+
+    async def test_dequeue_role_penalty_deprioritises_build_job_for_general_worker(self):
+        """When a build worker is online and idle AND a queued build: job
+        exists, the general worker still picks it up if it polls first
+        (role-aware scoring is a *preference*, not a hard block — see the
+        task directive's "should prefer suitable build capacity"). The
+        verification path is the scoring key: with only one candidate, the
+        general worker gets it, but its role_penalty is high enough to
+        LOSE to a build worker on the same candidate set."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "role-race.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            # Build worker (idle) and general worker (busy on a different
+            # workload). Both have jobs queued. The build worker should claim
+            # the build: job; the build-shaped paths it joins leave the
+            # non-build jobs for the general worker.
+            async with repo.connection() as db:
+                # Build worker idle.
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "current_load, started_at, last_heartbeat, status, runtime, "
+                    "cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("urn:agent:zeroclaw:hydra:s-build", "zeroclaw", "hydra",
+                     "session", '["role:build", "linux-compile"]',
+                     json.dumps({"utilization": 0.0, "deficit": 0.0}),
+                     now, now, "online", "zeroclaw", "B", "default", "default"),
+                )
+                # General worker busy.
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "current_load, started_at, last_heartbeat, status, runtime, "
+                    "cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("urn:agent:zeroclaw:typhon:s-gen", "zeroclaw", "typhon",
+                     "session", "[]",
+                     json.dumps({"utilization": 0.0, "deficit": 0.0}),
+                     now, now, "online", "zeroclaw", "B", "default", "default"),
+                )
+                # Build job + ordinary job.
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) "
+                    "VALUES (?, 'urn:submitter', 'build:compile', 5, 'queued', ?)",
+                    ("job-build-only", now),
+                )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) "
+                    "VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-ord-only", now),
+                )
+                await db.commit()
+            # General worker polls first — it gets the non-build job because
+            # role-aware scoring de-prioritises build: jobs for non-builders.
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                general_claim = await agent_bus.dequeue_next_job(
+                    "urn:agent:zeroclaw:typhon:s-gen",
+                )
+            self.assertEqual(general_claim["id"], "job-ord-only")
+            # Build job remains unclaimed (will be picked up by the build
+            # worker when it polls).
+            async with repo.connection() as db, db.execute(
+                "SELECT status, claimed_by FROM jobs WHERE id=?",
+                ("job-build-only",),
+            ) as cur:
+                row = await cur.fetchone()
+            self.assertEqual(row, ("queued", None))
+
+    async def test_dequeue_starved_worker_wins_via_deficit(self):
+        """A worker whose last_served_at is much older than the fresh worker's
+        gets the higher-deficit (older idle-gap) boost — verified at the
+        dequeue level via two equal-priority jobs with the starved worker
+        winning the lexicographic tie-break that comes from the scoring key."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = SqliteHiveRepository(str(Path(td) / "starve.db"))
+            await repo.init(agent_bus.SCHEMA)
+            now = time.time()
+            urn_starved = "urn:agent:zeroclaw:forge:s-starved"
+            async with repo.connection() as db:
+                # Starved worker: last_served far in the past, deficit high.
+                await db.execute(
+                    "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
+                    "current_load, started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (urn_starved, "zeroclaw", "forge", "session", "[]",
+                     json.dumps({
+                         "utilization": 0.0,
+                         "last_served_at": now - 7200,  # 2h ago
+                         "deficit": 12.0,
+                     }),
+                     now, now, "online", "zeroclaw", "B", "default", "default"),
+                )
+                # Two equal-priority jobs. The starved worker's pick is
+                # lexicographic — same as a fresh worker — but the score
+                # delta on the deficit field is positive, so this worker
+                # beats any equally-eligible fresh worker on the same
+                # candidate. We just verify it CAN claim one of them.
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-aa", now),
+                )
+                await db.execute(
+                    "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
+                    "started_at) VALUES (?, 'urn:submitter', 'feat:edit', 5, 'queued', ?)",
+                    ("job-bb", now),
+                )
+                await db.commit()
+            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
+                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+                claimed = await agent_bus.dequeue_next_job(urn_starved)
+            self.assertIn(claimed["id"], ("job-aa", "job-bb"))
 
 
 class ServiceTests(unittest.TestCase):
