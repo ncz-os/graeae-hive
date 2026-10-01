@@ -1,1 +1,49 @@
-PRODUCTION READY
+PRODUCTION READY (round-2 refactor)
+==================================
+
+Scheduler-intelligence round-2 review fixes landed on master at 3d0711e.
+All existing Hive tests + the new scheduler tests pass on this host:
+
+  test_queue_logic.py             18/18  PASS
+  test_scheduler.py               64/64  PASS   (was 60/60)
+  test_no_token_in_job_description  3/3  PASS
+  test_defect_fixes.py            42/42  PASS   (non-McpBridge; was 40/40)
+    10 McpBridgeTests still fail under the pre-existing mcp<2 env
+    mismatch on this host — unchanged from the round-1 commit, NOT
+    caused by anything in this commit.
+
+ruff lint (hive/scheduler.py, test_scheduler.py): clean
+ruff lint (test_defect_fixes.py): 3 pre-existing errors only
+ruff lint (agent_bus.py): 127 pre-existing errors only — none added
+by this commit.
+
+What changed in 3d0711e:
+  * hive/scheduler.py: new ``build_pool_snapshot(active_assignments)``
+    pure helper centralises the per-worker + global MiniMax cap math;
+    the dequeue flow now builds the pool state through this API
+    instead of inline counters.
+  * agent_bus.py: dequeue_next_job MiniMax pre-flight uses
+    ``MiniMaxPoolState.can_assign`` + ``assign`` (deferred to AFTER a
+    successful UPDATE so a failed claim never consumes pool capacity);
+    on a denied MiniMax claim, emit ``minimax.pool.denied`` for fleet
+    observability; the 204 header now reports ``minimax_pool_saturated``
+    (not the silent ``no_jobs_available``) when the worker is on a
+    MiniMax route and the pool is at the 5/5 global cap.
+  * test_scheduler.py: +4 build_pool_snapshot checks (empty input,
+    normal input, de-dupe, defensive empty-field drop). 60 -> 64.
+  * test_defect_fixes.py: strengthened the 6th-MiniMax-claim assertion
+    from a string-concat fallback to a strict header equality check;
+    +2 new SchedulerDequeueTests (role-penalty de-prioritises build:
+    jobs for general workers; starved worker with old last_served wins
+    via deficit field). 40 -> 42.
+
+Push:
+  * Canonical (ssh://root@192.0.2.101/mnt/datapool/git/graeae-hive.git):
+    pushed dba1d0a..3d0711e master via the file:// insteadof alias.
+  * ARGONAS (file:///mnt/argonas-git/graeae-hive.git): same push,
+    HEAD = 3d0711e on the bare mirror.
+
+No production services restarted, no automatic deploy. The
+scheduler-intelligence rollout remains a code-only change that activates
+on the next service reload (rollout/verification plan in the commit
+message body).
