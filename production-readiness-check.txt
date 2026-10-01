@@ -1,7 +1,9 @@
-PRODUCTION READY (round-5 scheduler-intelligence hardening)
-==========================================================
+PRODUCTION READY (round-5 scheduler-intelligence hardening + .gitignore follow-up)
+====================================================================================
 
-Scheduler-intelligence round-5 review hardening landed on master.
+Scheduler-intelligence round-5 review hardening landed on master, followed by
+a zoder-driven hygiene commit (dc8b01d) that adds .pytest_cache/ and
+.ruff_cache/ to .gitignore so local tool cache artifacts can't be staged.
 
 All existing Hive tests + the new scheduler tests pass on this host:
 
@@ -26,7 +28,7 @@ ruff lint:
   agent_bus.py                             127 pre-existing errors; 0 new errors
                                           added by this commit
 
-What changed in this commit (round-5 hardening):
+What changed in round-5 (f193fc5):
 
   The previous rounds closed most of the gaps, but missed the directive's
   exact wording: "a hard global maximum of 5 concurrent OR ASSIGNED MiniMax
@@ -88,6 +90,18 @@ What changed in this commit (round-5 hardening):
       offered lease doesn't count against the pool — fresh MiniMax claim
       succeeds. Verifies the lease-expiry filter applies to offered rows
       too (a crashed worker doesn't permanently reduce capacity).
+
+What changed in the follow-up commit (dc8b01d):
+
+  The round-5 commit was reviewed by zoder (working-tree scope). The reviewer
+  flagged that the local .pytest_cache/ and .ruff_cache/ directories existed
+  in the working tree after running the test/lint suite, and although they
+  were not in the index, a stricter reviewer would block on their visibility.
+  This follow-up adds both patterns to the root .gitignore so future runs
+  can never accidentally stage the cache artifacts. No code or test changes;
+  ruff and test suites pass identically to round-5.
+
+  * .gitignore: +2 lines (.pytest_cache/, .ruff_cache/).
 
 Push:
   * Canonical (ssh://root@192.0.2.101/mnt/datapool/git/graeae-hive.git
