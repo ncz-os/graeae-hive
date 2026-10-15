@@ -6,7 +6,7 @@
   "repos": {
     "graeae-hive-mind": {
       "display_name": "GRAEAE Hive Mind",
-      "aliases": ["hive", "hive-mind", "agent-bus", "graeae-hive"],
+      "aliases": ["hive", "hive-mind", "agent-bus"],
       "language": "python",
       "owner": "ncz-os",
       "status": "active",
@@ -127,7 +127,7 @@
     },
     "meta-cix": {
       "display_name": "meta-cix (Yocto)",
-      "aliases": ["meta-nclawzero", "meta-base", "nclawzero-yocto"],
+      "aliases": ["meta-cix-full", "nclawzero-yocto"],
       "owner": "ncz-os",
       "status": "active",
       "live": [{"host": "argos", "path": "/mnt/argonas/datapool/projects/nclawzero-yocto"}],

@@ -82,6 +82,15 @@ class LoaderTests(unittest.TestCase):
         )
         self.assertEqual(repos.required_mnemos_queries("mnemos"), [])  # required=False
 
+    def test_to_dict_emits_required_mnemos_queries(self):
+        # the bus endpoint AND the MCP bridge both read this key off the payload
+        entry = repos.get_repo("graeae-hive-mind")
+        self.assertEqual(entry["required_mnemos_queries"], ["hive architecture", "hive job lifecycle"])
+        self.assertEqual(repos.get_repo("mnemos")["required_mnemos_queries"], [])
+
+    def test_resolve_is_capped(self):
+        self.assertLessEqual(len(repos.resolve("e", limit=1)), 1)
+
     def test_resolve_ranks_exact_then_prefix(self):
         ids = [e["id"] for e in repos.resolve("hive")]
         self.assertEqual(ids[0], "graeae-hive-mind")

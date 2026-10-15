@@ -2856,7 +2856,11 @@ async def list_hosts(include_stale: bool = False):
 @app.get("/v1/repos/resolve")
 async def resolve_repos(q: str):
     """Fuzzy-resolve a project name to catalog entries (id/alias/display_name)."""
-    return {"query": q, "matches": repo_registry.resolve(q)}
+    try:
+        matches = repo_registry.resolve(q)
+    except FileNotFoundError as e:
+        raise HTTPException(503, f"repo catalog unavailable: {e}") from e
+    return {"query": q, "matches": matches}
 
 
 @app.get("/v1/repos")
@@ -2888,8 +2892,7 @@ async def get_repo(repo_id: str, host: str | None = None):
         raise HTTPException(503, f"repo catalog unavailable: {e}") from e
     if entry is None:
         raise HTTPException(404, f"repo not found: {repo_id!r}")
-    entry["required_mnemos_queries"] = repo_registry.required_mnemos_queries(entry["id"])
-    return entry
+    return entry  # includes required_mnemos_queries (emitted by to_dict)
 
 
 @app.get("/v1/agents/{urn_path:path}/throttle")

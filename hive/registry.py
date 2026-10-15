@@ -29,6 +29,24 @@ from typing import Any
 
 _API_KEYS = Path.home() / ".api_keys_master.json"
 
+# ARGONAS canonical bare-repo location, in both spellings. The directory on the
+# NAS is /mnt/datapool/git; /mnt/argonas_git is the NFS mount of the SAME dir on
+# other hosts. Derived from these constants so argonas_bare / clone_ssh /
+# clone_nfs can never drift apart (review finding).
+ARGONAS_SSH_USER = "jasonperlow"  # documented clone user (ssh://jasonperlow@...); needs a key
+ARGONAS_SSH_HOST = "192.0.2.101"
+ARGONAS_GIT_PATH_SSH = "/mnt/datapool/git"  # real directory on the NAS
+ARGONAS_GIT_PATH_NFS = "/mnt/argonas_git"  # NFS mount spelling of the same dir
+ARGONAS_DISCOVER_USER = "root"  # proven user for the NAS listing (password/sshpass)
+
+
+def argonas_ssh_url(slug: str) -> str:
+    return f"ssh://{ARGONAS_SSH_USER}@{ARGONAS_SSH_HOST}{ARGONAS_GIT_PATH_SSH}/{slug}.git"
+
+
+def argonas_nfs_path(slug: str) -> str:
+    return f"{ARGONAS_GIT_PATH_NFS}/{slug}.git"
+
 
 # --------------------------------------------------------------------------- #
 # credential + http helpers
@@ -124,10 +142,10 @@ def discover_github(token: str, user: str | None = None) -> dict[str, dict[str, 
 
 def discover_argonas(
     *,
-    host: str = "192.0.2.101",
-    user: str = "root",
+    host: str = ARGONAS_SSH_HOST,
+    user: str = ARGONAS_DISCOVER_USER,
     password: str | None = None,
-    git_dir: str = "/mnt/datapool/git",
+    git_dir: str = ARGONAS_GIT_PATH_SSH,
 ) -> set[str]:
     """Canonical bare repos present on ARGONAS (`ls *.git`). Returns slugs."""
     ssh = ["ssh", "-o", "PubkeyAuthentication=no", "-o", "StrictHostKeyChecking=no",
@@ -270,7 +288,7 @@ def build_registry(
     # Tag ARGONAS presence.
     for slug in argonas_slugs:
         entry = forge_facts.setdefault(slug, {"id": slug, "sources": []})
-        entry["argonas_bare"] = f"/mnt/argonas_git/{slug}.git"
+        entry["argonas_bare"] = argonas_nfs_path(slug)
         entry["argonas_present"] = True
         if "argonas" not in entry["sources"]:
             entry["sources"].append("argonas")
@@ -282,8 +300,8 @@ def build_registry(
     # Fill clone recipes for any entry that has a forge or ARGONAS presence.
     for entry in merged.values():
         if entry.get("argonas_present"):
-            entry.setdefault("clone_ssh", f"ssh://jasonperlow@192.0.2.101/mnt/datapool/git/{entry['id']}.git")
-            entry.setdefault("clone_nfs", f"/mnt/argonas_git/{entry['id']}.git")
+            entry.setdefault("clone_ssh", argonas_ssh_url(entry["id"]))
+            entry.setdefault("clone_nfs", argonas_nfs_path(entry["id"]))
 
     repos = sorted(merged.values(), key=lambda e: e["id"])
     return {

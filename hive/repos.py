@@ -85,8 +85,26 @@ def _default_branch(entry: dict[str, Any]) -> str:
     return entry.get("default_branch", "master")
 
 
+def _required_mnemos_queries(entry: dict[str, Any]) -> list[str]:
+    """The MNEMOS searches an agent MUST run before working this repo."""
+    mn = entry.get("mnemos") or {}
+    if not mn.get("required"):
+        return []
+    queries = list(mn.get("queries") or [])
+    tags = mn.get("tags") or []
+    if not queries and tags:
+        queries = [" ".join(tags)]
+    return queries
+
+
 def to_dict(entry: dict[str, Any], *, host: str | None = None) -> dict[str, Any]:
-    """Normalize a catalog entry for API output."""
+    """Normalize a catalog entry for API output.
+
+    Emits ``required_mnemos_queries`` itself so every consumer (bus endpoint
+    AND MCP bridge) sees the same field — no endpoint-side mutation needed.
+    This is a fresh dict per call (never the cached entry), so callers may
+    mutate the result safely.
+    """
     remotes = {}
     for facet in ("gitlab", "github"):
         f = entry.get(facet) or {}
@@ -110,6 +128,7 @@ def to_dict(entry: dict[str, Any], *, host: str | None = None) -> dict[str, Any]
         "status": entry.get("status", "active"),
         "deps": entry.get("deps", []),
         "mnemos": entry.get("mnemos", {}),
+        "required_mnemos_queries": _required_mnemos_queries(entry),
         "notes": entry.get("notes"),
     }
     if host is not None:
@@ -156,7 +175,12 @@ def get_repo(repo_id: str, *, host: str | None = None) -> dict[str, Any] | None:
     return to_dict(entry, host=host) if entry else None
 
 
-def resolve(query: str) -> list[dict[str, Any]]:
+def resolve(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
+    """Ranked fuzzy match over id / display_name / aliases (exact > prefix > substring).
+
+    Result count is capped at ``limit`` so a short query cannot return the
+    whole catalog.
+    """
     q = query.strip().lower()
     if not q:
         return []
@@ -164,18 +188,22 @@ def resolve(query: str) -> list[dict[str, Any]]:
     for entry in load_catalog().values():
         hay = [entry["id"].lower(), (entry.get("display_name") or "").lower()]
         hay += [a.lower() for a in entry.get("aliases", [])]
-        best = None
+        rank: int | None = None
         for h in hay:
             if h == q:
-                best = min(best if best is not None else 100, 0)
+                score = 0
             elif h.startswith(q):
-                best = min(best if best is not None else 100, 1)
+                score = 1
             elif q in h:
-                best = min(best if best is not None else 100, 2)
-        if best is not None:
-            scored.append((best, entry))
+                score = 2
+            else:
+                continue
+            if rank is None or score < rank:
+                rank = score
+        if rank is not None:
+            scored.append((rank, entry))
     scored.sort(key=lambda t: (t[0], t[1]["id"]))
-    return [to_dict(e) for _s, e in scored]
+    return [to_dict(e) for _score, e in scored[:limit]]
 
 
 def required_mnemos_queries(repo_id: str) -> list[str]:
@@ -183,14 +211,7 @@ def required_mnemos_queries(repo_id: str) -> list[str]:
     entry = get_repo(repo_id)
     if entry is None:
         return []
-    mn = entry.get("mnemos") or {}
-    if not mn.get("required"):
-        return []
-    queries = list(mn.get("queries") or [])
-    tags = mn.get("tags") or []
-    if not queries and tags:
-        queries = [" ".join(tags)]
-    return queries
+    return list(entry.get("required_mnemos_queries") or [])
 
 
 def catalog_meta() -> dict[str, Any]:
