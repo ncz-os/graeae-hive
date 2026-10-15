@@ -36,7 +36,7 @@ import queue_logic
 import retry_policy
 from hive import repos as repo_registry
 from hive import scheduler as sched
-from hive.core.models import COST_TIERS, LLM_RATES, PROVIDER_COST_TIER, cost_tier_for, rate_for
+from hive.core.models import COST_TIERS, cost_tier_for, rate_for
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
 
