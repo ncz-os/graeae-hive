@@ -6,7 +6,6 @@ from abc import ABC, abstractmethod
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol, runtime_checkable
 
-
 Row = tuple[Any, ...]
 
 
@@ -38,13 +37,23 @@ class HiveMindRepository(ABC):
     def connection(self) -> AbstractAsyncContextManager[Transaction]: ...
 
     @abstractmethod
-    async def emit_event(self, tx: Transaction, *, ts: float, kind: str, payload_json: str, agent_urn: str | None) -> None: ...
+    async def emit_event(
+        self,
+        tx: Transaction,
+        *,
+        ts: float,
+        kind: str,
+        payload_json: str,
+        agent_urn: str | None,
+    ) -> None: ...
 
     @abstractmethod
     async def register_agent(self, **fields: Any) -> None: ...
 
     @abstractmethod
-    async def heartbeat_agent(self, *, urn: str, ts: float, status: str, metadata_json: str | None = None) -> int: ...
+    async def heartbeat_agent(
+        self, *, urn: str, ts: float, status: str, metadata_json: str | None = None
+    ) -> int: ...
 
     @abstractmethod
     async def require_agent(self, *, urn: str) -> Row | None: ...
@@ -90,16 +99,22 @@ class HiveMindRepository(ABC):
     async def list_messages(self, **filters: Any) -> list[dict[str, Any]]: ...
 
     @abstractmethod
-    async def tail_events(self, *, since_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]: ...
+    async def tail_events(
+        self, *, since_id: int | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]: ...
 
     @abstractmethod
-    async def cache_lookup(self, *, cache_key: str, cutoff: float) -> dict[str, Any] | None: ...
+    async def cache_lookup(
+        self, *, cache_key: str, cutoff: float
+    ) -> dict[str, Any] | None: ...
 
     @abstractmethod
     async def cache_store(self, **fields: Any) -> None: ...
 
     @abstractmethod
-    async def cache_record_hit(self, *, cache_key: str, cost_saved_usd: float, ts: float) -> None: ...
+    async def cache_record_hit(
+        self, *, cache_key: str, cost_saved_usd: float, ts: float
+    ) -> None: ...
 
     @abstractmethod
     async def upsert_worker_kind_stats(self, **fields: Any) -> None: ...

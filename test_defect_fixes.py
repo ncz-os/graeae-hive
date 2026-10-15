@@ -46,7 +46,7 @@ def load_script(name, filename):
 
 auto_restore = load_script("hive_auto_restore", "hive-auto-restore.py")
 with mock.patch("pathlib.Path.mkdir"):
-    worker = load_script("zeroclaw_worker_under_test", "zeroclaw_wss_worker_v2.py")
+    worker = load_script("zeroclaw_worker_under_test", "tests/fixtures/zeroclaw_wss_worker_v2.py")
 
 
 class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
@@ -1582,7 +1582,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(routing[0][2]["eligible_kinds"], ["claude", "codex"])
 
     def test_completion_outbox_is_instance_scoped_and_locked(self):
-        source = Path("zeroclaw_wss_worker_v2.py").read_text()
+        source = Path("tests/fixtures/zeroclaw_wss_worker_v2.py").read_text()
         self.assertIn('hive_completion_outbox.{INSTANCE}.json', source)
         self.assertIn("fcntl.LOCK_EX", source)
 

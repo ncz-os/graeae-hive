@@ -7,7 +7,9 @@ Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 a
 Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
 Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
 """
+
 from __future__ import annotations
+
 import asyncio
 import hmac
 import json
@@ -17,26 +19,28 @@ import secrets
 import sys
 import time
 import uuid
-from contextlib import asynccontextmanager
-from contextlib import suppress
-from typing import Optional, Any
+from contextlib import asynccontextmanager, suppress
+from typing import Any
 
 try:
     import aiosqlite
 except ModuleNotFoundError:
     from hive.persistence import _sqlite_async as aiosqlite
 
-import queue_logic
-import retry_policy
-from hive.persistence.factory import get_hive_repository
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+import queue_logic
+import retry_policy
+from hive.persistence.factory import get_hive_repository
+
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
-ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
+ORACLE_DSN = os.environ.get(
+    "ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1"
+)
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
 HEARTBEAT_OFFLINE_AFTER = 300.0
@@ -64,8 +68,14 @@ SWEEPABLE_STATUSES = ("done", "failed", "failed_completion", "cancelled", "dead-
 ACTIVE_JOB_STATUSES = ("queued", "offered", "claimed", "running", "needs-review")
 # Substrings (case-insensitive) that mark a job description as obvious test junk.
 TEST_JOB_DESC_PATTERNS = (
-    "e2e", "testdispatch", "append a one-line", "dated comment",
-    "xfam", "validate native", "hive functional", "hive deploy e2e",
+    "e2e",
+    "testdispatch",
+    "append a one-line",
+    "dated comment",
+    "xfam",
+    "validate native",
+    "hive functional",
+    "hive deploy e2e",
 )
 SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
@@ -87,6 +97,7 @@ _TABLE_MAP = {
 
 def _parse_oracle_url(url: str) -> tuple[str, str, str]:
     from urllib.parse import unquote, urlparse
+
     parsed = urlparse(url)
     if parsed.scheme != "oracle":
         return "", "", url
@@ -99,20 +110,34 @@ def _parse_oracle_url(url: str) -> tuple[str, str, str]:
 
 
 if HIVE_BACKEND not in {"sqlite", "oracle", "db2"}:
-    raise RuntimeError(f"HIVE_BACKEND must be sqlite, oracle, or db2, got {HIVE_BACKEND!r}")
+    raise RuntimeError(
+        f"HIVE_BACKEND must be sqlite, oracle, or db2, got {HIVE_BACKEND!r}"
+    )
 
 if HIVE_BACKEND == "oracle":
     try:
         import oracledb
     except Exception as exc:
-        print(f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         raise
     try:
-        _oracle_user, _oracle_password, _oracle_connect_dsn = _parse_oracle_url(ORACLE_DSN)
-        _probe = oracledb.connect(user=_oracle_user, password=_oracle_password, dsn=_oracle_connect_dsn)
+        _oracle_user, _oracle_password, _oracle_connect_dsn = _parse_oracle_url(
+            ORACLE_DSN
+        )
+        _probe = oracledb.connect(
+            user=_oracle_user, password=_oracle_password, dsn=_oracle_connect_dsn
+        )
         _probe.close()
     except Exception as exc:
-        print(f"HIVE_BACKEND=oracle failed initial Oracle connection to {ORACLE_DSN!r}: {exc}", file=sys.stderr, flush=True)
+        print(
+            f"HIVE_BACKEND=oracle failed initial Oracle connection to {ORACLE_DSN!r}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
         raise
 else:
     oracledb = None
@@ -121,6 +146,7 @@ _HIVE_REPO = None
 
 
 # ---------- helpers ----------
+
 
 def _replace_qmarks(sql: str) -> str:
     out = []
@@ -155,14 +181,29 @@ def _rewrite_tables(sql: str) -> str:
     def repl(match: re.Match) -> str:
         return f"{match.group(1)} {_TABLE_MAP[match.group(2).lower()]}"
 
-    sql = re.sub(rf"\b(FROM|INTO|UPDATE|DELETE\s+FROM|JOIN)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
-    sql = re.sub(rf"\b(ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
+    sql = re.sub(
+        rf"\b(FROM|INTO|UPDATE|DELETE\s+FROM|JOIN)\s+({names})\b",
+        repl,
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        rf"\b(ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE)\s+({names})\b",
+        repl,
+        sql,
+        flags=re.IGNORECASE,
+    )
     sql = re.sub(rf"\b(ON)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
     return sql
 
 
 def _rewrite_limit(sql: str) -> str:
-    return re.sub(r"\s+LIMIT\s+(:\d+|\d+)\s*$", r" FETCH FIRST \1 ROWS ONLY", sql, flags=re.IGNORECASE)
+    return re.sub(
+        r"\s+LIMIT\s+(:\d+|\d+)\s*$",
+        r" FETCH FIRST \1 ROWS ONLY",
+        sql,
+        flags=re.IGNORECASE,
+    )
 
 
 def _rewrite_sqlite_time_funcs(sql: str) -> str:
@@ -181,7 +222,7 @@ def _rewrite_sqlite_time_funcs(sql: str) -> str:
     return sql
 
 
-def _translate_upsert(sql: str) -> Optional[str]:
+def _translate_upsert(sql: str) -> str | None:
     normalized = " ".join(sql.split())
     cache_pattern = (
         r"INSERT INTO hive_cache \(cache_key, result_json, source_job_id, result_mnemos_id, "
@@ -230,7 +271,7 @@ def _translate_upsert(sql: str) -> Optional[str]:
     return None
 
 
-def _translate_sql(sql: str, params: Any = None) -> tuple[Optional[str], Any]:
+def _translate_sql(sql: str, params: Any = None) -> tuple[str | None, Any]:
     stripped = sql.strip()
     upper = stripped.upper()
     if not stripped:
@@ -242,7 +283,10 @@ def _translate_sql(sql: str, params: Any = None) -> tuple[Optional[str], Any]:
     if upper.startswith(("CREATE ", "ALTER TABLE ", "DROP TABLE ")):
         return None, params
     if "SQLITE_MASTER" in upper:
-        return "SELECT 'CREATE TABLE agents (status TEXT CHECK(status IN (''online'',''idle'',''stale'',''offline'',''error'')))' FROM dual", ()
+        return (
+            "SELECT 'CREATE TABLE agents (status TEXT CHECK(status IN (''online'',''idle'',''stale'',''offline'',''error'')))' FROM dual",
+            (),
+        )
 
     sql = _rewrite_tables(stripped)
     sql = _replace_qmarks(sql)
@@ -255,12 +299,16 @@ def _translate_sql(sql: str, params: Any = None) -> tuple[Optional[str], Any]:
 
 
 class BackendCursor:
-    def __init__(self, cursor=None, rows: Optional[list] = None, rowcount: int = -1):
+    def __init__(self, cursor=None, rows: list | None = None, rowcount: int = -1):
         self._cursor = cursor
         self._rows = rows
         self._index = 0
-        self.rowcount = rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
-        self.lastrowid = getattr(cursor, "lastrowid", None) if cursor is not None else None
+        self.rowcount = (
+            rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
+        )
+        self.lastrowid = (
+            getattr(cursor, "lastrowid", None) if cursor is not None else None
+        )
 
     async def __aenter__(self):
         return self
@@ -291,18 +339,19 @@ class BackendCursor:
     @staticmethod
     async def _normalize_row(row):
         """Normalize Oracle-specific types to sqlite-equivalent shapes:
-          - Oracle 23ai auto-decodes JSON CLOBs to dict/list -> re-serialize to str
-          - NUMBER columns return Decimal -> float for JSON serializability
-          - CLOB objects -> str via .read()
-          - TIMESTAMP WITH TIME ZONE -> float epoch seconds (matches SQLite REAL)
-          - bytes (RAW(16) for UUID id cols) -> uuid hex string (matches SQLite TEXT)
+        - Oracle 23ai auto-decodes JSON CLOBs to dict/list -> re-serialize to str
+        - NUMBER columns return Decimal -> float for JSON serializability
+        - CLOB objects -> str via .read()
+        - TIMESTAMP WITH TIME ZONE -> float epoch seconds (matches SQLite REAL)
+        - bytes (RAW(16) for UUID id cols) -> uuid hex string (matches SQLite TEXT)
         """
         if row is None:
             return None
-        import json as _json
         import datetime as _dt
-        from decimal import Decimal as _Decimal
+        import json as _json
         import uuid as _uuid
+        from decimal import Decimal as _Decimal
+
         def _json_default(o):
             if isinstance(o, _Decimal):
                 return float(o) if o != o.to_integral_value() else int(o)
@@ -313,6 +362,7 @@ class BackendCursor:
             if isinstance(o, _dt.datetime):
                 return o.isoformat()
             raise TypeError(f"unhandled type {type(o).__name__}")
+
         out = []
         for v in row:
             if isinstance(v, (dict, list)):
@@ -321,6 +371,7 @@ class BackendCursor:
                 try:
                     r = v.read()
                     import inspect as _inspect
+
                     if _inspect.iscoroutine(r):
                         r = await r
                     out.append(r)
@@ -356,7 +407,7 @@ class BackendCursor:
 
     async def fetchall(self):
         if self._rows is not None:
-            rows = self._rows[self._index:]
+            rows = self._rows[self._index :]
             self._index = len(self._rows)
             return [await self._normalize_row(r) for r in rows]
         rows = await self._cursor.fetchall()
@@ -372,7 +423,7 @@ class BackendCursor:
 
 
 class _OracleExecuteResult:
-    def __init__(self, conn: "OracleConnection", sql: str, params: Any = None):
+    def __init__(self, conn: OracleConnection, sql: str, params: Any = None):
         self._conn = conn
         self._sql = sql
         self._params = params
@@ -408,14 +459,19 @@ class OracleConnection:
 
     async def _execute(self, sql: str, params: Any = None):
         if re.match(r"^\s*PRAGMA\s+table_info\((\w+)\)", sql, flags=re.IGNORECASE):
-            table = re.match(r"^\s*PRAGMA\s+table_info\((\w+)\)", sql, flags=re.IGNORECASE).group(1)
+            table = re.match(
+                r"^\s*PRAGMA\s+table_info\((\w+)\)", sql, flags=re.IGNORECASE
+            ).group(1)
             mapped = _TABLE_MAP.get(table.lower(), table)
             cur = self._conn.cursor()
             await cur.execute(
                 "SELECT column_name FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id",
                 (mapped.upper(),),
             )
-            rows = [(i, row[0].lower(), None, None, None, None) for i, row in enumerate(await cur.fetchall())]
+            rows = [
+                (i, row[0].lower(), None, None, None, None)
+                for i, row in enumerate(await cur.fetchall())
+            ]
             await BackendCursor(cur).close()
             return BackendCursor(rows=rows)
         translated, translated_params = _translate_sql(sql, params)
@@ -469,6 +525,7 @@ def hive_repo():
             db2_dsn=os.environ.get("DB2_DSN") or os.environ.get("HIVE_DB2_DSN", ""),
         )
     return _HIVE_REPO
+
 
 @asynccontextmanager
 async def connect_db():
@@ -745,34 +802,40 @@ CREATE INDEX IF NOT EXISTS idx_sched_next ON scheduled_jobs(next_fire_at, enable
 
 # Runtime → eligible kinds map (Kimi-K2.6 advisory 2026-05-23).
 RUNTIME_KIND_MAP: dict[str, set[str]] = {
-    "claude-code":   {"claude", "claude-code"},
-    "claude-cli":    {"claude", "claude-code"},
-    "opencode":      {"opencode"},                 # opencode CAN run any model — kind=opencode
-    "opencode-cli":  {"opencode"},
-    "codex":         {"codex"},
-    "codex-cli":     {"codex"},
-    "hermes":        {"hermes"},
-    "zeroclaw":      {"zeroclaw"},  # zeroclaw is its own kind; does not alias codex/opencode/claude
-    "openclaw":      {"openclaw"},
-    "ic-engine":     {"ic-engine"},
-    "mnemos":        {"mnemos"},
-    "human":         {"human"},
-    "claude":        {"claude"},
-    "system":        {"system"},                    # fleet hosts (ARGOS/TYPHON/HYDRA/MEDUSA/CERBERUS/PROTEUS/cixmini)
-    "doctor":        {"doctor"},  # PYTHIA zeroclaw doctor — triage authority + DB access
-    "dream-walker":  {"dream-walker"},
-    "unknown":       {"unknown"},
+    "claude-code": {"claude", "claude-code"},
+    "claude-cli": {"claude", "claude-code"},
+    "opencode": {"opencode"},  # opencode CAN run any model — kind=opencode
+    "opencode-cli": {"opencode"},
+    "codex": {"codex"},
+    "codex-cli": {"codex"},
+    "hermes": {"hermes"},
+    "zeroclaw": {
+        "zeroclaw"
+    },  # zeroclaw is its own kind; does not alias codex/opencode/claude
+    "openclaw": {"openclaw"},
+    "ic-engine": {"ic-engine"},
+    "mnemos": {"mnemos"},
+    "human": {"human"},
+    "claude": {"claude"},
+    "system": {
+        "system"
+    },  # fleet hosts (ARGOS/TYPHON/HYDRA/MEDUSA/CERBERUS/PROTEUS/cixmini)
+    "doctor": {"doctor"},  # PYTHIA zeroclaw doctor — triage authority + DB access
+    "dream-walker": {"dream-walker"},
+    "unknown": {"unknown"},
 }
 AUTONOMY_LEVELS = {"autonomous", "confirm-risky", "interactive", "unknown"}
 AUTH_METHODS = {"subscription", "api", "free", "unknown"}
 # Plan caps (USD/month) per CLAUDE.md:
 DEFAULT_PLAN_CAPS = {
-    "subscription": 200.0,   # Anthropic Max plan ($200 until 2026-05-31, $100 from 2026-06-01 — operator updates)
-    "api":          1000.0,  # pay-per-token has no hard cap; treat as high ceiling for safety
-    "free":         0.0,     # no cap (no cost)
-    "unknown":      50.0,    # conservative
+    "subscription": 200.0,  # Anthropic Max plan ($200 until 2026-05-31, $100 from 2026-06-01 — operator updates)
+    "api": 1000.0,  # pay-per-token has no hard cap; treat as high ceiling for safety
+    "free": 0.0,  # no cap (no cost)
+    "unknown": 50.0,  # conservative
 }
-THROTTLE_HEADROOM = 0.85  # at >=85% of plan cap, prefer non-subscription workers for tier-B/C jobs
+THROTTLE_HEADROOM = (
+    0.85  # at >=85% of plan cap, prefer non-subscription workers for tier-B/C jobs
+)
 VALID_AGENT_STATUSES = {"online", "idle", "stale", "offline", "error"}
 ACTIVE_AGENT_STATUSES = {"online", "idle"}
 
@@ -780,20 +843,24 @@ ACTIVE_AGENT_STATUSES = {"online", "idle"}
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
 # Orchestrators include a distinct Codex role. Ordinary Codex workers stay claim-only.
 WORKER_ONLY_RUNTIMES: set[str] = {
-    "opencode", "opencode-cli",
-    "opencode", "opencode-cli",
-    "codex", "codex-cli",
+    "opencode",
+    "opencode-cli",
+    "codex",
+    "codex-cli",
     "hermes",
-    "zeroclaw", "openclaw",
+    "zeroclaw",
+    "openclaw",
     "ic-engine",
-    "system",   # fleet hosts (system-watcher daemons) — sensors + optional build/ci workers, never submitters
+    "system",  # fleet hosts (system-watcher daemons) — sensors + optional build/ci workers, never submitters
 }
 ORCHESTRATOR_RUNTIMES: set[str] = {
-    "claude-code", "claude-cli", "claude",
+    "claude-code",
+    "claude-cli",
+    "claude",
     "codex-orchestrator",
     "human",
     "mnemos",
-    "doctor",   # PYTHIA triage authority — submits codex sub-jobs + auto-triage
+    "doctor",  # PYTHIA triage authority — submits codex sub-jobs + auto-triage
     "dream-walker",  # zeropi Dream Walker — dispatches hourly analysis jobs
     "unknown",
 }
@@ -804,13 +871,16 @@ ORCHESTRATOR_RUNTIMES: set[str] = {
 KIND_HOST_AFFINITY: dict[str, list[str]] = {
     # Argonaut DBPR work requires the florida-licenses workspace. Route to
     # a verified zeroclaw host with the Argonaut workspace map installed.
-    "argonaut:":      ["ULTRA", "HYDRA"],  # TYPHON offline 2026-06-01; retargeted to live zeroclaw hosts w/ florida-licenses workspace
+    "argonaut:": [
+        "ULTRA",
+        "HYDRA",
+    ],  # TYPHON offline 2026-06-01; retargeted to live zeroclaw hosts w/ florida-licenses workspace
     # Hardware-bound: needs physical CIX Sky1 NPU — zeroclaw cannot substitute with SSH
-    "cixmini-os:":    ["cixmini"],
-    "ncz-os:":        ["cixmini"],
+    "cixmini-os:": ["cixmini"],
+    "ncz-os:": ["cixmini"],
     # Pi-specific tasks (explicit opt-in; general jobs use any worker)
-    "pi:":            ["bigpi", "clawpi", "zeropi"],
-    "arm64-test:":    ["bigpi", "clawpi", "zeropi", "cixmini"],
+    "pi:": ["bigpi", "clawpi", "zeropi"],
+    "arm64-test:": ["bigpi", "clawpi", "zeropi", "cixmini"],
     # Note: investorclaw/investorclaude are NOT here — any zeroclaw can execute
     # those by SSHing to the appropriate host. Host affinity would over-restrict.
 }
@@ -821,7 +891,7 @@ NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 # has a BROKEN gateway: it claims jobs then 400s the WSS handshake in ~0.5s,
 # thrashing every job it touches (2026-06-07). Quarantine it bus-side instead
 # of tearing down another owner's host. Remove once its gateway is fixed.
-QUARANTINED_HOSTS = set()  # all hosts un-quarantined 2026-06-14: proteus+typhon now proxmox workers, spark DGX-verified (operator directive)
+
 
 # 2026-10-02 (operator): hold sentinels are DEPRECATED. They existed to park jobs
 # behind the zeroclaw pre-submission gate, which is no longer enforced. Treat
@@ -880,41 +950,50 @@ HEAVY_REPO_KIND_PREFIXES = ("zeroclaw:", "ncz-os-zeroclaw:")
 #                 (Together DeepSeek-V4-Pro = anti-pattern — use DeepSeek direct instead)
 PROVIDER_COST_TIER: dict[str, str] = {
     # Tier A = FREE / local / on-prem NGC (claim-anything; no spend)
-    "ngc":             "A",
-    "nvidia":          "A",
-    "nvidia-ngc":      "A",
-    "local-llamacpp":  "A",
-    "local-vllm":      "A",
-    "ollama":          "A",
+    "ngc": "A",
+    "nvidia": "A",
+    "nvidia-ngc": "A",
+    "local-llamacpp": "A",
+    "local-vllm": "A",
+    "ollama": "A",
     "ollama-cerberus": "A",
-    "local":           "A",
-    "pantheon":        "A",
-
+    "local": "A",
+    "pantheon": "A",
     # Tier B = MID (cheap paid commercial)
-    "groq":            "B",
-    "xai":             "B",
-    "deepseek":        "B",
+    "groq": "B",
+    "xai": "B",
+    "deepseek": "B",
     "deepseek-direct": "B",
-    "together":        "B",
-    "bedrock":         "B",
-    "gemini-flash":    "B",
-    "openai-mini":     "B",
-    "perplexity":      "B",
-
+    "together": "B",
+    "bedrock": "B",
+    "gemini-flash": "B",
+    "openai-mini": "B",
+    "perplexity": "B",
     # Tier C = PREMIUM (expensive, reserve)
-    "anthropic":       "C",
-    "claude":          "C",
-    "openai":          "C",
-    "openai-pro":      "C",
-    "openai-gpt55":    "C",
-    "gemini":          "C",
-    "gemini-pro":      "C",
-    "together-pro":    "C",
-
-    "unknown":         "A",
+    "anthropic": "C",
+    "claude": "C",
+    "openai": "C",
+    "openai-pro": "C",
+    "openai-gpt55": "C",
+    "gemini": "C",
+    "gemini-pro": "C",
+    "together-pro": "C",
+    "unknown": "A",
 }
 COST_TIERS = ["A", "B", "C"]
-VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter", "needs-review", "released"}
+VALID_JOB_STATUSES = {
+    "queued",
+    "offered",
+    "claimed",
+    "running",
+    "done",
+    "failed",
+    "failed_completion",
+    "cancelled",
+    "dead-letter",
+    "needs-review",
+    "released",
+}
 # `released` was terminal here but is NOT in the jobs.status CHECK constraint and
 # is produced by no transition, so PATCH status=released passed validation then
 # died in the DB as a raw IntegrityError (500, not 4xx). An unreachable
@@ -924,14 +1003,33 @@ TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
 MAX_DECLINE_REQUEUES = 3
-DECLINE_REASON_PREFIXES: tuple[str, ...] = ("no_workspace_for_kind", "no_workspace_for_repo")  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
+DECLINE_REASON_PREFIXES: tuple[str, ...] = (
+    "no_workspace_for_kind",
+    "no_workspace_for_repo",
+)  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
     "offered": {"queued", "claimed", "cancelled"},
-    "claimed": {"queued", "claimed", "running", "done", "failed", "cancelled", "needs-review"},
+    "claimed": {
+        "queued",
+        "claimed",
+        "running",
+        "done",
+        "failed",
+        "cancelled",
+        "needs-review",
+    },
     "running": {"queued", "running", "done", "failed", "cancelled", "needs-review"},
-    "needs-review": {"needs-review", "done", "failed", "cancelled"},  # awaiting review; promotable
-    "done": {"done", "cancelled"},  # allow cancelling fake/duplicate completions out of done
+    "needs-review": {
+        "needs-review",
+        "done",
+        "failed",
+        "cancelled",
+    },  # awaiting review; promotable
+    "done": {
+        "done",
+        "cancelled",
+    },  # allow cancelling fake/duplicate completions out of done
     # A failed job may be RETIRED as cancelled (superseded work), never
     # reopened -- same exception as done -> cancelled. Without it a
     # superseded failure stayed "failed" forever (2026-10-03).
@@ -952,7 +1050,8 @@ CLAIM_SCAN_WINDOW = int(os.environ.get("CLAIM_SCAN_WINDOW", "10000"))
 # the failed queue with 241/243 recent fails — denylist it until config-fix.
 # Format: lowercase short hostname. Updated via env or admin endpoint.
 HOST_DENYLIST: set[str] = {
-    h.strip().lower() for h in os.environ.get("HIVE_HOST_DENYLIST", "").split(",")
+    h.strip().lower()
+    for h in os.environ.get("HIVE_HOST_DENYLIST", "").split(",")
     if h.strip()
 }
 
@@ -960,14 +1059,19 @@ HOST_DENYLIST: set[str] = {
 # coding kind) can only be claimed by a host advertising >=1 live llm-* cap, so a
 # host whose only LLM provider is dead self-excludes (no host denylist needed).
 # Default OFF until workers advertise llm-* fleet-wide (flip after Phase 4).
-LLM_CAP_GATE = os.environ.get("HIVE_LLM_CAP_GATE", "0").strip().lower() in ("1", "true", "yes", "on")
+LLM_CAP_GATE = os.environ.get("HIVE_LLM_CAP_GATE", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def cost_tier_for(provider: str) -> str:
     return PROVIDER_COST_TIER.get((provider or "unknown").lower(), "C")
 
 
-def json_list(raw: Optional[str]) -> list[Any]:
+def json_list(raw: str | None) -> list[Any]:
     if not raw:
         return []
     try:
@@ -995,7 +1099,7 @@ def _norm_str_set(values: Any) -> set[str]:
     return {_norm_str(v) for v in (values or []) if _norm_str(v)}
 
 
-def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
+def agent_kind_aliases(kind: str, runtime: str | None) -> set[str]:
     kind = _norm_str(kind)
     runtime = _norm_str(runtime)
     aliases = {kind}
@@ -1025,7 +1129,7 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
     return aliases
 
 
-def workspace_capability_for_kind(kind: str) -> Optional[str]:
+def workspace_capability_for_kind(kind: str) -> str | None:
     kind = _norm_str(kind)
     for prefix, capability in KIND_WORKSPACE_CAPABILITY.items():
         if kind.startswith(prefix):
@@ -1033,7 +1137,7 @@ def workspace_capability_for_kind(kind: str) -> Optional[str]:
     return None
 
 
-def kind_affinity_for_kind(kind: str) -> Optional[list[str]]:
+def kind_affinity_for_kind(kind: str) -> list[str] | None:
     kind = _norm_str(kind)
     for prefix, kinds in KIND_KIND_AFFINITY.items():
         if kind.startswith(prefix):
@@ -1050,7 +1154,9 @@ def job_agent_preference_score(job: dict[str, Any], agent: dict[str, Any]) -> in
     score = 0
     agent_provider = _norm_str(agent.get("provider"))
     agent_model = _norm_str(agent.get("model"))
-    provs = [_norm_str(p) for p in (job.get("preferred_providers") or []) if _norm_str(p)]
+    provs = [
+        _norm_str(p) for p in (job.get("preferred_providers") or []) if _norm_str(p)
+    ]
     models = [_norm_str(m) for m in (job.get("preferred_models") or []) if _norm_str(m)]
     if agent_provider in provs:
         score += 1000 - provs.index(agent_provider)
@@ -1059,186 +1165,68 @@ def job_agent_preference_score(job: dict[str, Any], agent: dict[str, Any]) -> in
     return score
 
 
-# ── Spark takeover (operator directive 2026-06-06) ─────────────────────────
-# The DGX Spark (NGC Enterprise Inference Hub — large non-metered pool, NOT the
-# operator's personal NVIDIA work account) may claim ANY codex- or claude-
-# eligible job regardless of project/workspace/cost-tier restrictions, and
-# chooses any model from its hub inventory. While the OAuth cap breaker is
-# OPEN (codex weekly/rolling allowance exhausted), codex/claude-eligible jobs
-# are RESERVED for Spark (not burned on metered deepseek) as long as a Spark
-# relay agent is online.
-SPARK_HOSTS = {"spark-0c53"}
-# spark-0c53 build-deny lift (2026-06-16): the false-done root was fixed
-# (poller declares an honest terminal status; commit-expecting kinds with no
-# commit/patch fail honest) and caps were narrowed off ["*"], so spark may now
-# be RELAYED build:* jobs. Reversible: set SPARK_ALLOW_BUILD=0 to restore the
-# hard-deny (and build takeover-disable) without code changes.
-SPARK_ALLOW_BUILD = os.environ.get("SPARK_ALLOW_BUILD", "1").strip().lower() not in ("0", "false", "no", "off")
-# NOTE: submit-time admission rewrites eligible_kinds=["codex"] -> ["zeroclaw"]
-# (codex is a CLI zeroclaw workers shell out to), so coding jobs reach the DB
-# as zeroclaw-eligible — the takeover set must include zeroclaw for Spark to
-# see them. Operator: "any type of codex or claude job ... override all".
-SPARK_TAKEOVER_KINDS = {"codex", "claude", "zeroclaw"}
-SPARK_ONLINE_TTL_SEC = 120.0
-# Spark-takeover reservation grace (Q3 deadlock fix 2026-06-09): a takeover job
-# is reserved for Spark only while it has been queued < this many seconds. After
-# the grace expires any eligible worker may claim it, so a Spark relay that is
-# online-but-non-delivering (e.g. quarantined) cannot starve zeroclaw/codex/
-# claude jobs indefinitely. Preserves Spark-first preference for fresh jobs.
-# started_at is set at enqueue (NOT NULL) so a real job's age is always known
-# and crosses the grace; unknown/unparseable age fails CLOSED (stays reserved).
-SPARK_RESERVE_GRACE_SEC = 90.0
-# Kinds whose work is pro-grade (adversarial review, architecture, repo-wide
-# refactors) — routed Spark-first to preserve OAuth weekly allowance and keep
-# v4-PRO as the spark-offline last resort.
-SPARK_HEAVY_KIND_PREFIXES = ("review", "adversarial", "architecture", "design", "refactor")
-_SPARK_LAST_SEEN: dict[str, float] = {}
-
-
-def note_spark_seen_urn(urn: str) -> None:
-    parts = (urn or "").split(":")
-    if len(parts) >= 4:
-        note_spark_seen(parts[3])
-
-
-def note_spark_seen(host: str) -> None:
-    h = _norm_str(host)
-    if h in SPARK_HOSTS:
-        _SPARK_LAST_SEEN[h] = time.time()
-
-
-def spark_online() -> bool:
-    now = time.time()
-    # Snapshot via list() so a concurrent mutation of _SPARK_LAST_SEEN during
-    # iteration can't raise, and type-guard each value so a malformed heartbeat
-    # entry can't either (callers in job_agent_eligible are no longer wrapped in
-    # a broad except — a raise here would turn polling/claims into 500s).
-    return any(
-        isinstance(t, (int, float)) and now - t < SPARK_ONLINE_TTL_SEC
-        # A quarantined spark cannot take the work, so reserving zeroclaw/codex/
-        # claude jobs for it is pointless — exclude quarantined hosts so live
-        # workers claim immediately (auto-restores reservation on un-quarantine).
-        for h, t in list(_SPARK_LAST_SEEN.items())
-        if h not in QUARANTINED_HOSTS
-    )
-
-
-def _job_queued_age(job: dict[str, Any]) -> Optional[float]:
-    """Seconds since the job entered the queue, or None if unknown/unparseable.
-    Callers treat None as fail-CLOSED (job stays Spark-reserved) so a missing or
-    malformed timestamp can never release a job early; only a KNOWN age past the
-    grace releases it. started_at is set at enqueue, so real jobs always parse."""
-    raw = job.get("queued_at")
-    if raw is None:
-        raw = job.get("started_at")
-    if raw is None:
-        return None
-    try:
-        return max(0.0, time.time() - float(raw))
-    except (TypeError, ValueError):
-        return None
-
-
 def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool, str]:
     agent_host = _norm_str(agent.get("host"))
     agent_caps = _norm_str_set(agent.get("capabilities"))
     eligible_aliases = _norm_str_set(agent.get("eligible_aliases"))
     j_kind = _norm_str(job.get("kind"))
 
-    # Quarantined hosts (broken gateway/worker) never get served — they only
-    # thrash. Checked first so nothing else can override it.
-    if agent_host in QUARANTINED_HOSTS:
-        return False, f"host {agent_host} is quarantined (broken gateway)"
-
-    # Spark NEVER executes build:* jobs by ANY path (takeover, host-pin, or general
-    # eligibility): the DGX poller has no repo-mapping for a build: kind. Hard-deny
-    # so a build job can only be claimed by a real zeroclaw worker (zc_oneshot harness).
-    if (not SPARK_ALLOW_BUILD) and agent_host in SPARK_HOSTS and j_kind.startswith("build:"):
-        return False, f"spark does not execute build kinds ({j_kind}); real zeroclaw workers only"
-
-    j_kinds = _norm_str_set(job.get("eligible_kinds"))
-    spark_takeover_job = (bool(j_kinds.intersection(SPARK_TAKEOVER_KINDS)) or "*" in j_kinds)
-    # build:* jobs need the zc_oneshot harness on a real zeroclaw worker; the DGX
-    # Spark poller has no repo-mapping for a build: kind, so it must never take them
-    # (the 2026-06-08 "no repo mapping" needs-review poison). codex/claude coding
-    # jobs (non-build: kinds, also eligible_kinds=["zeroclaw"]) still route to Spark.
-    if j_kind.startswith("build:") and not SPARK_ALLOW_BUILD:
-        spark_takeover_job = False
-
-    # Spark override: any codex/claude-eligible job (or a job host-pinned to
-    # Spark) is claimable by the Spark relay, bypassing kind-affinity,
-    # narrow-host, capability, project and cost-tier checks. Operator 2026-06-06.
-    if agent_host in SPARK_HOSTS:
-        pin_hosts = _norm_str_set(job.get("eligible_hosts"))
-        if spark_takeover_job or agent_host in pin_hosts or "*" in pin_hosts:
-            return True, "spark takeover override (operator 2026-06-06)"
-
-    # While the OAuth cap breaker is open, reserve codex/claude-eligible jobs
-    # for Spark instead of burning metered fallback — but only when a Spark
-    # relay is actually online (no deadlock if the relay is down).
-    if spark_takeover_job and agent_host not in SPARK_HOSTS:
-        # Fail CLOSED: unknown age (None) keeps the job reserved; only a known
-        # age >= grace releases it to general workers.
-        age = _job_queued_age(job)
-        within_grace = age is None or age < SPARK_RESERVE_GRACE_SEC
-        try:
-            capped = bool(oauth_cap_state().get("capped"))
-        except Exception:
-            capped = False
-        if capped and spark_online() and within_grace:
-            return False, "reserved for Spark while OAuth allowance is capped (operator 2026-06-06; releases after grace)"
-
-    # Heavy/review work prefers Spark even when OAuth is healthy (GRAEAE
-    # consult a30d0c1f + operator 2026-06-06): it preserves the weekly OAuth
-    # allowance and keeps deepseek v4-PRO (66 burned in 2 days) as a true
-    # spark-offline last resort. Workers only see these kinds when no Spark
-    # relay is online.
-    if (
-        spark_takeover_job
-        and agent_host not in SPARK_HOSTS
-        and j_kind.startswith(SPARK_HEAVY_KIND_PREFIXES)
-    ):
-        # Fail CLOSED on unknown age, as above.
-        age = _job_queued_age(job)
-        within_grace = age is None or age < SPARK_RESERVE_GRACE_SEC
-        if spark_online() and within_grace:
-            return False, "heavy/review kind reserved for Spark while a relay is online (operator 2026-06-06; releases after grace)"
-
     if agent_host in NARROW_HOSTS and not j_kind.startswith(NARROW_ALLOWLIST):
         return False, f"narrow host {agent_host} not allowed for kind {j_kind}"
 
     kind_affinity = kind_affinity_for_kind(j_kind)
-    if kind_affinity and not _norm_str_set(kind_affinity).intersection(eligible_aliases):
-        return False, f"agent kind aliases={sorted(eligible_aliases)!r} do not satisfy kind affinity={kind_affinity!r}"
+    if kind_affinity and not _norm_str_set(kind_affinity).intersection(
+        eligible_aliases
+    ):
+        return (
+            False,
+            f"agent kind aliases={sorted(eligible_aliases)!r} do not satisfy kind affinity={kind_affinity!r}",
+        )
 
     kinds = _norm_str_set(job.get("eligible_kinds"))
     if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
-        return False, f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}"
+        return (
+            False,
+            f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}",
+        )
 
     hosts = _norm_str_set(job.get("eligible_hosts"))
     hosts = {h for h in hosts if h not in _HOLD_HOSTS}
     if hosts and "*" not in hosts and agent_host not in hosts:
         return False, f"agent host={agent_host!r} not in eligible_hosts={sorted(hosts)}"
 
-    labels = [_norm_str(c) for c in (job.get("required_capabilities") or []) if _norm_str(c)]
+    labels = [
+        _norm_str(c) for c in (job.get("required_capabilities") or []) if _norm_str(c)
+    ]
     if heavy_repo_required_for_kind(j_kind) and "heavy-repo" not in labels:
         labels.append("heavy-repo")
-    _wcap = workspace_capability_for_kind(j_kind)  # kind->capability (compile jobs -> linux-compile)
+    _wcap = workspace_capability_for_kind(
+        j_kind
+    )  # kind->capability (compile jobs -> linux-compile)
     if _wcap and _wcap not in labels:
         labels.append(_wcap)
     if labels:
         cap_match = queue_logic.match(labels, agent_caps)
         if not cap_match.eligible:
-            return False, f"agent does not satisfy required_capabilities: {cap_match.reason}"
+            return (
+                False,
+                f"agent does not satisfy required_capabilities: {cap_match.reason}",
+            )
 
     # Provider-as-capability gate (flag-gated; Phase 2). Executor jobs need a
     # live LLM; a host advertising no llm-* provider is excluded here -- this
     # is what replaces the manual HIVE_HOST_DENYLIST for dead-provider hosts.
     if LLM_CAP_GATE:
-        _needs_llm = (j_kind.startswith("build:")
-                      or workspace_capability_for_kind(j_kind) is not None)
+        _needs_llm = (
+            j_kind.startswith("build:")
+            or workspace_capability_for_kind(j_kind) is not None
+        )
         if _needs_llm and not any(c.startswith("llm-") for c in agent_caps):
-            return False, "agent has no live llm-* provider capability (kind %s needs an LLM)" % j_kind
+            return (
+                False,
+                "agent has no live llm-* provider capability (kind %s needs an LLM)"
+                % j_kind,
+            )
 
     job_max_tier = (job.get("max_cost_tier") or "B").upper()
     agent_tier = (agent.get("cost_tier") or "C").upper()
@@ -1247,10 +1235,16 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     if agent_tier not in COST_TIERS:
         agent_tier = "C"
     if COST_TIERS.index(agent_tier) > COST_TIERS.index(job_max_tier):
-        return False, f"agent cost_tier={agent_tier!r} exceeds job max_cost_tier={job_max_tier!r}"
+        return (
+            False,
+            f"agent cost_tier={agent_tier!r} exceeds job max_cost_tier={job_max_tier!r}",
+        )
 
     if agent.get("subscription_throttled") and job_max_tier != "A":
-        return False, f"subscription agent throttled (>= {THROTTLE_HEADROOM*100:.0f}% MTD); cannot claim tier-{job_max_tier} jobs"
+        return (
+            False,
+            f"subscription agent throttled (>= {THROTTLE_HEADROOM * 100:.0f}% MTD); cannot claim tier-{job_max_tier} jobs",
+        )
 
     return True, "eligible"
 
@@ -1262,21 +1256,27 @@ def field_was_set(model: BaseModel, name: str) -> bool:
     return name in fields_set
 
 
-async def require_registered_agent(urn: str, *, active_only: bool = False) -> tuple[str, str]:
+async def require_registered_agent(
+    urn: str, *, active_only: bool = False
+) -> tuple[str, str]:
     if not urn or not urn.strip():
         raise HTTPException(422, "agent urn is required")
-    async with connect_db() as db:
-        async with db.execute(
+    async with (
+        connect_db() as db,
+        db.execute(
             "SELECT runtime, status FROM agents WHERE urn=?",
             (urn,),
-        ) as cur:
-            row = await cur.fetchone()
+        ) as cur,
+    ):
+        row = await cur.fetchone()
     if not row:
         raise HTTPException(403, f"agent is not registered: {urn}")
     runtime = (row[0] or "unknown").lower()
     status = (row[1] or "unknown").lower()
     if active_only and status not in ACTIVE_AGENT_STATUSES:
-        raise HTTPException(403, f"agent {urn} is not active; current status={status!r}")
+        raise HTTPException(
+            403, f"agent {urn} is not active; current status={status!r}"
+        )
     return runtime, status
 
 
@@ -1332,24 +1332,31 @@ def valid_completion_proof(proof: dict) -> bool:
     commits = proof.get("commits")
     files = proof.get("files_changed")
     return bool(
-        isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
-        and isinstance(commits, list) and sha in commits
-        and all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c) for c in commits)
-        and isinstance(files, list) and files and all(isinstance(f, str) and f for f in files)
+        isinstance(sha, str)
+        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
+        and isinstance(commits, list)
+        and sha in commits
+        and all(
+            isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c)
+            for c in commits
+        )
+        and isinstance(files, list)
+        and files
+        and all(isinstance(f, str) and f for f in files)
         and proof.get("worktree_clean") is True
-        and proof.get("remote_verified") is True
-        and proof.get("remote_sha") == sha
     )
 
 
-def normalize_result_payload(status: str, result: Optional[dict]) -> Optional[dict]:
+def normalize_result_payload(status: str, result: dict | None) -> dict | None:
     if result is None or status != "done":
         return result
     normalized = dict(result)
     commits = normalized.get("commits")
     files_changed = normalized.get("files_changed")
     normalized["commits"] = commits if isinstance(commits, list) else []
-    normalized["files_changed"] = files_changed if isinstance(files_changed, list) else []
+    normalized["files_changed"] = (
+        files_changed if isinstance(files_changed, list) else []
+    )
     return normalized
 
 
@@ -1357,52 +1364,52 @@ def normalize_result_payload(status: str, result: Optional[dict]) -> Optional[di
 # hive computes estimated_cost_usd. Wildcard model "*" applies to any model on that provider.
 # Source: ~/.claude/rules/llm-usage-policy-2026-05-22.md
 LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
-    ("anthropic", "claude-opus-4-7"):       (5.00, 25.00),
-    ("anthropic", "claude-opus-4-6"):       (5.00, 25.00),
-    ("anthropic", "claude-sonnet-4-6"):     (3.00, 15.00),
-    ("anthropic", "claude-sonnet-4-7"):     (3.00, 15.00),
-    ("anthropic", "claude-haiku-4-5"):      (1.00,  5.00),
-    ("anthropic", "*"):                     (3.00, 15.00),
-    ("openai",    "gpt-5.5"):               (5.00, 30.00),
-    ("openai",    "gpt-5.5-pro"):           (30.00, 180.00),
-    ("openai",    "gpt-5.4-nano"):          (0.20,  1.25),
-    ("openai",    "o4-mini"):               (0.55,  2.20),
-    ("openai",    "o3"):                    (2.00,  8.00),
-    ("openai",    "*"):                     (5.00, 30.00),
-    ("xai",       "grok-4.3"):              (1.25,  2.50),
-    ("xai",       "grok-4.1-fast"):         (0.20,  0.50),
-    ("xai",       "grok-4.20"):             (2.00,  6.00),
-    ("xai",       "*"):                     (1.25,  2.50),
-    ("groq",      "llama-3.3-70b-versatile"): (0.59,  0.79),
-    ("groq",      "llama-3.1-8b-instant"):  (0.05,  0.08),
-    ("groq",      "llama-4-scout-17b"):     (0.11,  0.34),
-    ("groq",      "qwen3-32b"):             (0.29,  0.59),
-    ("groq",      "gpt-oss-120b"):          (0.15,  0.60),
-    ("groq",      "gpt-oss-20b"):           (0.075, 0.30),
-    ("groq",      "*"):                     (0.29,  0.59),
-    ("ngc-proxy", "gpt-5.5"):         (0.0,   0.0),
-    ("ngc-proxy", "*"):                     (0.0,   0.0),
+    ("anthropic", "claude-opus-4-7"): (5.00, 25.00),
+    ("anthropic", "claude-opus-4-6"): (5.00, 25.00),
+    ("anthropic", "claude-sonnet-4-6"): (3.00, 15.00),
+    ("anthropic", "claude-sonnet-4-7"): (3.00, 15.00),
+    ("anthropic", "claude-haiku-4-5"): (1.00, 5.00),
+    ("anthropic", "*"): (3.00, 15.00),
+    ("openai", "gpt-5.5"): (5.00, 30.00),
+    ("openai", "gpt-5.5-pro"): (30.00, 180.00),
+    ("openai", "gpt-5.4-nano"): (0.20, 1.25),
+    ("openai", "o4-mini"): (0.55, 2.20),
+    ("openai", "o3"): (2.00, 8.00),
+    ("openai", "*"): (5.00, 30.00),
+    ("xai", "grok-4.3"): (1.25, 2.50),
+    ("xai", "grok-4.1-fast"): (0.20, 0.50),
+    ("xai", "grok-4.20"): (2.00, 6.00),
+    ("xai", "*"): (1.25, 2.50),
+    ("groq", "llama-3.3-70b-versatile"): (0.59, 0.79),
+    ("groq", "llama-3.1-8b-instant"): (0.05, 0.08),
+    ("groq", "llama-4-scout-17b"): (0.11, 0.34),
+    ("groq", "qwen3-32b"): (0.29, 0.59),
+    ("groq", "gpt-oss-120b"): (0.15, 0.60),
+    ("groq", "gpt-oss-20b"): (0.075, 0.30),
+    ("groq", "*"): (0.29, 0.59),
+    ("ngc-proxy", "gpt-5.5"): (0.0, 0.0),
+    ("ngc-proxy", "*"): (0.0, 0.0),
     ("deepseek-direct", "deepseek-v4-pro"): (0.435, 0.87),
     ("deepseek-direct", "deepseek-v4-flash"): (0.14, 0.28),
-    ("deepseek-direct", "*"):               (0.435, 0.87),
-    ("deepseek",        "*"):               (0.435, 0.87),
-    ("together",  "minimax-m2.7"):          (0.40,  1.20),
-    ("together",  "deepseek-v4-pro"):       (2.10,  4.40),
-    ("together",  "kimi-k2.6"):             (1.20,  4.40),
-    ("together",  "glm-3.5-90"):            (0.10,  0.15),
-    ("together",  "qwen2.5-coder-32b"):     (0.05,  0.12),
-    ("together",  "*"):                     (0.40,  1.20),
-    ("bedrock",   "amazon.nova-micro-v1:0"): (0.035, 0.14),
-    ("bedrock",   "amazon.nova-lite-v1:0"):  (0.06,  0.24),
-    ("bedrock",   "amazon.nova-pro-v1:0"):   (0.80,  3.20),
-    ("bedrock",   "*"):                      (0.06,  0.24),
-    ("gemini",    "gemini-2.5-flash-lite"): (0.10,  0.40),
-    ("gemini",    "gemini-2.5-flash"):      (0.30,  2.50),
-    ("gemini",    "gemini-3.1-pro"):        (2.00, 12.00),
-    ("gemini",    "*"):                     (1.25, 10.00),
-    ("perplexity","sonar"):                 (1.00,  1.00),
-    ("perplexity","sonar-pro"):             (3.00, 15.00),
-    ("perplexity","*"):                     (1.00,  1.00),
+    ("deepseek-direct", "*"): (0.435, 0.87),
+    ("deepseek", "*"): (0.435, 0.87),
+    ("together", "minimax-m2.7"): (0.40, 1.20),
+    ("together", "deepseek-v4-pro"): (2.10, 4.40),
+    ("together", "kimi-k2.6"): (1.20, 4.40),
+    ("together", "glm-3.5-90"): (0.10, 0.15),
+    ("together", "qwen2.5-coder-32b"): (0.05, 0.12),
+    ("together", "*"): (0.40, 1.20),
+    ("bedrock", "amazon.nova-micro-v1:0"): (0.035, 0.14),
+    ("bedrock", "amazon.nova-lite-v1:0"): (0.06, 0.24),
+    ("bedrock", "amazon.nova-pro-v1:0"): (0.80, 3.20),
+    ("bedrock", "*"): (0.06, 0.24),
+    ("gemini", "gemini-2.5-flash-lite"): (0.10, 0.40),
+    ("gemini", "gemini-2.5-flash"): (0.30, 2.50),
+    ("gemini", "gemini-3.1-pro"): (2.00, 12.00),
+    ("gemini", "*"): (1.25, 10.00),
+    ("perplexity", "sonar"): (1.00, 1.00),
+    ("perplexity", "sonar-pro"): (3.00, 15.00),
+    ("perplexity", "*"): (1.00, 1.00),
 }
 
 
@@ -1421,7 +1428,14 @@ def rate_for(provider: str, model: str) -> tuple[float, float]:
     return (1.0, 5.0)  # conservative fallback
 
 
-SUBSCRIPTION_PROVIDERS = {"openai", "codex", "codex-oauth", "codex-cli", "gpt", "chatgpt"}
+SUBSCRIPTION_PROVIDERS = {
+    "openai",
+    "codex",
+    "codex-oauth",
+    "codex-cli",
+    "gpt",
+    "chatgpt",
+}
 
 
 def estimate_cost(provider: str, model: str, tokens_in: int, tokens_out: int) -> float:
@@ -1429,10 +1443,12 @@ def estimate_cost(provider: str, model: str, tokens_in: int, tokens_out: int) ->
     if (provider or "").lower() in SUBSCRIPTION_PROVIDERS:
         return 0.0
     in_rate, out_rate = rate_for(provider, model)
-    return round((tokens_in / 1_000_000) * in_rate + (tokens_out / 1_000_000) * out_rate, 6)
+    return round(
+        (tokens_in / 1_000_000) * in_rate + (tokens_out / 1_000_000) * out_rate, 6
+    )
 
 
-def hallucination_check(result: dict) -> Optional[str]:
+def hallucination_check(result: dict) -> str | None:
     """Return reason string if result looks like an LLM token-loop / hallucination,
     else None. Saves marking-done garbage that wastes a cache entry + claims completion.
 
@@ -1448,7 +1464,10 @@ def hallucination_check(result: dict) -> Optional[str]:
         return None
     if "rate limit exceeded" in stdout.lower():
         return "rate_limit_in_output"
-    if "authentication error" in stdout.lower() or "authentication failed" in stdout.lower():
+    if (
+        "authentication error" in stdout.lower()
+        or "authentication failed" in stdout.lower()
+    ):
         return "auth_error_in_output"
     if "context length" in stdout.lower() and "exceed" in stdout.lower():
         return "context_overflow_in_output"
@@ -1456,6 +1475,7 @@ def hallucination_check(result: dict) -> Optional[str]:
     words = stdout.split()
     if len(words) > 200:
         from collections import Counter
+
         top_word, top_count = Counter(words).most_common(1)[0]
         if top_count / len(words) > 0.4:
             return f"token_loop:{top_word!r}_repeated_{top_count}_of_{len(words)}"
@@ -1467,18 +1487,25 @@ def hallucination_check(result: dict) -> Optional[str]:
 # When identical job submitted, return cached result instantly. Cuts LLM spend
 # 30-70% on repetitive work + avoids NGC 429 storms from duplicate dispatches.
 import hashlib as _hashlib
-CACHE_TTL_SECONDS = 24 * 3600  # 24h default; idempotent work like compiles/lints often valid much longer
+
+CACHE_TTL_SECONDS = (
+    24 * 3600
+)  # 24h default; idempotent work like compiles/lints often valid much longer
 
 
-def cache_key_for(kind: str, description: Optional[str], max_cost_tier: str,
-                  required_capabilities: Optional[list[str]]) -> str:
+def cache_key_for(
+    kind: str,
+    description: str | None,
+    max_cost_tier: str,
+    required_capabilities: list[str] | None,
+) -> str:
     norm_desc = (description or "").strip()
     norm_caps = ",".join(sorted(required_capabilities or []))
     payload = f"{kind}\n{norm_desc}\n{max_cost_tier}\n{norm_caps}"
     return _hashlib.sha256(payload.encode()).hexdigest()
 
 
-async def cache_lookup(db, cache_key: str) -> Optional[dict]:
+async def cache_lookup(db, cache_key: str) -> dict | None:
     cutoff = time.time() - CACHE_TTL_SECONDS
     async with db.execute(
         "SELECT result_json, source_job_id, result_mnemos_id, hit_count, cost_saved_usd, model, provider, cached_at "
@@ -1491,14 +1518,20 @@ async def cache_lookup(db, cache_key: str) -> Optional[dict]:
     _res = json.loads(r[0]) if r[0] else None
     # Defensive: never SERVE a poisoned needs-review entry as a done answer,
     # even if one slipped into the table before the store-side guard landed
-    # (spark orphan propagation, 2026-06-07).
-    if isinstance(_res, dict) and (_res.get("needs_review") or _res.get("status") == "needs-review"):
+    # (orphan propagation, 2026-06-07).
+    if isinstance(_res, dict) and (
+        _res.get("needs_review") or _res.get("status") == "needs-review"
+    ):
         return None
     return {
         "result": _res,
-        "source_job_id": r[1], "result_mnemos_id": r[2],
-        "hit_count": r[3], "cost_saved_usd": r[4],
-        "model": r[5], "provider": r[6], "cached_at": r[7],
+        "source_job_id": r[1],
+        "result_mnemos_id": r[2],
+        "hit_count": r[3],
+        "cost_saved_usd": r[4],
+        "model": r[5],
+        "provider": r[6],
+        "cached_at": r[7],
     }
 
 
@@ -1506,7 +1539,7 @@ def _cache_json(result: dict, limit: int = 32000) -> str:
     """Serialize a job result for hive_cache without breaking JSON validity.
 
     The old code sliced the serialized string to 32000 chars; any result
-    bigger than that (e.g. Spark agentic results carrying a format-patch)
+    bigger than that (e.g. agentic results carrying a format-patch)
     became truncated NON-JSON and tripped the Oracle `result_json IS JSON`
     check constraint -> every PATCH on the job 500'd (2026-06-06). Trim the
     bulky FIELDS instead, and fall back to a stub if still oversized.
@@ -1523,15 +1556,25 @@ def _cache_json(result: dict, limit: int = 32000) -> str:
     if len(payload) <= limit:
         return payload
     return json.dumps(
-        {"cache_truncated": True, "exit_code": result.get("exit_code"),
-         "status": result.get("status")},
+        {
+            "cache_truncated": True,
+            "exit_code": result.get("exit_code"),
+            "status": result.get("status"),
+        },
         default=str,
     )
 
 
-async def cache_store(db, cache_key: str, source_job_id: str, result: dict,
-                      result_mnemos_id: Optional[str], model: str, provider: str,
-                      cost_for_save: float):
+async def cache_store(
+    db,
+    cache_key: str,
+    source_job_id: str,
+    result: dict,
+    result_mnemos_id: str | None,
+    model: str,
+    provider: str,
+    cost_for_save: float,
+):
     now = time.time()
     await db.execute(
         "INSERT INTO hive_cache (cache_key, result_json, source_job_id, result_mnemos_id, "
@@ -1541,8 +1584,15 @@ async def cache_store(db, cache_key: str, source_job_id: str, result: dict,
         "result_json=excluded.result_json, source_job_id=excluded.source_job_id, "
         "result_mnemos_id=excluded.result_mnemos_id, cached_at=excluded.cached_at, "
         "model=excluded.model, provider=excluded.provider",
-        (cache_key, _cache_json(result), source_job_id,
-         result_mnemos_id, model, provider, now),
+        (
+            cache_key,
+            _cache_json(result),
+            source_job_id,
+            result_mnemos_id,
+            model,
+            provider,
+            now,
+        ),
     )
 
 
@@ -1570,18 +1620,26 @@ class AgentRegister(BaseModel):
     model: str = "unknown"
     provider: str = "unknown"
     host: str
-    kind: Optional[str] = Field(None, pattern=r"^[a-z][a-z0-9-]{0,31}$",
-                                description="URN routing segment — defaults to runtime")
-    autonomy_level: str = Field("unknown",
-                                description="autonomous / confirm-risky / interactive / unknown")
-    auth_method: str = Field("unknown",
-                             description="subscription (Max plan), api (pay-per-token), free, unknown")
-    plan_cap_usd: Optional[float] = None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
-    pid: Optional[int] = None
-    capabilities: Optional[list[str]] = None
-    version: Optional[str] = None
-    metadata: Optional[dict] = None
-    subscription_pools: Optional[list[str]] = Field(default_factory=list)
+    kind: str | None = Field(
+        None,
+        pattern=r"^[a-z][a-z0-9-]{0,31}$",
+        description="URN routing segment — defaults to runtime",
+    )
+    autonomy_level: str = Field(
+        "unknown", description="autonomous / confirm-risky / interactive / unknown"
+    )
+    auth_method: str = Field(
+        "unknown",
+        description="subscription (Max plan), api (pay-per-token), free, unknown",
+    )
+    plan_cap_usd: float | None = (
+        None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
+    )
+    pid: int | None = None
+    capabilities: list[str] | None = None
+    version: str | None = None
+    metadata: dict | None = None
+    subscription_pools: list[str] | None = Field(default_factory=list)
     # Stable per-worker-instance identity for registration dedup (2026-06-15).
     # Workers run as systemd units `zeroclaw-wss-worker@N` / `zc-worker@N` with a
     # %i identity that is STABLE across restarts (unlike pid/session_id). When a
@@ -1591,79 +1649,104 @@ class AgentRegister(BaseModel):
     # `instance` (claude/codex/system/mnemos/old workers) keep the original
     # mint-a-new-URN behavior, so this is fully backward-compatible and never
     # breaks an existing agent kind. Bounded pattern: prevents pathological keys.
-    instance: Optional[str] = Field(None, pattern=r"^[A-Za-z0-9._:@-]{1,64}$",
-                                    description="stable per-worker-instance id for register dedup")
+    instance: str | None = Field(
+        None,
+        pattern=r"^[A-Za-z0-9._:@-]{1,64}$",
+        description="stable per-worker-instance id for register dedup",
+    )
 
 
 class AgentHeartbeat(BaseModel):
     urn: str
     status: str = "online"
-    metadata: Optional[dict] = None
+    metadata: dict | None = None
 
 
 class JobCreate(BaseModel):
-    submitter_urn: str                                # who is asking (user OR delegating agent)
-    parent_job_id: Optional[str] = None
-    kind: str                                          # work type (code-edit/research/review/build/etc)
-    description: Optional[str] = None
-    priority: int = 0                                  # higher = more urgent (default 0)
-    deadline: Optional[float] = None                   # unix ts, optional SLA
-    required_capabilities: Optional[list[str]] = None  # worker must have ALL of these
-    eligible_kinds: Optional[list[str]] = None         # restrict to agent kinds; null = any
-    eligible_hosts: Optional[list[str]] = None         # restrict to agent hosts (e.g. ["cixmini"]); null = any
-    target_workspace: Optional[str] = None             # GRAEAE permanent-fix: bus-side first-class workspace (replaces worker KIND_WORKSPACE_MAP guessing)
+    submitter_urn: str  # who is asking (user OR delegating agent)
+    parent_job_id: str | None = None
+    kind: str  # work type (code-edit/research/review/build/etc)
+    description: str | None = None
+    priority: int = 0  # higher = more urgent (default 0)
+    deadline: float | None = None  # unix ts, optional SLA
+    required_capabilities: list[str] | None = None  # worker must have ALL of these
+    eligible_kinds: list[str] | None = None  # restrict to agent kinds; null = any
+    eligible_hosts: list[str] | None = (
+        None  # restrict to agent hosts (e.g. ["cixmini"]); null = any
+    )
+    target_workspace: str | None = (
+        None  # GRAEAE permanent-fix: bus-side first-class workspace (replaces worker KIND_WORKSPACE_MAP guessing)
+    )
     # #10 FIX (review 2026-05-23): project tag — separate from worker capabilities.
     # 'riskyeats'/'investorclaw' are PROJECTS, not capabilities. Workers don't gain/lose
     # the ability to do work because of a project label; the label is for filter+routing.
-    project: Optional[str] = None
-    max_retries: int = 2                               # auto-resubmit after worker reports failed (up to N times)
+    project: str | None = None
+    max_retries: int = 2  # auto-resubmit after worker reports failed (up to N times)
     # COST DISCIPLINE (per CLAUDE.md llm-usage-policy):
-    max_cost_tier: str = "B"                           # adaptive tier cap: A=local/NGC first (free), B=Groq/xAI overflow (paid), C=reserve. Default B=Tier A preferred, Tier B fallback when Tier A overloaded.
-    preferred_providers: Optional[list[str]] = None    # ranked preference (first match wins among tier-eligible)
-    preferred_models: Optional[list[str]] = None       # ranked model preference
+    max_cost_tier: str = "B"  # adaptive tier cap: A=local/NGC first (free), B=Groq/xAI overflow (paid), C=reserve. Default B=Tier A preferred, Tier B fallback when Tier A overloaded.
+    preferred_providers: list[str] | None = (
+        None  # ranked preference (first match wins among tier-eligible)
+    )
+    preferred_models: list[str] | None = None  # ranked model preference
     # MNEMOS provenance:
-    mnemos_refs: Optional[list[str]] = None            # mem_XXX ids — context/handoffs/related work the worker should consult
+    mnemos_refs: list[str] | None = (
+        None  # mem_XXX ids — context/handoffs/related work the worker should consult
+    )
     # DAG support:
-    depends_on: Optional[list[str]] = None             # job ids that must be status='done' before this job is dequeueable
-    idempotency_key: Optional[str] = None              # forced-rerun escape: a unique value is never coalesced
+    depends_on: list[str] | None = (
+        None  # job ids that must be status='done' before this job is dequeueable
+    )
+    idempotency_key: str | None = (
+        None  # forced-rerun escape: a unique value is never coalesced
+    )
     # PR-fix routing (operator 2026-06-17): forge + repo + branch/PR to check out.
-    site: Optional[str] = None                         # git_sites.json key (github/gitlab-ncz/codeberg/internal)
-    repo: Optional[str] = None                         # owner/name path on that site
-    head_branch: Optional[str] = None                  # branch / PR head to check out
-    pr_number: Optional[int] = None                    # PR/MR number (forge-specific ref scheme)
+    site: str | None = None  # git_sites.json key (github/gitlab-ncz/codeberg/internal)
+    repo: str | None = None  # owner/name path on that site
+    head_branch: str | None = None  # branch / PR head to check out
+    pr_number: int | None = None  # PR/MR number (forge-specific ref scheme)
 
 
 class JobUpdate(BaseModel):
     status: str
-    result: Optional[dict] = None
-    claimed_by: Optional[str] = None
-    tokens_in: Optional[int] = None    # workers SHOULD report token usage on done/failed for cost audit
-    tokens_out: Optional[int] = None
-    result_mnemos_id: Optional[str] = None   # mem_XXX id where worker stored the outcome — closes provenance loop
+    result: dict | None = None
+    claimed_by: str | None = None
+    tokens_in: int | None = (
+        None  # workers SHOULD report token usage on done/failed for cost audit
+    )
+    tokens_out: int | None = None
+    result_mnemos_id: str | None = (
+        None  # mem_XXX id where worker stored the outcome — closes provenance loop
+    )
     # Routing re-assignment (queued/offered jobs only — use status=queued to re-route)
-    eligible_kinds: Optional[list[str]] = None
-    eligible_hosts: Optional[list[str]] = None
+    eligible_kinds: list[str] | None = None
+    eligible_hosts: list[str] | None = None
 
 
 class ScheduleCreate(BaseModel):
     name: str
-    interval_seconds: int = Field(..., ge=60, le=86400 * 30,
-                                  description="60s minimum (avoid hot-loop); 30d maximum")
-    job_template: dict   # full JobCreate body that will be submitted each tick
+    interval_seconds: int = Field(
+        ...,
+        ge=60,
+        le=86400 * 30,
+        description="60s minimum (avoid hot-loop); 30d maximum",
+    )
+    job_template: dict  # full JobCreate body that will be submitted each tick
     enabled: bool = True
 
 
 class MessagePublish(BaseModel):
     from_urn: str
-    to_urn: Optional[str] = None
-    in_reply_to: Optional[str] = None
+    to_urn: str | None = None
+    in_reply_to: str | None = None
     topic: str
     payload: dict
 
 
 # ---------- lifecycle ----------
 
-CLAIM_STALE_AFTER = 1800.0   # claim → still 'claimed'/'running' without update >30min ⇒ orphan
+CLAIM_STALE_AFTER = (
+    1800.0  # claim → still 'claimed'/'running' without update >30min ⇒ orphan
+)
 # REVIEW #2 fix: kind-specific overrides. Orchestration jobs that fan out
 # + collect can legitimately run 60+ minutes without a PATCH while
 # sub-jobs execute. Reaper also measures against last_update_at (any PATCH
@@ -1684,8 +1767,10 @@ CLAIM_STALE_AFTER_BY_KIND = {
 # reaped no matter how often its claimant pokes it.
 CLAIM_HARD_MAX_AGE = float(os.environ.get("HIVE_CLAIM_HARD_MAX_AGE", "14400"))  # 4h
 CLAIM_HARD_MAX_AGE_BY_KIND = {
-    "migration": 21600.0,   # 6h — multi-host fleet migrations may legitimately run long
+    "migration": 21600.0,  # 6h — multi-host fleet migrations may legitimately run long
 }
+
+
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
@@ -1709,7 +1794,9 @@ async def reaper_task(app: FastAPI):
                     )
                     await db.commit()
                     for urn in stale:
-                        await emit_event(db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"})
+                        await emit_event(
+                            db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"}
+                        )
 
                 async with db.execute(
                     "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
@@ -1748,13 +1835,22 @@ async def reaper_task(app: FastAPI):
                             (urn,),
                         )
                         for job_id in assigned_jobs:
-                            await emit_event(db, "job.unclaimed", {
-                                "id": job_id, "prior_claimer": urn,
-                                "reason": "agent_offline_heartbeat_timeout",
-                            })
+                            await emit_event(
+                                db,
+                                "job.unclaimed",
+                                {
+                                    "id": job_id,
+                                    "prior_claimer": urn,
+                                    "reason": "agent_offline_heartbeat_timeout",
+                                },
+                            )
                     await db.commit()
                     for urn in dead:
-                        await emit_event(db, "agent.offline", {"urn": urn, "reason": "heartbeat_timeout"})
+                        await emit_event(
+                            db,
+                            "agent.offline",
+                            {"urn": urn, "reason": "heartbeat_timeout"},
+                        )
 
                 # 1b. AGENT PURGE: hard-delete agents offline beyond AGENT_PURGE_AFTER.
                 # Each worker restart registers a fresh session URN; without this the
@@ -1777,10 +1873,15 @@ async def reaper_task(app: FastAPI):
                     "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running')))",
                     (purge_cutoff,),
                 )
-                purged = max(0, getattr(pcur, "rowcount", 0) or 0)  # some drivers report -1
+                purged = max(
+                    0, getattr(pcur, "rowcount", 0) or 0
+                )  # some drivers report -1
                 if purged:
                     await db.commit()
-                    print(f"agent purge: removed {purged} agents offline > {AGENT_PURGE_AFTER:.0f}s", flush=True)
+                    print(
+                        f"agent purge: removed {purged} agents offline > {AGENT_PURGE_AFTER:.0f}s",
+                        flush=True,
+                    )
                 # 2. ORPHAN CLAIM RECOVERY — jobs claimed by dead/stale workers go back to queue.
                 # REVIEW #2 fix: measure staleness against COALESCE(last_update_at, claimed_at)
                 # so steady PATCH progress keeps reaper at bay. Kind-specific cutoffs let
@@ -1804,9 +1905,15 @@ async def reaper_task(app: FastAPI):
                     "      j.claim_lease_expires_at <= ? OR "
                     "      j.claimed_at < ? OR "
                     "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
-                    (now_ts, hard_cutoff, default_cutoff,)
+                    (
+                        now_ts,
+                        hard_cutoff,
+                        default_cutoff,
+                    ),
                 ) as cur:
-                    candidates = [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
+                    candidates = [
+                        (r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur
+                    ]
                 # Apply kind-specific override: keep job if its kind has a longer TTL
                 # AND its latest progress timestamp is within that window.
                 orphans = []
@@ -1833,18 +1940,24 @@ async def reaper_task(app: FastAPI):
                             "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
                             "ended_at=NULL, result=NULL "
                             "WHERE id=? AND status IN ('claimed','running')",
-                            (job_id,))
-                        await emit_event(db, "job.unclaimed", {
-                            "id": job_id, "prior_claimer": claimer,
-                            "reason": "worker_offline_or_stale_claim",
-                        })
+                            (job_id,),
+                        )
+                        await emit_event(
+                            db,
+                            "job.unclaimed",
+                            {
+                                "id": job_id,
+                                "prior_claimer": claimer,
+                                "reason": "worker_offline_or_stale_claim",
+                            },
+                        )
                     await db.commit()
                 # 3. Scheduler — fire due interval-based jobs
                 now_ts = time.time()
                 async with db.execute(
                     "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count "
                     "FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
-                    (now_ts,)
+                    (now_ts,),
                 ) as cur:
                     due = [tuple(r) async for r in cur]
                 for sched_id, sname, sub_urn, interval, tpl_json, fcount in due:
@@ -1852,17 +1965,22 @@ async def reaper_task(app: FastAPI):
                         tpl = json.loads(tpl_json)
                         tpl["submitter_urn"] = sub_urn
                         # synth a JobCreate + go through the cache+role machinery
-                        from fastapi import HTTPException as _HE
                         await create_job(JobCreate(**tpl))  # type: ignore
                         await db.execute(
                             "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
                             "fire_count=fire_count+1 WHERE id=?",
                             (now_ts, now_ts + interval, sched_id),
                         )
-                        await emit_event(db, "schedule.fired", {
-                            "schedule_id": sched_id, "name": sname,
-                            "fire_count": fcount + 1, "next_at": now_ts + interval,
-                        })
+                        await emit_event(
+                            db,
+                            "schedule.fired",
+                            {
+                                "schedule_id": sched_id,
+                                "name": sname,
+                                "fire_count": fcount + 1,
+                                "next_at": now_ts + interval,
+                            },
+                        )
                     except Exception as se:
                         print(f"scheduler error {sched_id}: {se}", flush=True)
                 if due:
@@ -1871,7 +1989,7 @@ async def reaper_task(app: FastAPI):
                 stale_job_cutoff = time.time() - 7 * 24 * 3600
                 async with db.execute(
                     "SELECT id FROM jobs WHERE status='queued' AND started_at < ?",
-                    (stale_job_cutoff,)
+                    (stale_job_cutoff,),
                 ) as cur:
                     stale_ids = [r[0] async for r in cur]
                 if stale_ids:
@@ -1880,7 +1998,9 @@ async def reaper_task(app: FastAPI):
                         [(time.time(), j) for j in stale_ids],
                     )
                     for j in stale_ids:
-                        await emit_event(db, "job.cancelled", {"id": j, "reason": "stale_>7d"})
+                        await emit_event(
+                            db, "job.cancelled", {"id": j, "reason": "stale_>7d"}
+                        )
                     await db.commit()
                 # 5. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
@@ -1948,6 +2068,7 @@ async def lifespan(app: FastAPI):
     async with connect_db() as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
+
         # graeae:schema-drift (2026-05-23): additive migrations for live DBs.
         # New-column indexes stay out of SCHEMA because CREATE INDEX fails on
         # old live tables until the corresponding ALTER TABLE has run.
@@ -1966,14 +2087,32 @@ async def lifespan(app: FastAPI):
             if "stale" in table_sql:
                 return
             cols = (
-                "urn", "kind", "host", "session_id", "pid", "capabilities",
-                "version", "started_at", "last_heartbeat", "status", "metadata",
-                "runtime", "model", "provider", "autonomy_level", "cost_tier",
-                "current_load", "auth_method", "plan_cap_usd", "plan_period_used_usd",
+                "urn",
+                "kind",
+                "host",
+                "session_id",
+                "pid",
+                "capabilities",
+                "version",
+                "started_at",
+                "last_heartbeat",
+                "status",
+                "metadata",
+                "runtime",
+                "model",
+                "provider",
+                "autonomy_level",
+                "cost_tier",
+                "current_load",
+                "auth_method",
+                "plan_cap_usd",
+                "plan_period_used_usd",
                 "subscription_pools",
             )
             col_list = ", ".join(cols)
-            await conn.execute("ALTER TABLE agents RENAME TO agents__pre_stale_migration")
+            await conn.execute(
+                "ALTER TABLE agents RENAME TO agents__pre_stale_migration"
+            )
             await conn.execute(
                 "CREATE TABLE agents ("
                 "urn TEXT PRIMARY KEY, "
@@ -2021,8 +2160,12 @@ async def lifespan(app: FastAPI):
                 return  # no status CHECK, or already permissive — nothing to do
             async with conn.execute("PRAGMA table_info(jobs)") as cur:
                 old_cols = [r[1] for r in await cur.fetchall()]
-            await conn.execute("ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration")
-            await conn.executescript(SCHEMA)  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
+            await conn.execute(
+                "ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration"
+            )
+            await conn.executescript(
+                SCHEMA
+            )  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
             # Copy only columns common to old + recreated table — guards against
             # drift columns the recreated SCHEMA lacks (the live_columns ALTERs
             # below re-add any expected-but-missing ones afterwards).
@@ -2111,10 +2254,17 @@ async def lifespan(app: FastAPI):
                     rcur.execute(
                         "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
                     )
-                for _c, _d in (("SITE", "VARCHAR2(64)"), ("REPO", "VARCHAR2(512)"),
-                               ("HEAD_BRANCH", "VARCHAR2(512)"), ("PR_NUMBER", "NUMBER")):
-                    rcur.execute("SELECT COUNT(*) FROM user_tab_columns "
-                                 "WHERE table_name = 'HIVE_JOBS' AND column_name = :1", [_c])
+                for _c, _d in (
+                    ("SITE", "VARCHAR2(64)"),
+                    ("REPO", "VARCHAR2(512)"),
+                    ("HEAD_BRANCH", "VARCHAR2(512)"),
+                    ("PR_NUMBER", "NUMBER"),
+                ):
+                    rcur.execute(
+                        "SELECT COUNT(*) FROM user_tab_columns "
+                        "WHERE table_name = 'HIVE_JOBS' AND column_name = :1",
+                        [_c],
+                    )
                     if not (rcur.fetchone())[0]:
                         rcur.execute(f"ALTER TABLE HIVE_JOBS ADD ({_c} {_d})")
                 rcur.execute(
@@ -2124,7 +2274,9 @@ async def lifespan(app: FastAPI):
                 crow = rcur.fetchone()
                 cond = str(crow[0]) if crow and crow[0] is not None else ""
                 if crow is not None and "dead-letter" not in cond:
-                    rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
+                    rcur.execute(
+                        "ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS"
+                    )
                     rcur.execute(
                         "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
                         "CHECK (status IN ('queued','offered','claimed','running',"
@@ -2138,7 +2290,9 @@ async def lifespan(app: FastAPI):
                 # fails, every subsequent decline PATCH would error (invalid
                 # identifier / CHECK violation), so refuse to start rather than
                 # serve a half-migrated bus.
-                print(f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True)
+                print(
+                    f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True
+                )
                 # non-fatal: runtime dead-letter UPDATE falls back to requeue if CHECK not relaxed
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
@@ -2179,21 +2333,36 @@ app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 
 # ---------- endpoints ----------
 
+
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
+    return {
+        "status": "healthy",
+        "ts": time.time(),
+        "service": "graeae-hive-mind",
+        "version": "0.1.0",
+    }
 
 
 @app.get("/")
 async def dashboard():
     """Minimal HTML+JS dashboard. Auto-refreshes /v1/agents + /v1/jobs + /v1/stats/* + SSE."""
     from fastapi.responses import HTMLResponse
+
     p = "/srv/agent-bus/dashboard.html"
     try:
         with open(p) as f:
-            return HTMLResponse(f.read(), headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"})
+            return HTMLResponse(
+                f.read(),
+                headers={
+                    "Cache-Control": "no-store, no-cache, must-revalidate",
+                    "Pragma": "no-cache",
+                },
+            )
     except FileNotFoundError:
-        return HTMLResponse(f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404)
+        return HTMLResponse(
+            f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404
+        )
 
 
 @app.post("/v1/agents/register")
@@ -2208,8 +2377,9 @@ async def register(req: AgentRegister):
     kind = (req.kind or runtime).lower()
     if runtime == "unknown" and not req.kind:
         raise HTTPException(
-            422, "must provide runtime (claude-code/opencode/codex/...) OR explicit kind. "
-                 "Defaulting to 'unknown' was masking session-bricking misregistrations."
+            422,
+            "must provide runtime (claude-code/opencode/codex/...) OR explicit kind. "
+            "Defaulting to 'unknown' was masking session-bricking misregistrations.",
         )
     # If kind was provided but runtime omitted/unknown, default runtime to the
     # kind when the kind matches a known runtime identifier. Previously a
@@ -2242,11 +2412,21 @@ async def register(req: AgentRegister):
         )
     autonomy = (req.autonomy_level or "unknown").lower()
     if autonomy not in AUTONOMY_LEVELS:
-        raise HTTPException(422, f"autonomy_level must be one of {sorted(AUTONOMY_LEVELS)}, got {autonomy!r}")
+        raise HTTPException(
+            422,
+            f"autonomy_level must be one of {sorted(AUTONOMY_LEVELS)}, got {autonomy!r}",
+        )
     auth_method = (req.auth_method or "unknown").lower()
     if auth_method not in AUTH_METHODS:
-        raise HTTPException(422, f"auth_method must be one of {sorted(AUTH_METHODS)}, got {auth_method!r}")
-    plan_cap_usd = req.plan_cap_usd if req.plan_cap_usd is not None else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
+        raise HTTPException(
+            422,
+            f"auth_method must be one of {sorted(AUTH_METHODS)}, got {auth_method!r}",
+        )
+    plan_cap_usd = (
+        req.plan_cap_usd
+        if req.plan_cap_usd is not None
+        else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
+    )
     provider = (req.provider or "unknown").lower()
     model = (req.model or "unknown").lower()
     # EIH ban (operator 2026-06-18): the hive must never advertise EIH / gpt-5.5
@@ -2292,8 +2472,11 @@ async def register(req: AgentRegister):
     # is never blocked or serialized), which is the correct safety posture for the
     # most critical fleet component.
     instance = req.instance
-    effective_metadata = dict(req.metadata) if isinstance(req.metadata, dict) else (
-        {} if instance else None)
+    effective_metadata = (
+        dict(req.metadata)
+        if isinstance(req.metadata, dict)
+        else ({} if instance else None)
+    )
     if instance:
         effective_metadata["_instance"] = instance
     async with connect_db() as db:
@@ -2310,12 +2493,23 @@ async def register(req: AgentRegister):
             "host, session_id, pid, capabilities, version, started_at, last_heartbeat, status, metadata) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
             (
-                urn, kind, runtime, model, provider, tier, autonomy,
-                auth_method, plan_cap_usd,
+                urn,
+                kind,
+                runtime,
+                model,
+                provider,
+                tier,
+                autonomy,
+                auth_method,
+                plan_cap_usd,
                 json.dumps(req.subscription_pools or []),
-                req.host, session_id, req.pid,
+                req.host,
+                session_id,
+                req.pid,
                 json.dumps(req.capabilities) if req.capabilities else None,
-                req.version, now, now,
+                req.version,
+                now,
+                now,
                 json.dumps(effective_metadata) if effective_metadata else None,
             ),
         )
@@ -2395,20 +2589,39 @@ async def register(req: AgentRegister):
                 # availability. Printed (house style — this module logs via print,
                 # not a logger) so the data-quality regression stays observable in
                 # the service journal.
-                print(f"register dedup skipped for host={req.host} kind={kind} "
-                      f"instance={instance!r}: {_dedup_exc!r}", flush=True)
+                print(
+                    f"register dedup skipped for host={req.host} kind={kind} "
+                    f"instance={instance!r}: {_dedup_exc!r}",
+                    flush=True,
+                )
         await db.commit()
-        await emit_event(db, "agent.online", {
-            "urn": urn, "kind": kind, "runtime": runtime,
-            "model": model, "provider": provider, "cost_tier": tier,
-            "host": req.host, "autonomy_level": autonomy,
-            "subscription_pools": req.subscription_pools or [],
-        })
+        await emit_event(
+            db,
+            "agent.online",
+            {
+                "urn": urn,
+                "kind": kind,
+                "runtime": runtime,
+                "model": model,
+                "provider": provider,
+                "cost_tier": tier,
+                "host": req.host,
+                "autonomy_level": autonomy,
+                "subscription_pools": req.subscription_pools or [],
+            },
+        )
     return {
-        "urn": urn, "session_id": session_id, "registered_at": now,
-        "kind": kind, "runtime": runtime, "model": model,
-        "provider": provider, "cost_tier": tier, "autonomy_level": autonomy,
-        "auth_method": auth_method, "plan_cap_usd": plan_cap_usd,
+        "urn": urn,
+        "session_id": session_id,
+        "registered_at": now,
+        "kind": kind,
+        "runtime": runtime,
+        "model": model,
+        "provider": provider,
+        "cost_tier": tier,
+        "autonomy_level": autonomy,
+        "auth_method": auth_method,
+        "plan_cap_usd": plan_cap_usd,
         "subscription_pools": req.subscription_pools or [],
     }
 
@@ -2416,10 +2629,12 @@ async def register(req: AgentRegister):
 @app.post("/v1/agents/heartbeat")
 async def heartbeat(req: AgentHeartbeat):
     now = time.time()
-    note_spark_seen_urn(req.urn)
     status = (req.status or "online").lower()
     if status not in VALID_AGENT_STATUSES:
-        raise HTTPException(422, f"agent status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}")
+        raise HTTPException(
+            422,
+            f"agent status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}",
+        )
     async with connect_db() as db:
         if req.metadata is not None:
             async with db.execute(
@@ -2453,29 +2668,45 @@ async def heartbeat(req: AgentHeartbeat):
 
 @app.get("/v1/agents")
 async def list_agents(
-    status: Optional[str] = None,
-    kind: Optional[str] = None,
-    host: Optional[str] = None,
-    runtime: Optional[str] = None,
-    pid: Optional[int] = None,
-    cost_tier: Optional[str] = None,
+    status: str | None = None,
+    kind: str | None = None,
+    host: str | None = None,
+    runtime: str | None = None,
+    pid: int | None = None,
+    cost_tier: str | None = None,
     include_offline: bool = False,
 ):
-    sql = ("SELECT urn, kind, host, status, last_heartbeat, capabilities, version, metadata, "
-           "pid, runtime, model, provider, cost_tier, autonomy_level "
-           "FROM agents WHERE 1=1")
+    sql = (
+        "SELECT urn, kind, host, status, last_heartbeat, capabilities, version, metadata, "
+        "pid, runtime, model, provider, cost_tier, autonomy_level "
+        "FROM agents WHERE 1=1"
+    )
     args: list = []
     if status:
         if status not in VALID_AGENT_STATUSES:
-            raise HTTPException(422, f"status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}")
-        sql += " AND status=?";    args.append(status)
+            raise HTTPException(
+                422,
+                f"status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}",
+            )
+        sql += " AND status=?"
+        args.append(status)
     elif not include_offline:
         sql += " AND status='online'"
-    if kind:      sql += " AND kind=?";      args.append(kind)
-    if host:      sql += " AND host=?";      args.append(host)
-    if runtime:   sql += " AND runtime=?";   args.append(runtime)
-    if pid is not None: sql += " AND pid=?"; args.append(pid)
-    if cost_tier: sql += " AND cost_tier=?"; args.append(cost_tier)
+    if kind:
+        sql += " AND kind=?"
+        args.append(kind)
+    if host:
+        sql += " AND host=?"
+        args.append(host)
+    if runtime:
+        sql += " AND runtime=?"
+        args.append(runtime)
+    if pid is not None:
+        sql += " AND pid=?"
+        args.append(pid)
+    if cost_tier:
+        sql += " AND cost_tier=?"
+        args.append(cost_tier)
     sql += " ORDER BY last_heartbeat DESC"
     rows = []
     async with connect_db() as db:
@@ -2490,32 +2721,37 @@ async def list_agents(
                     display += f"[pid={r[8]}]"
                 if cwd_short:
                     display += f" cwd={cwd_short}"
-                rows.append({
-                    "urn": r[0], "kind": r[1], "host": r[2], "status": r[3],
-                    "last_heartbeat": r[4],
-                    "capabilities": json.loads(r[5]) if r[5] else None,
-                    "version": r[6],
-                    "metadata": meta,
-                    "pid": r[8],
-                    "runtime": r[9],
-                    "model": r[10],
-                    "provider": r[11],
-                    "cost_tier": r[12],
-                    "autonomy_level": r[13],
-                    "display": display,
-                })
+                rows.append(
+                    {
+                        "urn": r[0],
+                        "kind": r[1],
+                        "host": r[2],
+                        "status": r[3],
+                        "last_heartbeat": r[4],
+                        "capabilities": json.loads(r[5]) if r[5] else None,
+                        "version": r[6],
+                        "metadata": meta,
+                        "pid": r[8],
+                        "runtime": r[9],
+                        "model": r[10],
+                        "provider": r[11],
+                        "cost_tier": r[12],
+                        "autonomy_level": r[13],
+                        "display": display,
+                    }
+                )
     return {"count": len(rows), "agents": rows}
 
 
 @app.get("/v1/agents/stats")
 async def agent_stats():
     counts = {status: 0 for status in VALID_AGENT_STATUSES}
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT status, COUNT(*) FROM agents GROUP BY status"
-        ) as cur:
-            async for status, count in cur:
-                counts[status] = count
+    async with (
+        connect_db() as db,
+        db.execute("SELECT status, COUNT(*) FROM agents GROUP BY status") as cur,
+    ):
+        async for status, count in cur:
+            counts[status] = count
     total = sum(counts.values())
     return {
         "online": counts.get("online", 0),
@@ -2541,8 +2777,10 @@ async def list_hosts(include_stale: bool = False):
     this response instead of sweeping the segment and guessing.
     """
     cutoff = time.time() - 60  # 60s stale threshold
-    sql = ("SELECT urn, host, status, last_heartbeat, capabilities, metadata, subscription_pools "
-           "FROM agents WHERE kind='system'")
+    sql = (
+        "SELECT urn, host, status, last_heartbeat, capabilities, metadata, subscription_pools "
+        "FROM agents WHERE kind='system'"
+    )
     if not include_stale:
         sql += " AND last_heartbeat >= ?"
         args: list = [cutoff]
@@ -2550,52 +2788,51 @@ async def list_hosts(include_stale: bool = False):
         args = []
     sql += " ORDER BY last_heartbeat DESC"
     seen_hosts: dict[str, dict] = {}
-    async with connect_db() as db:
-        async with db.execute(sql, args) as cur:
-            async for r in cur:
-                h = r[1]
-                if h in seen_hosts:
-                    continue  # already have a newer entry for this host
-                meta = json.loads(r[5]) if r[5] else {}
-                specs = meta.get("specs", {})
-                load  = meta.get("load", {})
-                age_s = time.time() - (r[3] or 0)
-                # Addresses arrive in specs at registration and are refreshed in load on
-                # every heartbeat; prefer load so a DHCP change is picked up promptly.
-                net = load.get("network") or specs.get("network") or {}
-                seen_hosts[h] = {
-                    "ip":               net.get("primary_ip"),
-                    "addresses":        net.get("addresses") or [],
-                    "network":          net,
-                    "host":           h,
-                    "urn":            r[0],
-                    "status":         r[2],
-                    "last_heartbeat": r[3],
-                    "age_s":          round(age_s, 1),
-                    "stale":          age_s > 60,
-                    "capabilities":   json.loads(r[4]) if r[4] else [],
-                    "subscription_pools": json.loads(r[6]) if len(r) > 6 and r[6] else [],
-                    # static specs (from registration)
-                    "cpu_model":      specs.get("cpu_model"),
-                    "cpu_threads":    specs.get("cpu_threads") or specs.get("cpu_count"),
-                    "ram_gb":         specs.get("ram_gb"),
-                    "os":             specs.get("os"),
-                    "arch":           specs.get("arch"),
-                    "gpus":           specs.get("gpus", []),
-                    "has_docker":     specs.get("has_docker"),
-                    "has_podman":     specs.get("has_podman"),
-                    "has_npu":        specs.get("has_npu", False),
-                    # dynamic load (updated each heartbeat)
-                    "load_1min":      load.get("load_1min"),
-                    "load_5min":      load.get("load_5min"),
-                    "ram_used_pct":   load.get("ram_used_pct"),
-                    "srv_free_gb":    load.get("srv_free_gb"),
-                    "uptime_sec":     load.get("uptime_sec"),
-                    # Multi-volume + cpu utilization (added 2026-05-26)
-                    "volumes":        load.get("volumes") or [],
-                    "cpu_used_pct":   load.get("cpu_used_pct"),
-                    "gpus_runtime":   load.get("gpus_runtime") or [],
-                }
+    async with connect_db() as db, db.execute(sql, args) as cur:
+        async for r in cur:
+            h = r[1]
+            if h in seen_hosts:
+                continue  # already have a newer entry for this host
+            meta = json.loads(r[5]) if r[5] else {}
+            specs = meta.get("specs", {})
+            load = meta.get("load", {})
+            age_s = time.time() - (r[3] or 0)
+            # Addresses arrive in specs at registration and are refreshed in load on
+            # every heartbeat; prefer load so a DHCP change is picked up promptly.
+            net = load.get("network") or specs.get("network") or {}
+            seen_hosts[h] = {
+                "ip": net.get("primary_ip"),
+                "addresses": net.get("addresses") or [],
+                "network": net,
+                "host": h,
+                "urn": r[0],
+                "status": r[2],
+                "last_heartbeat": r[3],
+                "age_s": round(age_s, 1),
+                "stale": age_s > 60,
+                "capabilities": json.loads(r[4]) if r[4] else [],
+                "subscription_pools": json.loads(r[6]) if len(r) > 6 and r[6] else [],
+                # static specs (from registration)
+                "cpu_model": specs.get("cpu_model"),
+                "cpu_threads": specs.get("cpu_threads") or specs.get("cpu_count"),
+                "ram_gb": specs.get("ram_gb"),
+                "os": specs.get("os"),
+                "arch": specs.get("arch"),
+                "gpus": specs.get("gpus", []),
+                "has_docker": specs.get("has_docker"),
+                "has_podman": specs.get("has_podman"),
+                "has_npu": specs.get("has_npu", False),
+                # dynamic load (updated each heartbeat)
+                "load_1min": load.get("load_1min"),
+                "load_5min": load.get("load_5min"),
+                "ram_used_pct": load.get("ram_used_pct"),
+                "srv_free_gb": load.get("srv_free_gb"),
+                "uptime_sec": load.get("uptime_sec"),
+                # Multi-volume + cpu utilization (added 2026-05-26)
+                "volumes": load.get("volumes") or [],
+                "cpu_used_pct": load.get("cpu_used_pct"),
+                "gpus_runtime": load.get("gpus_runtime") or [],
+            }
     hosts = sorted(seen_hosts.values(), key=lambda x: x["host"])
     return {"count": len(hosts), "hosts": hosts}
 
@@ -2603,19 +2840,26 @@ async def list_hosts(include_stale: bool = False):
 @app.get("/v1/agents/{urn_path:path}/throttle")
 async def agent_throttle(urn_path: str):
     """Inspect an agent's plan-cap throttle state."""
-    async with connect_db() as db:
-        async with db.execute(
+    async with (
+        connect_db() as db,
+        db.execute(
             "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd "
-            "FROM agents WHERE urn=?", (urn_path,)) as cur:
-            row = await cur.fetchone()
+            "FROM agents WHERE urn=?",
+            (urn_path,),
+        ) as cur,
+    ):
+        row = await cur.fetchone()
     if not row:
         raise HTTPException(404, f"agent not found: {urn_path}")
     used = row[5] or 0
     cap = row[4] or 0
     pct = (100 * used / cap) if cap else 0
     return {
-        "urn": row[0], "kind": row[1], "runtime": row[2],
-        "auth_method": row[3], "plan_cap_usd": cap,
+        "urn": row[0],
+        "kind": row[1],
+        "runtime": row[2],
+        "auth_method": row[3],
+        "plan_cap_usd": cap,
         "plan_period_used_usd": round(used, 4),
         "plan_period_pct": round(pct, 1),
         "throttled": row[3] == "subscription" and pct >= 85.0,
@@ -2628,7 +2872,8 @@ async def reset_plan_period(urn_path: str):
     """Operator zeros the MTD usage — call monthly on billing rollover."""
     async with connect_db() as db:
         cur = await db.execute(
-            "UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,))
+            "UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,)
+        )
         await db.commit()
     if cur.rowcount == 0:
         raise HTTPException(404, f"agent not found: {urn_path}")
@@ -2650,8 +2895,13 @@ async def whoami(host: str, pid: int):
     if not r:
         raise HTTPException(404, f"no online agent matches host={host} pid={pid}")
     return {
-        "urn": r[0], "kind": r[1], "runtime": r[2], "model": r[3],
-        "provider": r[4], "cost_tier": r[5], "autonomy_level": r[6],
+        "urn": r[0],
+        "kind": r[1],
+        "runtime": r[2],
+        "model": r[3],
+        "provider": r[4],
+        "cost_tier": r[5],
+        "autonomy_level": r[6],
         "started_at": r[7],
     }
 
@@ -2659,18 +2909,40 @@ async def whoami(host: str, pid: int):
 # GRAEAE permanent logjam-fix (consensus 1.0, 2026-06-04): bus-side first-class workspace
 # resolution mirroring the worker KIND_WORKSPACE_MAP (prefix -> workspace name).
 WORKSPACE_CATALOG_PREFIXES = {
-    "argonaut:": "florida-licenses", "fix:codex-pro-oauth-verify": "mnemos",
-    "feat:knemon": "mnemos", "fix:knemon": "mnemos", "feat:oracle-backend": "mnemos",
-    "fix:sync-provider-models": "mnemos", "fix:knemon-cost": "mnemos", "mnemos:": "mnemos",
-    "riskybiz:": "florida-licenses", "riskyeats:": "riskyeats",
-    "investorclaw:": "ic-engine", "ic-engine:": "ic-engine",
-    "ncz-os-zeroclaw:": "zeroclaw", "ncz-os-openclaw:": "openclaw", "ncz-os-": "ncz-installer",
-    "cixmini-os:": "cix-installer", "fleet-infra:": "fleet-ops",
+    "argonaut:": "florida-licenses",
+    "fix:codex-pro-oauth-verify": "mnemos",
+    "feat:knemon": "mnemos",
+    "fix:knemon": "mnemos",
+    "feat:oracle-backend": "mnemos",
+    "fix:sync-provider-models": "mnemos",
+    "fix:knemon-cost": "mnemos",
+    "mnemos:": "mnemos",
+    "riskybiz:": "florida-licenses",
+    "riskyeats:": "riskyeats",
+    "investorclaw:": "ic-engine",
+    "ic-engine:": "ic-engine",
+    "ncz-os-zeroclaw:": "zeroclaw",
+    "ncz-os-openclaw:": "openclaw",
+    "ncz-os-": "ncz-installer",
+    "cixmini-os:": "cix-installer",
+    "fleet-infra:": "fleet-ops",
 }
 WORKSPACE_NAMES = set(WORKSPACE_CATALOG_PREFIXES.values())
 ADMISSION_NONCOMMIT_PREFIXES = (
-    "review", "architecture", "triage", "docs:", "investigation", "track:", "ops:",
-    "diag:", "ping:", "hive-stats", "dream-walker", "research", "analysis", "design",
+    "review",
+    "architecture",
+    "triage",
+    "docs:",
+    "investigation",
+    "track:",
+    "ops:",
+    "diag:",
+    "ping:",
+    "hive-stats",
+    "dream-walker",
+    "research",
+    "analysis",
+    "design",
 )
 
 
@@ -2686,7 +2958,8 @@ def resolve_workspace_shadow(kind, description, target_workspace, project):
         if k.startswith(prefix):
             return (WORKSPACE_CATALOG_PREFIXES[prefix], "prefix-fallback")
     import re as _re
-    if _re.search(r"\brepo:\s*([A-Za-z0-9_./:\-]+)", description or "", _re.I):
+
+    if _re.search(r"\brepo:\s*([A-Za-z0-9_./:\-]+)", description or "", _re.IGNORECASE):
         return (None, "repo-hint")
     if any(k.startswith(pp) for pp in ADMISSION_NONCOMMIT_PREFIXES):
         return (None, "noncommit")
@@ -2706,7 +2979,9 @@ async def create_job(req: JobCreate):
     now = time.time()
     max_cost_tier = (req.max_cost_tier or "B").upper()
     if max_cost_tier not in COST_TIERS:
-        raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
+        raise HTTPException(
+            422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}"
+        )
     # 2026-05-26: codex-only eligibility auto-rewrite, ORIGINALLY for all of
     # codex/review/hermes-cli — codex was a CLI zeroclaw shells out to, with
     # no standalone claimer. RESCINDED for codex 2026-09-14 (operator): a real
@@ -2725,9 +3000,15 @@ async def create_job(req: JobCreate):
             # Mixed (e.g. ["zeroclaw", "codex"]) → keep only the claimer kinds
             req = req.model_copy(update={"eligible_kinds": kept})
     if req.mnemos_refs:
-        bad = [r for r in req.mnemos_refs if not (isinstance(r, str) and r.startswith("mem_"))]
+        bad = [
+            r
+            for r in req.mnemos_refs
+            if not (isinstance(r, str) and r.startswith("mem_"))
+        ]
         if bad:
-            raise HTTPException(422, f"mnemos_refs must be mem_XXX ids — bad entries: {bad}")
+            raise HTTPException(
+                422, f"mnemos_refs must be mem_XXX ids — bad entries: {bad}"
+            )
     # DAG: validate depends_on targets exist + no self-cycle
     if req.depends_on:
         if job_id in req.depends_on:
@@ -2741,7 +3022,9 @@ async def create_job(req: JobCreate):
                 found = {row[0] async for row in cur}
             missing = [d for d in req.depends_on if d not in found]
             if missing:
-                raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
+                raise HTTPException(
+                    422, f"depends_on references unknown job ids: {missing}"
+                )
     # AFFINITY INJECTION REMOVED (operator 2026-06-03): jobs are not pinned to
     # hosts/kinds/capabilities — all workers eligible for everything.
     # NARROW HEAVY-REPO CARVE-OUT (operator 2026-06-04, GRAEAE consult): the only
@@ -2762,13 +3045,13 @@ async def create_job(req: JobCreate):
     await require_orchestrator_submitter(req.submitter_urn)
 
     if req.eligible_kinds and "*" not in req.eligible_kinds:
-        async with connect_db() as _edb:
-            async with _edb.execute(
-                "SELECT kind, runtime FROM agents"
-            ) as _cur:
-                registered_aliases: set[str] = set()
-                async for _kind, _runtime in _cur:
-                    registered_aliases.update(agent_kind_aliases(_kind, _runtime))
+        async with (
+            connect_db() as _edb,
+            _edb.execute("SELECT kind, runtime FROM agents") as _cur,
+        ):
+            registered_aliases: set[str] = set()
+            async for _kind, _runtime in _cur:
+                registered_aliases.update(agent_kind_aliases(_kind, _runtime))
         requested = _norm_str_set(req.eligible_kinds)
         if requested and not requested.intersection(registered_aliases):
             raise HTTPException(
@@ -2781,26 +3064,47 @@ async def create_job(req: JobCreate):
     # Mode-1 jam = jobs (kind="code", no project/repo) whose workspace can't resolve -> worker
     # declines -> dead-letter. Observe would-be 422s now; enforce after vocabulary stabilizes (~1wk).
     try:
-        _ws, _wsrc = resolve_workspace_shadow(req.kind, req.description, req.target_workspace, req.project)
+        _ws, _wsrc = resolve_workspace_shadow(
+            req.kind, req.description, req.target_workspace, req.project
+        )
         if _wsrc == "UNRESOLVABLE":
-            print(f"ADMISSION_SHADOW would-422 no_resolvable_workspace kind={req.kind!r} "
-                  f"project={req.project!r} submitter={req.submitter_urn}", flush=True)
+            print(
+                f"ADMISSION_SHADOW would-422 no_resolvable_workspace kind={req.kind!r} "
+                f"project={req.project!r} submitter={req.submitter_urn}",
+                flush=True,
+            )
         elif _wsrc == "prefix-fallback":
-            print(f"ADMISSION_SHADOW deprecated_prefix_resolve kind={req.kind!r} -> ws={_ws} "
-                  f"(migrate submitter to target_workspace)", flush=True)
+            print(
+                f"ADMISSION_SHADOW deprecated_prefix_resolve kind={req.kind!r} -> ws={_ws} "
+                f"(migrate submitter to target_workspace)",
+                flush=True,
+            )
         if _wsrc in ("UNRESOLVABLE", "prefix-fallback"):
             try:
                 import json as _sj
+
                 with open("/srv/agent-bus/admission_shadow.jsonl", "a") as _sf:
-                    _sf.write(_sj.dumps({"ts": now, "verdict": _wsrc, "kind": req.kind,
-                                         "project": req.project, "submitter": req.submitter_urn,
-                                         "resolved_ws": _ws}) + "\n")
+                    _sf.write(
+                        _sj.dumps(
+                            {
+                                "ts": now,
+                                "verdict": _wsrc,
+                                "kind": req.kind,
+                                "project": req.project,
+                                "submitter": req.submitter_urn,
+                                "resolved_ws": _ws,
+                            }
+                        )
+                        + "\n"
+                    )
             except Exception:
                 pass
     except Exception:
         pass
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
-    ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
+    ck = cache_key_for(
+        req.kind, req.description, max_cost_tier, req.required_capabilities
+    )
     async with connect_db() as db:
         cached = await cache_lookup(db, ck)
         # Repository jobs must execute against their actual checkout. A cached
@@ -2816,20 +3120,36 @@ async def create_job(req: JobCreate):
                 "claimed_cost_tier, estimated_cost_usd, result_mnemos_id) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
                 (
-                    job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
-                    req.priority, req.deadline,
-                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
+                    job_id,
+                    req.submitter_urn,
+                    req.parent_job_id,
+                    req.kind,
+                    req.description,
+                    req.priority,
+                    req.deadline,
+                    json.dumps(req.required_capabilities)
+                    if req.required_capabilities
+                    else None,
                     json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
                     json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
                     req.project,
                     max_cost_tier,
-                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
+                    json.dumps(req.preferred_providers)
+                    if req.preferred_providers
+                    else None,
                     json.dumps(req.preferred_models) if req.preferred_models else None,
                     json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
-                    now, now,
-                    json.dumps({**(cached["result"] or {}), "cache_hit": True,
-                                "source_job_id": cached["source_job_id"]}),
-                    cached["provider"], cached["model"],
+                    now,
+                    now,
+                    json.dumps(
+                        {
+                            **(cached["result"] or {}),
+                            "cache_hit": True,
+                            "source_job_id": cached["source_job_id"],
+                        }
+                    ),
+                    cached["provider"],
+                    cached["model"],
                     cached.get("result_mnemos_id"),
                 ),
             )
@@ -2837,13 +3157,21 @@ async def create_job(req: JobCreate):
             saved = 0.01  # conservative fallback if no token data
             await cache_record_hit(db, ck, saved)
             await db.commit()
-            await emit_event(db, "job.cached", {
-                "id": job_id, "source_job_id": cached["source_job_id"],
-                "kind": req.kind, "cost_saved_usd": saved,
-            })
+            await emit_event(
+                db,
+                "job.cached",
+                {
+                    "id": job_id,
+                    "source_job_id": cached["source_job_id"],
+                    "kind": req.kind,
+                    "cost_saved_usd": saved,
+                },
+            )
             return {
-                "id": job_id, "created_at": now,
-                "status": "done", "cache_hit": True,
+                "id": job_id,
+                "created_at": now,
+                "status": "done",
+                "cache_hit": True,
                 "source_job_id": cached["source_job_id"],
                 "result": cached["result"],
                 "result_mnemos_id": cached.get("result_mnemos_id"),
@@ -2883,20 +3211,31 @@ async def create_job(req: JobCreate):
                 "mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, pr_number, status, started_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
                 (
-                    job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
-                    req.priority, req.deadline,
-                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
+                    job_id,
+                    req.submitter_urn,
+                    req.parent_job_id,
+                    req.kind,
+                    req.description,
+                    req.priority,
+                    req.deadline,
+                    json.dumps(req.required_capabilities)
+                    if req.required_capabilities
+                    else None,
                     json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
                     json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
                     req.project,
                     max_cost_tier,
-                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
+                    json.dumps(req.preferred_providers)
+                    if req.preferred_providers
+                    else None,
                     json.dumps(req.preferred_models) if req.preferred_models else None,
                     json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
                     json.dumps(req.depends_on) if req.depends_on else None,
                     int(req.max_retries),
                     dedup_hash,
-                    req.site, req.repo, req.head_branch,
+                    req.site,
+                    req.repo,
+                    req.head_branch,
                     (int(req.pr_number) if req.pr_number is not None else None),
                     now,
                 ),
@@ -2915,14 +3254,21 @@ async def create_job(req: JobCreate):
             if _row:
                 return {"id": _row[0], "created_at": _row[1], "coalesced": True}
             raise
-        await emit_event(db, "job.queued", {
-            "id": job_id, "submitter": req.submitter_urn, "kind": req.kind,
-            "description": req.description, "priority": req.priority,
-            "required_capabilities": req.required_capabilities,
-            "eligible_kinds": req.eligible_kinds,
-            "max_cost_tier": max_cost_tier,
-            "mnemos_refs": req.mnemos_refs,
-        })
+        await emit_event(
+            db,
+            "job.queued",
+            {
+                "id": job_id,
+                "submitter": req.submitter_urn,
+                "kind": req.kind,
+                "description": req.description,
+                "priority": req.priority,
+                "required_capabilities": req.required_capabilities,
+                "eligible_kinds": req.eligible_kinds,
+                "max_cost_tier": max_cost_tier,
+                "mnemos_refs": req.mnemos_refs,
+            },
+        )
     return {"id": job_id, "created_at": now, "mnemos_refs": req.mnemos_refs}
 
 
@@ -2938,16 +3284,19 @@ async def dequeue_next_job(agent_urn: str):
 
     Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
     """
-    note_spark_seen_urn(agent_urn)
     now = time.time()
     urn_parts = agent_urn.split(":")
     agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
     if agent_host in HOST_DENYLIST:
         from fastapi.responses import Response as _DRsp
-        return _DRsp(status_code=204, headers={
-            "X-Hive-Claim-Result": "host_denylisted",
-            "X-Hive-Claim-Detail": f"host {agent_host} is in HIVE_HOST_DENYLIST",
-        })
+
+        return _DRsp(
+            status_code=204,
+            headers={
+                "X-Hive-Claim-Result": "host_denylisted",
+                "X-Hive-Claim-Detail": f"host {agent_host} is in HIVE_HOST_DENYLIST",
+            },
+        )
 
     try:
         async with connect_db() as db:
@@ -2961,9 +3310,21 @@ async def dequeue_next_job(agent_urn: str):
                 agent_row = await cur.fetchone()
             if not agent_row:
                 await db.execute("ROLLBACK")
-                raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
-            (agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier,
-             a_auth, a_cap, a_used, agent_status) = agent_row
+                raise HTTPException(
+                    404, f"claim failed: agent not registered: {agent_urn}"
+                )
+            (
+                agent_kind,
+                caps_json,
+                a_runtime,
+                a_model,
+                a_provider,
+                a_tier,
+                a_auth,
+                a_cap,
+                a_used,
+                agent_status,
+            ) = agent_row
             if agent_status not in ACTIVE_AGENT_STATUSES:
                 await db.execute("ROLLBACK")
                 raise HTTPException(
@@ -2986,7 +3347,9 @@ async def dequeue_next_job(agent_urn: str):
                 "capabilities": agent_caps,
                 "eligible_aliases": agent_kind_aliases(agent_kind, a_runtime),
                 "subscription_throttled": (
-                    a_auth == "subscription" and a_cap and a_used
+                    a_auth == "subscription"
+                    and a_cap
+                    and a_used
                     and a_used >= THROTTLE_HEADROOM * a_cap
                 ),
             }
@@ -3003,7 +3366,8 @@ async def dequeue_next_job(agent_urn: str):
             ) as cur:
                 candidates = [tuple(r) async for r in cur]
             candidates = [
-                r for _idx, r in sorted(
+                r
+                for _idx, r in sorted(
                     enumerate(candidates),
                     key=lambda item: (
                         item[1][5] or 0,
@@ -3022,11 +3386,30 @@ async def dequeue_next_job(agent_urn: str):
 
             claimed = None
             for r in candidates:
-                (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
-                 j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
-                 j_pref_providers, j_pref_models, j_mnemos_refs, j_deps_json,
-                 _j_retry_backoff_until, j_started_at,
-                 j_site, j_repo, j_head_branch, j_pr_number) = r
+                (
+                    j_id,
+                    j_submitter,
+                    j_parent,
+                    j_kind,
+                    j_desc,
+                    j_priority,
+                    j_deadline,
+                    j_caps_json,
+                    j_kinds_json,
+                    j_hosts_json,
+                    j_project,
+                    j_max_tier,
+                    j_pref_providers,
+                    j_pref_models,
+                    j_mnemos_refs,
+                    j_deps_json,
+                    _j_retry_backoff_until,
+                    j_started_at,
+                    j_site,
+                    j_repo,
+                    j_head_branch,
+                    j_pr_number,
+                ) = r
                 deps = json_list(j_deps_json)
                 if deps:
                     ph = ",".join("?" * len(deps))
@@ -3057,8 +3440,17 @@ async def dequeue_next_job(agent_urn: str):
                     "claim_lease_expires_at=?, last_update_at=?, "
                     "ended_at=NULL, result=NULL "
                     "WHERE id=? AND status IN ('queued','offered')",
-                    (agent_urn, now, a_runtime, a_model, a_provider, a_tier,
-                     now + CLAIM_LEASE_SECONDS, now, j_id),
+                    (
+                        agent_urn,
+                        now,
+                        a_runtime,
+                        a_model,
+                        a_provider,
+                        a_tier,
+                        now + CLAIM_LEASE_SECONDS,
+                        now,
+                        j_id,
+                    ),
                 )
                 if cur2.rowcount == 0:
                     continue
@@ -3097,21 +3489,32 @@ async def dequeue_next_job(agent_urn: str):
             await db.commit()
             if claimed:
                 resources = claimed.get("claimed_resources") or {}
-                await emit_event(db, "job.claimed", {
-                    "id": claimed["id"], "claimed_by": agent_urn, "kind": claimed["kind"],
-                    "runtime": resources.get("runtime"), "model": resources.get("model"),
-                    "provider": resources.get("provider"), "cost_tier": resources.get("cost_tier"),
-                })
+                await emit_event(
+                    db,
+                    "job.claimed",
+                    {
+                        "id": claimed["id"],
+                        "claimed_by": agent_urn,
+                        "kind": claimed["kind"],
+                        "runtime": resources.get("runtime"),
+                        "model": resources.get("model"),
+                        "provider": resources.get("provider"),
+                        "cost_tier": resources.get("cost_tier"),
+                    },
+                )
                 return claimed
     except HTTPException:
         raise
     except aiosqlite.Error as e:
-        raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
+        raise HTTPException(
+            500, f"claim failed: database error while claiming next job: {e}"
+        ) from e
 
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
     # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
     # contract and triggers h11 LocalProtocolError. Use Response (no body).
     from fastapi.responses import Response as _Response
+
     return _Response(
         status_code=204,
         headers={
@@ -3145,15 +3548,18 @@ async def update_job(job_id: str, req: JobUpdate):
             req = JobUpdate(
                 status="failed",
                 result=patched,
-                claimed_by=req.claimed_by, tokens_in=req.tokens_in,
-                tokens_out=req.tokens_out, result_mnemos_id=req.result_mnemos_id,
+                claimed_by=req.claimed_by,
+                tokens_in=req.tokens_in,
+                tokens_out=req.tokens_out,
+                result_mnemos_id=req.result_mnemos_id,
             )
     req.result = normalize_result_payload(req.status, req.result)
 
     claimed_by_was_set = original_claimed_by_was_set
     result_mnemos_was_set = original_result_mnemos_was_set
     patch_payload = (
-        req.model_dump(exclude_unset=True) if hasattr(req, "model_dump")
+        req.model_dump(exclude_unset=True)
+        if hasattr(req, "model_dump")
         else req.dict(exclude_unset=True)
     )
     cost_estimate = None
@@ -3184,7 +3590,17 @@ async def update_job(job_id: str, req: JobUpdate):
             if not current:
                 await db.execute("ROLLBACK")
                 raise HTTPException(404, f"job not found: {job_id}")
-            old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count, job_kind, job_repo = current
+            (
+                old_status,
+                old_claimed_by,
+                prov,
+                mod,
+                retry_count,
+                max_retries,
+                decline_count,
+                job_kind,
+                job_repo,
+            ) = current
 
             if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
                 await db.execute("ROLLBACK")
@@ -3193,12 +3609,21 @@ async def update_job(job_id: str, req: JobUpdate):
                     f"invalid status transition {old_status!r} -> {req.status!r}",
                 )
 
-            if (old_status in TERMINAL_JOB_STATUSES and req.status != old_status
-                    and not (old_status in {"done", "failed"} and req.status == "cancelled")):  # retire fake/dup completions and superseded failures
+            if (
+                old_status in TERMINAL_JOB_STATUSES
+                and req.status != old_status
+                and not (old_status in {"done", "failed"} and req.status == "cancelled")
+            ):  # retire fake/dup completions and superseded failures
                 await db.execute("ROLLBACK")
-                raise HTTPException(409, f"terminal job status {old_status!r} cannot be reopened by PATCH")
+                raise HTTPException(
+                    409,
+                    f"terminal job status {old_status!r} cannot be reopened by PATCH",
+                )
 
-            if old_status in {"queued", "offered"} and req.status in {"claimed", "running"}:
+            if old_status in {"queued", "offered"} and req.status in {
+                "claimed",
+                "running",
+            }:
                 await db.execute("ROLLBACK")
                 raise HTTPException(
                     409,
@@ -3206,18 +3631,34 @@ async def update_job(job_id: str, req: JobUpdate):
                     "so agent registration, capabilities, dependencies, and cost tier are checked",
                 )
 
-            release_to_queue = req.status == "queued" and old_status in {"claimed", "running", "offered"}
-            if req.status == "queued" and old_status in {"claimed", "running", "offered"}:
+            release_to_queue = req.status == "queued" and old_status in {
+                "claimed",
+                "running",
+                "offered",
+            }
+            if req.status == "queued" and old_status in {
+                "claimed",
+                "running",
+                "offered",
+            }:
                 if not old_claimed_by:
                     await db.execute("ROLLBACK")
-                    raise HTTPException(409, "cannot release a job with no current claimant")
+                    raise HTTPException(
+                        409, "cannot release a job with no current claimant"
+                    )
                 if not claimed_by_was_set or req.claimed_by != old_claimed_by:
                     await db.execute("ROLLBACK")
-                    raise HTTPException(403, "release to queued requires claimed_by to match the current claimant")
+                    raise HTTPException(
+                        403,
+                        "release to queued requires claimed_by to match the current claimant",
+                    )
 
             if claimed_by_was_set and req.claimed_by is None:
                 await db.execute("ROLLBACK")
-                raise HTTPException(422, "claimed_by=null is not accepted; provide the current claimant urn")
+                raise HTTPException(
+                    422,
+                    "claimed_by=null is not accepted; provide the current claimant urn",
+                )
 
             if claimed_by_was_set and req.claimed_by is not None:
                 if old_claimed_by and req.claimed_by != old_claimed_by:
@@ -3227,26 +3668,56 @@ async def update_job(job_id: str, req: JobUpdate):
                         f"claimed_by overwrite rejected: current={old_claimed_by!r} requested={req.claimed_by!r}",
                     )
 
-            if old_claimed_by and req.status in {"claimed", "running", "done", "failed", "cancelled"}:
+            if old_claimed_by and req.status in {
+                "claimed",
+                "running",
+                "done",
+                "failed",
+                "cancelled",
+            }:
                 if not claimed_by_was_set or req.claimed_by != old_claimed_by:
                     await db.execute("ROLLBACK")
-                    raise HTTPException(403, "job update requires claimed_by to match the current claimant")
+                    raise HTTPException(
+                        403,
+                        "job update requires claimed_by to match the current claimant",
+                    )
 
-            effective_claimed_by = None if release_to_queue else (req.claimed_by or old_claimed_by)
+            effective_claimed_by = (
+                None if release_to_queue else (req.claimed_by or old_claimed_by)
+            )
             if req.status in {"claimed", "running"} and not effective_claimed_by:
                 await db.execute("ROLLBACK")
-                raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
+                raise HTTPException(
+                    422,
+                    f"status={req.status!r} requires an existing or explicit claimed_by",
+                )
 
-            commit_required = bool(job_repo) or str(job_kind) in ("riskyeats", "code") or str(job_kind).startswith((
-                "riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:",
-                "ic-engine", "investorclaw", "ncz-os",
-            ))
+            commit_required = (
+                bool(job_repo)
+                or str(job_kind) in ("riskyeats", "code")
+                or str(job_kind).startswith(
+                    (
+                        "riskyeats:",
+                        "feat:",
+                        "fix:",
+                        "argonaut:",
+                        "riskybiz:",
+                        "mnemos:",
+                        "ic-engine",
+                        "investorclaw",
+                        "ncz-os",
+                    )
+                )
+            )
             if req.status == "done" and commit_required:
                 proof = req.result or {}
                 if not valid_completion_proof(proof):
                     req.status = "needs-review"
                     completion_rejected = True
-                    req.result = {**proof, "failure_reason": "completion_evidence_missing"}
+                    req.result = {
+                        **proof,
+                        "failure_reason": "completion_evidence_missing",
+                    }
                     patch_payload["status"] = req.status
                     patch_payload["result"] = req.result
 
@@ -3259,23 +3730,32 @@ async def update_job(job_id: str, req: JobUpdate):
                 fields.append("result=?")
                 args.append(json.dumps(req.result))
             if release_to_queue:
-                fields.extend([
-                    "claimed_by=NULL", "claimed_at=NULL", "claimed_runtime=NULL",
-                    "claimed_model=NULL", "claimed_provider=NULL", "claimed_cost_tier=NULL",
-                    "ended_at=NULL",
-                ])
+                fields.extend(
+                    [
+                        "claimed_by=NULL",
+                        "claimed_at=NULL",
+                        "claimed_runtime=NULL",
+                        "claimed_model=NULL",
+                        "claimed_provider=NULL",
+                        "claimed_cost_tier=NULL",
+                        "ended_at=NULL",
+                    ]
+                )
                 # GRAEAE dispatch consensus 1.0 (2026-06-04) SHIP-FIRST: backoff on EVERY release
                 # so a job a worker can't run cannot hot-loop (claim->release->reclaim). The serve
                 # query already skips jobs with retry_backoff_until>now. Mild exponential on
                 # decline_count + ±20% jitter (decorrelate N simultaneous releases); ~5s first
                 # bounce -> 300s cap. Stops the pegasus/medusa thrash.
                 import random as _rnd
+
                 # exponential per-release (NOT flat — flat = infinite churn on a job no local
                 # worker can run; GRAEAE 2026-06-04). Bump retry_count each release so the
                 # backoff escalates to the 300s cap (~6 bounces); a capable host grabs it during
                 # a backoff window while the incapable host stops hammering it.
                 _rc = int(retry_count or 0) + 1
-                _bo = min(5.0 * (2 ** min(_rc, 6)), 300.0) * (1.0 + _rnd.uniform(-0.2, 0.2))
+                _bo = min(5.0 * (2 ** min(_rc, 6)), 300.0) * (
+                    1.0 + _rnd.uniform(-0.2, 0.2)
+                )
                 fields.append("retry_count=retry_count+1")
                 fields.append("retry_backoff_until=?")
                 args.append(now + _bo)
@@ -3291,7 +3771,9 @@ async def update_job(job_id: str, req: JobUpdate):
             if req.tokens_in is not None or req.tokens_out is not None:
                 t_in = int(req.tokens_in or 0)
                 t_out = int(req.tokens_out or 0)
-                cost_estimate = estimate_cost(prov or "unknown", mod or "unknown", t_in, t_out)
+                cost_estimate = estimate_cost(
+                    prov or "unknown", mod or "unknown", t_in, t_out
+                )
                 fields.extend(["tokens_in=?", "tokens_out=?", "estimated_cost_usd=?"])
                 args.extend([t_in, t_out, cost_estimate])
 
@@ -3299,13 +3781,19 @@ async def update_job(job_id: str, req: JobUpdate):
             if field_was_set(req, "eligible_kinds") and req.eligible_kinds is not None:
                 if old_status not in {"queued", "offered"}:
                     await db.execute("ROLLBACK")
-                    raise HTTPException(409, f"eligible_kinds can only be updated on queued/offered jobs, not {old_status!r}")
+                    raise HTTPException(
+                        409,
+                        f"eligible_kinds can only be updated on queued/offered jobs, not {old_status!r}",
+                    )
                 fields.append("eligible_kinds=?")
                 args.append(json.dumps(req.eligible_kinds))
             if field_was_set(req, "eligible_hosts") and req.eligible_hosts is not None:
                 if old_status not in {"queued", "offered"}:
                     await db.execute("ROLLBACK")
-                    raise HTTPException(409, f"eligible_hosts can only be updated on queued/offered jobs, not {old_status!r}")
+                    raise HTTPException(
+                        409,
+                        f"eligible_hosts can only be updated on queued/offered jobs, not {old_status!r}",
+                    )
                 fields.append("eligible_hosts=?")
                 args.append(json.dumps(req.eligible_hosts))
 
@@ -3366,7 +3854,7 @@ async def update_job(job_id: str, req: JobUpdate):
             # On failed: auto-retry if under max_retries. Exponential backoff: 30s x 2^retry_count
             retried = False
             if req.status == "failed" and retry_count < max_retries:
-                backoff = 30.0 * (2 ** retry_count)
+                backoff = 30.0 * (2**retry_count)
                 next_at = time.time() + backoff
                 await db.execute(
                     "UPDATE jobs SET status='queued', retry_count=retry_count+1, "
@@ -3383,15 +3871,29 @@ async def update_job(job_id: str, req: JobUpdate):
             # Gate on a REAL non-terminal -> terminal transition: done->done /
             # failed->failed are allowed (idempotent re-PATCH), so without this guard a
             # duplicate terminal PATCH would double-count stats AND the usage_ledger cost.
-            if req.status in TERMINAL_JOB_STATUSES and old_status not in TERMINAL_JOB_STATUSES:
+            if (
+                req.status in TERMINAL_JOB_STATUSES
+                and old_status not in TERMINAL_JOB_STATUSES
+            ):
                 async with db.execute(
                     "SELECT kind, description, max_cost_tier, required_capabilities, "
                     "claimed_model, claimed_provider, claimed_by, result, started_at "
-                    "FROM jobs WHERE id=?", (job_id,)
+                    "FROM jobs WHERE id=?",
+                    (job_id,),
                 ) as cur2:
                     jrow = await cur2.fetchone()
                 if jrow:
-                    kind_j, desc_j, mtier, reqcaps_json, mdl_j, prov_j, claimed_by_j, result_j, started_j = jrow
+                    (
+                        kind_j,
+                        desc_j,
+                        mtier,
+                        reqcaps_json,
+                        mdl_j,
+                        prov_j,
+                        claimed_by_j,
+                        result_j,
+                        started_j,
+                    ) = jrow
                     # Workers carry real token usage + the ACTUAL gateway
                     # model/provider INSIDE result, not as top-level PATCH
                     # fields, so cost was never computed before (usage_ledger
@@ -3403,8 +3905,16 @@ async def update_job(job_id: str, req: JobUpdate):
                         _rd = req.result or {}
                     if not isinstance(_rd, dict):
                         _rd = {}
-                    rt_in = _safe_nonneg_int(req.tokens_in if req.tokens_in is not None else _rd.get("tokens_in"))
-                    rt_out = _safe_nonneg_int(req.tokens_out if req.tokens_out is not None else _rd.get("tokens_out"))
+                    rt_in = _safe_nonneg_int(
+                        req.tokens_in
+                        if req.tokens_in is not None
+                        else _rd.get("tokens_in")
+                    )
+                    rt_out = _safe_nonneg_int(
+                        req.tokens_out
+                        if req.tokens_out is not None
+                        else _rd.get("tokens_out")
+                    )
                     rt_reason = _safe_nonneg_int(_rd.get("tokens_reasoning"))
                     # Some workers report only a combined total — attribute to output.
                     if rt_in == 0 and rt_out == 0 and _rd.get("tokens_total"):
@@ -3413,9 +3923,10 @@ async def update_job(job_id: str, req: JobUpdate):
                     eff_prov = _safe_str(_rd.get("gateway_provider") or prov_j)
                     # Cost estimation must never break the hot completion path.
                     try:
-                        job_cost = estimate_cost(eff_prov, eff_model, rt_in, rt_out) or 0
-                        if job_cost < 0:
-                            job_cost = 0
+                        job_cost = (
+                            estimate_cost(eff_prov, eff_model, rt_in, rt_out) or 0
+                        )
+                        job_cost = max(job_cost, 0)
                     except Exception as _ce:  # noqa: BLE001
                         print(f"cost estimate skipped for {job_id}: {_ce}", flush=True)
                         job_cost = 0
@@ -3426,8 +3937,16 @@ async def update_job(job_id: str, req: JobUpdate):
                         # per-restart session segment) so a worker's history
                         # aggregates across restarts instead of fragmenting.
                         worker_key = stable_worker_id(claimed_by_j)
-                        duration = (time.time() - (started_j or time.time())) if started_j else 0
-                        col = {"done": "success_count", "failed": "fail_count", "cancelled": "cancelled_count"}[req.status]
+                        duration = (
+                            (time.time() - (started_j or time.time()))
+                            if started_j
+                            else 0
+                        )
+                        col = {
+                            "done": "success_count",
+                            "failed": "fail_count",
+                            "cancelled": "cancelled_count",
+                        }[req.status]
                         await db.execute(
                             f"INSERT INTO worker_kind_stats (urn, kind, {col}, total_tokens_in, total_tokens_out, "
                             f"total_cost_usd, total_duration_sec, last_run) "
@@ -3440,11 +3959,18 @@ async def update_job(job_id: str, req: JobUpdate):
                             f"total_duration_sec = total_duration_sec + ?, "
                             f"last_run = ?",
                             (
-                                worker_key, kind_j,
-                                rt_in, rt_out,
-                                job_cost or 0, duration, time.time(),
-                                rt_in, rt_out,
-                                job_cost or 0, duration, time.time(),
+                                worker_key,
+                                kind_j,
+                                rt_in,
+                                rt_out,
+                                job_cost or 0,
+                                duration,
+                                time.time(),
+                                rt_in,
+                                rt_out,
+                                job_cost or 0,
+                                duration,
+                                time.time(),
                             ),
                         )
                         # Per-job cost ledger row (the hive cost tracker). Best-effort:
@@ -3460,41 +3986,75 @@ async def update_job(job_id: str, req: JobUpdate):
                                 "subscription_amortized, path_kind) "
                                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSTIMESTAMP, ?, ?, ?, ?)",
                                 (
-                                    eff_prov, eff_model, kind_j, rt_in, rt_out, rt_reason,
-                                    job_cost or 0, max(0, int(duration * 1000)),
+                                    eff_prov,
+                                    eff_model,
+                                    kind_j,
+                                    rt_in,
+                                    rt_out,
+                                    rt_reason,
+                                    job_cost or 0,
+                                    max(0, int(duration * 1000)),
                                     # outcome is constrained to ('ok','err','timeout')
                                     "ok" if req.status == "done" else "err",
-                                    "hive", (mtier or "A").upper(), claimed_by_j, 1,
-                                    1 if (eff_prov or "").lower() in SUBSCRIPTION_PROVIDERS else 0,
+                                    "hive",
+                                    (mtier or "A").upper(),
+                                    claimed_by_j,
+                                    1,
+                                    1
+                                    if (eff_prov or "").lower()
+                                    in SUBSCRIPTION_PROVIDERS
+                                    else 0,
                                     str(_rd.get("via") or "worker"),
                                 ),
                             )
                         except Exception as _le:
-                            print(f"usage_ledger write skipped for {job_id}: {_le}", flush=True)
+                            print(
+                                f"usage_ledger write skipped for {job_id}: {_le}",
+                                flush=True,
+                            )
                     if req.status == "done":
-                        ck = cache_key_for(kind_j, desc_j, (mtier or "A").upper(),
-                                           json_list(reqcaps_json))
+                        ck = cache_key_for(
+                            kind_j,
+                            desc_j,
+                            (mtier or "A").upper(),
+                            json_list(reqcaps_json),
+                        )
                         rdict = json.loads(result_j) if result_j else (req.result or {})
                         ec = (rdict or {}).get("exit_code")
-                        # NEVER cache a non-terminal / unlanded result. A spark
-                        # needs-review result (work is a patch on spark-0c53, NOT
-                        # landed) has exit_code=None and would otherwise be served
-                        # as an instant fake-"done" to every matching resubmit
-                        # (the 73 orphaned FRI jobs, 2026-06-07). Only cache real
+                        # NEVER cache a non-terminal / unlanded result. A
+                        # needs-review result (work is a patch, NOT landed) has
+                        # exit_code=None and would otherwise be served as an
+                        # instant fake-"done" to every matching resubmit (the 73
+                        # orphaned FRI jobs, 2026-06-07). Only cache real
                         # completed work: not needs_review, and either it carries
                         # commits or it is a non-workspace job (no repo to commit).
-                        _nr = bool((rdict or {}).get("needs_review")) or \
-                              (rdict or {}).get("status") == "needs-review"
+                        _nr = (
+                            bool((rdict or {}).get("needs_review"))
+                            or (rdict or {}).get("status") == "needs-review"
+                        )
                         if (ec == 0 or ec is None) and not _nr:
-                            await cache_store(db, ck, job_id, rdict, req.result_mnemos_id,
-                                              mdl_j or "unknown", prov_j or "unknown", cost_estimate or 0)
+                            await cache_store(
+                                db,
+                                ck,
+                                job_id,
+                                rdict,
+                                req.result_mnemos_id,
+                                mdl_j or "unknown",
+                                prov_j or "unknown",
+                                cost_estimate or 0,
+                            )
 
             await db.execute(
                 "INSERT INTO job_audit_log (job_id, ts, actor_urn, old_status, new_status, "
                 "old_claimed_by, new_claimed_by, patch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    job_id, now, req.claimed_by or old_claimed_by, old_status,
-                    "dead-letter" if dead_lettered else ("queued" if retried else req.status),
+                    job_id,
+                    now,
+                    req.claimed_by or old_claimed_by,
+                    old_status,
+                    "dead-letter"
+                    if dead_lettered
+                    else ("queued" if retried else req.status),
                     old_claimed_by,
                     None if release_to_queue else effective_claimed_by,
                     json.dumps(patch_payload, default=str),
@@ -3509,34 +4069,57 @@ async def update_job(job_id: str, req: JobUpdate):
 
     async with connect_db() as event_db:
         if req.status == "failed" and retry_count < max_retries:
-            await emit_event(event_db, "job.retry", {
-                "id": job_id, "retry_count": retry_count + 1,
-                "max_retries": max_retries,
-            })
+            await emit_event(
+                event_db,
+                "job.retry",
+                {
+                    "id": job_id,
+                    "retry_count": retry_count + 1,
+                    "max_retries": max_retries,
+                },
+            )
         if dead_lettered:
             # Emit ONLY the effective terminal event; suppress the misleading
             # job.queued (the inbound PATCH was queued but the job was diverted).
-            await emit_event(event_db, "job.dead-letter", {
-                "id": job_id, "claimed_by": req.claimed_by or old_claimed_by,
-                "last_decline_reason": decline_reason,
-                "decline_threshold": MAX_DECLINE_REQUEUES,
-            })
+            await emit_event(
+                event_db,
+                "job.dead-letter",
+                {
+                    "id": job_id,
+                    "claimed_by": req.claimed_by or old_claimed_by,
+                    "last_decline_reason": decline_reason,
+                    "decline_threshold": MAX_DECLINE_REQUEUES,
+                },
+            )
         else:
-            await emit_event(event_db, f"job.{req.status}", {
-                "id": job_id, "claimed_by": req.claimed_by or old_claimed_by,
-                "tokens_in": req.tokens_in, "tokens_out": req.tokens_out,
-                "estimated_cost_usd": cost_estimate,
-            })
+            await emit_event(
+                event_db,
+                f"job.{req.status}",
+                {
+                    "id": job_id,
+                    "claimed_by": req.claimed_by or old_claimed_by,
+                    "tokens_in": req.tokens_in,
+                    "tokens_out": req.tokens_out,
+                    "estimated_cost_usd": cost_estimate,
+                },
+            )
     if completion_rejected:
         # Older workers delete successful checkouts after HTTP 200. Returning
         # non-200 is necessary until those workers have all been upgraded.
-        return JSONResponse(status_code=409, content={
-            "ok": False, "status": "needs-review", "reason": "completion_evidence_missing"
-        })
-    return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate,
-            "dead_lettered": dead_lettered}
-
-
+        return JSONResponse(
+            status_code=409,
+            content={
+                "ok": False,
+                "status": "needs-review",
+                "reason": "completion_evidence_missing",
+            },
+        )
+    return {
+        "ok": True,
+        "ts": now,
+        "estimated_cost_usd": cost_estimate,
+        "dead_lettered": dead_lettered,
+    }
 
 
 @app.post("/v1/jobs/{job_id}/auto-retry")
@@ -3596,11 +4179,12 @@ class RequeueRequest(BaseModel):
 @app.post("/v1/admin/jobs/requeue", dependencies=[Depends(require_mutation_actor)])
 async def admin_requeue_jobs(req: RequeueRequest):
     """Force-requeue terminal (failed/cancelled) or any non-done jobs back to queued."""
-    now = time.time()
     results = {"ok": [], "not_found": [], "skipped_done": []}
     async with connect_db() as db:
         for job_id in req.job_ids:
-            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+            async with db.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)
+            ) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -3623,6 +4207,7 @@ class PurgeRequest(BaseModel):
     job_ids: list[str]
     reason: str = "doctor-dlq-remove"
 
+
 @app.post("/v1/admin/jobs/purge", dependencies=[Depends(require_mutation_actor)])
 async def admin_purge_jobs(req: PurgeRequest):
     """Permanently remove terminal dead-letter jobs (doctor 'remove' action).
@@ -3633,7 +4218,9 @@ async def admin_purge_jobs(req: PurgeRequest):
     results: dict = {"ok": [], "not_found": [], "skipped_not_dead_letter": []}
     async with connect_db() as db:
         for job_id in req.job_ids:
-            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+            async with db.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)
+            ) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -3641,12 +4228,16 @@ async def admin_purge_jobs(req: PurgeRequest):
             if row[0] != "dead-letter":
                 results["skipped_not_dead_letter"].append(job_id)
                 continue
-            await db.execute("DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,))
+            await db.execute(
+                "DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,)
+            )
             await db.commit()
             results["ok"].append(job_id)
     async with connect_db() as event_db:
         for job_id in results["ok"]:
-            await emit_event(event_db, "job.purged", {"id": job_id, "reason": req.reason})
+            await emit_event(
+                event_db, "job.purged", {"id": job_id, "reason": req.reason}
+            )
     return results
 
 
@@ -3658,7 +4249,10 @@ async def admin_purge_jobs(req: PurgeRequest):
 # parameters (no string interpolation of caller input -> no SQL injection).
 # ---------------------------------------------------------------------------
 
-async def _cascade_delete_jobs(db, job_ids: list[str], *, allow_active: bool = False) -> list[str]:
+
+async def _cascade_delete_jobs(
+    db, job_ids: list[str], *, allow_active: bool = False
+) -> list[str]:
     """Delete the given jobs and their job_audit_log rows. ATOMIC active-job guard
     (codex review #3): the job row is deleted with a compare-and-delete predicate
     that re-checks status AT DELETE TIME, so a job that was queued/offered at SELECT
@@ -3727,19 +4321,22 @@ async def delete_job(job_id: str, force: bool = False):
             f"job {job_id} became in-flight during delete; pass ?force=true to override",
         )
     async with connect_db() as event_db:
-        await emit_event(event_db, "job.deleted",
-                         {"id": job_id, "prior_status": status, "forced": force})
+        await emit_event(
+            event_db,
+            "job.deleted",
+            {"id": job_id, "prior_status": status, "forced": force},
+        )
     return {"deleted": 1, "id": job_id, "prior_status": status}
 
 
 class JobPurgeRequest(BaseModel):
-    kind_prefix: Optional[str] = None
-    status: Optional[str] = None
-    statuses: Optional[list[str]] = None
-    description_contains: Optional[str] = None
-    submitter_urn: Optional[str] = None
-    older_than_seconds: Optional[float] = None
-    ids: Optional[list[str]] = None
+    kind_prefix: str | None = None
+    status: str | None = None
+    statuses: list[str] | None = None
+    description_contains: str | None = None
+    submitter_urn: str | None = None
+    older_than_seconds: float | None = None
+    ids: list[str] | None = None
     include_active: bool = False
     reason: str = "housekeeping-purge"
 
@@ -3771,9 +4368,14 @@ async def purge_jobs(req: JobPurgeRequest):
     # in-flight guard, so it MUST be paired with at least one narrow selector
     # (codex review #2 round 2): age/status-only + include_active could otherwise
     # delete ~all jobs incl. running ones.
-    has_narrow = any([
-        req.kind_prefix, req.description_contains, req.submitter_urn, req.ids,
-    ])
+    has_narrow = any(
+        [
+            req.kind_prefix,
+            req.description_contains,
+            req.submitter_urn,
+            req.ids,
+        ]
+    )
     if req.include_active and not has_narrow:
         raise HTTPException(
             422,
@@ -3782,11 +4384,16 @@ async def purge_jobs(req: JobPurgeRequest):
             "a broad age/status-only purge may not target in-flight jobs",
         )
 
-    has_filter = any([
-        req.kind_prefix, statuses, req.description_contains,
-        req.submitter_urn, req.older_than_seconds is not None,
-        req.ids,
-    ])
+    has_filter = any(
+        [
+            req.kind_prefix,
+            statuses,
+            req.description_contains,
+            req.submitter_urn,
+            req.older_than_seconds is not None,
+            req.ids,
+        ]
+    )
     if not has_filter:
         raise HTTPException(
             422,
@@ -3803,8 +4410,11 @@ async def purge_jobs(req: JobPurgeRequest):
     if req.kind_prefix:
         # Escape LIKE metacharacters so a literal '%'/'_' in the prefix cannot turn
         # into a match-all wildcard (codex review #2). 'kind%' anchors the prefix.
-        kp = (req.kind_prefix
-              .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        kp = (
+            req.kind_prefix.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         wheres.append("kind LIKE ? ESCAPE '\\'")
         params.append(kp + "%")
     if statuses:
@@ -3813,8 +4423,11 @@ async def purge_jobs(req: JobPurgeRequest):
     if req.description_contains:
         wheres.append("description LIKE ?")
         # escape LIKE metacharacters in caller input so % / _ are literal
-        esc = (req.description_contains
-               .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        esc = (
+            req.description_contains.replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         params.append("%" + esc + "%")
         # NB: ESCAPE clause appended below for the description predicate only
         wheres[-1] = "description LIKE ? ESCAPE '\\'"
@@ -3830,9 +4443,7 @@ async def purge_jobs(req: JobPurgeRequest):
 
     # Active-job guard: unless explicitly included, never match in-flight work.
     if not req.include_active:
-        wheres.append(
-            "status NOT IN (%s)" % ",".join("?" for _ in ACTIVE_JOB_STATUSES)
-        )
+        wheres.append("status NOT IN (%s)" % ",".join("?" for _ in ACTIVE_JOB_STATUSES))
         params.extend(ACTIVE_JOB_STATUSES)
 
     select_sql = "SELECT id FROM jobs WHERE " + " AND ".join(wheres)
@@ -3845,12 +4456,14 @@ async def purge_jobs(req: JobPurgeRequest):
             # cascade re-checks status at delete time, so a job that got claimed
             # between SELECT and DELETE is skipped (atomic guard, codex review #3).
             deleted = await _cascade_delete_jobs(
-                db, matched, allow_active=req.include_active)
+                db, matched, allow_active=req.include_active
+            )
             await db.commit()
     if deleted:
         async with connect_db() as event_db:
-            await emit_event(event_db, "jobs.purged",
-                             {"count": len(deleted), "reason": req.reason})
+            await emit_event(
+                event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason}
+            )
     return {"deleted": len(deleted), "matched_ids": deleted}
 
 
@@ -3859,10 +4472,12 @@ async def purge_jobs(req: JobPurgeRequest):
 # human). Used by the doctor for ambiguous dead-letter jobs.
 RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
 
+
 class ReclassifyRequest(BaseModel):
     job_ids: list[str]
     status: str
     reason: str = "doctor-dlq-reclassify"
+
 
 @app.post("/v1/admin/jobs/reclassify", dependencies=[Depends(require_mutation_actor)])
 async def admin_reclassify_jobs(req: ReclassifyRequest):
@@ -3870,11 +4485,15 @@ async def admin_reclassify_jobs(req: ReclassifyRequest):
     status, bypassing ALLOWED_TRANSITIONS. The doctor uses status='needs-review'
     to surface ambiguous dead-letter jobs for a human."""
     if req.status not in RECLASSIFY_ALLOWED_TARGETS:
-        raise HTTPException(422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}")
+        raise HTTPException(
+            422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}"
+        )
     results: dict = {"ok": [], "not_found": [], "skipped_done": []}
     async with connect_db() as db:
         for job_id in req.job_ids:
-            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+            async with db.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)
+            ) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -3898,8 +4517,11 @@ async def admin_reclassify_jobs(req: ReclassifyRequest):
             results["ok"].append(job_id)
     async with connect_db() as event_db:
         for job_id in results["ok"]:
-            await emit_event(event_db, "job.reclassified", {
-                "id": job_id, "new_status": req.status, "reason": req.reason})
+            await emit_event(
+                event_db,
+                "job.reclassified",
+                {"id": job_id, "new_status": req.status, "reason": req.reason},
+            )
     return results
 
 
@@ -3915,7 +4537,9 @@ async def create_schedule(req: ScheduleCreate):
     try:
         tpl_copy = dict(req.job_template)
         if not tpl_copy.get("submitter_urn"):
-            raise ValueError("job_template.submitter_urn is required and must be a registered orchestrator")
+            raise ValueError(
+                "job_template.submitter_urn is required and must be a registered orchestrator"
+            )
         JobCreate(**tpl_copy)
     except Exception as e:
         raise HTTPException(422, f"job_template invalid: {e}")
@@ -3925,9 +4549,16 @@ async def create_schedule(req: ScheduleCreate):
             "INSERT INTO scheduled_jobs (id, name, created_by_urn, interval_seconds, "
             "job_template, enabled, last_fired_at, next_fire_at, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
-            (sid, req.name, tpl_copy.get("submitter_urn"), int(req.interval_seconds),
-             json.dumps(req.job_template), 1 if req.enabled else 0,
-             now + req.interval_seconds, now),
+            (
+                sid,
+                req.name,
+                tpl_copy.get("submitter_urn"),
+                int(req.interval_seconds),
+                json.dumps(req.job_template),
+                1 if req.enabled else 0,
+                now + req.interval_seconds,
+                now,
+            ),
         )
         await db.commit()
     return {"id": sid, "name": req.name, "next_fire_at": now + req.interval_seconds}
@@ -3936,24 +4567,34 @@ async def create_schedule(req: ScheduleCreate):
 @app.get("/v1/schedules")
 async def list_schedules():
     rows = []
-    async with connect_db() as db:
-        async with db.execute(
+    async with (
+        connect_db() as db,
+        db.execute(
             "SELECT id, name, created_by_urn, interval_seconds, enabled, "
             "last_fired_at, next_fire_at, fire_count, created_at FROM scheduled_jobs"
-        ) as cur:
-            async for r in cur:
-                rows.append({
-                    "id": r[0], "name": r[1], "created_by": r[2],
-                    "interval_seconds": r[3], "enabled": bool(r[4]),
-                    "last_fired_at": r[5], "next_fire_at": r[6],
-                    "fire_count": r[7], "created_at": r[8],
-                })
+        ) as cur,
+    ):
+        async for r in cur:
+            rows.append(
+                {
+                    "id": r[0],
+                    "name": r[1],
+                    "created_by": r[2],
+                    "interval_seconds": r[3],
+                    "enabled": bool(r[4]),
+                    "last_fired_at": r[5],
+                    "next_fire_at": r[6],
+                    "fire_count": r[7],
+                    "created_at": r[8],
+                }
+            )
     return {"count": len(rows), "schedules": rows}
 
 
 @app.patch("/v1/schedules/{sid}")
-async def patch_schedule(sid: str, enabled: Optional[bool] = None,
-                         interval_seconds: Optional[int] = None):
+async def patch_schedule(
+    sid: str, enabled: bool | None = None, interval_seconds: int | None = None
+):
     sets, args = [], []
     if enabled is not None:
         sets.append("enabled=?")
@@ -3970,7 +4611,8 @@ async def patch_schedule(sid: str, enabled: Optional[bool] = None,
     args.append(sid)
     async with connect_db() as db:
         cur = await db.execute(
-            f"UPDATE scheduled_jobs SET {', '.join(sets)} WHERE id=?", args)
+            f"UPDATE scheduled_jobs SET {', '.join(sets)} WHERE id=?", args
+        )
         await db.commit()
     if cur.rowcount == 0:
         raise HTTPException(404, "schedule not found")
@@ -3988,20 +4630,23 @@ async def delete_schedule(sid: str):
 
 
 @app.get("/v1/stats/workers")
-async def worker_stats(kind: Optional[str] = None, top_n: int = 30,
-                       include_system: bool = False):
+async def worker_stats(
+    kind: str | None = None, top_n: int = 30, include_system: bool = False
+):
     """Per-worker per-kind capability scores. Submitters use this to pick best worker for a kind.
 
     #8 FIX (review 2026-05-23): exclude `system` kind agents by default (they're host monitors,
     not compute workers — including them was misleading). Pass include_system=true to override.
     """
     top_n = clamp_limit(top_n, default=30, max_limit=500)
-    sql = ("SELECT urn, kind, success_count, fail_count, cancelled_count, "
-           "total_tokens_in, total_tokens_out, ROUND(total_cost_usd,4), "
-           "ROUND(total_duration_sec/NULLIF(success_count+fail_count,0),1) AS avg_dur, "
-           "datetime(last_run,'unixepoch') AS last_run, "
-           "ROUND(100.0 * success_count / NULLIF(success_count+fail_count+cancelled_count,0), 1) AS success_pct "
-           "FROM worker_kind_stats WHERE 1=1")
+    sql = (
+        "SELECT urn, kind, success_count, fail_count, cancelled_count, "
+        "total_tokens_in, total_tokens_out, ROUND(total_cost_usd,4), "
+        "ROUND(total_duration_sec/NULLIF(success_count+fail_count,0),1) AS avg_dur, "
+        "datetime(last_run,'unixepoch') AS last_run, "
+        "ROUND(100.0 * success_count / NULLIF(success_count+fail_count+cancelled_count,0), 1) AS success_pct "
+        "FROM worker_kind_stats WHERE 1=1"
+    )
     args: list = []
     if kind:
         sql += " AND kind=?"
@@ -4011,16 +4656,23 @@ async def worker_stats(kind: Optional[str] = None, top_n: int = 30,
     sql += " ORDER BY success_count DESC, success_pct DESC LIMIT ?"
     args.append(top_n)
     rows = []
-    async with connect_db() as db:
-        async with db.execute(sql, args) as cur:
-            async for r in cur:
-                rows.append({
-                    "urn": r[0], "kind": r[1],
-                    "success_count": r[2], "fail_count": r[3], "cancelled_count": r[4],
-                    "total_tokens_in": r[5], "total_tokens_out": r[6],
-                    "total_cost_usd": r[7], "avg_duration_sec": r[8],
-                    "last_run": r[9], "success_pct": r[10],
-                })
+    async with connect_db() as db, db.execute(sql, args) as cur:
+        async for r in cur:
+            rows.append(
+                {
+                    "urn": r[0],
+                    "kind": r[1],
+                    "success_count": r[2],
+                    "fail_count": r[3],
+                    "cancelled_count": r[4],
+                    "total_tokens_in": r[5],
+                    "total_tokens_out": r[6],
+                    "total_cost_usd": r[7],
+                    "avg_duration_sec": r[8],
+                    "last_run": r[9],
+                    "success_pct": r[10],
+                }
+            )
     return {"count": len(rows), "workers": rows}
 
 
@@ -4033,8 +4685,11 @@ async def cache_stats(top_n: int = 20):
             "SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache"
         ) as cur:
             r = await cur.fetchone()
-        totals = {"cached_jobs": r[0] or 0, "total_hits": r[1] or 0,
-                  "total_cost_saved_usd": r[2] or 0}
+        totals = {
+            "cached_jobs": r[0] or 0,
+            "total_hits": r[1] or 0,
+            "total_cost_saved_usd": r[2] or 0,
+        }
         # job-side stats
         async with db.execute(
             "SELECT COUNT(*) FROM jobs WHERE result LIKE '%\"cache_hit\": true%'"
@@ -4046,16 +4701,21 @@ async def cache_stats(top_n: int = 20):
             "SELECT cache_key, hit_count, cost_saved_usd, model, provider, "
             "datetime(cached_at,'unixepoch') AS cached_at, source_job_id "
             "FROM hive_cache ORDER BY hit_count DESC, cost_saved_usd DESC LIMIT ?",
-            (top_n,)
+            (top_n,),
         ) as cur:
             entries = []
             async for row in cur:
-                entries.append({
-                    "cache_key": row[0][:16], "hit_count": row[1],
-                    "cost_saved_usd": row[2], "model": row[3],
-                    "provider": row[4], "cached_at": row[5],
-                    "source_job_id": row[6],
-                })
+                entries.append(
+                    {
+                        "cache_key": row[0][:16],
+                        "hit_count": row[1],
+                        "cost_saved_usd": row[2],
+                        "model": row[3],
+                        "provider": row[4],
+                        "cached_at": row[5],
+                        "source_job_id": row[6],
+                    }
+                )
     return {"totals": totals, "top_entries": entries}
 
 
@@ -4064,23 +4724,36 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
     """Aggregated cost stats. group_by: provider | model | runtime | cost_tier | claimed_by | day.
     since_hours: window in hours (default 168 = 7 days).
     """
-    if group_by not in {"provider", "model", "runtime", "cost_tier", "claimed_by", "day", "kind"}:
-        raise HTTPException(422, "group_by must be one of: provider, model, runtime, cost_tier, claimed_by, day, kind")
+    if group_by not in {
+        "provider",
+        "model",
+        "runtime",
+        "cost_tier",
+        "claimed_by",
+        "day",
+        "kind",
+    }:
+        raise HTTPException(
+            422,
+            "group_by must be one of: provider, model, runtime, cost_tier, claimed_by, day, kind",
+        )
     cutoff = time.time() - since_hours * 3600
     if group_by == "day":
         sel = "DATE(ended_at, 'unixepoch')"
     elif group_by == "provider":
         # Derive REAL provider from result.agent_alias (the alias that did the work),
         # NOT claimed_provider (which carries the zeroclaw #7066 label-lie = openai/codex).
-        sel = ("CASE "
-               "WHEN JSON_VALUE(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
-               "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
-               "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
-               "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
-               "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_together%' THEN 'together' "
-               "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
-               "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
-               "ELSE COALESCE(claimed_provider,'unknown') END")
+        sel = (
+            "CASE "
+            "WHEN JSON_VALUE(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
+            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
+            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
+            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
+            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_together%' THEN 'together' "
+            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
+            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
+            "ELSE COALESCE(claimed_provider,'unknown') END"
+        )
     elif group_by == "model":
         sel = "COALESCE(claimed_model,'unknown')"
     elif group_by == "runtime":
@@ -4102,14 +4775,18 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
         f"GROUP BY bucket ORDER BY tot_cost_usd DESC, job_count DESC"
     )
     rows = []
-    async with connect_db() as db:
-        async with db.execute(sql, (cutoff,)) as cur:
-            async for r in cur:
-                rows.append({
-                    "bucket": r[0], "job_count": r[1],
-                    "tokens_in": r[2], "tokens_out": r[3],
-                    "estimated_cost_usd": r[4], "avg_duration_sec": r[5],
-                })
+    async with connect_db() as db, db.execute(sql, (cutoff,)) as cur:
+        async for r in cur:
+            rows.append(
+                {
+                    "bucket": r[0],
+                    "job_count": r[1],
+                    "tokens_in": r[2],
+                    "tokens_out": r[3],
+                    "estimated_cost_usd": r[4],
+                    "avg_duration_sec": r[5],
+                }
+            )
     # totals
     totals = {
         "job_count": sum(r["job_count"] for r in rows),
@@ -4117,7 +4794,12 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
         "tokens_out": sum(r["tokens_out"] or 0 for r in rows),
         "estimated_cost_usd": round(sum(r["estimated_cost_usd"] or 0 for r in rows), 4),
     }
-    return {"since_hours": since_hours, "group_by": group_by, "totals": totals, "buckets": rows}
+    return {
+        "since_hours": since_hours,
+        "group_by": group_by,
+        "totals": totals,
+        "buckets": rows,
+    }
 
 
 # ── KNEMON COST-AWARE ROUTER (2026-06-02) ────────────────────────────────────
@@ -4135,8 +4817,8 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
 # described A=premium which is INVERTED from the code; the code convention wins.
 #
 # Working provider set (operator 2026-06-01): deepseek/groq/together/xai/gemini/
-# siliconflow. EXCLUDED: codex (review-only, scarce OAuth pool), nvidia (Spark-
-# only, not integrated). Each entry: provider, model, worker alias, $/1M-out
+# siliconflow. EXCLUDED: codex (review-only, scarce OAuth pool), nvidia (not
+# integrated). Each entry: provider, model, worker alias, $/1M-out
 # (used only as the deterministic cheapest-first sort key).
 #
 # alias = the hive_* agent alias the wss worker dispatches to (gateway maps it
@@ -4144,22 +4826,42 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
 # like its local TIER_CHAINS values.
 KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # provider,         model,                 alias,                  in,    out
-    {"provider": "groq",      "model": "gpt-oss-20b",          "alias": "hive_groq_1",        "tier": "B"},
-    {"provider": "gemini",    "model": "gemini-2.5-flash-lite","alias": "hive_gemini_1",      "tier": "B"},
+    {"provider": "groq", "model": "gpt-oss-20b", "alias": "hive_groq_1", "tier": "B"},
+    {
+        "provider": "gemini",
+        "model": "gemini-2.5-flash-lite",
+        "alias": "hive_gemini_1",
+        "tier": "B",
+    },
     # FORBIDDEN 2026-09-07 (operator): neither deepseek nor siliconflow may be
     # used directly, fleet-wide. Both providers removed from the candidate
     # pool (siliconflow was already disabled 2026-06-03 for an invalid key;
     # deepseek-direct's two aliases hive_deepseek_1/hive_deepseek_pro_1 are
     # struck below, not just disabled).
-    {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
-    {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
+    {
+        "provider": "together",
+        "model": "minimax-m2.7",
+        "alias": "hive_together_1",
+        "tier": "B",
+    },
+    {"provider": "xai", "model": "grok-4.1-fast", "alias": "hive_xai_1", "tier": "B"},
     # REMOVED 2026-06-17 (operator: "remove ngc-review from all agents" +
     # compute edict: EIH frontier forbidden). hive_ngc_1 (ngc-proxy gpt-5.5 via
     # the .4 EIH gateway) is no longer a coding/review candidate for any agent.
     # Bedrock Nova (funded AWS creds, worker agents shipped 2026-06-02):
     # cheap metered fallbacks (lite 0.06/0.24, micro 0.035/0.14).
-    {"provider": "bedrock",   "model": "amazon.nova-lite-v1:0", "alias": "hive_nova_1",       "tier": "B"},
-    {"provider": "bedrock",   "model": "amazon.nova-micro-v1:0","alias": "hive_nova_2",       "tier": "B"},
+    {
+        "provider": "bedrock",
+        "model": "amazon.nova-lite-v1:0",
+        "alias": "hive_nova_1",
+        "tier": "B",
+    },
+    {
+        "provider": "bedrock",
+        "model": "amazon.nova-micro-v1:0",
+        "alias": "hive_nova_2",
+        "tier": "B",
+    },
 ]
 
 
@@ -4171,7 +4873,9 @@ def knemon_candidates(max_tier: str, kind: str = "") -> list[dict[str, Any]]:
     stable deterministic tie-break. Providers whose cost tier exceeds the budget
     ceiling are excluded.
     """
-    ceiling_idx = COST_TIERS.index(max_tier) if max_tier in COST_TIERS else len(COST_TIERS) - 1
+    ceiling_idx = (
+        COST_TIERS.index(max_tier) if max_tier in COST_TIERS else len(COST_TIERS) - 1
+    )
     out: list[dict[str, Any]] = []
     for p in KNEMON_PROVIDERS:
         # Effective cost tier is the per-entry, MODEL-SPECIFIC tier hint
@@ -4186,14 +4890,16 @@ def knemon_candidates(max_tier: str, kind: str = "") -> list[dict[str, Any]]:
         if COST_TIERS.index(eff_tier) > ceiling_idx:
             continue
         in_rate, out_rate = rate_for(p["provider"], p["model"])
-        out.append({
-            "provider": p["provider"],
-            "model": p["model"],
-            "alias": p["alias"],
-            "cost_tier": eff_tier,
-            "rate_in_per_1m": in_rate,
-            "rate_out_per_1m": out_rate,
-        })
+        out.append(
+            {
+                "provider": p["provider"],
+                "model": p["model"],
+                "alias": p["alias"],
+                "cost_tier": eff_tier,
+                "rate_in_per_1m": in_rate,
+                "rate_out_per_1m": out_rate,
+            }
+        )
     out.sort(key=lambda c: (c["rate_out_per_1m"], c["rate_in_per_1m"], c["provider"]))
     return out
 
@@ -4227,24 +4933,38 @@ OAUTH_CAP_PROBE_RATE = 0.05
 def oauth_cap_state() -> dict:
     """OAuth-cap circuit-breaker state. A worker that hits usage_limit on the codex/gpt
     lead POSTs /v1/knemon/cap, opening the breaker so knemon_route stops leading every job
-    with the doomed OAuth model. Auto-expires at capped_until (then a spark-lead probe
+    with the doomed OAuth model. Auto-expires at capped_until (then a probe
     resumes; a probe success clears the file via /v1/knemon/cap/clear)."""
     import json as _j
     import time as _t
+
     try:
         with open(KNEMON_CAP_FILE) as f:
             d = _j.load(f)
         until = float(d.get("capped_until") or 0)
         now = _t.time()
-        return {"capped": now < until, "capped_until": until, "hit_at": d.get("hit_at"),
-                "model": d.get("model"), "reporter": d.get("reporter"),
-                "verified": False, "remaining_sec": max(0, int(until - now))}
+        return {
+            "capped": now < until,
+            "capped_until": until,
+            "hit_at": d.get("hit_at"),
+            "model": d.get("model"),
+            "reporter": d.get("reporter"),
+            "verified": False,
+            "remaining_sec": max(0, int(until - now)),
+        }
     except Exception:
-        return {"capped": False, "capped_until": None, "hit_at": None,
-                "model": None, "reporter": None, "verified": False, "remaining_sec": 0}
+        return {
+            "capped": False,
+            "capped_until": None,
+            "hit_at": None,
+            "model": None,
+            "reporter": None,
+            "verified": False,
+            "remaining_sec": 0,
+        }
 
 
-def clear_oauth_cap() -> Optional[str]:
+def clear_oauth_cap() -> str | None:
     try:
         os.remove(KNEMON_CAP_FILE)  # no exists() pre-check (avoid TOCTOU)
     except FileNotFoundError:
@@ -4259,9 +4979,11 @@ async def knemon_providers():
     """Provider denylist for the worker llm-* capability probe (Phase 2). A
     family listed here is treated as globally dead; workers drop its llm-* cap.
     Set HIVE_PROVIDER_DENYLIST=comma,list (e.g. nvidia,eih)."""
-    denied = [p.strip().lower()
-              for p in os.environ.get("HIVE_PROVIDER_DENYLIST", "").split(",")
-              if p.strip()]
+    denied = [
+        p.strip().lower()
+        for p in os.environ.get("HIVE_PROVIDER_DENYLIST", "").split(",")
+        if p.strip()
+    ]
     return {"denied": denied}
 
 
@@ -4276,7 +4998,7 @@ async def knemon_route(req: Request):
         body = {}
     if not isinstance(body, dict):
         body = {}
-    raw_tier = (body.get("max_cost_tier") or body.get("tier") or "C")
+    raw_tier = body.get("max_cost_tier") or body.get("tier") or "C"
     max_tier = str(raw_tier).upper()
     if max_tier not in COST_TIERS:
         max_tier = "C"
@@ -4293,8 +5015,13 @@ async def knemon_route(req: Request):
     #   light/narrow (triage/docs/investigation) -> hive_gpt_mini (gpt-5.4-mini)
     #   everything else (coding default) -> hive_gpt (gpt-5.4)
     kl = kind.lower()
-    review_kind = any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial"))
-    arch_kind = any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:")
+    review_kind = any(
+        kl.startswith(p)
+        for p in ("review:", "codex", "doctor:codex-fix", "adversarial")
+    )
+    arch_kind = any(t in kl for t in ("architecture", "design")) or kl.startswith(
+        "heavy:"
+    )
     # DEEPSEEK POLICY (operator 2026-06-07) SUPERSEDED 2026-09-07: deepseek
     # direct is now FORBIDDEN fleet-wide, full stop — not just gated to
     # review/architecture. Both aliases are already struck from
@@ -4351,7 +5078,9 @@ async def knemon_route(req: Request):
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
-            if CODEX_SUB_LEAD and secrets.randbelow(10000) < int(OAUTH_CAP_PROBE_RATE * 10000):
+            if CODEX_SUB_LEAD and secrets.randbelow(10000) < int(
+                OAUTH_CAP_PROBE_RATE * 10000
+            ):
                 oauth_cap_probe = True
                 chain = list(CODEX_SUB_LEAD) + METERED_FALLBACK
             else:
@@ -4365,7 +5094,11 @@ async def knemon_route(req: Request):
     # a caller could bypass the deepseek/siliconflow removal above by simply
     # requesting one of the struck aliases directly as lead_alias — this was
     # the removal's only unvalidated entry point. Refuse it there too.
-    BANNED_LEAD_ALIASES = {"hive_deepseek_1", "hive_deepseek_pro_1", "hive_siliconflow_1"}
+    BANNED_LEAD_ALIASES = {
+        "hive_deepseek_1",
+        "hive_deepseek_pro_1",
+        "hive_siliconflow_1",
+    }
     if lead_alias and lead_alias not in BANNED_LEAD_ALIASES:
         chain = [lead_alias] + [a for a in chain if a != lead_alias]
     return {
@@ -4375,7 +5108,9 @@ async def knemon_route(req: Request):
         "knemon_bypass": bypass,
         "oauth_cap": cap,
         "oauth_cap_probe": oauth_cap_probe,
-        "oauth_cap_probe_rate": OAUTH_CAP_PROBE_RATE if cap.get("capped") and CODEX_SUB_LEAD else 0.0,
+        "oauth_cap_probe_rate": OAUTH_CAP_PROBE_RATE
+        if cap.get("capped") and CODEX_SUB_LEAD
+        else 0.0,
         "sub_lead": CODEX_SUB_LEAD,
         # codex/gpt sub agent first ($0 unlimited), metered open-weights as fallback
         "chain": chain,
@@ -4387,8 +5122,11 @@ async def knemon_route(req: Request):
 @app.get("/v1/knemon/bypass")
 async def knemon_bypass_get():
     """Read hive-level KNEMON bypass state."""
-    return {"ok": True, "bypass": knemon_bypass_active(),
-            "flag_file": KNEMON_BYPASS_FILE}
+    return {
+        "ok": True,
+        "bypass": knemon_bypass_active(),
+        "flag_file": KNEMON_BYPASS_FILE,
+    }
 
 
 @app.post("/v1/knemon/bypass", dependencies=[Depends(require_mutation_actor)])
@@ -4418,8 +5156,12 @@ async def knemon_bypass_set(req: Request):
 @app.get("/v1/knemon/cap")
 async def knemon_cap_get():
     """OAuth-cap circuit-breaker state (dashboard 5h countdown reads this)."""
-    return {"ok": True, "reset_sec": OAUTH_CAP_RESET_SEC,
-            "flag_file": KNEMON_CAP_FILE, **oauth_cap_state()}
+    return {
+        "ok": True,
+        "reset_sec": OAUTH_CAP_RESET_SEC,
+        "flag_file": KNEMON_CAP_FILE,
+        **oauth_cap_state(),
+    }
 
 
 @app.post("/v1/knemon/cap", dependencies=[Depends(require_mutation_actor)])
@@ -4431,6 +5173,7 @@ async def knemon_cap_set(req: Request):
     """
     import json as _j
     import time as _t
+
     try:
         body = await req.json()
     except Exception:
@@ -4459,7 +5202,9 @@ async def knemon_cap_set(req: Request):
         "hit_at": now,
         "capped_until": now + reset,
         "model": str(body.get("model") or ""),
-        "reporter": str(body.get("reporter") or body.get("worker") or body.get("host") or ""),
+        "reporter": str(
+            body.get("reporter") or body.get("worker") or body.get("host") or ""
+        ),
     }
     try:
         tmp = KNEMON_CAP_FILE + ".tmp"
@@ -4499,15 +5244,17 @@ async def knemon_spend(since_hours: int = 168):
     except (TypeError, ValueError):
         since_hours = 168
     cutoff = time.time() - since_hours * 3600
-    async with connect_db() as db:
-        async with db.execute(
+    async with (
+        connect_db() as db,
+        db.execute(
             "SELECT COUNT(*), ROUND(SUM(COALESCE(estimated_cost_usd,0)),4), "
             "SUM(COALESCE(tokens_in,0)), SUM(COALESCE(tokens_out,0)) "
             "FROM jobs WHERE ended_at IS NOT NULL AND ended_at >= ? "
             "AND estimated_cost_usd IS NOT NULL",
             (cutoff,),
-        ) as cur:
-            r = await cur.fetchone()
+        ) as cur,
+    ):
+        r = await cur.fetchone()
     return {
         "since_hours": since_hours,
         "jobs_with_cost": (r[0] or 0) if r else 0,
@@ -4517,24 +5264,23 @@ async def knemon_spend(since_hours: int = 168):
     }
 
 
-
 @app.get("/v1/jobs/metrics")
 async def job_metrics():
     counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT status, COUNT(*) FROM jobs GROUP BY status"
-        ) as cur:
-            async for status, count in cur:
-                counts["total"] += count
-                if status in {"queued", "offered"}:
-                    counts["pending"] += count
-                elif status in {"claimed", "running"}:
-                    counts["running"] += count
-                elif status == "done":
-                    counts["completed"] += count
-                elif status == "failed":
-                    counts["failed"] += count
+    async with (
+        connect_db() as db,
+        db.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status") as cur,
+    ):
+        async for status, count in cur:
+            counts["total"] += count
+            if status in {"queued", "offered"}:
+                counts["pending"] += count
+            elif status in {"claimed", "running"}:
+                counts["running"] += count
+            elif status == "done":
+                counts["completed"] += count
+            elif status == "failed":
+                counts["failed"] += count
     return counts
 
 
@@ -4573,10 +5319,23 @@ async def claim_job(job_id: str, by: str):
             agent_row = await cur.fetchone()
         if not agent_row:
             raise HTTPException(404, f"claim failed: agent not registered: {by}")
-        (agent_kind, caps_json, a_runtime, a_model, a_provider, a_tier,
-         a_auth, a_cap, a_used, agent_status) = agent_row
+        (
+            agent_kind,
+            caps_json,
+            a_runtime,
+            a_model,
+            a_provider,
+            a_tier,
+            a_auth,
+            a_cap,
+            a_used,
+            agent_status,
+        ) = agent_row
         if agent_status not in ACTIVE_AGENT_STATUSES:
-            raise HTTPException(409, f"claim failed: agent status is {agent_status!r}, not online/idle: {by}")
+            raise HTTPException(
+                409,
+                f"claim failed: agent status is {agent_status!r}, not online/idle: {by}",
+            )
         agent_caps = set(json.loads(caps_json)) if caps_json else set()
         eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
         a_tier = (a_tier or "C").upper()
@@ -4584,7 +5343,9 @@ async def claim_job(job_id: str, by: str):
             a_tier = "C"
         a_auth = (a_auth or "unknown").lower()
         sub_throttled = (
-            a_auth == "subscription" and a_cap and a_used
+            a_auth == "subscription"
+            and a_cap
+            and a_used
             and a_used >= THROTTLE_HEADROOM * a_cap
         )
 
@@ -4599,9 +5360,19 @@ async def claim_job(job_id: str, by: str):
             job_row = await cur.fetchone()
         if not job_row:
             raise HTTPException(404, f"job not found: {job_id}")
-        (j_status, j_kind, j_caps_json, j_kinds_json, j_hosts_json, j_max_tier,
-         j_pref_providers, j_pref_models, j_deps_json,
-         j_retry_backoff_until, j_started_at) = job_row
+        (
+            j_status,
+            j_kind,
+            j_caps_json,
+            j_kinds_json,
+            j_hosts_json,
+            j_max_tier,
+            j_pref_providers,
+            j_pref_models,
+            j_deps_json,
+            j_retry_backoff_until,
+            j_started_at,
+        ) = job_row
 
         urn_parts = by.split(":")
         agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
@@ -4660,7 +5431,11 @@ async def claim_job(job_id: str, by: str):
         }
         eligible, reason = job_agent_eligible(job, agent)
         if not eligible:
-            status = 422 if reason.startswith("job max_cost_tier") else (429 if reason.startswith("subscription agent throttled") else 403)
+            status = (
+                422
+                if reason.startswith("job max_cost_tier")
+                else (429 if reason.startswith("subscription agent throttled") else 403)
+            )
             raise HTTPException(status, reason)
 
         # 3. atomic claim with race guard + populate claimed_resources
@@ -4670,31 +5445,50 @@ async def claim_job(job_id: str, by: str):
             "claim_lease_expires_at=?, last_update_at=?, "
             "ended_at=NULL, result=NULL "
             "WHERE id=? AND status IN ('queued','offered')",
-            (by, now, a_runtime, a_model, a_provider, a_tier,
-             now + CLAIM_LEASE_SECONDS, now, job_id),
+            (
+                by,
+                now,
+                a_runtime,
+                a_model,
+                a_provider,
+                a_tier,
+                now + CLAIM_LEASE_SECONDS,
+                now,
+                job_id,
+            ),
         )
         await db.commit()
         if cur.rowcount == 0:
             raise HTTPException(409, "job already claimed or not available (race)")
-        await emit_event(db, "job.claimed", {
-            "id": job_id, "claimed_by": by,
-            "claimed_runtime": a_runtime, "claimed_model": a_model,
-            "claimed_provider": a_provider, "claimed_cost_tier": a_tier,
-            "manual_claim": True,
-        })
+        await emit_event(
+            db,
+            "job.claimed",
+            {
+                "id": job_id,
+                "claimed_by": by,
+                "claimed_runtime": a_runtime,
+                "claimed_model": a_model,
+                "claimed_provider": a_provider,
+                "claimed_cost_tier": a_tier,
+                "manual_claim": True,
+            },
+        )
     return {
-        "claimed": True, "ts": now,
-        "claimed_runtime": a_runtime, "claimed_model": a_model,
-        "claimed_provider": a_provider, "claimed_cost_tier": a_tier,
+        "claimed": True,
+        "ts": now,
+        "claimed_runtime": a_runtime,
+        "claimed_model": a_model,
+        "claimed_provider": a_provider,
+        "claimed_cost_tier": a_tier,
     }
 
 
 @app.get("/v1/jobs")
 async def list_jobs(
-    status: Optional[str] = None,
-    agent_urn: Optional[str] = None,
-    parent_job_id: Optional[str] = None,
-    since: Optional[float] = None,
+    status: str | None = None,
+    agent_urn: str | None = None,
+    parent_job_id: str | None = None,
+    since: float | None = None,
     limit: int = 100,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
@@ -4712,9 +5506,11 @@ async def list_jobs(
                 400,
                 f"unknown status {status!r}; valid: {sorted(VALID_JOB_STATUSES)}",
             )
-    sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-           "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-           "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE 1=1")
+    sql = (
+        "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
+        "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
+        "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE 1=1"
+    )
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -4756,20 +5552,31 @@ async def list_jobs(
             total = row[0] if row else 0
         async with db.execute(sql, args) as cur:
             async for r in cur:
-                rows.append({
-                    "id": r[0], "submitter_urn": r[1], "parent_job_id": r[2],
-                    "kind": r[3], "description": r[4], "priority": r[5],
-                    "status": r[6], "claimed_by": r[7],
-                    "started_at": r[8], "ended_at": r[9],
-                    "result": json.loads(r[10]) if r[10] else None,
-                    "estimated_cost_usd": r[11],
-                    "required_capabilities": json.loads(r[12]) if r[12] else None,
-                    "eligible_kinds": json.loads(r[13]) if r[13] else None,
-                    "eligible_hosts": json.loads(r[14]) if r[14] else None,
-                    "site": r[15], "repo": r[16],
-                    "head_branch": r[17], "pr_number": r[18],
-                    "max_retries": r[19], "retry_count": r[20],
-                })
+                rows.append(
+                    {
+                        "id": r[0],
+                        "submitter_urn": r[1],
+                        "parent_job_id": r[2],
+                        "kind": r[3],
+                        "description": r[4],
+                        "priority": r[5],
+                        "status": r[6],
+                        "claimed_by": r[7],
+                        "started_at": r[8],
+                        "ended_at": r[9],
+                        "result": json.loads(r[10]) if r[10] else None,
+                        "estimated_cost_usd": r[11],
+                        "required_capabilities": json.loads(r[12]) if r[12] else None,
+                        "eligible_kinds": json.loads(r[13]) if r[13] else None,
+                        "eligible_hosts": json.loads(r[14]) if r[14] else None,
+                        "site": r[15],
+                        "repo": r[16],
+                        "head_branch": r[17],
+                        "pr_number": r[18],
+                        "max_retries": r[19],
+                        "retry_count": r[20],
+                    }
+                )
     return {"count": len(rows), "total": total, "jobs": rows}
 
 
@@ -4782,23 +5589,33 @@ async def get_job(job_id: str):
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
             "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE id=?",
-            (job_id,)) as cur:
+            (job_id,),
+        ) as cur:
             r = await cur.fetchone()
     if not r:
         raise HTTPException(404, f"job not found: {job_id}")
     return {
-        "id": r[0], "submitter_urn": r[1], "parent_job_id": r[2],
-        "kind": r[3], "description": r[4], "priority": r[5],
-        "status": r[6], "claimed_by": r[7],
-        "started_at": r[8], "ended_at": r[9],
+        "id": r[0],
+        "submitter_urn": r[1],
+        "parent_job_id": r[2],
+        "kind": r[3],
+        "description": r[4],
+        "priority": r[5],
+        "status": r[6],
+        "claimed_by": r[7],
+        "started_at": r[8],
+        "ended_at": r[9],
         "result": json.loads(r[10]) if r[10] else None,
         "estimated_cost_usd": r[11],
         "required_capabilities": json.loads(r[12]) if r[12] else None,
         "eligible_kinds": json.loads(r[13]) if r[13] else None,
         "eligible_hosts": json.loads(r[14]) if r[14] else None,
-        "site": r[15], "repo": r[16],
-        "head_branch": r[17], "pr_number": r[18],
-        "max_retries": r[19], "retry_count": r[20],
+        "site": r[15],
+        "repo": r[16],
+        "head_branch": r[17],
+        "pr_number": r[18],
+        "max_retries": r[19],
+        "retry_count": r[20],
     }
 
 
@@ -4811,21 +5628,36 @@ async def publish_message(req: MessagePublish):
         await db.execute(
             "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (msg_id, req.from_urn, req.to_urn, req.in_reply_to, req.topic, json.dumps(req.payload), now),
+            (
+                msg_id,
+                req.from_urn,
+                req.to_urn,
+                req.in_reply_to,
+                req.topic,
+                json.dumps(req.payload),
+                now,
+            ),
         )
         await db.commit()
-        await emit_event(db, "message", {
-            "id": msg_id, "from": req.from_urn, "to": req.to_urn,
-            "topic": req.topic, "payload": req.payload,
-        })
+        await emit_event(
+            db,
+            "message",
+            {
+                "id": msg_id,
+                "from": req.from_urn,
+                "to": req.to_urn,
+                "topic": req.topic,
+                "payload": req.payload,
+            },
+        )
     return {"id": msg_id, "ts": now}
 
 
 @app.get("/v1/messages")
 async def list_messages(
-    to_urn: Optional[str] = None,
-    topic: Optional[str] = None,
-    since: Optional[float] = None,
+    to_urn: str | None = None,
+    topic: str | None = None,
+    since: float | None = None,
     limit: int = 100,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
@@ -4843,21 +5675,29 @@ async def list_messages(
     sql += " ORDER BY ts DESC LIMIT ?"
     args.append(limit)
     rows = []
-    async with connect_db() as db:
-        async with db.execute(sql, args) as cur:
-            async for r in cur:
-                rows.append({
-                    "id": r[0], "from": r[1], "to": r[2], "in_reply_to": r[3],
-                    "topic": r[4], "payload": json.loads(r[5]), "ts": r[6],
-                })
+    async with connect_db() as db, db.execute(sql, args) as cur:
+        async for r in cur:
+            rows.append(
+                {
+                    "id": r[0],
+                    "from": r[1],
+                    "to": r[2],
+                    "in_reply_to": r[3],
+                    "topic": r[4],
+                    "payload": json.loads(r[5]),
+                    "ts": r[6],
+                }
+            )
     return {"count": len(rows), "messages": rows}
 
 
 @app.get("/v1/events")
-async def stream_events(request: Request, since_id: Optional[int] = None):
+async def stream_events(request: Request, since_id: int | None = None):
     """SSE stream of events. Optional since_id for catch-up."""
     if len(EVENT_QUEUE) >= MAX_EVENT_SUBSCRIBERS:
-        raise HTTPException(503, f"too many event subscribers; max={MAX_EVENT_SUBSCRIBERS}")
+        raise HTTPException(
+            503, f"too many event subscribers; max={MAX_EVENT_SUBSCRIBERS}"
+        )
     sub_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
     EVENT_QUEUE[sub_id] = queue
@@ -4874,7 +5714,13 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
                         async for r in cur:
                             yield {
                                 "id": str(r[0]),
-                                "data": json.dumps({"ts": r[1], "kind": r[2], "payload": json.loads(r[3])}),
+                                "data": json.dumps(
+                                    {
+                                        "ts": r[1],
+                                        "kind": r[2],
+                                        "payload": json.loads(r[3]),
+                                    }
+                                ),
                             }
             # live stream — use un-typed events (event: message) so browser onmessage fires
             last_ping = time.time()
@@ -4897,7 +5743,7 @@ async def stream_events(request: Request, since_id: Optional[int] = None):
 
 
 @app.get("/v1/events/log")
-async def events_log(since_id: Optional[int] = None, limit: int = 100):
+async def events_log(since_id: int | None = None, limit: int = 100):
     """JSON polling alternative to SSE."""
     limit = clamp_limit(limit, default=100, max_limit=1000)
     sql = "SELECT id, ts, kind, payload, agent_urn FROM events"
@@ -4908,19 +5754,28 @@ async def events_log(since_id: Optional[int] = None, limit: int = 100):
     sql += " ORDER BY id ASC LIMIT ?"
     args.append(limit)
     rows = []
-    async with connect_db() as db:
-        async with db.execute(sql, args) as cur:
-            async for r in cur:
-                rows.append({
-                    "id": r[0], "ts": r[1], "kind": r[2],
-                    "payload": json.loads(r[3]), "agent_urn": r[4],
-                })
-    return {"count": len(rows), "events": rows, "last_id": rows[-1]["id"] if rows else since_id}
+    async with connect_db() as db, db.execute(sql, args) as cur:
+        async for r in cur:
+            rows.append(
+                {
+                    "id": r[0],
+                    "ts": r[1],
+                    "kind": r[2],
+                    "payload": json.loads(r[3]),
+                    "agent_urn": r[4],
+                }
+            )
+    return {
+        "count": len(rows),
+        "events": rows,
+        "last_id": rows[-1]["id"] if rows else since_id,
+    }
 
 
 # ---------- minimal MCP shim ----------
 # Maps a few common MCP-style JSON-RPC calls to the REST endpoints.
 # Phase 2: replace with full mcp-server-sdk.
+
 
 @app.post("/mcp")
 async def mcp_rpc(body: dict):
@@ -4961,29 +5816,39 @@ async def mcp_rpc(body: dict):
 @app.get("/v1/jobs/{job_id}/preview")
 async def zcgate_get_preview(job_id: str):
     """Return the zerocode-gate PreviewBundle stored on a needs-review job."""
-    async with connect_db() as db:
-        async with db.execute(
+    async with (
+        connect_db() as db,
+        db.execute(
             "SELECT result, status, repo, head_branch, pr_number FROM jobs WHERE id=?",
             (job_id,),
-        ) as cur:
-            r = await cur.fetchone()
+        ) as cur,
+    ):
+        r = await cur.fetchone()
     if not r:
         raise HTTPException(404, f"job not found: {job_id}")
     result = json.loads(r[0]) if r[0] else {}
     preview = result.get("preview")
     if not preview:
         raise HTTPException(404, f"no preview bundle on job {job_id}")
-    return {"job_id": job_id, "status": r[1], "repo": r[2],
-            "head_branch": r[3], "pr_number": r[4], "preview": preview}
+    return {
+        "job_id": job_id,
+        "status": r[1],
+        "repo": r[2],
+        "head_branch": r[3],
+        "pr_number": r[4],
+        "preview": preview,
+    }
 
 
 @app.post("/v1/jobs/{job_id}/release")
 async def zcgate_release(job_id: str):
     """Human-gated 'Release & Push': enqueue a release:<repo> job that a worker
     claims and runs `zc-gate release` on (push branch + open upstream PR)."""
-    async with connect_db() as db:
-        async with db.execute("SELECT result, status FROM jobs WHERE id=?", (job_id,)) as cur:
-            r = await cur.fetchone()
+    async with (
+        connect_db() as db,
+        db.execute("SELECT result, status FROM jobs WHERE id=?", (job_id,)) as cur,
+    ):
+        r = await cur.fetchone()
     if not r:
         raise HTTPException(404, f"job not found: {job_id}")
     result = json.loads(r[0]) if r[0] else {}
@@ -5004,29 +5869,36 @@ async def zcgate_release(job_id: str):
         raise HTTPException(503, "no active orchestrator to submit the release job")
     submitter = o[0]
     repo = preview.get("repo") or "zeroclaw-labs/zeroclaw"
-    rel = await create_job(JobCreate(
-        submitter_urn=submitter,
-        kind="release:zeroclaw",
-        description=job_id,
-        eligible_kinds=["zeroclaw"],
-        eligible_hosts=["zcgate-release-sink"],
-        priority=5,
-    ))
+    rel = await create_job(
+        JobCreate(
+            submitter_urn=submitter,
+            kind="release:zeroclaw",
+            description=job_id,
+            eligible_kinds=["zeroclaw"],
+            eligible_hosts=["zcgate-release-sink"],
+            priority=5,
+        )
+    )
     rel_id = rel.get("id") if isinstance(rel, dict) else None
     result["release_job_id"] = rel_id
     result["release_requested_at"] = time.time()
     async with connect_db() as db:
-        await db.execute("UPDATE jobs SET result=? WHERE id=?",
-                         (json.dumps(result), job_id))
+        await db.execute(
+            "UPDATE jobs SET result=? WHERE id=?", (json.dumps(result), job_id)
+        )
         await db.commit()
     return {"ok": True, "release_job_id": rel_id, "repo": repo, "submitter": submitter}
+
+
 # ===== end zerocode-gate patch =====
 
 
 # ===== zerocode-gate static mount =====
 try:
-    from fastapi.staticfiles import StaticFiles as _ZCStatic
     import os as _zcos
+
+    from fastapi.staticfiles import StaticFiles as _ZCStatic
+
     _zcdir = "/srv/agent-bus/static"
     _zcos.makedirs(_zcdir, exist_ok=True)
     app.mount("/static", _ZCStatic(directory=_zcdir), name="zcstatic")

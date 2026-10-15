@@ -7,13 +7,13 @@ import datetime as _dt
 import json as _json
 import os
 import re
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from decimal import Decimal as _Decimal
-from typing import Any, AsyncIterator
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .sqlite import SqliteHiveRepository
-
 
 _TABLE_MAP = {
     "agents": "hive_agents",
@@ -35,11 +35,15 @@ def _rewrite_tables(sql: str) -> str:
 
     sql = re.sub(
         rf"\b(FROM|INTO|UPDATE|DELETE\s+FROM|JOIN)\s+({names})\b",
-        repl, sql, flags=re.IGNORECASE,
+        repl,
+        sql,
+        flags=re.IGNORECASE,
     )
     sql = re.sub(
         rf"\b(ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE)\s+({names})\b",
-        repl, sql, flags=re.IGNORECASE,
+        repl,
+        sql,
+        flags=re.IGNORECASE,
     )
     sql = re.sub(rf"\b(ON)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
     return sql
@@ -247,20 +251,44 @@ _DB2_ADDITIVE_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("CLAIM_LEASE_EXPIRES_AT", "claim_lease_expires_at DOUBLE"),
         ("DECLINE_COUNT", "decline_count INTEGER NOT NULL DEFAULT 0"),
         ("DEDUP_HASH", "dedup_hash VARCHAR(64)"),
-        ("DEDUP_ACTIVE_HASH", "dedup_active_hash VARCHAR(64) GENERATED ALWAYS AS "
-         "(CASE WHEN status IN ('queued', 'offered', 'claimed', 'running') THEN dedup_hash ELSE NULL END)"),
+        (
+            "DEDUP_ACTIVE_HASH",
+            "dedup_active_hash VARCHAR(64) GENERATED ALWAYS AS "
+            "(CASE WHEN status IN ('queued', 'offered', 'claimed', 'running') THEN dedup_hash ELSE NULL END)",
+        ),
     ),
 }
 
 _DB2_REQUIRED_BASE_COLUMNS = {
     "HIVE_AGENTS": {
-        "URN", "KIND", "HOST", "SESSION_ID", "PID", "CAPABILITIES", "VERSION",
-        "STARTED_AT", "LAST_HEARTBEAT", "STATUS", "METADATA",
+        "URN",
+        "KIND",
+        "HOST",
+        "SESSION_ID",
+        "PID",
+        "CAPABILITIES",
+        "VERSION",
+        "STARTED_AT",
+        "LAST_HEARTBEAT",
+        "STATUS",
+        "METADATA",
     },
     "HIVE_JOBS": {
-        "ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION", "PRIORITY",
-        "DEADLINE", "REQUIRED_CAPABILITIES", "ELIGIBLE_KINDS", "STATUS", "CLAIMED_BY",
-        "CLAIMED_AT", "STARTED_AT", "ENDED_AT", "RESULT",
+        "ID",
+        "SUBMITTER_URN",
+        "PARENT_JOB_ID",
+        "KIND",
+        "DESCRIPTION",
+        "PRIORITY",
+        "DEADLINE",
+        "REQUIRED_CAPABILITIES",
+        "ELIGIBLE_KINDS",
+        "STATUS",
+        "CLAIMED_BY",
+        "CLAIMED_AT",
+        "STARTED_AT",
+        "ENDED_AT",
+        "RESULT",
     },
 }
 
@@ -292,7 +320,9 @@ def _split_script(script: str) -> list[str]:
 
 def _is_already_exists(exc: BaseException) -> bool:
     text = str(exc).upper()
-    return "SQLSTATE=42710" in text or "SQLSTATE 42710" in text or "ALREADY EXISTS" in text
+    return (
+        "SQLSTATE=42710" in text or "SQLSTATE 42710" in text or "ALREADY EXISTS" in text
+    )
 
 
 def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...]]:
@@ -314,17 +344,23 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
             (name,),
         )
 
-    cache_upsert = re.search(r"INSERT INTO hive_cache .* ON CONFLICT\(cache_key\) DO UPDATE SET", " ".join(stripped.split()), re.IGNORECASE)
+    cache_upsert = re.search(
+        r"INSERT INTO hive_cache .* ON CONFLICT\(cache_key\) DO UPDATE SET",
+        " ".join(stripped.split()),
+        re.IGNORECASE,
+    )
     if cache_upsert:
         return (
-            _rewrite_tables("MERGE INTO hive_cache t USING (VALUES (?, ?, ?, ?, ?, ?, ?)) "
-            "s(cache_key, result_json, source_job_id, result_mnemos_id, model, provider, cached_at) "
-            "ON t.cache_key = s.cache_key "
-            "WHEN MATCHED THEN UPDATE SET result_json=s.result_json, source_job_id=s.source_job_id, "
-            "result_mnemos_id=s.result_mnemos_id, cached_at=s.cached_at, model=s.model, provider=s.provider "
-            "WHEN NOT MATCHED THEN INSERT "
-            "(cache_key, result_json, source_job_id, result_mnemos_id, hit_count, cost_saved_usd, model, provider, cached_at, last_hit_at) "
-            "VALUES (s.cache_key, s.result_json, s.source_job_id, s.result_mnemos_id, 0, 0, s.model, s.provider, s.cached_at, NULL)"),
+            _rewrite_tables(
+                "MERGE INTO hive_cache t USING (VALUES (?, ?, ?, ?, ?, ?, ?)) "
+                "s(cache_key, result_json, source_job_id, result_mnemos_id, model, provider, cached_at) "
+                "ON t.cache_key = s.cache_key "
+                "WHEN MATCHED THEN UPDATE SET result_json=s.result_json, source_job_id=s.source_job_id, "
+                "result_mnemos_id=s.result_mnemos_id, cached_at=s.cached_at, model=s.model, provider=s.provider "
+                "WHEN NOT MATCHED THEN INSERT "
+                "(cache_key, result_json, source_job_id, result_mnemos_id, hit_count, cost_saved_usd, model, provider, cached_at, last_hit_at) "
+                "VALUES (s.cache_key, s.result_json, s.source_job_id, s.result_mnemos_id, 0, 0, s.model, s.provider, s.cached_at, NULL)"
+            ),
             values,
         )
 
@@ -336,15 +372,17 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
     if stats_match:
         col = stats_match.group(1)
         return (
-            _rewrite_tables("MERGE INTO worker_kind_stats t USING (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)) "
-            "s(urn, kind, ins_tokens_in, ins_tokens_out, ins_cost, ins_duration, ins_last_run, "
-            "upd_tokens_in, upd_tokens_out, upd_cost, upd_duration, upd_last_run) "
-            "ON t.urn = s.urn AND t.kind = s.kind "
-            f"WHEN MATCHED THEN UPDATE SET {col}={col}+1, "
-            "total_tokens_in=total_tokens_in+s.upd_tokens_in, total_tokens_out=total_tokens_out+s.upd_tokens_out, "
-            "total_cost_usd=total_cost_usd+s.upd_cost, total_duration_sec=total_duration_sec+s.upd_duration, last_run=s.upd_last_run "
-            f"WHEN NOT MATCHED THEN INSERT (urn, kind, {col}, total_tokens_in, total_tokens_out, total_cost_usd, total_duration_sec, last_run) "
-            "VALUES (s.urn, s.kind, 1, s.ins_tokens_in, s.ins_tokens_out, s.ins_cost, s.ins_duration, s.ins_last_run)"),
+            _rewrite_tables(
+                "MERGE INTO worker_kind_stats t USING (VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)) "
+                "s(urn, kind, ins_tokens_in, ins_tokens_out, ins_cost, ins_duration, ins_last_run, "
+                "upd_tokens_in, upd_tokens_out, upd_cost, upd_duration, upd_last_run) "
+                "ON t.urn = s.urn AND t.kind = s.kind "
+                f"WHEN MATCHED THEN UPDATE SET {col}={col}+1, "
+                "total_tokens_in=total_tokens_in+s.upd_tokens_in, total_tokens_out=total_tokens_out+s.upd_tokens_out, "
+                "total_cost_usd=total_cost_usd+s.upd_cost, total_duration_sec=total_duration_sec+s.upd_duration, last_run=s.upd_last_run "
+                f"WHEN NOT MATCHED THEN INSERT (urn, kind, {col}, total_tokens_in, total_tokens_out, total_cost_usd, total_duration_sec, last_run) "
+                "VALUES (s.urn, s.kind, 1, s.ins_tokens_in, s.ins_tokens_out, s.ins_cost, s.ins_duration, s.ins_last_run)"
+            ),
             values,
         )
 
@@ -353,18 +391,35 @@ def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...
         if not values:
             raise ValueError("Db2 LIMIT ? translation requires a bound limit value")
         limit = int(values[-1])
-        stripped = re.sub(r"\s+LIMIT\s+\?\s*$", f" FETCH FIRST {limit} ROWS ONLY", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(
+            r"\s+LIMIT\s+\?\s*$",
+            f" FETCH FIRST {limit} ROWS ONLY",
+            stripped,
+            flags=re.IGNORECASE,
+        )
         values = values[:-1]
-    stripped = re.sub(r"\s+LIMIT\s+(\d+)\s*$", r" FETCH FIRST \1 ROWS ONLY", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(
+        r"\s+LIMIT\s+(\d+)\s*$",
+        r" FETCH FIRST \1 ROWS ONLY",
+        stripped,
+        flags=re.IGNORECASE,
+    )
     return _rewrite_tables(stripped), values
 
 
 class _Db2Cursor:
-    def __init__(self, cursor: Any | None = None, rows: list[tuple[Any, ...]] | None = None, rowcount: int = -1):
+    def __init__(
+        self,
+        cursor: Any | None = None,
+        rows: list[tuple[Any, ...]] | None = None,
+        rowcount: int = -1,
+    ):
         self._cursor = cursor
         self._rows = rows
         self._index = 0
-        self.rowcount = rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
+        self.rowcount = (
+            rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
+        )
         self.lastrowid = None
 
     async def __aenter__(self):
@@ -399,12 +454,16 @@ class _Db2Cursor:
         out = []
         for value in row:
             if isinstance(value, (dict, list)):
-                out.append(_json.dumps(value, separators=(",", ":"), default=cls._json_default))
+                out.append(
+                    _json.dumps(value, separators=(",", ":"), default=cls._json_default)
+                )
             elif hasattr(value, "read") and callable(value.read):
                 result = await asyncio.to_thread(value.read)
                 out.append(result)
             elif isinstance(value, _Decimal):
-                out.append(int(value) if value == value.to_integral_value() else float(value))
+                out.append(
+                    int(value) if value == value.to_integral_value() else float(value)
+                )
             elif isinstance(value, _dt.datetime):
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=_dt.timezone.utc)
@@ -426,10 +485,13 @@ class _Db2Cursor:
 
     async def fetchall(self):
         if self._rows is not None:
-            rows = self._rows[self._index:]
+            rows = self._rows[self._index :]
             self._index = len(self._rows)
             return [await self._normalize_row(row) for row in rows]
-        return [await self._normalize_row(row) for row in await asyncio.to_thread(self._cursor.fetchall)]
+        return [
+            await self._normalize_row(row)
+            for row in await asyncio.to_thread(self._cursor.fetchall)
+        ]
 
     async def close(self):
         if self._cursor is not None:
@@ -437,7 +499,7 @@ class _Db2Cursor:
 
 
 class _Db2ExecuteResult:
-    def __init__(self, conn: "_Db2Connection", sql: str, params: Any = None):
+    def __init__(self, conn: _Db2Connection, sql: str, params: Any = None):
         self._conn = conn
         self._sql = sql
         self._params = params
@@ -480,7 +542,9 @@ class _Db2Connection:
 
         return _Db2Cursor(await asyncio.to_thread(_go))
 
-    async def executemany(self, sql: str, seq_of_params: list[tuple[Any, ...]]) -> _Db2Cursor:
+    async def executemany(
+        self, sql: str, seq_of_params: list[tuple[Any, ...]]
+    ) -> _Db2Cursor:
         if not seq_of_params:
             return _Db2Cursor(rows=[])
         adapted, _ = _adapt_sql(sql, seq_of_params[0])
@@ -514,7 +578,14 @@ class _Db2Connection:
 
 
 class _Db2Pool:
-    def __init__(self, dsn: str, *, min_size: int = 0, max_size: int = 8, acquire_timeout: float = 30.0):
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_size: int = 0,
+        max_size: int = 8,
+        acquire_timeout: float = 30.0,
+    ):
         self._parts = _parse_db2_dsn(dsn)
         self._min_size = max(0, min_size)
         self._max_size = max(1, max_size)
@@ -530,8 +601,12 @@ class _Db2Pool:
         try:
             import ibm_db_dbi  # type: ignore
         except Exception as exc:
-            raise RuntimeError(f"HIVE_BACKEND=db2 requires ibm_db/ibm_db_dbi importable before connecting: {exc}") from exc
-        raw = await asyncio.to_thread(ibm_db_dbi.connect, _dsn_string(self._parts), "", "")
+            raise RuntimeError(
+                f"HIVE_BACKEND=db2 requires ibm_db/ibm_db_dbi importable before connecting: {exc}"
+            ) from exc
+        raw = await asyncio.to_thread(
+            ibm_db_dbi.connect, _dsn_string(self._parts), "", ""
+        )
         return _Db2Connection(raw)
 
     async def warmup(self) -> None:
@@ -564,7 +639,9 @@ class _Db2Pool:
                     break
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    raise TimeoutError(f"DB2 pool acquire timeout after {self._acquire_timeout:.1f}s")
+                    raise TimeoutError(
+                        f"DB2 pool acquire timeout after {self._acquire_timeout:.1f}s"
+                    )
                 await asyncio.wait_for(self._not_full.wait(), remaining)
         if need_open:
             try:
@@ -609,13 +686,32 @@ class _Db2Pool:
 
 
 class Db2HiveRepository(SqliteHiveRepository):
-    def __init__(self, dsn: str, *, min_size: int | None = None, max_size: int | None = None, acquire_timeout: float | None = None) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        min_size: int | None = None,
+        max_size: int | None = None,
+        acquire_timeout: float | None = None,
+    ) -> None:
         super().__init__(":memory:")
         self.dsn = dsn
         self._pool: _Db2Pool | None = None
-        self._min_size = int(min_size if min_size is not None else os.environ.get("HIVE_DB2_POOL_MIN", "0"))
-        self._max_size = int(max_size if max_size is not None else os.environ.get("HIVE_DB2_POOL_MAX", "8"))
-        self._acquire_timeout = float(acquire_timeout if acquire_timeout is not None else os.environ.get("HIVE_DB2_ACQUIRE_TIMEOUT", "30"))
+        self._min_size = int(
+            min_size
+            if min_size is not None
+            else os.environ.get("HIVE_DB2_POOL_MIN", "0")
+        )
+        self._max_size = int(
+            max_size
+            if max_size is not None
+            else os.environ.get("HIVE_DB2_POOL_MAX", "8")
+        )
+        self._acquire_timeout = float(
+            acquire_timeout
+            if acquire_timeout is not None
+            else os.environ.get("HIVE_DB2_ACQUIRE_TIMEOUT", "30")
+        )
 
     async def init(self, schema: str | None = None) -> None:
         if not self.dsn:
@@ -647,8 +743,7 @@ class Db2HiveRepository(SqliteHiveRepository):
             (table.upper(),),
         ) as cur:
             return {
-                str(row[0]).strip().upper(): int(row[1])
-                for row in await cur.fetchall()
+                str(row[0]).strip().upper(): int(row[1]) for row in await cur.fetchall()
             }
 
     @staticmethod
@@ -687,7 +782,9 @@ class Db2HiveRepository(SqliteHiveRepository):
             columns = await self._columns(db, table)
             for name, fragment in definitions:
                 if name not in columns:
-                    await db.execute(f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}")
+                    await db.execute(
+                        f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}"
+                    )
                     columns.add(name)
 
         # Core created HIVE_JOBS.STATUS as VARCHAR(16), but failed_completion
@@ -700,15 +797,27 @@ class Db2HiveRepository(SqliteHiveRepository):
         # Core's original checks predate the stale/failed_completion/
         # dead-letter/needs-review states used by the current service.
         for table, values, constraint in (
-            ("HIVE_AGENTS", "'online','idle','stale','offline','error'", "ck_hive_agents_status_runtime"),
-            ("HIVE_JOBS", "'queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review'", "ck_hive_jobs_status_runtime"),
+            (
+                "HIVE_AGENTS",
+                "'online','idle','stale','offline','error'",
+                "ck_hive_agents_status_runtime",
+            ),
+            (
+                "HIVE_JOBS",
+                "'queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review'",
+                "ck_hive_jobs_status_runtime",
+            ),
         ):
             checks = await self._status_checks(db, table)
             required_values = {value.strip("'") for value in values.split(",")}
-            if not any(all(value.upper() in text for value in required_values)
-                       for text in checks.values()):
+            if not any(
+                all(value.upper() in text for value in required_values)
+                for text in checks.values()
+            ):
                 for old_constraint in checks:
-                    await db.execute(f"ALTER TABLE {table.lower()} DROP CHECK {old_constraint}")
+                    await db.execute(
+                        f"ALTER TABLE {table.lower()} DROP CHECK {old_constraint}"
+                    )
                 await db.execute(
                     f"ALTER TABLE {table.lower()} ADD CONSTRAINT {constraint} "
                     f"CHECK (status IN ({values}))"
@@ -736,10 +845,12 @@ class Db2HiveRepository(SqliteHiveRepository):
             active = await cur.fetchall()
         seen_hashes: set[str] = set()
         now = _dt.datetime.now(tz=_dt.timezone.utc).timestamp()
-        migration_result = _json.dumps({
-            "dead_letter": True,
-            "reason": "db2_migration:duplicate_active_dedup_hash",
-        })
+        migration_result = _json.dumps(
+            {
+                "dead_letter": True,
+                "reason": "db2_migration:duplicate_active_dedup_hash",
+            }
+        )
         for job_id, dedup_hash in active:
             if dedup_hash not in seen_hashes:
                 seen_hashes.add(dedup_hash)
@@ -767,9 +878,13 @@ class Db2HiveRepository(SqliteHiveRepository):
             expected = base | {name for name, _fragment in _DB2_ADDITIVE_COLUMNS[table]}
             missing = expected - await self._columns(db, table)
             if missing:
-                raise RuntimeError(f"Db2 schema verification failed: {table} missing {sorted(missing)}")
+                raise RuntimeError(
+                    f"Db2 schema verification failed: {table} missing {sorted(missing)}"
+                )
         if "JOBS_ACTIVE_DEDUP_UQ" not in await self._indexes(db, "HIVE_JOBS"):
-            raise RuntimeError("Db2 schema verification failed: jobs_active_dedup_uq is missing")
+            raise RuntimeError(
+                "Db2 schema verification failed: jobs_active_dedup_uq is missing"
+            )
         status_length = (await self._column_lengths(db, "HIVE_JOBS")).get("STATUS", 0)
         if status_length < 17:
             raise RuntimeError(
@@ -783,7 +898,12 @@ class Db2HiveRepository(SqliteHiveRepository):
 
     async def _ensure_pool(self) -> _Db2Pool:
         if self._pool is None:
-            pool = _Db2Pool(self.dsn, min_size=self._min_size, max_size=self._max_size, acquire_timeout=self._acquire_timeout)
+            pool = _Db2Pool(
+                self.dsn,
+                min_size=self._min_size,
+                max_size=self._max_size,
+                acquire_timeout=self._acquire_timeout,
+            )
             await pool.warmup()
             self._pool = pool
         return self._pool

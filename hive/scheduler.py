@@ -190,7 +190,8 @@ class MiniMaxPoolState:
         # Per-worker cap: count how many leases this worker holds (a single
         # worker is allowed MINIMAX_PER_WORKER_MAX concurrent leases).
         held_for_worker = sum(
-            1 for u, jid in self.leases_by_worker.items()
+            1
+            for u, jid in self.leases_by_worker.items()
             if u == urn and jid is not None
         )
         if held_for_worker >= MINIMAX_PER_WORKER_MAX:

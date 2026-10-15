@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 Error = sqlite3.Error
 IntegrityError = sqlite3.IntegrityError
@@ -42,7 +43,7 @@ class Cursor:
 
 
 class _ExecuteResult:
-    def __init__(self, conn: "Connection", sql: str, params: Any = None):
+    def __init__(self, conn: Connection, sql: str, params: Any = None):
         self._conn = conn
         self._sql = sql
         self._params = params
@@ -107,5 +108,7 @@ class Connection:
 async def connect(database: str, **kwargs: Any) -> Connection:
     timeout = kwargs.pop("timeout", 5.0)
     check_same_thread = kwargs.pop("check_same_thread", False)
-    conn = sqlite3.connect(database, timeout=timeout, check_same_thread=check_same_thread)
+    conn = sqlite3.connect(
+        database, timeout=timeout, check_same_thread=check_same_thread
+    )
     return Connection(conn)

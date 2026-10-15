@@ -277,13 +277,6 @@ small.dim{font-size:.85em}
   <div id="realwork-recent" style="margin-top:.5em;font-size:.78em"></div>
 </div>
 
-<div class="panel" id="remote-spark-panel" style="margin-top:.5em">
-  <h2>🛰️ Remote Activity — Spark <span class="cnt" id="remote-spark-cnt"></span></h2>
-  <div id="remote-spark-stats" style="display:flex;gap:1.5em;flex-wrap:wrap;font-size:.86em"></div>
-  <div id="remote-spark-recent" style="margin-top:.5em;font-size:.78em"></div>
-</div>
-
-
 <!-- Main Grid -->
 <div class="grid">
   <div class="panel">
@@ -784,44 +777,7 @@ async function refreshRealWork(){
   } catch(e) { console.warn('realwork err', e); }
 }
 
-async function refreshRemote(){
-  try{
-    const HOST='spark-0c53';
-    const [ag,dn,nr,act]=await Promise.all([
-      api('GET','/v1/agents'),
-      api('GET','/v1/jobs?status=done&limit=200'),
-      api('GET','/v1/jobs?status=needs-review&limit=100'),
-      api('GET','/v1/jobs'),
-    ]);
-    const NOW=Date.now()/1000;
-    const isSpark=u=>String(u||'').split(':')[3]===HOST||String(u||'').includes(HOST);
-    const match=j=>((j.eligible_hosts||[]).includes(HOST))||String(j.kind||'').startsWith('nvidia');
-    const bridge=(ag.agents||[]).filter(a=>isSpark(a.urn));
-    const online=bridge.some(a=>['online','idle'].includes(a.status));
-    const jobs=(act.jobs||act||[]);
-    const running=jobs.filter(j=>match(j)&&['claimed','running','offered'].includes(j.status));
-    const queued=jobs.filter(j=>match(j)&&j.status==='queued');
-    const done=[...(dn.jobs||[]),...(nr.jobs||[])].filter(match);
-    const doneH=done.filter(j=>(NOW-(j.ended_at||0))<3600);
-    document.getElementById('remote-spark-cnt').textContent='('+(online?'online':'offline')+')';
-    document.getElementById('remote-spark-stats').innerHTML=''
-      +'<div>bridge <b style="color:'+(online?'#7ee787':'#f85149')+'">'+(online?'online':'offline')+'</b></div>'
-      +'<div><b>'+running.length+'</b> running</div>'
-      +'<div><b>'+queued.length+'</b> queued</div>'
-      +'<div><b style="color:#7ee787">'+doneH.length+'</b> completed last 1h</div>'
-      +'<div class="dim">GB10 · local coder (NGC fallback)</div>';
-    done.sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
-    const rows=[...running,...done.slice(0,8)];
-    document.getElementById('remote-spark-recent').innerHTML=rows.slice(0,10).map(j=>{
-      const m=(j.result||{}).metrics||{};const be=m.backend||'';
-      const t=j.ended_at?new Date(j.ended_at*1000).toLocaleTimeString():'…';
-      const st=j.status==='done'?'<span style="color:#7ee787">done</span>':esc(j.status||'');
-      return '<div>'+t+' '+st+' '+esc(j.kind||'').slice(0,40)+(be?' <span class="dim">['+esc(be)+']</span>':'')+'</div>';
-    }).join('')||'<div class="dim">no spark jobs yet</div>';
-  }catch(e){console.warn('remote err',e);}
-}
-
-const MODEL_NAMES={hive_gpt:'gpt-5.3-codex-spark',hive_gpt_mini:'gpt-5.3-codex-spark',hive_gpt_heavy:'gpt-5.3-codex-spark',hive_codex:'gpt-5.3-codex-spark',hive_deepseek_pro_1:'deepseek-v4-pro',hive_deepseek_1:'deepseek-v4-flash',hive_deepseek_pro_2:'deepseek-v4-pro',hive_deepseek_pro_3:'deepseek-v4-pro',hive_deepseek_pro_4:'deepseek-v4-pro',hive_deepseek_pro_5:'deepseek-v4-pro',hive_deepseek_pro_6:'deepseek-v4-pro',hive_deepseek_pro_7:'deepseek-v4-pro',hive_deepseek_pro_8:'deepseek-v4-pro',hive_deepseek_3:'deepseek-v4-flash',hive_deepseek_4:'deepseek-v4-flash',hive_deepseek_5:'deepseek-v4-flash',hive_deepseek_6:'deepseek-v4-flash',hive_deepseek_7:'deepseek-v4-flash',hive_deepseek_8:'deepseek-v4-flash',hive_groq_8b:'llama-3.1-8b',hive_groq_2:'qwen3-32b',hive_groq_3:'gpt-oss-120b',hive_groq_4:'llama-4-scout',hive_groq_5:'llama-3.3-70b',hive_groq_6:'llama-3.3-70b',hive_groq_7:'llama-3.3-70b',hive_groq_8:'llama-3.3-70b',hive_groq_1:'gpt-5.3-codex',hive_xai_1:'grok-4.3',hive_nvidia_1:'gpt-5.3-codex',hive_siliconflow_3:'qwen3-coder-30b',hive_siliconflow_8:'deepseek-v4-pro(sf)',hive_nvidia_2:'nemotron-120b',hive_nvidia_5:'qwen3-coder-480b',hive_nvidia_6:'qwen3-coder-480b',hive_nvidia_7:'qwen3-coder-480b',hive_nvidia_8:'qwen3-coder-480b',hive_together_2:'kimi-k2.6'};
+const MODEL_NAMES={};
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
@@ -848,7 +804,7 @@ async function refreshResults(){
       preview=parts.length?parts.join('  ·  '):'(build, no detail)';
     }
     if(!preview)preview='(no text result)';
-    const _at=(r.alias_tried&&r.alias_tried.length)?r.alias_tried[r.alias_tried.length-1]:'';const prov=MODEL_NAMES[_at]||MODEL_NAMES[r.agent_alias]||_at||r.gateway_provider_reported||r.gateway_model||r.agent_alias||'';
+    const _at=(r.alias_tried&&r.alias_tried.length)?r.alias_tried[r.alias_tried.length-1]:'';const prov=_at||r.gateway_provider_reported||r.gateway_model||r.agent_alias||'';
     const isCodex=/codex/i.test(j.kind||'')||/codex/i.test(prov)||/codex/i.test(r.via||'')||/codex/i.test(r.gateway_provider||'')||r.runtime==='codex';
     let agentType=r.runtime||String(j.kind||'').split(':')[0]||'agent';
     const wkHost=(String(j.claimed_by||'').match(/:zeroclaw:([^:]+):/)||[])[1]||(String(j.claimed_by||'').split(':')[3])||'';
@@ -1224,7 +1180,6 @@ async function refreshAll(){
       refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),refreshCapBanner(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
       refreshHosts(),refreshGPU(),
-      refreshRemote(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
 }

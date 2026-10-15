@@ -12,13 +12,13 @@ import inspect
 import json as _json
 import re
 import uuid as _uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from decimal import Decimal as _Decimal
-from typing import Any, AsyncIterator
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .sqlite import SqliteHiveRepository
-
 
 _ORACLE_JOB_ADDITIONS = {
     "REQUIRED_AUTONOMY": "required_autonomy VARCHAR2(32)",
@@ -37,19 +37,59 @@ _ORACLE_JOB_ADDITIONS = {
     "DEDUP_HASH": "dedup_hash VARCHAR2(64)",
 }
 _ORACLE_REQUIRED_JOB_COLUMNS = {
-    "ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION", "PRIORITY",
-    "DEADLINE", "REQUIRED_CAPABILITIES", "ELIGIBLE_KINDS", "ELIGIBLE_HOSTS",
-    "PROJECT", "STATUS", "CLAIMED_BY", "CLAIMED_AT", "STARTED_AT", "ENDED_AT",
-    "RESULT", "REQUIRED_AUTONOMY", "MAX_COST_TIER", "PREFERRED_PROVIDERS",
-    "PREFERRED_MODELS", "CLAIMED_RUNTIME", "CLAIMED_MODEL", "CLAIMED_PROVIDER",
-    "CLAIMED_COST_TIER", "TOKENS_IN", "TOKENS_OUT", "ESTIMATED_COST_USD",
-    "MNEMOS_REFS", "RESULT_MNEMOS_ID", "REQUIRED_RESOURCES", "CLAIMED_HOST_CAPS",
-    "TAGS", "DEPENDS_ON", "RETRY_COUNT", "MAX_RETRIES", "RETRY_BACKOFF_UNTIL",
-    "LAST_UPDATE_AT", "CLAIM_LEASE_EXPIRES_AT", "DECLINE_COUNT", "DEDUP_HASH",
+    "ID",
+    "SUBMITTER_URN",
+    "PARENT_JOB_ID",
+    "KIND",
+    "DESCRIPTION",
+    "PRIORITY",
+    "DEADLINE",
+    "REQUIRED_CAPABILITIES",
+    "ELIGIBLE_KINDS",
+    "ELIGIBLE_HOSTS",
+    "PROJECT",
+    "STATUS",
+    "CLAIMED_BY",
+    "CLAIMED_AT",
+    "STARTED_AT",
+    "ENDED_AT",
+    "RESULT",
+    "REQUIRED_AUTONOMY",
+    "MAX_COST_TIER",
+    "PREFERRED_PROVIDERS",
+    "PREFERRED_MODELS",
+    "CLAIMED_RUNTIME",
+    "CLAIMED_MODEL",
+    "CLAIMED_PROVIDER",
+    "CLAIMED_COST_TIER",
+    "TOKENS_IN",
+    "TOKENS_OUT",
+    "ESTIMATED_COST_USD",
+    "MNEMOS_REFS",
+    "RESULT_MNEMOS_ID",
+    "REQUIRED_RESOURCES",
+    "CLAIMED_HOST_CAPS",
+    "TAGS",
+    "DEPENDS_ON",
+    "RETRY_COUNT",
+    "MAX_RETRIES",
+    "RETRY_BACKOFF_UNTIL",
+    "LAST_UPDATE_AT",
+    "CLAIM_LEASE_EXPIRES_AT",
+    "DECLINE_COUNT",
+    "DEDUP_HASH",
 }
 _ORACLE_JOB_STATUSES = (
-    "queued", "offered", "claimed", "running", "done", "failed",
-    "failed_completion", "cancelled", "dead-letter", "needs-review",
+    "queued",
+    "offered",
+    "claimed",
+    "running",
+    "done",
+    "failed",
+    "failed_completion",
+    "cancelled",
+    "dead-letter",
+    "needs-review",
 )
 
 
@@ -129,14 +169,29 @@ def _rewrite_tables(sql: str) -> str:
     def repl(match: re.Match) -> str:
         return f"{match.group(1)} {_TABLE_MAP[match.group(2).lower()]}"
 
-    sql = re.sub(rf"\b(FROM|INTO|UPDATE|DELETE\s+FROM|JOIN)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
-    sql = re.sub(rf"\b(ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
+    sql = re.sub(
+        rf"\b(FROM|INTO|UPDATE|DELETE\s+FROM|JOIN)\s+({names})\b",
+        repl,
+        sql,
+        flags=re.IGNORECASE,
+    )
+    sql = re.sub(
+        rf"\b(ALTER\s+TABLE|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?|DROP\s+TABLE)\s+({names})\b",
+        repl,
+        sql,
+        flags=re.IGNORECASE,
+    )
     sql = re.sub(rf"\b(ON)\s+({names})\b", repl, sql, flags=re.IGNORECASE)
     return sql
 
 
 def _rewrite_limit(sql: str) -> str:
-    return re.sub(r"\s+LIMIT\s+(:\d+|\d+)\s*$", r" FETCH FIRST \1 ROWS ONLY", sql, flags=re.IGNORECASE)
+    return re.sub(
+        r"\s+LIMIT\s+(:\d+|\d+)\s*$",
+        r" FETCH FIRST \1 ROWS ONLY",
+        sql,
+        flags=re.IGNORECASE,
+    )
 
 
 def _rewrite_sqlite_time_funcs(sql: str) -> str:
@@ -212,7 +267,10 @@ def _translate_sql(sql: str, params: Any = None) -> tuple[str | None, Any]:
     if upper.startswith(("CREATE ", "ALTER TABLE ", "DROP TABLE ")):
         return None, params
     if "SQLITE_MASTER" in upper:
-        return "SELECT 'CREATE TABLE agents (status TEXT CHECK(status IN (''online'',''idle'',''stale'',''offline'',''error'')))' FROM dual", ()
+        return (
+            "SELECT 'CREATE TABLE agents (status TEXT CHECK(status IN (''online'',''idle'',''stale'',''offline'',''error'')))' FROM dual",
+            (),
+        )
 
     sql = _rewrite_tables(stripped)
     sql = _replace_qmarks(sql)
@@ -229,8 +287,12 @@ class BackendCursor:
         self._cursor = cursor
         self._rows = rows
         self._index = 0
-        self.rowcount = rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
-        self.lastrowid = getattr(cursor, "lastrowid", None) if cursor is not None else None
+        self.rowcount = (
+            rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
+        )
+        self.lastrowid = (
+            getattr(cursor, "lastrowid", None) if cursor is not None else None
+        )
 
     async def __aenter__(self):
         return self
@@ -254,7 +316,9 @@ class BackendCursor:
 
         def default(value):
             if isinstance(value, _Decimal):
-                return float(value) if value != value.to_integral_value() else int(value)
+                return (
+                    float(value) if value != value.to_integral_value() else int(value)
+                )
             if isinstance(value, (bytes, bytearray)):
                 if len(value) == 16:
                     return str(_uuid.UUID(bytes=bytes(value)))
@@ -273,7 +337,9 @@ class BackendCursor:
                     result = await result
                 out.append(result)
             elif isinstance(value, _Decimal):
-                out.append(int(value) if value == value.to_integral_value() else float(value))
+                out.append(
+                    int(value) if value == value.to_integral_value() else float(value)
+                )
             elif isinstance(value, _dt.datetime):
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=_dt.timezone.utc)
@@ -295,7 +361,7 @@ class BackendCursor:
 
     async def fetchall(self):
         if self._rows is not None:
-            rows = self._rows[self._index:]
+            rows = self._rows[self._index :]
             self._index = len(self._rows)
             return [await self._normalize_row(row) for row in rows]
         return [await self._normalize_row(row) for row in await self._cursor.fetchall()]
@@ -310,7 +376,7 @@ class BackendCursor:
 
 
 class _OracleExecuteResult:
-    def __init__(self, conn: "OracleConnection", sql: str, params: Any = None):
+    def __init__(self, conn: OracleConnection, sql: str, params: Any = None):
         self._conn = conn
         self._sql = sql
         self._params = params
@@ -347,7 +413,10 @@ class OracleConnection:
                 "SELECT column_name FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id",
                 (mapped.upper(),),
             )
-            rows = [(i, row[0].lower(), None, None, None, None) for i, row in enumerate(await cur.fetchall())]
+            rows = [
+                (i, row[0].lower(), None, None, None, None)
+                for i, row in enumerate(await cur.fetchall())
+            ]
             await BackendCursor(cur).close()
             return BackendCursor(rows=rows)
         translated, translated_params = _translate_sql(sql, params)
@@ -362,7 +431,9 @@ class OracleConnection:
         if translated is None:
             return BackendCursor(rows=[])
         cur = self._conn.cursor()
-        await cur.executemany(_rewrite_limit(translated), [tuple(p) for p in seq_of_params])
+        await cur.executemany(
+            _rewrite_limit(translated), [tuple(p) for p in seq_of_params]
+        )
         return BackendCursor(cur)
 
     async def executescript(self, script: str):
@@ -400,7 +471,9 @@ class OracleHiveRepository(SqliteHiveRepository):
         try:
             import oracledb
         except Exception as exc:
-            raise RuntimeError(f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}") from exc
+            raise RuntimeError(
+                f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}"
+            ) from exc
         user, password, dsn = _parse_oracle_url(self.dsn)
         raw = await oracledb.connect_async(user=user, password=password, dsn=dsn)
         try:
@@ -421,7 +494,10 @@ class OracleHiveRepository(SqliteHiveRepository):
             "WHERE table_name = 'HIVE_JOBS'",
         )
         return {
-            str(name).strip().upper(): (str(data_type).strip().upper(), int(length) if length is not None else None)
+            str(name).strip().upper(): (
+                str(data_type).strip().upper(),
+                int(length) if length is not None else None,
+            )
             for name, data_type, length in rows
         }
 
@@ -445,7 +521,9 @@ class OracleHiveRepository(SqliteHiveRepository):
         columns = await self._job_columns(raw)
         status_type, status_length = columns.get("STATUS", ("", 0))
         if status_type not in {"VARCHAR2", "VARCHAR"} or (status_length or 0) < 32:
-            await _raw_execute(raw, "ALTER TABLE HIVE_JOBS MODIFY (status VARCHAR2(32))")
+            await _raw_execute(
+                raw, "ALTER TABLE HIVE_JOBS MODIFY (status VARCHAR2(32))"
+            )
 
         checks = await _raw_execute(
             raw,
@@ -455,10 +533,14 @@ class OracleHiveRepository(SqliteHiveRepository):
         status_checks = [
             (str(name).strip().upper(), str(condition or ""))
             for name, condition in checks
-            if re.search(r"\bSTATUS\b\s+IN\s*\(", str(condition or ""), flags=re.IGNORECASE)
+            if re.search(
+                r"\bSTATUS\b\s+IN\s*\(", str(condition or ""), flags=re.IGNORECASE
+            )
         ]
-        if not any(all(value.upper() in condition.upper() for value in _ORACLE_JOB_STATUSES)
-                   for _name, condition in status_checks):
+        if not any(
+            all(value.upper() in condition.upper() for value in _ORACLE_JOB_STATUSES)
+            for _name, condition in status_checks
+        ):
             for name, _condition in status_checks:
                 await _raw_execute(raw, f"ALTER TABLE HIVE_JOBS DROP CONSTRAINT {name}")
             values = ",".join(f"'{value}'" for value in _ORACLE_JOB_STATUSES)
@@ -483,9 +565,11 @@ class OracleHiveRepository(SqliteHiveRepository):
                 "ORDER BY dedup_hash, started_at, id",
             )
             seen_hashes: set[str] = set()
-            migration_result = _json.dumps({
-                "reason": "oracle_migration:duplicate_active_dedup_hash",
-            })
+            migration_result = _json.dumps(
+                {
+                    "reason": "oracle_migration:duplicate_active_dedup_hash",
+                }
+            )
             for job_id, dedup_hash in active:
                 if dedup_hash not in seen_hashes:
                     seen_hashes.add(dedup_hash)
@@ -512,7 +596,9 @@ class OracleHiveRepository(SqliteHiveRepository):
         columns = await self._job_columns(raw)
         missing = _ORACLE_REQUIRED_JOB_COLUMNS - set(columns)
         if missing:
-            raise RuntimeError(f"Oracle schema verification failed: HIVE_JOBS missing {sorted(missing)}")
+            raise RuntimeError(
+                f"Oracle schema verification failed: HIVE_JOBS missing {sorted(missing)}"
+            )
         status_type, status_length = columns["STATUS"]
         if status_type not in {"VARCHAR2", "VARCHAR"} or (status_length or 0) < 17:
             raise RuntimeError(
@@ -524,21 +610,31 @@ class OracleHiveRepository(SqliteHiveRepository):
                 f"Oracle schema verification failed: HIVE_JOBS.DEDUP_HASH is {dedup_type}({dedup_length}), expected VARCHAR2(>=64)"
             )
         if columns["CLAIM_LEASE_EXPIRES_AT"][0] != "NUMBER":
-            raise RuntimeError("Oracle schema verification failed: HIVE_JOBS.CLAIM_LEASE_EXPIRES_AT must be NUMBER")
+            raise RuntimeError(
+                "Oracle schema verification failed: HIVE_JOBS.CLAIM_LEASE_EXPIRES_AT must be NUMBER"
+            )
         if columns["ELIGIBLE_HOSTS"][0] not in {"CLOB", "JSON"}:
-            raise RuntimeError("Oracle schema verification failed: HIVE_JOBS.ELIGIBLE_HOSTS must be CLOB or JSON")
+            raise RuntimeError(
+                "Oracle schema verification failed: HIVE_JOBS.ELIGIBLE_HOSTS must be CLOB or JSON"
+            )
         indexes = await self._indexes(raw)
         if "IDX_HIVE_JOBS_CLAIM_LEASE" not in indexes:
-            raise RuntimeError("Oracle schema verification failed: claim lease index is missing")
+            raise RuntimeError(
+                "Oracle schema verification failed: claim lease index is missing"
+            )
         if not ({"JOBS_ACTIVE_DEDUP_UQ", "HIVE_JOBS_ACTIVE_DEDUP_UQ"} & indexes):
-            raise RuntimeError("Oracle schema verification failed: active dedup index is missing")
+            raise RuntimeError(
+                "Oracle schema verification failed: active dedup index is missing"
+            )
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Any]:
         try:
             import oracledb
         except Exception as exc:
-            raise RuntimeError(f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}") from exc
+            raise RuntimeError(
+                f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}"
+            ) from exc
         user, password, dsn = _parse_oracle_url(self.dsn)
         raw = await oracledb.connect_async(user=user, password=password, dsn=dsn)
         db = self.connection_class(raw)
