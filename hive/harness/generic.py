@@ -36,6 +36,14 @@ _AUTH_METHOD_MAP: dict[str, str] = {
     "none": "free",
 }
 
+
+def _host_from_urn(urn: str) -> str | None:
+    """Extract host from ``urn:agent:<kind>:<host>:<session>`` (None if not that shape)."""
+    parts = urn.split(":")
+    if len(parts) >= 5 and parts[0] == "urn" and parts[1] == "agent":
+        return parts[3]
+    return None
+
 # transport(method, url, token, body) -> (status_code, parsed_json_or_None)
 Transport = Callable[[str, str, str | None, dict | None], tuple[int, dict | None]]
 
@@ -194,13 +202,26 @@ class GenericAdapter:
     def status(self, urn: str) -> dict[str, Any]:
         """Return this agent's row (model/provider/caps/last_heartbeat/...).
 
-        The bus has no single-agent GET (``/v1/agents`` takes filters but not
-        ``urn``), so list agents and match client-side. Absent ⇒ {}.
+        The bus ``GET /v1/agents`` takes ``host`` but **not** ``urn`` (verified:
+        its params are status/kind/host/runtime/pid/cost_tier/include_offline).
+        A URN encodes its host, so narrow server-side by host and match the exact
+        URN client-side. Absent ⇒ {}. An unexpected response shape raises rather
+        than being masked as "not found".
         """
-        status, resp = self._call("GET", "/v1/agents?include_offline=true")
+        query = "/v1/agents?include_offline=true"
+        host = _host_from_urn(urn)
+        if host:
+            query += f"&host={urllib.parse.quote(host, safe='')}"
+        status, resp = self._call("GET", query)
         if status not in (200, 204):
             raise RuntimeError(f"status failed for {urn!r}: status={status}")
-        for agent in (resp or {}).get("agents", []):
-            if agent.get("urn") == urn:
+        if resp is None:
+            return {}
+        if not isinstance(resp, dict):
+            raise RuntimeError(
+                f"status for {urn!r}: unexpected response type {type(resp).__name__}"
+            )
+        for agent in resp.get("agents", []):
+            if isinstance(agent, dict) and agent.get("urn") == urn:
                 return agent
         return {}

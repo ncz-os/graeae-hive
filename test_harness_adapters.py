@@ -46,6 +46,8 @@ class RegistryTests(unittest.TestCase):
                 self.assertEqual(adapter.capabilities().priority, priority)
 
     def test_codex_is_operator_gated(self):
+        # registry reads HARNESS_CODEX_AUTORUN lazily (os.environ.get per call),
+        # so toggling it between iterations genuinely exercises the gate.
         # Disabled by default and for every non-"1" value...
         for value in (None, "0", "", "true", "yes", "1 "):
             with self.subTest(value=value):
@@ -153,13 +155,29 @@ class BusProtocolTests(unittest.TestCase):
         adapter, _ = self._adapter(responses={"POST": (204, None)})
         self.assertEqual(adapter.heartbeat("urn:x", {"status": "online"}), {})
 
-    def test_status_lists_and_filters_by_urn(self):
+    def test_status_filters_by_urn(self):
         adapter, rec = self._adapter(
             responses={"GET": (200, {"agents": [{"urn": "a"}, {"urn": "b"}]})}
         )
         self.assertEqual(adapter.status("b"), {"urn": "b"})
         self.assertEqual(adapter.status("absent"), {})
         self.assertIn("include_offline=true", rec.calls[0][1])
+
+    def test_status_failure_modes(self):
+        # 204/empty and {} both mean "no row" -> {}
+        for resp in [(204, None), (200, {})]:
+            with self.subTest(resp=resp):
+                adapter, _ = self._adapter(responses={"GET": resp})
+                self.assertEqual(adapter.status("urn:agent:zoder:h:s"), {})
+        # a non-dict body is a schema drift, not "absent" -> raise
+        adapter, _ = self._adapter(responses={"GET": (200, ["not", "a", "dict"])})
+        with self.assertRaises(RuntimeError):
+            adapter.status("urn:agent:zoder:h:s")
+
+    def test_status_narrows_host_in_query(self):
+        adapter, rec = self._adapter(responses={"GET": (200, {"agents": []})})
+        adapter.status("urn:agent:zoder:typhon:abc")
+        self.assertIn("host=typhon", rec.calls[0][1])
 
 
 if __name__ == "__main__":
