@@ -60,6 +60,29 @@ Expand it to:
   over-driven or two arms touching the same file — the doctor cortex consumes
   these to replan.
 
+## The cortex runs on a LOCAL model (operator 2026-10-15)
+
+The brain must be **on-prem**, not cloud — low latency, no metered cost, no
+external dependency. Fleet local models:
+
+| Role | Model | Endpoint |
+|---|---|---|
+| **coder / planner** | `qwen38` | TYDEUS `192.0.2.73:8006/v1` |
+| **reviewer** | `gemma4-31b` | CERBERUS `192.0.2.96:8080/v1` |
+
+The doctor's phase defaults were repointed accordingly (were `gateway`/`codex`
+via the **retired `:4100`**):
+
+- `DOCTOR_TRIAGE_MODEL` → `qwen38` (TYDEUS) · `DOCTOR_TRIAGE_BASE_URL` → TYDEUS
+- `DOCTOR_REVIEW_MODEL` → `gemma4-31b` (CERBERUS) · `DOCTOR_REVIEW_BASE_URL` → CERBERUS
+- `DOCTOR_FIX_MODEL` → `qwen38` (TYDEUS) · `DOCTOR_FIX_BASE_URL` → TYDEUS
+- `_invoke_openweight(prompt, alias, base_url=…, model=…)` — per-phase base/model.
+- Local endpoints accept placeholder auth: a missing key is only fatal for a
+  base that is explicitly remote.
+
+The codex CLI / gateway paths stay reachable via env override but are **no
+longer defaults**. DeepSeek/Anthropic/Together remain forbidden as the brain.
+
 ## Net
 
 - **Bus** = brainstem (state, arbitration, capacity, reflexes) — *already running on the hive*.

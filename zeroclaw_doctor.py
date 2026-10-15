@@ -89,27 +89,39 @@ LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
 #             action_dispatch_codex_fix(eligible_kinds=["zeroclaw"]); this knob
 #             only governs any in-doctor model call labelled "fix".
 # Value is a model alias: "codex" -> local codex CLI; anything else -> the
-# open-weight OpenAI-compatible path (DOCTOR_OPENWEIGHT_*).
-DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "gateway").strip().lower()
-DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "codex").strip().lower()
-DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "codex").strip().lower()
+# OpenAI-compatible path (DOCTOR_<PHASE>_BASE_URL / DOCTOR_OPENWEIGHT_*).
+# LOCAL brain (operator 2026-10-15): the orchestrator reasons on on-prem models —
+# TYDEUS qwen38 (coder) + CERBERUS gemma4-31b (reviewer). NEVER the retired :4100.
+DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "qwen38").strip().lower()
+DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "gemma4-31b").strip().lower()
+DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "qwen38").strip().lower()
 _PHASE_MODELS = {
     "triage": DOCTOR_TRIAGE_MODEL,
     "review": DOCTOR_REVIEW_MODEL,
     "fix": DOCTOR_FIX_MODEL,
 }
-# Open-weight OpenAI-compatible endpoint used for any non-codex phase model.
-# Default = NGC Enterprise Inference Hub via the .4 LiteLLM gateway (PYTHIA:4100
-# tunnel, $0 enterprise). DeepSeek is FORBIDDEN here (operator 2026-06-07:
-# deepseek is code-review / high-level-architecture fallback ONLY — the doctor
-# does triage reasoning, neither). nemotron-3-super = strong direct-prompt
-# reasoner (no agentic tool loop on this path).
+# OpenAI-compatible local endpoints used for any non-codex phase model.
+#   TYDEUS  :8006/v1  = qwen38 (coder; fleet's zoder coder route)
+#   CERBERUS :8080/v1 = gemma4-31b (reviewer; fleet's zoder reviewer route)
+# These are the LOCAL brain (operator 2026-10-15). The retired :4100 gateway and
+# codex stay available via env override but are no longer defaults.
 DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get(
-    "DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.67:4100/v1").rstrip("/")
-DOCTOR_OPENWEIGHT_MODEL = os.environ.get(
-    "DOCTOR_OPENWEIGHT_MODEL", "nvidia/nvidia/nemotron-3-super-v3")
+    "DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.73:8006/v1").rstrip("/")
+DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "qwen38")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
 DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
+# Per-phase local bases: triage/fix -> TYDEUS (coder); review -> CERBERUS (reviewer).
+DOCTOR_TRIAGE_BASE_URL = os.environ.get(
+    "DOCTOR_TRIAGE_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+DOCTOR_REVIEW_BASE_URL = os.environ.get(
+    "DOCTOR_REVIEW_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
+DOCTOR_FIX_BASE_URL = os.environ.get(
+    "DOCTOR_FIX_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+_PHASE_BASE_URLS = {
+    "triage": DOCTOR_TRIAGE_BASE_URL,
+    "review": DOCTOR_REVIEW_BASE_URL,
+    "fix": DOCTOR_FIX_BASE_URL,
+}
 
 # Self-triage scanner config
 SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))   # seconds between failed-cluster scans
@@ -542,18 +554,24 @@ def _openweight_api_key() -> str:
     return ""
 
 
-def _invoke_openweight(prompt: str, model_alias: str) -> tuple[bool, str]:
-    """Run a non-codex (open-weight) phase via an OpenAI-compatible chat
-    endpoint. Used for cheap phases like triage classification. Anthropic +
-    Together remain FORBIDDEN per CLAUDE.md; DeepSeek is review/architecture-
-    only (operator 2026-06-07) so the default endpoint is the NGC .4 gateway.
-    Returns (ok, text) with the same contract as the codex path."""
+def _invoke_openweight(
+    prompt: str,
+    model_alias: str,
+    *,
+    base_url: str | None = None,
+    model: str | None = None,
+) -> tuple[bool, str]:
+    """Run a non-codex phase via an OpenAI-compatible chat endpoint.
+
+    Defaults to the LOCAL brain (TYDEUS qwen38 / CERBERUS gemma4-31b) — pass
+    ``base_url``/``model`` for a specific phase. Anthropic + Together remain
+    FORBIDDEN per CLAUDE.md. Local endpoints accept a placeholder auth, so a
+    missing key is only fatal when a base is explicitly remote."""
+    base = (base_url or DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+    model_id = model or DOCTOR_OPENWEIGHT_MODEL
     api_key = _openweight_api_key()
-    if not api_key:
-        return False, (f"open-weight model {model_alias!r} requested but no API key "
-                       "(set DOCTOR_OPENWEIGHT_API_KEY or deepseek key in config.toml)")
     body = {
-        "model": DOCTOR_OPENWEIGHT_MODEL,
+        "model": model_id,
         "messages": [
             {"role": "system", "content": DOCTOR_SYSTEM},
             {"role": "user", "content": prompt},
@@ -561,25 +579,27 @@ def _invoke_openweight(prompt: str, model_alias: str) -> tuple[bool, str]:
         "temperature": 0.0,
         "stream": False,
     }
-    url = f"{DOCTOR_OPENWEIGHT_BASE_URL}/chat/completions"
+    url = f"{base}/chat/completions"
     data = json.dumps(body).encode()
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"content-type": "application/json",
-                 "authorization": f"Bearer {api_key}"})
-    log.info("invoking open-weight model=%s alias=%s prompt_chars=%d",
-             DOCTOR_OPENWEIGHT_MODEL, model_alias, len(prompt))
+    headers = {"content-type": "application/json"}
+    if api_key:
+        headers["authorization"] = f"Bearer {api_key}"
+    else:
+        log.warning("no open-weight API key; calling %s unauthenticated (ok for local)", base)
+    req = urllib.request.Request(url, data=data, method="POST", headers=headers)
+    log.info("invoking model=%s at %s (alias=%s, prompt_chars=%d)",
+             model_id, base, model_alias, len(prompt))
     try:
         with urllib.request.urlopen(req, timeout=DOCTOR_OPENWEIGHT_TIMEOUT) as r:
             resp = json.loads(r.read())
         text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
         if text and text.strip():
             return True, text.strip()
-        return False, f"open-weight empty response: {str(resp)[:300]}"
+        return False, f"model {model_id} empty response: {str(resp)[:300]}"
     except urllib.error.HTTPError as e:
-        return False, f"open-weight HTTP {e.code}: {e.read()[:300]!r}"
+        return False, f"model {model_id} HTTP {e.code}: {e.read()[:300]!r}"
     except Exception as e:
-        return False, f"open-weight call failed: {e}"
+        return False, f"model {model_id} call failed at {base}: {e}"
 
 
 def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
@@ -609,10 +629,15 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
         if ok2 and text2.strip():
             return True, text2
         return False, f"gateway codex failed: {text}; open-weight fallback failed: {text2}"
-    ok, text = _invoke_openweight(prompt, model_alias)
+    ok, text = _invoke_openweight(
+        prompt,
+        model_alias,
+        base_url=_PHASE_BASE_URLS.get(phase, DOCTOR_OPENWEIGHT_BASE_URL),
+        model=model_alias,
+    )
     if ok and text.strip():
         return True, text
-    return False, f"open-weight ({model_alias}) failed: {text}"
+    return False, f"model ({model_alias}) failed: {text}"
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
