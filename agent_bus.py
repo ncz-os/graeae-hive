@@ -35,6 +35,7 @@ from sse_starlette.sse import EventSourceResponse
 import queue_logic
 import retry_policy
 from hive import repos as repo_registry
+from hive import scheduler as sched
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
 
@@ -3426,6 +3427,46 @@ async def dequeue_next_job(agent_urn: str):
                     and a_used >= THROTTLE_HEADROOM * a_cap
                 ),
             }
+
+            # MiniMax capacity pool (the first capacity-ledger instance). A
+            # MiniMax-ROUTED worker may not start a session when the pool is
+            # full: global cap = MINIMAX_GLOBAL_MAX concurrent OR ASSIGNED
+            # sessions (lease unexpired), per-worker cap = MINIMAX_PER_WORKER_MAX.
+            # Pool math lives in hive.scheduler; the dequeue supplies the
+            # snapshot. Denial = 204 minimax_pool_saturated (NOT a silent
+            # no_jobs) so the worker falls through to a non-MiniMax chain.
+            if sched.is_minimax_route(a_provider, a_model):
+                async with db.execute(
+                    "SELECT claimed_by, id FROM jobs "
+                    "WHERE status IN ('offered','claimed','running') "
+                    "AND claimed_provider=? AND claimed_model=? "
+                    "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
+                    (sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL, now),
+                ) as cur:
+                    pool_rows = [tuple(r) async for r in cur]
+                pool = sched.build_pool_snapshot(pool_rows)
+                ok, reason = pool.can_assign(agent_urn)
+                if not ok:
+                    await db.execute("ROLLBACK")
+                    await emit_event(
+                        db,
+                        "minimax.pool.denied",
+                        {
+                            "urn": agent_urn,
+                            "pool_active": pool.active_assignments,
+                            "pool_cap": sched.MINIMAX_GLOBAL_MAX,
+                            "reason": reason,
+                        },
+                    )
+                    from fastapi.responses import Response as _PoolRsp
+
+                    return _PoolRsp(
+                        status_code=204,
+                        headers={
+                            "X-Hive-Claim-Result": "minimax_pool_saturated",
+                            "X-Hive-Claim-Detail": f"minimax pool saturated: {reason}",
+                        },
+                    )
 
             async with db.execute(
                 "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
