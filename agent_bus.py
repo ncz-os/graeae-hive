@@ -29,7 +29,7 @@ except ModuleNotFoundError:
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 import queue_logic
@@ -37,6 +37,18 @@ import retry_policy
 from hive import repos as repo_registry
 from hive import scheduler as sched
 from hive.bus import capacity as _capacity
+from hive.bus.schemas import (
+    AgentHeartbeat,
+    AgentRegister,
+    JobCreate,
+    JobPurgeRequest,
+    JobUpdate,
+    MessagePublish,
+    PurgeRequest,
+    ReclassifyRequest,
+    RequeueRequest,
+    ScheduleCreate,
+)
 from hive.bus.domain.eligibility import (
     RUNTIME_KIND_MAP,
     THROTTLE_HEADROOM,
@@ -1312,141 +1324,16 @@ async def cache_record_hit(db, cache_key: str, cost_saved: float):
     )
 
 
-class AgentRegister(BaseModel):
-    # OPEN REGISTRATION + RUNTIME→KIND ENFORCEMENT (per Kimi advisory 2026-05-23).
-    # Any agent registers; identity is recorded for transparency. Kind must align
-    # with runtime (prevents opencode-misregistering-as-claude). Soft fields
-    # below default to "unknown" if not declared.
-    #
-    #   runtime          = TOOL/ORCHESTRATOR (claude-code, opencode, codex, hermes, zeroclaw, openclaw, ic-engine, mnemos, human)
-    #   model            = LLM (claude-opus-4-7, grok-4.3, kimi-k2.6, deepseek-v4-pro, gpt-5.5, gemini-3.1-pro, ...)
-    #   provider         = INFERENCE HOST (anthropic, xai, ngc, openai, deepseek, together, groq, gemini, local-llamacpp, ...)
-    #   kind             = URN routing segment — MUST be in RUNTIME_KIND_MAP[runtime] if runtime known
-    #   autonomy_level   = autonomous / confirm-risky / interactive / unknown
-    runtime: str = Field("unknown", pattern=r"^[a-z][a-z0-9-]{0,31}$")
-    model: str = "unknown"
-    provider: str = "unknown"
-    host: str
-    kind: str | None = Field(
-        None,
-        pattern=r"^[a-z][a-z0-9-]{0,31}$",
-        description="URN routing segment — defaults to runtime",
-    )
-    autonomy_level: str = Field(
-        "unknown", description="autonomous / confirm-risky / interactive / unknown"
-    )
-    auth_method: str = Field(
-        "unknown",
-        description="subscription (Max plan), api (pay-per-token), free, unknown",
-    )
-    plan_cap_usd: float | None = (
-        None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
-    )
-    pid: int | None = None
-    capabilities: list[str] | None = None
-    version: str | None = None
-    metadata: dict | None = None
-    subscription_pools: list[str] | None = Field(default_factory=list)
-    # Stable per-worker-instance identity for registration dedup (2026-06-15).
-    # Workers run as systemd units `zeroclaw-wss-worker@N` / `zc-worker@N` with a
-    # %i identity that is STABLE across restarts (unlike pid/session_id). When a
-    # worker restarts and re-registers with the same (host, kind, instance), the
-    # bus REPLACES its prior row instead of minting a new uuid4 URN -> ends the
-    # dashboard duplicate-registration/inflation. OPTIONAL: agents that don't send
-    # `instance` (claude/codex/system/mnemos/old workers) keep the original
-    # mint-a-new-URN behavior, so this is fully backward-compatible and never
-    # breaks an existing agent kind. Bounded pattern: prevents pathological keys.
-    instance: str | None = Field(
-        None,
-        pattern=r"^[A-Za-z0-9._:@-]{1,64}$",
-        description="stable per-worker-instance id for register dedup",
-    )
 
 
-class AgentHeartbeat(BaseModel):
-    urn: str
-    status: str = "online"
-    metadata: dict | None = None
 
 
-class JobCreate(BaseModel):
-    submitter_urn: str  # who is asking (user OR delegating agent)
-    parent_job_id: str | None = None
-    kind: str  # work type (code-edit/research/review/build/etc)
-    description: str | None = None
-    priority: int = 0  # higher = more urgent (default 0)
-    deadline: float | None = None  # unix ts, optional SLA
-    required_capabilities: list[str] | None = None  # worker must have ALL of these
-    eligible_kinds: list[str] | None = None  # restrict to agent kinds; null = any
-    eligible_hosts: list[str] | None = (
-        None  # restrict to agent hosts (e.g. ["cixmini"]); null = any
-    )
-    target_workspace: str | None = (
-        None  # GRAEAE permanent-fix: bus-side first-class workspace (replaces worker KIND_WORKSPACE_MAP guessing)
-    )
-    # #10 FIX (review 2026-05-23): project tag — separate from worker capabilities.
-    # 'riskyeats'/'investorclaw' are PROJECTS, not capabilities. Workers don't gain/lose
-    # the ability to do work because of a project label; the label is for filter+routing.
-    project: str | None = None
-    max_retries: int = 2  # auto-resubmit after worker reports failed (up to N times)
-    # COST DISCIPLINE (per CLAUDE.md llm-usage-policy):
-    max_cost_tier: str = "B"  # adaptive tier cap: A=local/NGC first (free), B=Groq/xAI overflow (paid), C=reserve. Default B=Tier A preferred, Tier B fallback when Tier A overloaded.
-    preferred_providers: list[str] | None = (
-        None  # ranked preference (first match wins among tier-eligible)
-    )
-    preferred_models: list[str] | None = None  # ranked model preference
-    # MNEMOS provenance:
-    mnemos_refs: list[str] | None = (
-        None  # mem_XXX ids — context/handoffs/related work the worker should consult
-    )
-    # DAG support:
-    depends_on: list[str] | None = (
-        None  # job ids that must be status='done' before this job is dequeueable
-    )
-    idempotency_key: str | None = (
-        None  # forced-rerun escape: a unique value is never coalesced
-    )
-    # PR-fix routing (operator 2026-06-17): forge + repo + branch/PR to check out.
-    site: str | None = None  # git_sites.json key (github/gitlab-ncz/codeberg/internal)
-    repo: str | None = None  # owner/name path on that site
-    head_branch: str | None = None  # branch / PR head to check out
-    pr_number: int | None = None  # PR/MR number (forge-specific ref scheme)
 
 
-class JobUpdate(BaseModel):
-    status: str
-    result: dict | None = None
-    claimed_by: str | None = None
-    tokens_in: int | None = (
-        None  # workers SHOULD report token usage on done/failed for cost audit
-    )
-    tokens_out: int | None = None
-    result_mnemos_id: str | None = (
-        None  # mem_XXX id where worker stored the outcome — closes provenance loop
-    )
-    # Routing re-assignment (queued/offered jobs only — use status=queued to re-route)
-    eligible_kinds: list[str] | None = None
-    eligible_hosts: list[str] | None = None
 
 
-class ScheduleCreate(BaseModel):
-    name: str
-    interval_seconds: int = Field(
-        ...,
-        ge=60,
-        le=86400 * 30,
-        description="60s minimum (avoid hot-loop); 30d maximum",
-    )
-    job_template: dict  # full JobCreate body that will be submitted each tick
-    enabled: bool = True
 
 
-class MessagePublish(BaseModel):
-    from_urn: str
-    to_urn: str | None = None
-    in_reply_to: str | None = None
-    topic: str
-    payload: dict
 
 
 # ---------- lifecycle ----------
@@ -4038,9 +3925,6 @@ async def auto_retry_job(job_id: str):
     return {"ok": True, "id": job_id, "retry_count": retry_count + 1}
 
 
-class RequeueRequest(BaseModel):
-    job_ids: list[str]
-    reason: str = "manual-requeue"
 
 
 @app.post("/v1/admin/jobs/requeue", dependencies=[Depends(require_mutation_actor)])
@@ -4076,9 +3960,6 @@ async def admin_requeue_jobs(req: RequeueRequest):
     return results
 
 
-class PurgeRequest(BaseModel):
-    job_ids: list[str]
-    reason: str = "doctor-dlq-remove"
 
 
 @app.post("/v1/admin/jobs/purge", dependencies=[Depends(require_mutation_actor)])
@@ -4202,16 +4083,6 @@ async def delete_job(job_id: str, force: bool = False):
     return {"deleted": 1, "id": job_id, "prior_status": status}
 
 
-class JobPurgeRequest(BaseModel):
-    kind_prefix: str | None = None
-    status: str | None = None
-    statuses: list[str] | None = None
-    description_contains: str | None = None
-    submitter_urn: str | None = None
-    older_than_seconds: float | None = None
-    ids: list[str] | None = None
-    include_active: bool = False
-    reason: str = "housekeeping-purge"
 
 
 @app.post("/v1/jobs/purge", dependencies=[Depends(require_mutation_actor)])
@@ -4346,10 +4217,6 @@ async def purge_jobs(req: JobPurgeRequest):
 RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
 
 
-class ReclassifyRequest(BaseModel):
-    job_ids: list[str]
-    status: str
-    reason: str = "doctor-dlq-reclassify"
 
 
 @app.post("/v1/admin/jobs/reclassify", dependencies=[Depends(require_mutation_actor)])
