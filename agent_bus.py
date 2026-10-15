@@ -2073,6 +2073,22 @@ async def reaper_task(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if HIVE_BACKEND == "db2":
+        # Db2 owns its DDL via the repository (init/close). Do NOT run the
+        # sqlite schema-convergence path below, which needs a raw connection
+        # handle the Db2 repo does not expose.
+        repo = hive_repo()
+        await repo.init()
+        task = asyncio.create_task(reaper_task(app))
+        app.state.reaper_task = task
+        try:
+            yield
+        finally:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+            await repo.close()
+        return
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with connect_db() as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
