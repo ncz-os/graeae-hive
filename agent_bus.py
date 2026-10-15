@@ -3473,10 +3473,10 @@ async def dequeue_next_job(agent_urn: str):
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
                 "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at, "
                 "site, repo, head_branch, pr_number "
-                "FROM jobs WHERE status IN ('queued','offered') "
+                "FROM jobs WHERE (status='queued' OR (status='offered' AND claimed_by=?)) "
                 "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
                 "ORDER BY priority DESC, started_at ASC LIMIT ?",
-                (now, CLAIM_SCAN_WINDOW),
+                (agent_urn, now, CLAIM_SCAN_WINDOW),
             ) as cur:
                 candidates = [tuple(r) async for r in cur]
             candidates = [
@@ -3553,7 +3553,7 @@ async def dequeue_next_job(agent_urn: str):
                     "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
                     "claim_lease_expires_at=?, last_update_at=?, "
                     "ended_at=NULL, result=NULL "
-                    "WHERE id=? AND status IN ('queued','offered')",
+                    "WHERE id=? AND (status='queued' OR (status='offered' AND claimed_by=?))",
                     (
                         agent_urn,
                         now,
@@ -3564,6 +3564,7 @@ async def dequeue_next_job(agent_urn: str):
                         now + CLAIM_LEASE_SECONDS,
                         now,
                         j_id,
+                        agent_urn,
                     ),
                 )
                 if cur2.rowcount == 0:
