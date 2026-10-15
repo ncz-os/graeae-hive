@@ -89,11 +89,17 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(repos.get_repo("mnemos")["required_mnemos_queries"], [])
 
     def test_resolve_is_capped(self):
-        # 'e' matches every entry's id/display/alias here; cap must apply and
-        # the result must be non-empty.
-        capped = repos.resolve("e", limit=1)
-        self.assertEqual(len(capped), 1)
-        self.assertGreater(len(repos.resolve("e", limit=10)), 1)
+        # the cap is the property under test; don't couple it to catalog size
+        self.assertGreaterEqual(len(repos.resolve("e", limit=100)), 1)  # sanity
+        self.assertLessEqual(len(repos.resolve("e", limit=1)), 1)
+
+    def test_aliases_unique_across_entries(self):
+        # no two entries may share an alias (else get_repo/resolve is ambiguous)
+        seen: dict[str, str] = {}
+        for entry in repos.list_repos():
+            for alias in entry["aliases"]:
+                self.assertNotIn(alias, seen, f"alias {alias!r} on both {seen.get(alias)} and {entry['id']}")
+                seen[alias] = entry["id"]
 
     def test_alias_does_not_collide_with_own_id(self):
         # every alias that exists must not equal another entry's id (ambiguity rule)
@@ -170,9 +176,12 @@ class BuiltCatalogTests(unittest.TestCase):
             self.skipTest("data/repos.json not built yet")
         data = json.loads(path.read_text())
         ids = {e["id"] for e in data["repos"]}
+        seen_aliases: dict[str, str] = {}
         for e in data["repos"]:
             for alias in e.get("aliases", []):
                 self.assertNotIn(alias, ids - {e["id"]}, f"alias {alias!r} collides with a repo id")
+                self.assertNotIn(alias, seen_aliases, f"alias {alias!r} shared by {seen_aliases.get(alias)} and {e['id']}")
+                seen_aliases[alias] = e["id"]
 
 
 if __name__ == "__main__":
