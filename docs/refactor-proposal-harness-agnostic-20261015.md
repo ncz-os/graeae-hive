@@ -149,16 +149,22 @@ commit and both the pre-merge and post-merge review flagged it as looking
 accidental. It was not accidental. It was operator-directed on 2026-10-15.
 
 Directive: the **remote Spark agent takeover path is removed from the hive**.
-The GB10 Spark is not integrated/tested with the fleet, and the OAuth-capped
-"reserve the queue for Spark" behaviour was starving real work. Removed surface
-(textual — verified with `git log -S`, so any re-introduction shows in blame):
+The Spark sits on the **NVIDIA LAN** and is unsupported going forward — the
+fleet is **local-LAN only**. It is not integrated/tested with the fleet, and
+the OAuth-capped "reserve the queue for Spark" behaviour was starving real
+work. Removed surface (textual — verified with `git log -S`, so any
+re-introduction shows in blame):
 
 - `SPARK_*` module constants + `note_spark_seen*` take-over bookkeeping
 - `_job_queued_age` queue-age probe used only by the Spark reservation
-- `QUARANTINED_HOSTS` admission gate
+- `QUARANTINED_HOSTS` admission gate + constant (operator ruling 2026-10-15:
+  the only host it ever guarded was the NVIDIA-LAN Spark; not reinstated)
 - admission `proof` fields `remote_verified` / `remote_sha`
 - dashboard Spark panel
 - `dashboard.html` `MODEL_NAMES` map (Spark provider display names)
+
+Live per-host exclusion is the systemd `HIVE_HOST_DENYLIST` env (see the
+`*.conf` drop-ins), NOT any bus-side constant.
 
 ### Consequence for `valid_completion_proof` (agent_bus.py)
 

@@ -887,13 +887,10 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 
 NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
 NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
-# Hosts the serve gate must NEVER hand a job to. PROTEUS (FreeBSD dev box)
-# has a BROKEN gateway: it claims jobs then 400s the WSS handshake in ~0.5s,
-# thrashing every job it touches (2026-06-07). Quarantine it bus-side instead
-# of tearing down another owner's host. Remove once its gateway is fixed.
-# NOTE: this is a general safety valve, independent of the retired Spark path —
-# the Spark removal must NOT have taken it along. Empty set = nothing quarantined.
-QUARANTINED_HOSTS: set[str] = set()  # all hosts un-quarantined 2026-06-14: proteus+typhon now proxmox workers (operator directive)
+# (Removed 2026-10-15): the bus-side host-quarantine constant/probe. The only
+# host it ever guarded was the NVIDIA-LAN Spark (spark-0c53, out-claiming
+# zeroclaw jobs); Spark is unsupported going forward — the fleet is local-LAN
+# only. Live host exclusion is the systemd `HIVE_HOST_DENYLIST` env, not this.
 
 
 # 2026-10-02 (operator): hold sentinels are DEPRECATED. They existed to park jobs
@@ -1173,11 +1170,6 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     agent_caps = _norm_str_set(agent.get("capabilities"))
     eligible_aliases = _norm_str_set(agent.get("eligible_aliases"))
     j_kind = _norm_str(job.get("kind"))
-
-    # Quarantined hosts (broken gateway/worker) never get served — they only
-    # thrash. Checked first so nothing else can override it.
-    if agent_host in QUARANTINED_HOSTS:
-        return False, f"host {agent_host} is quarantined (broken gateway)"
 
     if agent_host in NARROW_HOSTS and not j_kind.startswith(NARROW_ALLOWLIST):
         return False, f"narrow host {agent_host} not allowed for kind {j_kind}"
