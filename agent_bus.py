@@ -3442,9 +3442,9 @@ async def dequeue_next_job(agent_urn: str):
                 async with db.execute(
                     "SELECT claimed_by, id FROM jobs "
                     "WHERE status IN ('offered','claimed','running') "
-                    "AND claimed_provider=? "
+                    "AND claimed_provider=? AND claimed_model=? "
                     "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
-                    (sched.MINIMAX_PROVIDER, now),
+                    (sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL, now),
                 ) as cur:
                     pool_rows = [tuple(r) async for r in cur]
                 pool = sched.build_pool_snapshot(pool_rows)
@@ -3524,6 +3524,14 @@ async def dequeue_next_job(agent_urn: str):
                 ) as dc:
                     done_dep_ids = {row[0] async for row in dc}
 
+            # Canonical pool key for MiniMax-routed claims, so the occupancy
+            # query's provider+model filter is reliable regardless of how a
+            # worker spelled its model.
+            if sched.is_minimax_route(a_provider, a_model):
+                _claim_provider, _claim_model = sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL
+            else:
+                _claim_provider, _claim_model = a_provider, a_model
+
             claimed = None
             for r in candidates:
                 (
@@ -3577,8 +3585,8 @@ async def dequeue_next_job(agent_urn: str):
                         agent_urn,
                         now,
                         a_runtime,
-                        a_model,
-                        a_provider,
+                        _claim_model,
+                        _claim_provider,
                         a_tier,
                         now + CLAIM_LEASE_SECONDS,
                         now,
