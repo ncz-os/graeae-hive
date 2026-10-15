@@ -19,6 +19,33 @@ many agents each "under cap" can still blow one shared service's throughput.
 | **credits** | spend vs a pool over a window | DeepSeek prepaid; OAuth/subscription windows |
 | **cost × time** | $/MTok scaled by time | **DeepSeek peak 2×** (01–04 & 06–10 UTC Mon–Fri) |
 
+## Harness scoping (which harness can reach which service)
+
+Capacity is scoped by **harness**, not just by service — the operator's boundary
+(2026-10-15):
+
+| Harness | Service pool | Credits |
+|---|---|---|
+| **zoder** | OPEN models/services only: MiniMax, DeepSeek, EIH/NGC, local compute (+ groq/gemini/xai/bedrock) | metered / local |
+| **claude** CLI | **Anthropic only** | Claude Pro/Max subscription — usable *only* through the Claude CLI |
+| **codex** CLI | **OpenAI only** | ChatGPT/Codex subscription — only through the Codex CLI |
+| **opencode** | backup harness (runs on zoder hosts) | per its config |
+
+Anthropic/OpenAI are **not reachable from zoder** — verified: `KNEMON_PROVIDERS`
+contains zero `anthropic`/`openai` entries. So:
+
+- The ledger keys by **(harness, service)** and **accounts per harness**.
+- A job's **capability match includes its harness**; the router never sends an
+  Anthropic/OpenAI job down the zoder path.
+- `LLM_RATES`'s `anthropic`/`openai` rows are for **cost estimation of the
+  claude/codex harnesses**, not for zoder routing.
+
+**Encapsulation option (rejected as default):** zoder *could* wrap the claude/codex
+CLIs as a "harness for those systems", but the subscription credits are only
+usable through the native CLIs, and wrapping loses their native usage signal.
+Keep them **separate harnesses** with their own accounting; revisit only if a
+single dispatch surface is needed.
+
 ## What each service actually exposes (settled 2026-10-15)
 
 | Service | Ceiling | Live remaining | Pre-flight | Balance |
