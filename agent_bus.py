@@ -9,7 +9,6 @@ Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central 
 """
 from __future__ import annotations
 import asyncio
-import hashlib
 import hmac
 import json
 import os
@@ -28,29 +27,15 @@ except ModuleNotFoundError:
     from hive.persistence import _sqlite_async as aiosqlite
 
 import queue_logic
+import retry_policy
 from hive.persistence.factory import get_hive_repository
-from hive.scheduler import (
-    MINIMAX_ACTIVE_STATUSES as _SCHED_MINIMAX_ACTIVE_STATUSES,
-    MINIMAX_GLOBAL_MAX as _SCHED_MINIMAX_GLOBAL_MAX,
-    MINIMAX_MODEL as _SCHED_MINIMAX_MODEL,
-    MINIMAX_PROVIDER as _SCHED_MINIMAX_PROVIDER,
-    MiniMaxPoolState as _MiniMaxPoolState,
-    build_pool_snapshot as _build_minimax_pool,
-    order_candidates_for_worker,
-    worker_profile_from_metadata,
-)
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
-HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
-# Administrative mutations use a distinct credential; startup refuses an
-# ambiguous single-token configuration.
-HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
-HIVE_DASHBOARD_SESSION_TTL = int(os.environ.get("HIVE_DASHBOARD_SESSION_TTL", "3600"))
 ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
@@ -62,6 +47,26 @@ HEARTBEAT_OFFLINE_AFTER = 300.0
 # window while reaping long-dead session rows.
 AGENT_PURGE_AFTER = float(os.environ.get("HIVE_AGENT_PURGE_AFTER", "21600"))
 EVENTS_RETAIN_HOURS = 168  # 7 days
+# Job retention sweep (housekeeping — the dashboard fills with test/duplicate
+# jobs fast). Conservative defaults; both windows env-overridable.
+#  - Terminal jobs (done/failed/failed_completion/cancelled/dead-letter) older
+#    than RETAIN_DONE_JOBS_DAYS are auto-deleted.
+#  - Obvious test/e2e jobs (description matches TEST_JOB_DESC_PATTERNS) terminal
+#    AND older than RETAIN_TEST_JOBS_DAYS are deleted sooner.
+# Active jobs (queued/offered/claimed/running/needs-review) are NEVER swept.
+RETAIN_DONE_JOBS_DAYS = float(os.environ.get("RETAIN_DONE_JOBS_DAYS", "7"))
+RETAIN_TEST_JOBS_DAYS = float(os.environ.get("RETAIN_TEST_JOBS_DAYS", "1"))
+# Statuses considered terminal & sweepable. needs-review is intentionally
+# EXCLUDED (it is a human-attention queue, not finished work).
+SWEEPABLE_STATUSES = ("done", "failed", "failed_completion", "cancelled", "dead-letter")
+# Active/in-flight statuses that delete endpoints + the sweep refuse to touch
+# (without explicit force/include_active) so an in-flight worker is never orphaned.
+ACTIVE_JOB_STATUSES = ("queued", "offered", "claimed", "running", "needs-review")
+# Substrings (case-insensitive) that mark a job description as obvious test junk.
+TEST_JOB_DESC_PATTERNS = (
+    "e2e", "testdispatch", "append a one-line", "dated comment",
+    "xfam", "validate native", "hive functional", "hive deploy e2e",
+)
 SSE_PING_INTERVAL = 15.0
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
@@ -474,10 +479,7 @@ async def connect_db():
 def _is_dedup_violation(exc: BaseException) -> bool:
     """Unique-violation from the active-only dedup index ONLY (never another PK/unique)."""
     m = str(exc)
-    return any(name in m.upper() for name in (
-        "HIVE_JOBS_ACTIVE_DEDUP_UQ",  # Oracle physical-table index
-        "JOBS_ACTIVE_DEDUP_UQ",       # SQLite and Db2 index
-    )) or (
+    return "HIVE_JOBS_ACTIVE_DEDUP_UQ" in m.upper() or (
         "unique constraint failed" in m.lower() and "dedup_hash" in m.lower()
     )
 
@@ -615,6 +617,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   required_capabilities TEXT,                   -- json array; worker must have ALL
   eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
   eligible_hosts TEXT,                          -- json array; agent hosts eligible (null = any); e.g. ["cixmini"]
+  site TEXT,                                    -- git_sites.json key (github/gitlab-ncz/codeberg/internal)
+  repo TEXT,                                    -- owner/name path on that site
+  head_branch TEXT,                             -- branch / PR head to check out
+  pr_number INTEGER,                            -- PR/MR number (forge-specific ref scheme)
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review')),
   claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
@@ -644,8 +650,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   max_retries INTEGER NOT NULL DEFAULT 2,
   retry_backoff_until REAL,
   last_update_at REAL,
-  claim_lease_expires_at REAL,
-  dedup_hash TEXT
+  claim_lease_expires_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status            ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter         ON jobs(submitter_urn);
@@ -773,7 +778,7 @@ ACTIVE_AGENT_STATUSES = {"online", "idle"}
 
 # ROLE SPLIT (user directive 2026-05-23): opencode + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
-# Orchestrators: claude-code, human, mnemos. They submit work; workers execute it.
+# Orchestrators include a distinct Codex role. Ordinary Codex workers stay claim-only.
 WORKER_ONLY_RUNTIMES: set[str] = {
     "opencode", "opencode-cli",
     "opencode", "opencode-cli",
@@ -785,6 +790,7 @@ WORKER_ONLY_RUNTIMES: set[str] = {
 }
 ORCHESTRATOR_RUNTIMES: set[str] = {
     "claude-code", "claude-cli", "claude",
+    "codex-orchestrator",
     "human",
     "mnemos",
     "doctor",   # PYTHIA triage authority — submits codex sub-jobs + auto-triage
@@ -817,6 +823,18 @@ NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 # of tearing down another owner's host. Remove once its gateway is fixed.
 QUARANTINED_HOSTS = set()  # all hosts un-quarantined 2026-06-14: proteus+typhon now proxmox workers, spark DGX-verified (operator directive)
 
+# 2026-10-02 (operator): hold sentinels are DEPRECATED. They existed to park jobs
+# behind the zeroclaw pre-submission gate, which is no longer enforced. Treat
+# these as unrestricted so their jobs are schedulable by capable workers.
+# ``rescue-superseded-hold`` is deliberately NOT in this set: those jobs are
+# superseded and must be cancelled rather than run.
+_HOLD_HOSTS = {
+    "codex-manual-rescue",
+    "rescue-guard-hold",
+    "completion-repair-hold",
+    "zcgate-release-sink",
+}
+
 # WORKSPACE AFFINITY — automatic required_capabilities injection + claim guard.
 # Workspace-scoped jobs must only be offered to workers that explicitly
 # advertise the matching workspace capability. This protects both newly
@@ -835,7 +853,16 @@ KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
     "build:zeroclaw": "hard:linux-compile",
     "zeroclaw:": "hard:linux-compile",
     "ncz-os-zeroclaw:": "hard:linux-compile",
+    # zoder (ncz-os rust workspace, sibling to zeroclaw) -> linux-compile hosts only
+    "zoder:": "hard:linux-compile",
+    "ncz-os-zoder:": "hard:linux-compile",
     "compile:": "hard:linux-compile",
+    # mnemos rust hot-path jobs -> rust+CI hosts only (cerberus/hydra/achilles).
+    # Most mnemos work has NO such requirement and stays claimable by any host;
+    # tag a job build:mnemos-rust / mnemos-rust: / compile:mnemos to gate it. 2026-06-21.
+    "build:mnemos-rust": "hard:linux-compile",
+    "mnemos-rust:": "hard:linux-compile",
+    "compile:mnemos": "hard:linux-compile",
     "test:provider-bench-1-readme-fix-deepseek-pro": "workspace-riskybiz",
     "test:provider-bench-2-typo-deepseek-pro": "workspace-riskybiz",
     "test:provider-bench-": "workspace-riskybiz",
@@ -862,7 +889,6 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "ollama-cerberus": "A",
     "local":           "A",
     "pantheon":        "A",
-    "minimax":         "B",   # MiniMax-M3 capacity pool — paid metered mid-tier (5-slot global cap)
 
     # Tier B = MID (cheap paid commercial)
     "groq":            "B",
@@ -888,7 +914,11 @@ PROVIDER_COST_TIER: dict[str, str] = {
     "unknown":         "A",
 }
 COST_TIERS = ["A", "B", "C"]
-VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter", "needs-review"}
+VALID_JOB_STATUSES = {"queued", "offered", "claimed", "running", "done", "failed", "failed_completion", "cancelled", "dead-letter", "needs-review", "released"}
+# `released` was terminal here but is NOT in the jobs.status CHECK constraint and
+# is produced by no transition, so PATCH status=released passed validation then
+# died in the DB as a raw IntegrityError (500, not 4xx). An unreachable
+# terminal state is worse than no such state.
 TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
@@ -902,11 +932,20 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     "running": {"queued", "running", "done", "failed", "cancelled", "needs-review"},
     "needs-review": {"needs-review", "done", "failed", "cancelled"},  # awaiting review; promotable
     "done": {"done", "cancelled"},  # allow cancelling fake/duplicate completions out of done
-    "failed": {"failed"},
+    # A failed job may be RETIRED as cancelled (superseded work), never
+    # reopened -- same exception as done -> cancelled. Without it a
+    # superseded failure stayed "failed" forever (2026-10-03).
+    "failed": {"failed", "cancelled"},
     "cancelled": {"cancelled"},
     "dead-letter": {"dead-letter"},  # terminal; idempotent same-status PATCH only
 }
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
+#: Eligibility is evaluated in Python (job_agent_eligible), so the candidate
+#: query cannot know which rows THIS agent can take. A single fixed window
+#: therefore starves any agent whose work sits behind rows it is ineligible
+#: for: it gets 204 forever while claimable work sits queued. Scan deeper,
+#: bounded on both sides so a huge queue cannot turn a claim into a scan.
+CLAIM_SCAN_WINDOW = int(os.environ.get("CLAIM_SCAN_WINDOW", "10000"))
 # Hosts the bus refuses to offer jobs to — typically because their workers
 # have a broken config (e.g. enc2 secret-key mismatch) and would fail any
 # claim immediately. User directive 2026-05-26: pegasus (.79) is flooding
@@ -916,6 +955,12 @@ HOST_DENYLIST: set[str] = {
     h.strip().lower() for h in os.environ.get("HIVE_HOST_DENYLIST", "").split(",")
     if h.strip()
 }
+
+# Phase 2 provider-as-capability gate. When ON, an executor job (build / agent
+# coding kind) can only be claimed by a host advertising >=1 live llm-* cap, so a
+# host whose only LLM provider is dead self-excludes (no host denylist needed).
+# Default OFF until workers advertise llm-* fleet-wide (flip after Phase 4).
+LLM_CAP_GATE = os.environ.get("HIVE_LLM_CAP_GATE", "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 def cost_tier_for(provider: str) -> str:
@@ -961,16 +1006,21 @@ def agent_kind_aliases(kind: str, runtime: Optional[str]) -> set[str]:
         if kind in kinds:
             aliases.add(rt)
             aliases.update(kinds)
-    # ALL-EXECUTORS-ELIGIBLE (operator 2026-06-01): claude, codex, zeroclaw and
-    # opencode are MUTUALLY eligible for every executor job. They differ only at
-    # DISPATCH (zeroclaw routes per-model by complexity via KNEMON). A job marked
-    # for any one of them is claimable by all of them. This union was dropped in
-    # the 2026-06-06 spark-takeover refactor (regression mem_1780970182796) and is
-    # restored here so non-zeroclaw-kind executor workers can still claim the
-    # zeroclaw-eligible coding jobs that submit-time admission rewrites them into.
-    EXECUTOR_KINDS = {"claude", "codex", "zeroclaw", "opencode"}
-    if aliases & EXECUTOR_KINDS:
-        aliases |= EXECUTOR_KINDS
+    # ALL-EXECUTORS-ELIGIBLE union REMOVED 2026-09-15. It existed so a job
+    # marked for one executor kind (claude/codex/zeroclaw/opencode) was
+    # claimable by any of them, on the premise that "they differ only at
+    # DISPATCH (zeroclaw routes per-model by complexity via KNEMON)" -- true
+    # under the old zc-gateway/zeroclaw_wss_worker_v2.py architecture, where
+    # KNEMON picked the real model server-side regardless of which agent
+    # claimed the job. hive_worker.py (the fleet-wide replacement worker,
+    # deployed to every host this session) does NOT call KNEMON at all --
+    # WORKER_KIND directly selects the execution tool (`zoder loop` for
+    # zeroclaw, `codex exec` for codex). With the union still active, a
+    # codex-kind worker could claim a job with eligible_kinds=["zeroclaw"]
+    # and literally run it via `codex exec` instead of zoder -- reproduced
+    # live 2026-09-15 (TYDEUS's codex worker claimed + ran a zeroclaw smoke
+    # test job). Kind is strict again; a job's eligible_kinds now means what
+    # it says.
     aliases.discard("")
     return aliases
 
@@ -1018,6 +1068,12 @@ def job_agent_preference_score(job: dict[str, Any], agent: dict[str, Any]) -> in
 # are RESERVED for Spark (not burned on metered deepseek) as long as a Spark
 # relay agent is online.
 SPARK_HOSTS = {"spark-0c53"}
+# spark-0c53 build-deny lift (2026-06-16): the false-done root was fixed
+# (poller declares an honest terminal status; commit-expecting kinds with no
+# commit/patch fail honest) and caps were narrowed off ["*"], so spark may now
+# be RELAYED build:* jobs. Reversible: set SPARK_ALLOW_BUILD=0 to restore the
+# hard-deny (and build takeover-disable) without code changes.
+SPARK_ALLOW_BUILD = os.environ.get("SPARK_ALLOW_BUILD", "1").strip().lower() not in ("0", "false", "no", "off")
 # NOTE: submit-time admission rewrites eligible_kinds=["codex"] -> ["zeroclaw"]
 # (codex is a CLI zeroclaw workers shell out to), so coding jobs reach the DB
 # as zeroclaw-eligible — the takeover set must include zeroclaw for Spark to
@@ -1097,7 +1153,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     # Spark NEVER executes build:* jobs by ANY path (takeover, host-pin, or general
     # eligibility): the DGX poller has no repo-mapping for a build: kind. Hard-deny
     # so a build job can only be claimed by a real zeroclaw worker (zc_oneshot harness).
-    if agent_host in SPARK_HOSTS and j_kind.startswith("build:"):
+    if (not SPARK_ALLOW_BUILD) and agent_host in SPARK_HOSTS and j_kind.startswith("build:"):
         return False, f"spark does not execute build kinds ({j_kind}); real zeroclaw workers only"
 
     j_kinds = _norm_str_set(job.get("eligible_kinds"))
@@ -1106,7 +1162,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
     # Spark poller has no repo-mapping for a build: kind, so it must never take them
     # (the 2026-06-08 "no repo mapping" needs-review poison). codex/claude coding
     # jobs (non-build: kinds, also eligible_kinds=["zeroclaw"]) still route to Spark.
-    if j_kind.startswith("build:"):
+    if j_kind.startswith("build:") and not SPARK_ALLOW_BUILD:
         spark_takeover_job = False
 
     # Spark override: any codex/claude-eligible job (or a job host-pinned to
@@ -1160,6 +1216,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         return False, f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}"
 
     hosts = _norm_str_set(job.get("eligible_hosts"))
+    hosts = {h for h in hosts if h not in _HOLD_HOSTS}
     if hosts and "*" not in hosts and agent_host not in hosts:
         return False, f"agent host={agent_host!r} not in eligible_hosts={sorted(hosts)}"
 
@@ -1173,6 +1230,15 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         cap_match = queue_logic.match(labels, agent_caps)
         if not cap_match.eligible:
             return False, f"agent does not satisfy required_capabilities: {cap_match.reason}"
+
+    # Provider-as-capability gate (flag-gated; Phase 2). Executor jobs need a
+    # live LLM; a host advertising no llm-* provider is excluded here -- this
+    # is what replaces the manual HIVE_HOST_DENYLIST for dead-provider hosts.
+    if LLM_CAP_GATE:
+        _needs_llm = (j_kind.startswith("build:")
+                      or workspace_capability_for_kind(j_kind) is not None)
+        if _needs_llm and not any(c.startswith("llm-") for c in agent_caps):
+            return False, "agent has no live llm-* provider capability (kind %s needs an LLM)" % j_kind
 
     job_max_tier = (job.get("max_cost_tier") or "B").upper()
     agent_tier = (agent.get("cost_tier") or "C").upper()
@@ -1214,6 +1280,38 @@ async def require_registered_agent(urn: str, *, active_only: bool = False) -> tu
     return runtime, status
 
 
+async def require_mutation_actor(
+    x_hive_actor: str | None = Header(default=None, alias="X-Hive-Actor"),
+    x_hive_token: str | None = Header(default=None, alias="X-Hive-Token"),
+) -> str:
+    """Gate mutating endpoints that previously had NO guard at all.
+
+    Every one of these was reachable by anything that could open a socket, on
+    a service bound to 0.0.0.0. That set includes /v1/knemon/cap, which opens
+    the OAuth circuit-breaker for up to 24h and pushes every codex/claude job
+    to metered fallback -- a routing-layer denial of service -- and
+    /v1/admin/jobs/reclassify, which bypasses STATUS_TRANSITIONS outright.
+
+    Two layers, because "possess the URN" was the whole trust model:
+
+      1. If HIVE_SHARED_SECRET is set, a matching X-Hive-Token is required.
+         Set it in the unit Environment; until then this layer is inert and
+         behaves exactly as before.
+      2. X-Hive-Actor must name a REGISTERED, ACTIVE agent. Still a
+         self-asserted identity -- this is not real authentication -- but it
+         is strictly better than anonymous and matches the bar every other
+         mutator already met.
+    """
+    secret = os.environ.get("HIVE_SHARED_SECRET")
+    if secret:
+        if not x_hive_token or not hmac.compare_digest(str(x_hive_token), str(secret)):
+            raise HTTPException(401, "missing or incorrect X-Hive-Token")
+    if not x_hive_actor or not str(x_hive_actor).strip():
+        raise HTTPException(401, "X-Hive-Actor header is required for mutating calls")
+    await require_registered_agent(str(x_hive_actor).strip(), active_only=True)
+    return str(x_hive_actor).strip()
+
+
 async def require_orchestrator_submitter(submitter_urn: str) -> str:
     runtime, _status = await require_registered_agent(submitter_urn, active_only=True)
     if runtime in WORKER_ONLY_RUNTIMES or runtime not in ORCHESTRATOR_RUNTIMES:
@@ -1226,6 +1324,22 @@ async def require_orchestrator_submitter(submitter_urn: str) -> str:
             ),
         )
     return runtime
+
+
+def valid_completion_proof(proof: dict) -> bool:
+    """Fail closed on missing Git evidence, including successful subprocesses."""
+    sha = proof.get("head_sha")
+    commits = proof.get("commits")
+    files = proof.get("files_changed")
+    return bool(
+        isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
+        and isinstance(commits, list) and sha in commits
+        and all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c) for c in commits)
+        and isinstance(files, list) and files and all(isinstance(f, str) and f for f in files)
+        and proof.get("worktree_clean") is True
+        and proof.get("remote_verified") is True
+        and proof.get("remote_sha") == sha
+    )
 
 
 def normalize_result_payload(status: str, result: Optional[dict]) -> Optional[dict]:
@@ -1273,8 +1387,6 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
     ("deepseek-direct", "*"):               (0.435, 0.87),
     ("deepseek",        "*"):               (0.435, 0.87),
     ("together",  "minimax-m2.7"):          (0.40,  1.20),
-    ("minimax",   "minimax-m3"):            (0.30,  0.90),  # MiniMax-M3 capacity pool (5 global / 1 per worker)
-    ("minimax",   "*"):                     (0.30,  0.90),
     ("together",  "deepseek-v4-pro"):       (2.10,  4.40),
     ("together",  "kimi-k2.6"):             (1.20,  4.40),
     ("together",  "glm-3.5-90"):            (0.10,  0.15),
@@ -1470,6 +1582,17 @@ class AgentRegister(BaseModel):
     version: Optional[str] = None
     metadata: Optional[dict] = None
     subscription_pools: Optional[list[str]] = Field(default_factory=list)
+    # Stable per-worker-instance identity for registration dedup (2026-06-15).
+    # Workers run as systemd units `zeroclaw-wss-worker@N` / `zc-worker@N` with a
+    # %i identity that is STABLE across restarts (unlike pid/session_id). When a
+    # worker restarts and re-registers with the same (host, kind, instance), the
+    # bus REPLACES its prior row instead of minting a new uuid4 URN -> ends the
+    # dashboard duplicate-registration/inflation. OPTIONAL: agents that don't send
+    # `instance` (claude/codex/system/mnemos/old workers) keep the original
+    # mint-a-new-URN behavior, so this is fully backward-compatible and never
+    # breaks an existing agent kind. Bounded pattern: prevents pathological keys.
+    instance: Optional[str] = Field(None, pattern=r"^[A-Za-z0-9._:@-]{1,64}$",
+                                    description="stable per-worker-instance id for register dedup")
 
 
 class AgentHeartbeat(BaseModel):
@@ -1503,6 +1626,11 @@ class JobCreate(BaseModel):
     # DAG support:
     depends_on: Optional[list[str]] = None             # job ids that must be status='done' before this job is dequeueable
     idempotency_key: Optional[str] = None              # forced-rerun escape: a unique value is never coalesced
+    # PR-fix routing (operator 2026-06-17): forge + repo + branch/PR to check out.
+    site: Optional[str] = None                         # git_sites.json key (github/gitlab-ncz/codeberg/internal)
+    repo: Optional[str] = None                         # owner/name path on that site
+    head_branch: Optional[str] = None                  # branch / PR head to check out
+    pr_number: Optional[int] = None                    # PR/MR number (forge-specific ref scheme)
 
 
 class JobUpdate(BaseModel):
@@ -1547,6 +1675,17 @@ CLAIM_STALE_AFTER_BY_KIND = {
     "benchmark": 3600.0,
     "migration": 7200.0,  # multi-host db / fleet migrations need wide window
 }
+
+# Absolute, UN-REFRESHABLE claim ceiling (operator 2026-06-20). The lease +
+# last_update_at staleness checks are BOTH refreshed by any PATCH, so a worker
+# stuck re-attempting+failing the SAME job kept them fresh and a 51h 'running'
+# job never reaped (019ed7a4-7e33). This cap measures wall-clock since the FIRST
+# claim (claimed_at — never touched by PATCH), so a genuinely-stuck claim is
+# reaped no matter how often its claimant pokes it.
+CLAIM_HARD_MAX_AGE = float(os.environ.get("HIVE_CLAIM_HARD_MAX_AGE", "14400"))  # 4h
+CLAIM_HARD_MAX_AGE_BY_KIND = {
+    "migration": 21600.0,   # 6h — multi-host fleet migrations may legitimately run long
+}
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
@@ -1579,16 +1718,29 @@ async def reaper_task(app: FastAPI):
                     dead = [row[0] async for row in cur]
                 if dead:
                     for urn in dead:
+                        # A MISSED HEARTBEAT IS NOT PROOF OF AN ABANDONED JOB.
+                        # This used to requeue offered/claimed/RUNNING work and null
+                        # its result. A worker on a flaky link (not a dead one) lost
+                        # two heartbeats, its running job reset to 'queued', and when
+                        # it reported back the result was already gone -- PATCH 'done'
+                        # is not legal out of 'queued', so it took a 409 and the work
+                        # was silently discarded. Reclaiming in-flight work is step
+                        # 2's job, and step 2 measures staleness against
+                        # COALESCE(last_update_at, claimed_at) so a worker still
+                        # PATCHing progress is never reclaimed. Here we release only
+                        # work that has not STARTED, which cannot lose a result
+                        # because none exists yet.
                         async with db.execute(
-                            "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed','running')",
+                            "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed')",
                             (urn,),
                         ) as cur:
                             assigned_jobs = [row[0] async for row in cur]
                         await db.execute(
                             "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
                             "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL "
-                            "WHERE claimed_by=? AND status IN ('offered','claimed','running')",
+                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
+                            "ended_at=NULL, result=NULL "
+                            "WHERE claimed_by=? AND status IN ('offered','claimed')",
                             (urn,),
                         )
                         await db.execute(
@@ -1635,6 +1787,7 @@ async def reaper_task(app: FastAPI):
                 # orchestration / investigation / migration jobs run longer than default 30min.
                 now_ts = time.time()
                 default_cutoff = now_ts - CLAIM_STALE_AFTER
+                hard_cutoff = now_ts - CLAIM_HARD_MAX_AGE
                 async with db.execute(
                     "SELECT j.id, j.kind, j.claimed_by, j.claimed_at, j.last_update_at, "
                     "j.claim_lease_expires_at "
@@ -1649,8 +1802,9 @@ async def reaper_task(app: FastAPI):
                     "AND ( a.status = 'offline' OR a.urn IS NULL OR "
                     "      j.claimed_at IS NULL OR "
                     "      j.claim_lease_expires_at <= ? OR "
+                    "      j.claimed_at < ? OR "
                     "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
-                    (now_ts, default_cutoff,)
+                    (now_ts, hard_cutoff, default_cutoff,)
                 ) as cur:
                     candidates = [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
                 # Apply kind-specific override: keep job if its kind has a longer TTL
@@ -1658,6 +1812,13 @@ async def reaper_task(app: FastAPI):
                 orphans = []
                 for jid, jkind, claimer, c_at, u_at, lease_exp in candidates:
                     if lease_exp is not None and lease_exp <= now_ts:
+                        orphans.append((jid, claimer))
+                        continue
+                    # HARD CAP (un-refreshable): wall-clock since FIRST claim.
+                    # Defeats the retry-loop evasion where lease + last_update
+                    # stay fresh but the job never progresses.
+                    hard_ttl = CLAIM_HARD_MAX_AGE_BY_KIND.get(jkind, CLAIM_HARD_MAX_AGE)
+                    if c_at is not None and (now_ts - c_at) >= hard_ttl:
                         orphans.append((jid, claimer))
                         continue
                     kind_ttl = CLAIM_STALE_AFTER_BY_KIND.get(jkind, CLAIM_STALE_AFTER)
@@ -1669,7 +1830,8 @@ async def reaper_task(app: FastAPI):
                         await db.execute(
                             "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
                             "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL "
+                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
+                            "ended_at=NULL, result=NULL "
                             "WHERE id=? AND status IN ('claimed','running')",
                             (job_id,))
                         await emit_event(db, "job.unclaimed", {
@@ -1724,6 +1886,58 @@ async def reaper_task(app: FastAPI):
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
                 await db.commit()
+                # 6. JOB RETENTION SWEEP (housekeeping — keeps the dashboard clean).
+                # Auto-delete OLD TERMINAL jobs (+ cascade job_audit_log). Two tiers:
+                #   (a) obvious test/e2e junk older than RETAIN_TEST_JOBS_DAYS
+                #   (b) any terminal job older than RETAIN_DONE_JOBS_DAYS
+                # Active statuses (queued/offered/claimed/running/needs-review) are
+                # NEVER candidates — the status filter excludes them, so an in-flight
+                # worker can never be reaped here. Conservative + logged. Age is taken
+                # from COALESCE(ended_at, started_at). Done as SELECT-then-cascade so
+                # the same single-id cascade helper handles audit-log rows on both
+                # backends; the re-check is implicit (status is in the SELECT predicate
+                # and terminal jobs do not transition back to active).
+                now_ts = time.time()
+                sweep_ids: list[str] = []
+                # (a) test/e2e junk — terminal + matches any test pattern + > test window
+                test_cutoff = now_ts - RETAIN_TEST_JOBS_DAYS * 86400
+                status_ph = ",".join("?" for _ in SWEEPABLE_STATUSES)
+                like_ph = " OR ".join(
+                    "LOWER(description) LIKE ?" for _ in TEST_JOB_DESC_PATTERNS
+                )
+                test_params: list[Any] = list(SWEEPABLE_STATUSES)
+                test_params += [f"%{p.lower()}%" for p in TEST_JOB_DESC_PATTERNS]
+                test_params.append(test_cutoff)
+                async with db.execute(
+                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) "
+                    f"AND description IS NOT NULL AND ({like_ph}) "
+                    f"AND COALESCE(ended_at, started_at) < ?",
+                    tuple(test_params),
+                ) as cur:
+                    sweep_ids += [r[0] async for r in cur]
+                # (b) any terminal job older than the done-retention window
+                done_cutoff = now_ts - RETAIN_DONE_JOBS_DAYS * 86400
+                done_params: list[Any] = list(SWEEPABLE_STATUSES)
+                done_params.append(done_cutoff)
+                async with db.execute(
+                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) "
+                    f"AND COALESCE(ended_at, started_at) < ?",
+                    tuple(done_params),
+                ) as cur:
+                    sweep_ids += [r[0] async for r in cur]
+                sweep_ids = list(dict.fromkeys(sweep_ids))  # de-dupe, keep order
+                if sweep_ids:
+                    # allow_active defaults False: the cascade re-checks status at
+                    # delete time, so a job that somehow flipped back to active
+                    # between SELECT and DELETE is left alone (atomic guard).
+                    swept = await _cascade_delete_jobs(db, sweep_ids)
+                    await db.commit()
+                    if swept:
+                        print(
+                            f"job retention sweep: removed {len(swept)} terminal "
+                            f"jobs (test<{RETAIN_TEST_JOBS_DAYS}d / done<{RETAIN_DONE_JOBS_DAYS}d)",
+                            flush=True,
+                        )
         except Exception as e:
             print(f"reaper error: {e}", flush=True)
 
@@ -1731,26 +1945,6 @@ async def reaper_task(app: FastAPI):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    if not HIVE_BUS_TOKEN:
-        raise RuntimeError("HIVE_BUS_TOKEN must be configured")
-    if not HIVE_BUS_ADMIN_TOKEN:
-        raise RuntimeError("HIVE_BUS_ADMIN_TOKEN must be configured")
-    if secrets.compare_digest(HIVE_BUS_TOKEN, HIVE_BUS_ADMIN_TOKEN):
-        raise RuntimeError("HIVE_BUS_TOKEN and HIVE_BUS_ADMIN_TOKEN must be distinct")
-    # Each repository owns its startup convergence: SQLite creates its local
-    # schema, while Oracle and Db2 migrate and verify their canonical tables.
-    await hive_repo().init(SCHEMA if HIVE_BACKEND == "sqlite" else None)
-    if HIVE_BACKEND == "db2":
-        task = asyncio.create_task(reaper_task(app))
-        app.state.reaper_task = task
-        try:
-            yield
-        finally:
-            task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
-            await hive_repo().close()
-        return
     async with connect_db() as db:
         await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
         await db.executescript(SCHEMA)
@@ -1878,9 +2072,12 @@ async def lifespan(app: FastAPI):
             ("jobs", "retry_backoff_until", "retry_backoff_until REAL"),
             ("jobs", "last_update_at", "last_update_at REAL"),
             ("jobs", "claim_lease_expires_at", "claim_lease_expires_at REAL"),
-            ("jobs", "dedup_hash", "dedup_hash TEXT"),
             # Thrash fix (2026-06-02): per-job count of worker-decline requeues.
             ("jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0"),
+            ("jobs", "site", "site TEXT"),
+            ("jobs", "repo", "repo TEXT"),
+            ("jobs", "head_branch", "head_branch TEXT"),
+            ("jobs", "pr_number", "pr_number INTEGER"),
         )
         # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
         # rebuild recreates the table from SCHEMA (sans drift columns), then the
@@ -1893,8 +2090,56 @@ async def lifespan(app: FastAPI):
             await _ensure_column(db, table, col, ddl_fragment)
         await _ensure_agents_status_allows_stale(db)
 
-        # Oracle schema convergence and verification run in OracleHiveRepository.init
-        # before this connection and before the reaper is started.
+        # Thrash fix (2026-06-02) — Oracle backend equivalents. The live hive
+        # runs HIVE_BACKEND=oracle; the SQLite executescript/ALTER paths above
+        # are no-ops there, so add decline_count + relax CK_HIVE_JOBS_STATUS to
+        # include 'dead-letter' (and 'failed_completion') directly via the Oracle
+        # connection. Both steps are idempotent and guarded by existence checks.
+        # DDL on the Oracle adapter is intentionally a no-op (translate returns
+        # None for ALTER/CREATE/DROP), so run these on the RAW oracledb connection
+        # (db._conn) to actually apply them. Idempotent + existence-guarded.
+        if HIVE_BACKEND == "oracle" and getattr(db, "_conn", None) is not None:
+            try:
+                raw = db._conn
+                rcur = raw.cursor()
+                rcur.execute(
+                    "SELECT COUNT(*) FROM user_tab_columns "
+                    "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
+                )
+                has_col = (rcur.fetchone())[0]
+                if not has_col:
+                    rcur.execute(
+                        "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
+                    )
+                for _c, _d in (("SITE", "VARCHAR2(64)"), ("REPO", "VARCHAR2(512)"),
+                               ("HEAD_BRANCH", "VARCHAR2(512)"), ("PR_NUMBER", "NUMBER")):
+                    rcur.execute("SELECT COUNT(*) FROM user_tab_columns "
+                                 "WHERE table_name = 'HIVE_JOBS' AND column_name = :1", [_c])
+                    if not (rcur.fetchone())[0]:
+                        rcur.execute(f"ALTER TABLE HIVE_JOBS ADD ({_c} {_d})")
+                rcur.execute(
+                    "SELECT search_condition_vc FROM user_constraints "
+                    "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
+                )
+                crow = rcur.fetchone()
+                cond = str(crow[0]) if crow and crow[0] is not None else ""
+                if crow is not None and "dead-letter" not in cond:
+                    rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
+                    rcur.execute(
+                        "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
+                        "CHECK (status IN ('queued','offered','claimed','running',"
+                        "'done','failed','failed_completion','cancelled','dead-letter'))"
+                    )
+                rcur.close()
+                db._conn.commit()
+            except Exception as e:
+                # FATAL: the runtime decline/dead-letter path REQUIRES both the
+                # decline_count column and the relaxed status CHECK. If this DDL
+                # fails, every subsequent decline PATCH would error (invalid
+                # identifier / CHECK violation), so refuse to start rather than
+                # serve a half-migrated bus.
+                print(f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True)
+                # non-fatal: runtime dead-letter UPDATE falls back to requeue if CHECK not relaxed
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
             "CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status)",
@@ -1911,8 +2156,6 @@ async def lifespan(app: FastAPI):
             "CREATE INDEX IF NOT EXISTS idx_jobs_claimed_tier      ON jobs(claimed_cost_tier)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_backoff           ON jobs(retry_backoff_until)",
             "CREATE INDEX IF NOT EXISTS idx_jobs_claim_lease       ON jobs(claim_lease_expires_at)",
-            "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedup_uq ON jobs(dedup_hash) "
-            "WHERE dedup_hash IS NOT NULL AND status IN ('queued','offered','claimed','running')",
             "CREATE TABLE IF NOT EXISTS job_audit_log ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, ts REAL NOT NULL, "
             "actor_urn TEXT, old_status TEXT, new_status TEXT, old_claimed_by TEXT, "
@@ -1923,143 +2166,22 @@ async def lifespan(app: FastAPI):
             await db.execute(stmt)
         await db.commit()
     task = asyncio.create_task(reaper_task(app))
-    app.state.reaper_task = task
     try:
         yield
     finally:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
-        await hive_repo().close()
 
 
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 
 
-def _request_token(request: Request) -> str:
-    scheme, _, credential = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not credential:
-        return ""
-    return credential
-
-
-def _session_cookie(role: str, expires: int) -> str:
-    secret = HIVE_BUS_ADMIN_TOKEN if role == "admin" else HIVE_BUS_TOKEN
-    payload = f"{role}.{expires}"
-    signature = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}.{signature}"
-
-
-def _cookie_role(request: Request) -> str:
-    value = request.cookies.get("hive_session", "")
-    try:
-        role, expires_text, signature = value.split(".", 2)
-        expires = int(expires_text)
-    except (TypeError, ValueError):
-        return ""
-    if role not in {"worker", "admin"} or expires < int(time.time()):
-        return ""
-    expected = _session_cookie(role, expires).rsplit(".", 1)[1]
-    return role if secrets.compare_digest(signature, expected) else ""
-
-
-def _bearer_role(request: Request) -> str:
-    supplied = _request_token(request)
-    if not supplied:
-        return ""
-    if HIVE_BUS_ADMIN_TOKEN and secrets.compare_digest(supplied, HIVE_BUS_ADMIN_TOKEN):
-        return "admin"
-    if HIVE_BUS_TOKEN and secrets.compare_digest(supplied, HIVE_BUS_TOKEN):
-        return "worker"
-    return ""
-
-
-def _admin_route(method: str, path: str) -> bool:
-    if path.startswith("/v1/admin/"):
-        return True
-    if method == "POST" and re.fullmatch(r"/v1/agents/.+/plan-reset", path):
-        return True
-    if path == "/v1/schedules" and method == "POST":
-        return True
-    if path.startswith("/v1/schedules/") and method in {"PATCH", "DELETE"}:
-        return True
-    if method == "POST" and path in {
-        "/v1/knemon/bypass",
-        "/v1/knemon/cap/clear",
-        "/v1/knemon/cap/probe-ok",
-    }:
-        return True
-    return False
-
-
-def _require_admin_request(request: Request) -> None:
-    if getattr(request.state, "auth_role", "") != "admin":
-        raise HTTPException(403, "administrator credential required")
-
-
-@app.middleware("http")
-async def require_bus_auth(request: Request, call_next):
-    path = request.url.path
-    if path == "/mcp" or path.startswith("/v1/"):
-        admin_required = _admin_route(request.method.upper(), path)
-        if not HIVE_BUS_TOKEN or (admin_required and not HIVE_BUS_ADMIN_TOKEN):
-            return JSONResponse({"detail": "bus authentication is not configured"}, status_code=503)
-        role = _bearer_role(request) or _cookie_role(request)
-        if not role or (admin_required and role != "admin"):
-            return JSONResponse(
-                {"detail": "invalid or missing administrator credential" if admin_required
-                           else "invalid or missing bus credential"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        request.state.auth_role = role
-    return await call_next(request)
-
-
 # ---------- endpoints ----------
-
-@app.post("/v1/auth/session")
-async def create_browser_session(request: Request):
-    """Exchange an authenticated bearer request for a short-lived HttpOnly session."""
-    role = _bearer_role(request)
-    if role not in {"worker", "admin"}:
-        raise HTTPException(401, "authenticated bearer credential required")
-    expires = int(time.time()) + max(60, min(HIVE_DASHBOARD_SESSION_TTL, 86400))
-    response = JSONResponse({"ok": True, "role": role, "expires_at": expires})
-    response.set_cookie(
-        "hive_session",
-        _session_cookie(role, expires),
-        max_age=expires - int(time.time()),
-        httponly=True,
-        secure=request.url.scheme == "https",
-        samesite="strict",
-        path="/",
-    )
-    return response
 
 @app.get("/health")
 async def health():
-    detail = None
-    try:
-        async def _probe() -> None:
-            async with connect_db() as db:
-                # Probe a required queue table, not merely the server/session:
-                # SQLite would otherwise recreate a deleted DB file and pass.
-                async with db.execute("SELECT COUNT(*) FROM jobs") as cur:
-                    if await cur.fetchone() is None:
-                        raise RuntimeError("database probe returned no row")
-        await asyncio.wait_for(_probe(), timeout=5.0)
-        reaper = getattr(app.state, "reaper_task", None)
-        if reaper is None or reaper.done():
-            detail = "reaper task is not running"
-    except Exception as exc:
-        detail = f"database probe failed: {type(exc).__name__}: {exc}"
-    body = {"status": "healthy" if detail is None else "unhealthy", "ts": time.time(),
-            "service": "graeae-hive-mind", "version": "0.1.0"}
-    if detail is not None:
-        body["detail"] = detail
-        return JSONResponse(body, status_code=503)
-    return body
+    return {"status": "healthy", "ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
 
 
 @app.get("/")
@@ -2075,7 +2197,7 @@ async def dashboard():
 
 
 @app.post("/v1/agents/register")
-async def register(req: AgentRegister, request: Request):
+async def register(req: AgentRegister):
     # #5 FIX (review 2026-05-23): reject minimally-incomplete registrations with 422 so
     # callers see the error instead of getting a null URN that bricks their session.
     if (req.host or "").lower().strip() in HOST_DENYLIST:
@@ -2108,8 +2230,6 @@ async def register(req: AgentRegister, request: Request):
                 f"runtime. Provide an explicit runtime from "
                 f"{sorted(RUNTIME_KIND_MAP.keys())}.",
             )
-    if runtime in ORCHESTRATOR_RUNTIMES:
-        _require_admin_request(request)
     allowed = RUNTIME_KIND_MAP.get(runtime, {runtime, "unknown"})
     if runtime != "unknown" and kind not in allowed and kind != runtime:
         raise HTTPException(
@@ -2129,6 +2249,16 @@ async def register(req: AgentRegister, request: Request):
     plan_cap_usd = req.plan_cap_usd if req.plan_cap_usd is not None else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
     provider = (req.provider or "unknown").lower()
     model = (req.model or "unknown").lower()
+    # EIH ban (operator 2026-06-18): the hive must never advertise EIH / gpt-5.5
+    # authoring labels. Unmanaged workers still default their register model to
+    # the legacy "gpt-5.5 (EIH via gateway :4100)" string; everything actually
+    # routes through the PYTHIA gateway (:4100) to MiniMax, so normalize any such
+    # label to the real served upstream and drop the openai provider so the
+    # registry reflects reality.
+    if "gpt-5.5" in model or "eih" in model:
+        model = "minimax-m2.7"
+        if provider == "openai":
+            provider = "minimax"
     tier = cost_tier_for(provider)
     # User directive 2026-05-26: allow opencode + codex to claim work at ALL
     # tiers (A/B/C) regardless of provider. They are flexible multi-provider
@@ -2139,7 +2269,41 @@ async def register(req: AgentRegister, request: Request):
     session_id = str(uuid.uuid4())
     urn = make_urn(kind, req.host, session_id)
     now = time.time()
+    # REGISTRATION DEDUP (2026-06-15): a stable per-worker-instance identity lets a
+    # worker restart REPLACE its prior agents row instead of minting an endless
+    # stream of uuid4 URNs (10,930 rows / 10,882 offline observed 2026-06-08 — the
+    # root of dashboard duplicate-registration/inflation). The instance id is
+    # carried in the metadata JSON (no schema change / no DDL on the live Oracle DB)
+    # under the reserved key "_instance", so the dedup key is (host, kind, instance).
+    #
+    # Backward-compat invariant: dedup engages ONLY when req.instance is present.
+    # claude/codex/system/mnemos and old workers send no instance -> the historical
+    # "always a fresh URN" behavior is preserved untouched. This block can therefore
+    # never break an existing agent kind.
+    #
+    # Concurrency note: the bus is a single-process asyncio app and a worker
+    # registers exactly once per (re)start, so a self-collision (two simultaneous
+    # registers for the SAME (host,kind,instance)) is not a real workload. We
+    # deliberately do NOT add a DB unique key — that is DDL on the live Oracle prod
+    # DB, which is out of scope for this change. The dedup is therefore best-effort:
+    # in the pathological double-register race the worst case is one residual
+    # duplicate row, which the existing agent-purge reaper still collects. This
+    # trades a vanishingly-rare extra row for guaranteed bus availability (a register
+    # is never blocked or serialized), which is the correct safety posture for the
+    # most critical fleet component.
+    instance = req.instance
+    effective_metadata = dict(req.metadata) if isinstance(req.metadata, dict) else (
+        {} if instance else None)
+    if instance:
+        effective_metadata["_instance"] = instance
     async with connect_db() as db:
+        # INSERT the fresh row FIRST, then dedup-delete the stale prior rows for the
+        # same (host, kind, instance) EXCLUDING this new URN, all inside the single
+        # transaction that commits below. Insert-before-delete (vs delete-then-insert)
+        # means there is never a window where NO row exists for this instance — a
+        # dashboard/scheduler/heartbeat always sees at least the new row. The whole
+        # thing commits atomically, so an observer sees either {old} or {new}, never
+        # {empty} and never {old,new} post-commit.
         await db.execute(
             "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, autonomy_level, "
             "auth_method, plan_cap_usd, plan_period_used_usd, subscription_pools, "
@@ -2152,9 +2316,87 @@ async def register(req: AgentRegister, request: Request):
                 req.host, session_id, req.pid,
                 json.dumps(req.capabilities) if req.capabilities else None,
                 req.version, now, now,
-                json.dumps(req.metadata) if req.metadata else None,
+                json.dumps(effective_metadata) if effective_metadata else None,
             ),
         )
+        # Dedup the prior rows for this stable instance. We select-then-filter in
+        # Python (matching the heartbeat metadata-merge idiom at heartbeat()) rather
+        # than push a JSON predicate into SQL, so the path is identical on SQLite and
+        # Oracle (metadata is a CLOB the backend normalizes to a str). The new URN is
+        # excluded so we never delete the row we just inserted.
+        if instance:
+            try:
+                async with db.execute(
+                    "SELECT urn, metadata FROM agents WHERE host=? AND kind=?",
+                    (req.host, kind),
+                ) as dup_cur:
+                    dup_rows = await dup_cur.fetchall()
+                stale_urns = []
+                for d_row in dup_rows or []:
+                    # Defensive row access: BackendCursor._normalize_row returns a
+                    # 2-tuple of (urn, metadata-as-str) for BOTH sqlite and Oracle
+                    # (Oracle CLOB / auto-decoded JSON dict are normalized to str
+                    # before we see them), but never assume — index defensively so
+                    # a driver quirk degrades to "skip dedup", never crashes.
+                    try:
+                        d_urn = d_row[0]
+                        d_meta = d_row[1] if len(d_row) > 1 else None
+                    except (IndexError, TypeError):
+                        continue
+                    if d_urn == urn:
+                        continue  # never delete the row we just inserted
+                    # Oracle 23ai can auto-decode a JSON CLOB to dict; BackendCursor
+                    # re-serializes to str, but accept a dict directly too so a
+                    # driver that hands back a mapping never silently skips a valid
+                    # dedup row via the except branch.
+                    if isinstance(d_meta, dict):
+                        m = d_meta
+                    else:
+                        if isinstance(d_meta, (bytes, bytearray)):
+                            # CLOB-as-bytes path (some drivers): decode before parse
+                            # so a valid dedup row isn't silently skipped.
+                            try:
+                                d_meta = d_meta.decode("utf-8", errors="replace")
+                            except Exception:
+                                d_meta = None
+                        try:
+                            m = json.loads(d_meta) if d_meta else {}
+                        except Exception:
+                            m = {}
+                    if isinstance(m, dict) and m.get("_instance") == instance:
+                        stale_urns.append(d_urn)
+                for s_urn in stale_urns:
+                    # SAFETY GUARD: never delete a row that currently holds an
+                    # in-flight job claim, so a stale duplicate cannot orphan a
+                    # running job. This is the EXACT proven pattern the agent-purge
+                    # reaper uses (non-correlated `? NOT IN (SELECT claimed_by FROM
+                    # jobs WHERE claimed_by IS NOT NULL AND status IN (...))` with
+                    # UNQUALIFIED columns): the sqlite->Oracle rewriter only
+                    # translates table names in FROM/JOIN/ON positions, so a
+                    # table-qualified `jobs.claimed_by` survives untranslated and
+                    # the predicate misbehaves (an earlier `NOT EXISTS(... jobs.col
+                    # ...)` draft matched 0 rows on Oracle and silently no-op'd the
+                    # delete — verified live 2026-06-15). The active-claim status set
+                    # ('offered','claimed','running') is the same one the reaper and
+                    # claim-recovery use as the authoritative in-flight predicate;
+                    # `claimed_by IS NOT NULL` guards NOT-IN null-poison. A genuinely-
+                    # restarting worker holds no claim under its old URN, so its prior
+                    # row is removed.
+                    await db.execute(
+                        "DELETE FROM agents WHERE urn=? "
+                        "AND ? NOT IN (SELECT claimed_by FROM jobs "
+                        "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running'))",
+                        (s_urn, s_urn),
+                    )
+            except Exception as _dedup_exc:
+                # Dedup is best-effort: a failure here must NEVER fail a register.
+                # The new row is already inserted; worst case a stale duplicate row
+                # lingers (the agent-purge reaper still collects it), preserving bus
+                # availability. Printed (house style — this module logs via print,
+                # not a logger) so the data-quality regression stays observable in
+                # the service journal.
+                print(f"register dedup skipped for host={req.host} kind={kind} "
+                      f"instance={instance!r}: {_dedup_exc!r}", flush=True)
         await db.commit()
         await emit_event(db, "agent.online", {
             "urn": urn, "kind": kind, "runtime": runtime,
@@ -2291,6 +2533,12 @@ async def list_hosts(include_stale: bool = False):
     Agents that last heartbeated > 60s ago are flagged as stale unless
     include_stale=true, in which case all are returned.
     Used by workers to make resource-aware routing decisions.
+
+    Also the single source of truth for host ADDRESSES: `ip` is the routable
+    LAN address a peer SSHes to, `addresses` lists every reachable IPv4, and
+    `network` carries the raw block (ipv6, all_addresses). The system watcher
+    reports these, so an agent can refresh its own infrastructure notes from
+    this response instead of sweeping the segment and guessing.
     """
     cutoff = time.time() - 60  # 60s stale threshold
     sql = ("SELECT urn, host, status, last_heartbeat, capabilities, metadata, subscription_pools "
@@ -2312,7 +2560,13 @@ async def list_hosts(include_stale: bool = False):
                 specs = meta.get("specs", {})
                 load  = meta.get("load", {})
                 age_s = time.time() - (r[3] or 0)
+                # Addresses arrive in specs at registration and are refreshed in load on
+                # every heartbeat; prefer load so a DHCP change is picked up promptly.
+                net = load.get("network") or specs.get("network") or {}
                 seen_hosts[h] = {
+                    "ip":               net.get("primary_ip"),
+                    "addresses":        net.get("addresses") or [],
+                    "network":          net,
                     "host":           h,
                     "urn":            r[0],
                     "status":         r[2],
@@ -2453,11 +2707,13 @@ async def create_job(req: JobCreate):
     max_cost_tier = (req.max_cost_tier or "B").upper()
     if max_cost_tier not in COST_TIERS:
         raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
-    # 2026-05-26: codex-only eligibility auto-rewrite. codex is a CLI not an
-    # agent — zeroclaw workers shell out to it. eligible_kinds=['codex'] alone
-    # is unclaimable. Rewrite to ['zeroclaw'] (which routes through codex when
-    # kind matches CODEX_KINDS_PREFIXES on the worker side).
-    NON_CLAIMER_KINDS = {"codex", "review", "hermes-cli"}  # codex + future CLI tools
+    # 2026-05-26: codex-only eligibility auto-rewrite, ORIGINALLY for all of
+    # codex/review/hermes-cli — codex was a CLI zeroclaw shells out to, with
+    # no standalone claimer. RESCINDED for codex 2026-09-14 (operator): a real
+    # kind=codex claimer daemon now exists and self-registers, so
+    # eligible_kinds=['codex'] is claimable again. review/hermes-cli still
+    # have no claimer and stay rewritten to ['zeroclaw'].
+    NON_CLAIMER_KINDS = {"review", "hermes-cli"}
     if req.eligible_kinds:
         ek = list(req.eligible_kinds)
         # Filter out non-claimer kinds
@@ -2547,6 +2803,10 @@ async def create_job(req: JobCreate):
     ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
     async with connect_db() as db:
         cached = await cache_lookup(db, ck)
+        # Repository jobs must execute against their actual checkout. A cached
+        # narrative is not evidence of delivery, even if it contains old SHAs.
+        if req.repo:
+            cached = None
         if cached:
             # short-circuit: store job as done with cached result + cost=0
             await db.execute(
@@ -2620,8 +2880,8 @@ async def create_job(req: JobCreate):
             await db.execute(
                 "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, depends_on, max_retries, dedup_hash, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                "mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, pr_number, status, started_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
                 (
                     job_id, req.submitter_urn, req.parent_job_id, req.kind, req.description,
                     req.priority, req.deadline,
@@ -2636,6 +2896,8 @@ async def create_job(req: JobCreate):
                     json.dumps(req.depends_on) if req.depends_on else None,
                     int(req.max_retries),
                     dedup_hash,
+                    req.site, req.repo, req.head_branch,
+                    (int(req.pr_number) if req.pr_number is not None else None),
                     now,
                 ),
             )
@@ -2732,163 +2994,49 @@ async def dequeue_next_job(agent_urn: str):
             async with db.execute(
                 "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
                 "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
-                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at "
+                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at, "
+                "site, repo, head_branch, pr_number "
                 "FROM jobs WHERE status IN ('queued','offered') "
                 "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-                "ORDER BY priority DESC, started_at ASC LIMIT 100",
-                (now,),
+                "ORDER BY priority DESC, started_at ASC LIMIT ?",
+                (now, CLAIM_SCAN_WINDOW),
             ) as cur:
                 candidates = [tuple(r) async for r in cur]
-            # ── Scheduler: role + utilization + deficit ordering ──
-            # Replace the legacy "first-priority-wins" sort with a role/util/
-            # deficit-aware re-scoring (deterministic, starvation-protected).
-            # The SQL ``ORDER BY priority DESC, started_at ASC LIMIT 100``
-            # above still bounds the candidate set to a stable top-100; this
-            # block re-orders THOSE 100 for THIS specific worker so the worker
-            # gets the BEST-FIT job it can actually serve (not merely the
-            # highest-priority job it's eligible for). Hard eligibility is
-            # still checked one candidate at a time below; scoring never
-            # overrides ``job_agent_eligible``.
-            try:
-                _capabilities_list = list(agent_caps)
-            except Exception:
-                _capabilities_list = []
-            _raw_load_json = None
-            async with db.execute(
-                "SELECT current_load FROM agents WHERE urn=?",
-                (agent_urn,),
-            ) as _cl_cur:
-                _cl_row = await _cl_cur.fetchone()
-            if _cl_row and _cl_row[0]:
-                try:
-                    _raw_load_json = json.loads(_cl_row[0])
-                except Exception:
-                    _raw_load_json = None
-            # Identify the worker's currently-active MiniMax lease (if any).
-            # Active = status in (offered, claimed, running) — the rollout
-            # directive (2026-10-01) defines the cap as "5 concurrent OR
-            # ASSIGNED MiniMax sessions", so offered jobs that have been
-            # routed to a worker (claimed_by is set) count as assigned and
-            # must count against the per-worker cap. The lease-expiry filter
-            # is preserved — stale leases do not permanently reduce capacity.
-            # Status set is centralised in ``hive.scheduler.MINIMAX_ACTIVE_STATUSES``
-            # so the per-worker cap and the global cap use the same definition
-            # of "currently holding a MiniMax lease" (one source of truth).
-            _held_mx_lease: str | None = None
-            async with db.execute(
-                f"SELECT id FROM jobs WHERE claimed_by=? "
-                f"AND status IN ({','.join('?' * len(_SCHED_MINIMAX_ACTIVE_STATUSES))}) "
-                f"AND claimed_provider=? AND claimed_model=? "
-                f"AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
-                (agent_urn, *_SCHED_MINIMAX_ACTIVE_STATUSES,
-                 _SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
-            ) as _mx_cur:
-                _mx_row = await _mx_cur.fetchone()
-            if _mx_row and _mx_row[0]:
-                _held_mx_lease = _mx_row[0]
-            _worker_profile = worker_profile_from_metadata(
-                urn=agent_urn,
-                host=agent_host,
-                capabilities=_capabilities_list,
-                current_load=_raw_load_json,
-                active_minimax_lease=_held_mx_lease,
-            )
-            # Project the rows into the lightweight shape the scheduler
-            # scoring function expects, then re-rank by the scheduler key.
-            # ``order_candidates_for_worker`` is stable for equal sort keys
-            # (input order is preserved via the trailing tie-break), so the
-            # final iterate stays deterministic across runs without an extra
-            # DB round-trip.
-            _projected = [
-                {
-                    "id": r[0],
-                    "submitter_urn": r[1],
-                    "kind": r[3],
-                    "priority": r[5] or 0,
-                    "required_capabilities": json_list(r[7]),
-                }
-                for r in candidates
-            ]
-            _ranked_projected = order_candidates_for_worker(
-                candidates=_projected, worker=_worker_profile, now=now,
-            )
-            # Re-index original rows by job id, then walk the scheduler order.
-            _orig_by_id: dict[str, tuple] = {}
-            for r in candidates:
-                _orig_by_id[r[0]] = r
             candidates = [
-                _orig_by_id[c["id"]] for c in _ranked_projected
-                if c["id"] in _orig_by_id
+                r for _idx, r in sorted(
+                    enumerate(candidates),
+                    key=lambda item: (
+                        item[1][5] or 0,
+                        job_agent_preference_score(
+                            {
+                                "preferred_providers": json_list(item[1][12]),
+                                "preferred_models": json_list(item[1][13]),
+                            },
+                            agent,
+                        ),
+                        -item[0],
+                    ),
+                    reverse=True,
+                )
             ]
-
-            # Resolve DAG dependencies set-wise.  The previous implementation
-            # issued one COUNT query per candidate, turning a claim poll into
-            # as many as 100 database round trips.  Chunking keeps this safe on
-            # backends with an IN-list limit while reducing the normal path to
-            # one query (and the pathological path to a small bounded number).
-            candidate_dependencies = [json_list(r[15]) for r in candidates]
-            dependency_ids = list(dict.fromkeys(
-                dep for dependencies in candidate_dependencies for dep in dependencies
-            ))
-            completed_dependency_ids: set[str] = set()
-            for offset in range(0, len(dependency_ids), 900):
-                dependency_batch = dependency_ids[offset:offset + 900]
-                placeholders = ",".join("?" * len(dependency_batch))
-                async with db.execute(
-                    f"SELECT id FROM jobs WHERE id IN ({placeholders}) AND status='done'",
-                    tuple(dependency_batch),
-                ) as dep_cur:
-                    async for row in dep_cur:
-                        completed_dependency_ids.add(row[0])
 
             claimed = None
-            # Track whether the loop ended specifically because the
-            # MiniMax-M3 pool denied the worker — distinguishes between
-            # "no jobs matched eligibility" (normal 204) and "the pool
-            # refused this claim" (saturated 204). The per-worker cap
-            # denial is the case where the worker itself holds a lease
-            # already; the global cap is fleet-wide pool fullness.
-            _minimax_pool_denied_reason: str | None = None
-            # ── MiniMax-M3 capacity pool pre-flight ──
-            # If this worker is about to take a job whose dispatched route is
-            # the MiniMax-M3 pool, we must enforce BOTH:
-            #   (1) per-worker cap (1 active MiniMax lease per worker urn)
-            #   (2) global cap (5 active MiniMax leases fleet-wide)
-            # The snapshot below counts every lease that currently counts
-            # against the pool: status in (offered, claimed, running) AND
-            # lease not expired. Per the rollout directive (2026-10-01), the
-            # global cap is "5 concurrent OR ASSIGNED MiniMax sessions" — so
-            # offered jobs (the bus has routed them to a worker; claimed_by
-            # is set) count as assigned and reduce pool headroom. Stale
-            # leases are filtered out so a worker whose claim crashed without
-            # releasing its lease does NOT permanently reduce pool capacity.
-            # Status set is centralised in
-            # ``hive.scheduler.MINIMAX_ACTIVE_STATUSES`` — same source of
-            # truth as the per-worker cap above.
-            _minimax_active_pairs: list[tuple[str, str]] = []
-            async with db.execute(
-                f"SELECT claimed_by, id FROM jobs "
-                f"WHERE status IN ({','.join('?' * len(_SCHED_MINIMAX_ACTIVE_STATUSES))}) "
-                f"AND claimed_provider=? AND claimed_model=? "
-                f"AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
-                (*_SCHED_MINIMAX_ACTIVE_STATUSES, _SCHED_MINIMAX_PROVIDER, _SCHED_MINIMAX_MODEL, now),
-            ) as _mx_pool_cur:
-                async for _mx_pool_row in _mx_pool_cur:
-                    _minimax_active_pairs.append((_mx_pool_row[0], _mx_pool_row[1]))
-            _minimax_pool: _MiniMaxPoolState = _build_minimax_pool(
-                _minimax_active_pairs,
-            )
-            _worker_is_minimax_route = (
-                (a_model or "").lower() == _SCHED_MINIMAX_MODEL
-                and (a_provider or "").lower() == _SCHED_MINIMAX_PROVIDER
-            )
-            for r, deps in zip(candidates, candidate_dependencies):
+            for r in candidates:
                 (j_id, j_submitter, j_parent, j_kind, j_desc, j_priority, j_deadline,
                  j_caps_json, j_kinds_json, j_hosts_json, j_project, j_max_tier,
                  j_pref_providers, j_pref_models, j_mnemos_refs, j_deps_json,
-                 _j_retry_backoff_until, j_started_at) = r
-                if deps and len(completed_dependency_ids.intersection(deps)) < len(deps):
-                    continue
+                 _j_retry_backoff_until, j_started_at,
+                 j_site, j_repo, j_head_branch, j_pr_number) = r
+                deps = json_list(j_deps_json)
+                if deps:
+                    ph = ",".join("?" * len(deps))
+                    async with db.execute(
+                        f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
+                        tuple(deps),
+                    ) as dc:
+                        done_count = (await dc.fetchone())[0]
+                    if done_count < len(deps):
+                        continue
                 job = {
                     "id": j_id,
                     "kind": j_kind,
@@ -2903,66 +3051,17 @@ async def dequeue_next_job(agent_urn: str):
                 eligible, _reason = job_agent_eligible(job, agent)
                 if not eligible:
                     continue
-                # MiniMax-M3 pool gate: applied only when this claim would
-                # actually take a MiniMax lease (route chain's leaf is the
-                # MiniMax-M3 model). When the worker is on a non-MiniMax
-                # route, no pool check is performed — a worker may hold a
-                # MiniMax lease AND a non-MiniMax job simultaneously (the
-                # lease is exclusive to the MiniMax model, not to the
-                # worker). Fail-closed semantics: a denied MiniMax claim
-                # is logged + emitted on the response header but the
-                # candidate loop continues so the worker can fall through
-                # to a non-MiniMax eligible job instead of starving.
-                if _worker_is_minimax_route:
-                    # Delegate the cap math to the scheduler's pool API so
-                    # the dequeue flow stays thin: per-worker + global cap
-                    # is enforced by ``can_assign`` and a deny is logged
-                    # but the candidate loop continues so the worker can
-                    # fall through to a non-MiniMax eligible job. The pool
-                    # state is only mutated AFTER a successful UPDATE —
-                    # a failed claim must not consume pool capacity (a
-                    # BEGIN IMMEDIATE transaction is single-writer but the
-                    # UPDATE could still miss a race if the row was
-                    # changed between SELECT and UPDATE; in that case the
-                    # cap counter stays untouched).
-                    _ok, _mx_reason = _minimax_pool.can_assign(agent_urn)
-                    if not _ok:
-                        # Pool state is unchanged (can_assign is pure); a
-                        # denied MiniMax claim falls through to the next
-                        # candidate. Record the LAST denial reason so the
-                        # 204 fallback can surface why this worker was
-                        # turned away — distinguishes per-worker cap
-                        # (worker already holds a MiniMax lease) from
-                        # global cap (fleet-wide pool full). The per-
-                        # worker case often signals a real bug on the worker
-                        # (it forgot to release the prior lease) and is
-                        # worth flagging in the response header. Emit a
-                        # structured event so we can monitor pool
-                        # saturation without grepping stderr.
-                        _minimax_pool_denied_reason = _mx_reason
-                        await emit_event(db, "minimax.pool.denied", {
-                            "urn": agent_urn,
-                            "job_id": j_id,
-                            "reason": _mx_reason,
-                            "pool_active": _minimax_pool.active_assignments,
-                            "pool_cap": _SCHED_MINIMAX_GLOBAL_MAX,
-                        })
-                        continue
                 cur2 = await db.execute(
                     "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
                     "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
-                    "claim_lease_expires_at=? "
+                    "claim_lease_expires_at=?, last_update_at=?, "
+                    "ended_at=NULL, result=NULL "
                     "WHERE id=? AND status IN ('queued','offered')",
                     (agent_urn, now, a_runtime, a_model, a_provider, a_tier,
-                     now + CLAIM_LEASE_SECONDS, j_id),
+                     now + CLAIM_LEASE_SECONDS, now, j_id),
                 )
                 if cur2.rowcount == 0:
                     continue
-                if _worker_is_minimax_route:
-                    # UPDATE succeeded — record the lease on the pool so
-                    # subsequent iterations in the same dequeue call (if
-                    # the worker had multiple candidates) respect the cap.
-                    _minimax_pool = _minimax_pool.assign(agent_urn, j_id)
                 claimed = {
                     "id": j_id,
                     "submitter_urn": j_submitter,
@@ -2979,6 +3078,10 @@ async def dequeue_next_job(agent_urn: str):
                     "preferred_providers": json_list(j_pref_providers),
                     "preferred_models": json_list(j_pref_models),
                     "mnemos_refs": json_list(j_mnemos_refs),
+                    "site": j_site,
+                    "repo": j_repo,
+                    "head_branch": j_head_branch,
+                    "pr_number": j_pr_number,
                     "status": "claimed",
                     "claimed_by": agent_urn,
                     "claimed_at": now,
@@ -3008,37 +3111,12 @@ async def dequeue_next_job(agent_urn: str):
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
     # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
     # contract and triggers h11 LocalProtocolError. Use Response (no body).
-    # If the loop ended specifically because the MiniMax-M3 pool denied
-    # the worker (global cap OR per-worker cap), surface the reason so
-    # the worker can fall through to a non-MiniMax chain or release its
-    # held lease — without surfacing the reason, a worker that already
-    # holds a MiniMax lease would silently poll forever against a
-    # saturated per-worker slot.
     from fastapi.responses import Response as _Response
-    _claim_detail = "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier"
-    _claim_result = "no_jobs_available"
-    if _minimax_pool_denied_reason is not None:
-        _claim_result = "minimax_pool_saturated"
-        _claim_detail = (
-            f"{_minimax_pool_denied_reason}; "
-            "fall through to a non-minimax chain or release the held lease"
-        )
-    elif _worker_is_minimax_route and _minimax_pool.active_assignments >= _SCHED_MINIMAX_GLOBAL_MAX:
-        # Defensive fallback for the case where the pool was full going
-        # IN but every MiniMax-route candidate was already claimed by
-        # someone else (no ``can_assign`` deny recorded). Surface the
-        # global-cap reason explicitly.
-        _claim_result = "minimax_pool_saturated"
-        _claim_detail = (
-            f"minimax:global cap reached "
-            f"({_minimax_pool.active_assignments}/{_SCHED_MINIMAX_GLOBAL_MAX}); "
-            "fall through to a non-minimax chain"
-        )
     return _Response(
         status_code=204,
         headers={
-            "X-Hive-Claim-Result": _claim_result,
-            "X-Hive-Claim-Detail": _claim_detail,
+            "X-Hive-Claim-Result": "no_jobs_available",
+            "X-Hive-Claim-Detail": "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier",
         },
     )
 
@@ -3055,6 +3133,7 @@ async def update_job(job_id: str, req: JobUpdate):
     original_result_mnemos_was_set = field_was_set(req, "result_mnemos_id")
     # #3 FIX: Hallucination guard now surfaces failure_reason + exit_code=-2 (per review 2026-05-23)
     halluc_reason = None
+    completion_rejected = False
     if req.status == "done" and req.result:
         halluc_reason = hallucination_check(req.result)
         if halluc_reason:
@@ -3068,27 +3147,6 @@ async def update_job(job_id: str, req: JobUpdate):
                 result=patched,
                 claimed_by=req.claimed_by, tokens_in=req.tokens_in,
                 tokens_out=req.tokens_out, result_mnemos_id=req.result_mnemos_id,
-            )
-    # WORK CONTRACT (GRAEAE worker-accountability consensus 1.0, 2026-06-04): a commit-mandatory
-    # job marked done with ZERO commits is a contract breach — a silent fake-completion (model
-    # confabulated off-task instead of committing; observed 23/40 riskyeats/code "done" w/ 0
-    # commits + off-task chatter like "Hetzner API"/"SRRS"). Reclassify to failed so it never
-    # counts as done + feeds fault-attribution/backoff. kind from worker-stamped result;
-    # exit_code=-3 (vs hallucination_guard -2).
-    if req.status == "done" and isinstance(req.result, dict) and not halluc_reason:
-        _k = str(req.result.get("kind") or "")
-        _commits = req.result.get("commits") or []
-        _mand = (_k in ("riskyeats", "code") or _k.startswith((
-            "riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:",
-            "ic-engine", "investorclaw", "ncz-os")))
-        if _mand and not _commits:
-            _p = dict(req.result or {})
-            _p["exit_code"] = -3
-            _p["failure_reason"] = "contract_breach:commit_mandatory_no_commits"
-            req = JobUpdate(
-                status="failed", result=_p, claimed_by=req.claimed_by,
-                tokens_in=req.tokens_in, tokens_out=req.tokens_out,
-                result_mnemos_id=req.result_mnemos_id,
             )
     req.result = normalize_result_payload(req.status, req.result)
 
@@ -3119,14 +3177,14 @@ async def update_job(job_id: str, req: JobUpdate):
         try:
             async with db.execute(
                 "SELECT status, claimed_by, claimed_provider, claimed_model, retry_count, "
-                "max_retries, COALESCE(decline_count, 0) FROM jobs WHERE id=?",
+                "max_retries, COALESCE(decline_count, 0), kind, repo FROM jobs WHERE id=?",
                 (job_id,),
             ) as cur:
                 current = await cur.fetchone()
             if not current:
                 await db.execute("ROLLBACK")
                 raise HTTPException(404, f"job not found: {job_id}")
-            old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count = current
+            old_status, old_claimed_by, prov, mod, retry_count, max_retries, decline_count, job_kind, job_repo = current
 
             if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
                 await db.execute("ROLLBACK")
@@ -3136,7 +3194,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 )
 
             if (old_status in TERMINAL_JOB_STATUSES and req.status != old_status
-                    and not (old_status == "done" and req.status == "cancelled")):  # allow cancelling fake/dup completions
+                    and not (old_status in {"done", "failed"} and req.status == "cancelled")):  # retire fake/dup completions and superseded failures
                 await db.execute("ROLLBACK")
                 raise HTTPException(409, f"terminal job status {old_status!r} cannot be reopened by PATCH")
 
@@ -3179,6 +3237,19 @@ async def update_job(job_id: str, req: JobUpdate):
                 await db.execute("ROLLBACK")
                 raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
 
+            commit_required = bool(job_repo) or str(job_kind) in ("riskyeats", "code") or str(job_kind).startswith((
+                "riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:",
+                "ic-engine", "investorclaw", "ncz-os",
+            ))
+            if req.status == "done" and commit_required:
+                proof = req.result or {}
+                if not valid_completion_proof(proof):
+                    req.status = "needs-review"
+                    completion_rejected = True
+                    req.result = {**proof, "failure_reason": "completion_evidence_missing"}
+                    patch_payload["status"] = req.status
+                    patch_payload["result"] = req.result
+
             fields = ["status=?", "last_update_at=?"]
             args: list = [req.status, now]
             if req.status in TERMINAL_JOB_STATUSES:
@@ -3191,6 +3262,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 fields.extend([
                     "claimed_by=NULL", "claimed_at=NULL", "claimed_runtime=NULL",
                     "claimed_model=NULL", "claimed_provider=NULL", "claimed_cost_tier=NULL",
+                    "ended_at=NULL",
                 ])
                 # GRAEAE dispatch consensus 1.0 (2026-06-04) SHIP-FIRST: backoff on EVERY release
                 # so a job a worker can't run cannot hot-loop (claim->release->reclaim). The serve
@@ -3455,17 +3527,73 @@ async def update_job(job_id: str, req: JobUpdate):
                 "tokens_in": req.tokens_in, "tokens_out": req.tokens_out,
                 "estimated_cost_usd": cost_estimate,
             })
+    if completion_rejected:
+        # Older workers delete successful checkouts after HTTP 200. Returning
+        # non-200 is necessary until those workers have all been upgraded.
+        return JSONResponse(status_code=409, content={
+            "ok": False, "status": "needs-review", "reason": "completion_evidence_missing"
+        })
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate,
             "dead_lettered": dead_lettered}
 
 
 
 
+@app.post("/v1/jobs/{job_id}/auto-retry")
+async def auto_retry_job(job_id: str):
+    """Recheck stored retry policy under a row lock before consuming a retry."""
+    async with connect_db() as db:
+        try:
+            if HIVE_BACKEND == "sqlite":
+                await db.execute("BEGIN IMMEDIATE")
+            lock_clause = {
+                "sqlite": "",
+                "oracle": " FOR UPDATE",
+                "db2": " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS",
+            }[HIVE_BACKEND]
+            async with db.execute(
+                "SELECT status, kind, max_retries, retry_count, result "
+                "FROM jobs WHERE id=?" + lock_clause,
+                (job_id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                raise HTTPException(404, "job not found")
+            status, kind, max_retries, retry_count, raw_result = row
+            try:
+                result = json.loads(raw_result) if raw_result else None
+            except (ValueError, TypeError):
+                result = None
+            job = {
+                "status": status,
+                "kind": kind,
+                "max_retries": max_retries,
+                "retry_count": retry_count,
+                "result": result,
+            }
+            if not retry_policy.auto_retry_allowed(job):
+                raise HTTPException(409, "job is not eligible for automatic retry")
+            await db.execute(
+                "UPDATE jobs SET status='queued', retry_count=retry_count+1, "
+                "claimed_by=NULL, claimed_at=NULL, claimed_runtime=NULL, "
+                "claimed_model=NULL, claimed_provider=NULL, claimed_cost_tier=NULL, "
+                "claim_lease_expires_at=NULL, ended_at=NULL, retry_backoff_until=NULL "
+                "WHERE id=?",
+                (job_id,),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+    return {"ok": True, "id": job_id, "retry_count": retry_count + 1}
+
+
 class RequeueRequest(BaseModel):
     job_ids: list[str]
     reason: str = "manual-requeue"
 
-@app.post("/v1/admin/jobs/requeue")
+
+@app.post("/v1/admin/jobs/requeue", dependencies=[Depends(require_mutation_actor)])
 async def admin_requeue_jobs(req: RequeueRequest):
     """Force-requeue terminal (failed/cancelled) or any non-done jobs back to queued."""
     now = time.time()
@@ -3482,18 +3610,298 @@ async def admin_requeue_jobs(req: RequeueRequest):
                 continue
             await db.execute(
                 """UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL,
-                   claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL,
-                   claimed_cost_tier=NULL, claimed_host_caps=NULL,
-                   claim_lease_expires_at=NULL, ended_at=NULL, result=NULL,
-                   tokens_in=NULL, tokens_out=NULL, estimated_cost_usd=NULL,
-                   result_mnemos_id=NULL, retry_count=0, retry_backoff_until=NULL,
-                   decline_count=0, last_update_at=?
+                   retry_count=0, retry_backoff_until=NULL
                    WHERE id=?""",
-                (now, job_id),
+                (job_id,),
             )
             await db.commit()
             results["ok"].append(job_id)
     return results
+
+
+class PurgeRequest(BaseModel):
+    job_ids: list[str]
+    reason: str = "doctor-dlq-remove"
+
+@app.post("/v1/admin/jobs/purge", dependencies=[Depends(require_mutation_actor)])
+async def admin_purge_jobs(req: PurgeRequest):
+    """Permanently remove terminal dead-letter jobs (doctor 'remove' action).
+
+    Safety: ONLY purges jobs currently in 'dead-letter'. Anything else
+    (active, or other-terminal done/failed/cancelled) is refused so a stray or
+    buggy caller cannot delete live or historical work."""
+    results: dict = {"ok": [], "not_found": [], "skipped_not_dead_letter": []}
+    async with connect_db() as db:
+        for job_id in req.job_ids:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                results["not_found"].append(job_id)
+                continue
+            if row[0] != "dead-letter":
+                results["skipped_not_dead_letter"].append(job_id)
+                continue
+            await db.execute("DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,))
+            await db.commit()
+            results["ok"].append(job_id)
+    async with connect_db() as event_db:
+        for job_id in results["ok"]:
+            await emit_event(event_db, "job.purged", {"id": job_id, "reason": req.reason})
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Housekeeping delete/purge — single-job DELETE + filtered bulk purge.
+# Both paths cascade job_audit_log and use the file's `?`-placeholder convention
+# (the _translate_sql layer rewrites ? -> :bind and table names for Oracle), so
+# ONE SQL body works for both sqlite and oracle backends. All filters are bound
+# parameters (no string interpolation of caller input -> no SQL injection).
+# ---------------------------------------------------------------------------
+
+async def _cascade_delete_jobs(db, job_ids: list[str], *, allow_active: bool = False) -> list[str]:
+    """Delete the given jobs and their job_audit_log rows. ATOMIC active-job guard
+    (codex review #3): the job row is deleted with a compare-and-delete predicate
+    that re-checks status AT DELETE TIME, so a job that was queued/offered at SELECT
+    time but got CLAIMED by a worker before the delete is NOT removed (no orphaned
+    in-flight worker). Pass allow_active=True to bypass that guard (force / explicit
+    include_active). Audit-log rows are deleted only for jobs whose row is actually
+    gone (NOT EXISTS guard), so a job that survived the status race keeps its audit
+    history. Returns the ids actually deleted. Uses single-id executemany so the
+    per-backend (?->:bind) translation runs once and binds tuples — same shape as
+    the existing reaper deletes.
+    """
+    if not job_ids:
+        return []
+    rows = [(jid,) for jid in job_ids]
+    if allow_active:
+        await db.executemany("DELETE FROM jobs WHERE id=?", rows)
+    else:
+        active_ph = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
+        await db.executemany(
+            f"DELETE FROM jobs WHERE id=? AND status NOT IN ({active_ph})",
+            [(jid, *ACTIVE_JOB_STATUSES) for jid in job_ids],
+        )
+    # Re-read which of the candidates still exist; everything missing was deleted.
+    # (Set-based existence check, no table-qualified columns -> Oracle-safe.)
+    survivors: set[str] = set()
+    for jid in job_ids:
+        async with db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)) as cur:
+            if await cur.fetchone() is not None:
+                survivors.add(jid)
+    deleted = [jid for jid in job_ids if jid not in survivors]
+    if deleted:
+        await db.executemany(
+            "DELETE FROM job_audit_log WHERE job_id=?",
+            [(jid,) for jid in deleted],
+        )
+    return deleted
+
+
+@app.delete("/v1/jobs/{job_id}", dependencies=[Depends(require_mutation_actor)])
+async def delete_job(job_id: str, force: bool = False):
+    """Delete ONE job record (+ cascade its job_audit_log rows).
+
+    Refuses to delete an in-flight job (status running/claimed) unless
+    ?force=true, so a live worker is never orphaned. Returns {deleted:1} or 404.
+    """
+    async with connect_db() as db:
+        async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise HTTPException(404, f"job {job_id} not found")
+        status = row[0]
+        if status in ("running", "claimed") and not force:
+            raise HTTPException(
+                409,
+                f"job {job_id} is {status} (in-flight); pass ?force=true to delete anyway",
+            )
+        # allow_active=force: without force, the cascade re-checks status at delete
+        # time, so a queued/offered job that got CLAIMED in the race window is left
+        # intact (deleted=0) rather than orphaning the worker (codex review #3).
+        deleted = await _cascade_delete_jobs(db, [job_id], allow_active=force)
+        await db.commit()
+    if not deleted:
+        # Lost the race: the job became active (claimed) between read and delete.
+        raise HTTPException(
+            409,
+            f"job {job_id} became in-flight during delete; pass ?force=true to override",
+        )
+    async with connect_db() as event_db:
+        await emit_event(event_db, "job.deleted",
+                         {"id": job_id, "prior_status": status, "forced": force})
+    return {"deleted": 1, "id": job_id, "prior_status": status}
+
+
+class JobPurgeRequest(BaseModel):
+    kind_prefix: Optional[str] = None
+    status: Optional[str] = None
+    statuses: Optional[list[str]] = None
+    description_contains: Optional[str] = None
+    submitter_urn: Optional[str] = None
+    older_than_seconds: Optional[float] = None
+    ids: Optional[list[str]] = None
+    include_active: bool = False
+    reason: str = "housekeeping-purge"
+
+
+@app.post("/v1/jobs/purge", dependencies=[Depends(require_mutation_actor)])
+async def purge_jobs(req: JobPurgeRequest):
+    """Bulk housekeeping purge. JSON-body filters are AND-combined; at least one
+    filter is REQUIRED (an unfiltered purge is refused so nothing can delete
+    every job). By default jobs in an active status (queued/offered/claimed/
+    running/needs-review) are excluded; pass include_active=true to override.
+
+    older_than_seconds compares against COALESCE(ended_at, started_at) so a job
+    that has not yet ended is aged from when it entered the queue.
+
+    Returns {deleted:N, matched_ids:[...]}.
+    """
+    wheres: list[str] = []
+    params: list[Any] = []
+
+    statuses: list[str] = []
+    if req.status:
+        statuses.append(req.status)
+    if req.statuses:
+        statuses.extend(req.statuses)
+
+    # "Narrow" selectors target a specific subset of jobs (a kind, a submitter, a
+    # description fragment, or explicit ids). Age/status are "broad" — on their own
+    # they can match nearly the whole table. include_active=true bypasses the
+    # in-flight guard, so it MUST be paired with at least one narrow selector
+    # (codex review #2 round 2): age/status-only + include_active could otherwise
+    # delete ~all jobs incl. running ones.
+    has_narrow = any([
+        req.kind_prefix, req.description_contains, req.submitter_urn, req.ids,
+    ])
+    if req.include_active and not has_narrow:
+        raise HTTPException(
+            422,
+            "include_active=true requires a narrow selector "
+            "(kind_prefix / description_contains / submitter_urn / ids); "
+            "a broad age/status-only purge may not target in-flight jobs",
+        )
+
+    has_filter = any([
+        req.kind_prefix, statuses, req.description_contains,
+        req.submitter_urn, req.older_than_seconds is not None,
+        req.ids,
+    ])
+    if not has_filter:
+        raise HTTPException(
+            422,
+            "refusing unfiltered purge: supply at least one of "
+            "kind_prefix/status(es)/description_contains/submitter_urn/"
+            "older_than_seconds/ids",
+        )
+
+    if req.older_than_seconds is not None and req.older_than_seconds <= 0:
+        # A non-positive window yields a future/now cutoff -> COALESCE(...) < cutoff
+        # matches essentially every job. Refuse it so older_than_seconds can never
+        # be a delete-all wildcard (codex review #2).
+        raise HTTPException(422, "older_than_seconds must be > 0")
+    if req.kind_prefix:
+        # Escape LIKE metacharacters so a literal '%'/'_' in the prefix cannot turn
+        # into a match-all wildcard (codex review #2). 'kind%' anchors the prefix.
+        kp = (req.kind_prefix
+              .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        wheres.append("kind LIKE ? ESCAPE '\\'")
+        params.append(kp + "%")
+    if statuses:
+        wheres.append("status IN (%s)" % ",".join("?" for _ in statuses))
+        params.extend(statuses)
+    if req.description_contains:
+        wheres.append("description LIKE ?")
+        # escape LIKE metacharacters in caller input so % / _ are literal
+        esc = (req.description_contains
+               .replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"))
+        params.append("%" + esc + "%")
+        # NB: ESCAPE clause appended below for the description predicate only
+        wheres[-1] = "description LIKE ? ESCAPE '\\'"
+    if req.submitter_urn:
+        wheres.append("submitter_urn=?")
+        params.append(req.submitter_urn)
+    if req.older_than_seconds is not None:
+        wheres.append("COALESCE(ended_at, started_at) < ?")
+        params.append(time.time() - float(req.older_than_seconds))
+    if req.ids:
+        wheres.append("id IN (%s)" % ",".join("?" for _ in req.ids))
+        params.extend(req.ids)
+
+    # Active-job guard: unless explicitly included, never match in-flight work.
+    if not req.include_active:
+        wheres.append(
+            "status NOT IN (%s)" % ",".join("?" for _ in ACTIVE_JOB_STATUSES)
+        )
+        params.extend(ACTIVE_JOB_STATUSES)
+
+    select_sql = "SELECT id FROM jobs WHERE " + " AND ".join(wheres)
+    async with connect_db() as db:
+        async with db.execute(select_sql, tuple(params)) as cur:
+            matched = [r[0] async for r in cur]
+        deleted: list[str] = []
+        if matched:
+            # allow_active mirrors include_active: when not including active jobs the
+            # cascade re-checks status at delete time, so a job that got claimed
+            # between SELECT and DELETE is skipped (atomic guard, codex review #3).
+            deleted = await _cascade_delete_jobs(
+                db, matched, allow_active=req.include_active)
+            await db.commit()
+    if deleted:
+        async with connect_db() as event_db:
+            await emit_event(event_db, "jobs.purged",
+                             {"count": len(deleted), "reason": req.reason})
+    return {"deleted": len(deleted), "matched_ids": deleted}
+
+
+# Admin reclassify is an explicit override of the normal transition guard, so the
+# target is restricted to a small safe set (e.g. dead-letter -> needs-review for a
+# human). Used by the doctor for ambiguous dead-letter jobs.
+RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
+
+class ReclassifyRequest(BaseModel):
+    job_ids: list[str]
+    status: str
+    reason: str = "doctor-dlq-reclassify"
+
+@app.post("/v1/admin/jobs/reclassify", dependencies=[Depends(require_mutation_actor)])
+async def admin_reclassify_jobs(req: ReclassifyRequest):
+    """Admin override to move terminal (esp. dead-letter) jobs to a safe target
+    status, bypassing ALLOWED_TRANSITIONS. The doctor uses status='needs-review'
+    to surface ambiguous dead-letter jobs for a human."""
+    if req.status not in RECLASSIFY_ALLOWED_TARGETS:
+        raise HTTPException(422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}")
+    results: dict = {"ok": [], "not_found": [], "skipped_done": []}
+    async with connect_db() as db:
+        for job_id in req.job_ids:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                results["not_found"].append(job_id)
+                continue
+            if row[0] == "done":
+                results["skipped_done"].append(job_id)
+                continue
+            if req.status == "queued":
+                # full requeue semantics (reset claim + retry/backoff)
+                await db.execute(
+                    "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
+                    "retry_count=0, retry_backoff_until=NULL WHERE id=?",
+                    (job_id,),
+                )
+            else:
+                await db.execute(
+                    "UPDATE jobs SET status=?, claimed_by=NULL, claimed_at=NULL WHERE id=?",
+                    (req.status, job_id),
+                )
+            await db.commit()
+            results["ok"].append(job_id)
+    async with connect_db() as event_db:
+        for job_id in results["ok"]:
+            await emit_event(event_db, "job.reclassified", {
+                "id": job_id, "new_status": req.status, "reason": req.reason})
+    return results
+
 
 @app.post("/v1/schedules")
 async def create_schedule(req: ScheduleCreate):
@@ -3738,21 +4146,16 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # provider,         model,                 alias,                  in,    out
     {"provider": "groq",      "model": "gpt-oss-20b",          "alias": "hive_groq_1",        "tier": "B"},
     {"provider": "gemini",    "model": "gemini-2.5-flash-lite","alias": "hive_gemini_1",      "tier": "B"},
-    # DISABLED 2026-06-03 (blocker C): siliconflow key 401 invalid fleet-wide. Re-enable after key rotation.
-    # {"provider": "siliconflow","model": "qwen2.5-coder-32b",   "alias": "hive_siliconflow_1", "tier": "B"},
-    {"provider": "deepseek-direct","model": "deepseek-v4-flash","alias": "hive_deepseek_1",   "tier": "B"},
+    # FORBIDDEN 2026-09-07 (operator): neither deepseek nor siliconflow may be
+    # used directly, fleet-wide. Both providers removed from the candidate
+    # pool (siliconflow was already disabled 2026-06-03 for an invalid key;
+    # deepseek-direct's two aliases hive_deepseek_1/hive_deepseek_pro_1 are
+    # struck below, not just disabled).
     {"provider": "together",  "model": "minimax-m2.7",         "alias": "hive_together_1",    "tier": "B"},
-    # MiniMax-M3 capacity pool (worker-agnostic, 5-slot global cap, 1 per worker).
-    # Host-independent: any worker on the bus may take this lease as long as
-    # the global pool has headroom. The dequeue flow enforces the cap at
-    # claim time (see dequeue_next_job MiniMax pre-flight block).
-    {"provider": "minimax",   "model": "minimax-m3",            "alias": "hive_minimax_1",     "tier": "B"},
     {"provider": "xai",       "model": "grok-4.1-fast",        "alias": "hive_xai_1",         "tier": "B"},
-    {"provider": "deepseek-direct","model": "deepseek-v4-pro", "alias": "hive_deepseek_pro_1","tier": "B"},
-    # NGC Enterprise Inference Hub via the .4 LiteLLM gateway (PYTHIA:4100
-    # tunnel). Enterprise allocation, no per-token bill -> tier A. Worker
-    # agent = hive_ngc_1 (openai.ngc_nemotron, fleet-ops fe4d780).
-    {"provider": "ngc-proxy", "model": "gpt-5.5",            "alias": "hive_ngc_1",         "tier": "A"},
+    # REMOVED 2026-06-17 (operator: "remove ngc-review from all agents" +
+    # compute edict: EIH frontier forbidden). hive_ngc_1 (ngc-proxy gpt-5.5 via
+    # the .4 EIH gateway) is no longer a coding/review candidate for any agent.
     # Bedrock Nova (funded AWS creds, worker agents shipped 2026-06-02):
     # cheap metered fallbacks (lite 0.06/0.24, micro 0.035/0.14).
     {"provider": "bedrock",   "model": "amazon.nova-lite-v1:0", "alias": "hive_nova_1",       "tier": "B"},
@@ -3836,15 +4239,9 @@ def oauth_cap_state() -> dict:
         return {"capped": now < until, "capped_until": until, "hit_at": d.get("hit_at"),
                 "model": d.get("model"), "reporter": d.get("reporter"),
                 "verified": False, "remaining_sec": max(0, int(until - now))}
-    except FileNotFoundError:
+    except Exception:
         return {"capped": False, "capped_until": None, "hit_at": None,
                 "model": None, "reporter": None, "verified": False, "remaining_sec": 0}
-    except Exception as exc:
-        # A corrupt or unreadable breaker file is not evidence that the usage
-        # cap cleared. Fail closed and surface the storage fault to operators.
-        return {"capped": True, "capped_until": None, "hit_at": None,
-                "model": None, "reporter": None, "verified": False,
-                "remaining_sec": 0, "storage_error": f"{type(exc).__name__}: {exc}"}
 
 
 def clear_oauth_cap() -> Optional[str]:
@@ -3855,6 +4252,17 @@ def clear_oauth_cap() -> Optional[str]:
     except Exception as e:
         return str(e)
     return None
+
+
+@app.get("/v1/knemon/providers")
+async def knemon_providers():
+    """Provider denylist for the worker llm-* capability probe (Phase 2). A
+    family listed here is treated as globally dead; workers drop its llm-* cap.
+    Set HIVE_PROVIDER_DENYLIST=comma,list (e.g. nvidia,eih)."""
+    denied = [p.strip().lower()
+              for p in os.environ.get("HIVE_PROVIDER_DENYLIST", "").split(",")
+              if p.strip()]
+    return {"denied": denied}
 
 
 @app.post("/v1/knemon/route")
@@ -3873,6 +4281,8 @@ async def knemon_route(req: Request):
     if max_tier not in COST_TIERS:
         max_tier = "C"
     kind = str(body.get("kind") or "")
+    host = str(body.get("host") or "").lower()
+    lead_alias = str(body.get("lead_alias") or "").strip()
     cands = knemon_candidates(max_tier, kind)
     open_weight_chain = [c["alias"] for c in cands]
     # ── KNEMON sub-bucket dispatch (operator 2026-06-02): openai_codex sub is $0;
@@ -3885,22 +4295,17 @@ async def knemon_route(req: Request):
     kl = kind.lower()
     review_kind = any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial"))
     arch_kind = any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:")
-    # DEEPSEEK POLICY (operator directive 2026-06-07, refined same day):
-    # deepseek-v4-PRO = CODE REVIEW fallback or HIGH-LEVEL ARCHITECTURE
-    # fallback ONLY — never a general job model ($166 burn incident).
-    # deepseek-v4-FLASH (hive_deepseek_1) is UNRESTRICTED (~10x cheaper than
-    # pro). Strip only the PRO alias from non-review/non-arch kinds.
-    if not (review_kind or arch_kind):
-        cands = [c for c in cands if c["alias"] != "hive_deepseek_pro_1"]
-        open_weight_chain = [a for a in open_weight_chain if a != "hive_deepseek_pro_1"]
+    # DEEPSEEK POLICY (operator 2026-06-07) SUPERSEDED 2026-09-07: deepseek
+    # direct is now FORBIDDEN fleet-wide, full stop — not just gated to
+    # review/architecture. Both aliases are already struck from
+    # KNEMON_PROVIDERS above; nothing left here to strip.
+    # ADVERSARIAL-ONLY codex (operator 2026-06-17): codex/gpt OAuth leads ONLY
+    # review/adversarial kinds. Every other kind leads with the open-weight /
+    # local lineup (no OAuth lead) so coding goes local-first per the edict.
     if review_kind:
         CODEX_SUB_LEAD = ["hive_codex"]
-    elif any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:"):
-        CODEX_SUB_LEAD = ["hive_gpt"]  # gpt-5.5 (hive_gpt_heavy) OAuth allowance exhausted 2026-06-04 -> use gpt-5.4
-    elif any(kl.startswith(p) for p in ("triage", "docs:", "investigation")):
-        CODEX_SUB_LEAD = ["hive_gpt_mini"]
     else:
-        CODEX_SUB_LEAD = ["hive_gpt"]
+        CODEX_SUB_LEAD = []
     # HIVE-LEVEL BYPASS: when the flag is set, drop the codex/gpt sub-lead and
     # hand back the plain metered open-weight chain so all workers run direct.
     bypass = knemon_bypass_active()
@@ -3922,14 +4327,27 @@ async def knemon_route(req: Request):
         # fallback: when OAuth codex/gpt is capped it is the best available
         # driver AND $0. deepseek/nova/grok follow. (NGC nemotron stays as the
         # ngc-review CLI's direct-prompt reviewer, separate from this chain.)
+        # ngc/EIH removed 2026-06-17. Open-weight lineup leads (cheap flash first;
+        # minimax via hive_together_1 kept in chain -> promote to lead once the
+        # direct $200 MiniMax key is wired into the .4 gateway alias).
         if review_kind:
-            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_deepseek_1", "hive_xai_1"]
+            METERED_FALLBACK = ["hive_groq_3", "hive_xai_1"]
         elif arch_kind:
-            # High-level architecture: gpt-5.5, then deepseek-PRO (sanctioned), grok.
-            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_pro_1", "hive_xai_1"]
+            # High-level architecture: gpt-oss-120b, grok. (deepseek-PRO struck
+            # 2026-09-07 — deepseek direct is forbidden fleet-wide.)
+            METERED_FALLBACK = ["hive_groq_3", "hive_xai_1"]
         else:
-            # General jobs: gpt-5.5 (codex-class, free), flash, Nova lite, grok.
-            METERED_FALLBACK = ["hive_ngc_1", "hive_deepseek_1", "hive_nova_1", "hive_xai_1"]
+            # General coding rotation (operator 2026-09-07: deepseek-flash lead
+            # struck, forbidden fleet-wide). groq qwen3 (fast coder) leads, then
+            # groq gpt-oss-120b, grok funded tail. MiniMax (hive_together_1)
+            # REMOVED from the fleet chain -- reserved for the sole MiniMax
+            # builder (minos) via the host override below.
+            METERED_FALLBACK = ["hive_groq_2", "hive_groq_3", "hive_xai_1"]
+        # MINOS = sole MiniMax builder (operator 2026-06-19): only minos leads
+        # MiniMax ($200 plan key, TPM-limited @ 1 worker). Everyone else rotates
+        # the open-weight lineup above.
+        if "minos" in host and not review_kind:
+            METERED_FALLBACK = ["hive_together_1", "hive_groq_2"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
@@ -3940,6 +4358,16 @@ async def knemon_route(req: Request):
                 chain = list(METERED_FALLBACK)
         else:
             chain = list(CODEX_SUB_LEAD) + METERED_FALLBACK
+    # JOB-SELECTABLE LEAD (operator 2026-06-19): a job may request a specific
+    # lead alias (e.g. a host-local GPU coder: hive_cerberus_1 / hive_rocm_*).
+    # Honor it as the chain head while keeping the rotation as fallback.
+    # BANNED_LEAD_ALIASES (operator 2026-09-07, codex review 2026-09-14):
+    # a caller could bypass the deepseek/siliconflow removal above by simply
+    # requesting one of the struck aliases directly as lead_alias — this was
+    # the removal's only unvalidated entry point. Refuse it there too.
+    BANNED_LEAD_ALIASES = {"hive_deepseek_1", "hive_deepseek_pro_1", "hive_siliconflow_1"}
+    if lead_alias and lead_alias not in BANNED_LEAD_ALIASES:
+        chain = [lead_alias] + [a for a in chain if a != lead_alias]
     return {
         "ok": True,
         "max_cost_tier": max_tier,
@@ -3963,7 +4391,7 @@ async def knemon_bypass_get():
             "flag_file": KNEMON_BYPASS_FILE}
 
 
-@app.post("/v1/knemon/bypass")
+@app.post("/v1/knemon/bypass", dependencies=[Depends(require_mutation_actor)])
 async def knemon_bypass_set(req: Request):
     """Toggle hive-level KNEMON bypass. POST {enabled: bool, reason?: str}.
     When enabled, ALL workers skip the codex/gpt sub-lead (open-weights only)."""
@@ -3994,7 +4422,7 @@ async def knemon_cap_get():
             "flag_file": KNEMON_CAP_FILE, **oauth_cap_state()}
 
 
-@app.post("/v1/knemon/cap")
+@app.post("/v1/knemon/cap", dependencies=[Depends(require_mutation_actor)])
 async def knemon_cap_set(req: Request):
     """Workers report OAuth cap state.
 
@@ -4010,12 +4438,6 @@ async def knemon_cap_set(req: Request):
     if not isinstance(body, dict):
         body = {}
     if body.get("success") is True:
-        model = str(body.get("model") or "")
-        reporter = str(body.get("reporter") or "").strip()
-        if model not in {"hive_codex", "hive_gpt", "hive_gpt_mini", "hive_gpt_heavy"}:
-            raise HTTPException(422, "successful OAuth probe must identify a supported OAuth model")
-        if not reporter:
-            raise HTTPException(422, "successful OAuth probe must identify its reporter")
         err = clear_oauth_cap()
         if err:
             return {"ok": False, "error": err}
@@ -4118,6 +4540,13 @@ async def job_metrics():
 
 @app.post("/v1/jobs/{job_id}/claim")
 async def claim_job(job_id: str, by: str):
+    # HOST_DENYLIST was enforced on /v1/jobs/next but NOT here, so a denylisted
+    # host could take work by calling this by-id endpoint and skipping the
+    # dequeue path entirely.
+    _hp = by.split(":")
+    _host = (_hp[3] if len(_hp) > 3 else "").lower()
+    if _host in HOST_DENYLIST:
+        raise HTTPException(403, f"host {_host} is in HIVE_HOST_DENYLIST")
     """Targeted single-job claim with the same eligibility checks as
     /v1/jobs/next (dequeue_next_job).
 
@@ -4238,10 +4667,11 @@ async def claim_job(job_id: str, by: str):
         cur = await db.execute(
             "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
             "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
-            "claim_lease_expires_at=? "
+            "claim_lease_expires_at=?, last_update_at=?, "
+            "ended_at=NULL, result=NULL "
             "WHERE id=? AND status IN ('queued','offered')",
             (by, now, a_runtime, a_model, a_provider, a_tier,
-             now + CLAIM_LEASE_SECONDS, job_id),
+             now + CLAIM_LEASE_SECONDS, now, job_id),
         )
         await db.commit()
         if cur.rowcount == 0:
@@ -4266,7 +4696,6 @@ async def list_jobs(
     parent_job_id: Optional[str] = None,
     since: Optional[float] = None,
     limit: int = 100,
-    include_result: bool = True,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
     if status:
@@ -4283,13 +4712,9 @@ async def list_jobs(
                 400,
                 f"unknown status {status!r}; valid: {sorted(VALID_JOB_STATUSES)}",
             )
-    # Keep the historical response as the default.  Callers that only need
-    # queue metadata can opt out before SQLite/DB2/Oracle materializes and the
-    # API decodes potentially large result JSON blobs.
-    result_projection = "result" if include_result else "NULL"
     sql = ("SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-           f"claimed_by, started_at, ended_at, {result_projection}, estimated_cost_usd, "
-           "required_capabilities, eligible_kinds, eligible_hosts FROM jobs WHERE 1=1")
+           "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
+           "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE 1=1")
     args: list = []
     cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
     cnt_args: list = []
@@ -4331,19 +4756,20 @@ async def list_jobs(
             total = row[0] if row else 0
         async with db.execute(sql, args) as cur:
             async for r in cur:
-                job = {
+                rows.append({
                     "id": r[0], "submitter_urn": r[1], "parent_job_id": r[2],
                     "kind": r[3], "description": r[4], "priority": r[5],
                     "status": r[6], "claimed_by": r[7],
                     "started_at": r[8], "ended_at": r[9],
+                    "result": json.loads(r[10]) if r[10] else None,
                     "estimated_cost_usd": r[11],
                     "required_capabilities": json.loads(r[12]) if r[12] else None,
                     "eligible_kinds": json.loads(r[13]) if r[13] else None,
                     "eligible_hosts": json.loads(r[14]) if r[14] else None,
-                }
-                if include_result:
-                    job["result"] = json.loads(r[10]) if r[10] else None
-                rows.append(job)
+                    "site": r[15], "repo": r[16],
+                    "head_branch": r[17], "pr_number": r[18],
+                    "max_retries": r[19], "retry_count": r[20],
+                })
     return {"count": len(rows), "total": total, "jobs": rows}
 
 
@@ -4355,7 +4781,7 @@ async def get_job(job_id: str):
         async with db.execute(
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-            "required_capabilities, eligible_kinds, eligible_hosts, retry_count FROM jobs WHERE id=?",
+            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE id=?",
             (job_id,)) as cur:
             r = await cur.fetchone()
     if not r:
@@ -4370,7 +4796,9 @@ async def get_job(job_id: str):
         "required_capabilities": json.loads(r[12]) if r[12] else None,
         "eligible_kinds": json.loads(r[13]) if r[13] else None,
         "eligible_hosts": json.loads(r[14]) if r[14] else None,
-        "retry_count": r[15],
+        "site": r[15], "repo": r[16],
+        "head_branch": r[17], "pr_number": r[18],
+        "max_retries": r[19], "retry_count": r[20],
     }
 
 
@@ -4527,3 +4955,81 @@ async def mcp_rpc(body: dict):
             return await list_messages(**params)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# ===== zerocode-gate: pre-submission gate preview + release (patch) =====
+@app.get("/v1/jobs/{job_id}/preview")
+async def zcgate_get_preview(job_id: str):
+    """Return the zerocode-gate PreviewBundle stored on a needs-review job."""
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT result, status, repo, head_branch, pr_number FROM jobs WHERE id=?",
+            (job_id,),
+        ) as cur:
+            r = await cur.fetchone()
+    if not r:
+        raise HTTPException(404, f"job not found: {job_id}")
+    result = json.loads(r[0]) if r[0] else {}
+    preview = result.get("preview")
+    if not preview:
+        raise HTTPException(404, f"no preview bundle on job {job_id}")
+    return {"job_id": job_id, "status": r[1], "repo": r[2],
+            "head_branch": r[3], "pr_number": r[4], "preview": preview}
+
+
+@app.post("/v1/jobs/{job_id}/release")
+async def zcgate_release(job_id: str):
+    """Human-gated 'Release & Push': enqueue a release:<repo> job that a worker
+    claims and runs `zc-gate release` on (push branch + open upstream PR)."""
+    async with connect_db() as db:
+        async with db.execute("SELECT result, status FROM jobs WHERE id=?", (job_id,)) as cur:
+            r = await cur.fetchone()
+    if not r:
+        raise HTTPException(404, f"job not found: {job_id}")
+    result = json.loads(r[0]) if r[0] else {}
+    preview = result.get("preview")
+    if not preview:
+        raise HTTPException(404, f"no preview bundle on job {job_id}")
+    if (preview.get("verdict") or "").lower() == "blocked":
+        raise HTTPException(409, "bundle verdict is blocked; not releasable")
+    if result.get("release_job_id"):
+        return {"ok": True, "already": True, "release_job_id": result["release_job_id"]}
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT urn FROM agents WHERE runtime IN ('mnemos','human','claude-code','claude') "
+            "AND status != 'offline' ORDER BY last_heartbeat DESC LIMIT 1"
+        ) as cur:
+            o = await cur.fetchone()
+    if not o:
+        raise HTTPException(503, "no active orchestrator to submit the release job")
+    submitter = o[0]
+    repo = preview.get("repo") or "zeroclaw-labs/zeroclaw"
+    rel = await create_job(JobCreate(
+        submitter_urn=submitter,
+        kind="release:zeroclaw",
+        description=job_id,
+        eligible_kinds=["zeroclaw"],
+        eligible_hosts=["zcgate-release-sink"],
+        priority=5,
+    ))
+    rel_id = rel.get("id") if isinstance(rel, dict) else None
+    result["release_job_id"] = rel_id
+    result["release_requested_at"] = time.time()
+    async with connect_db() as db:
+        await db.execute("UPDATE jobs SET result=? WHERE id=?",
+                         (json.dumps(result), job_id))
+        await db.commit()
+    return {"ok": True, "release_job_id": rel_id, "repo": repo, "submitter": submitter}
+# ===== end zerocode-gate patch =====
+
+
+# ===== zerocode-gate static mount =====
+try:
+    from fastapi.staticfiles import StaticFiles as _ZCStatic
+    import os as _zcos
+    _zcdir = "/srv/agent-bus/static"
+    _zcos.makedirs(_zcdir, exist_ok=True)
+    app.mount("/static", _ZCStatic(directory=_zcdir), name="zcstatic")
+except Exception as _zce:
+    print("zcgate static mount failed:", _zce, flush=True)
+# ===== end zerocode-gate static mount =====
