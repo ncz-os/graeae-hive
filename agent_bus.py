@@ -5173,7 +5173,6 @@ async def knemon_route(req: Request):
     if max_tier not in COST_TIERS:
         max_tier = "C"
     kind = str(body.get("kind") or "")
-    host = str(body.get("host") or "").lower()
     lead_alias = str(body.get("lead_alias") or "").strip()
     cands = knemon_candidates(max_tier, kind)
     open_weight_chain = [c["alias"] for c in cands]
