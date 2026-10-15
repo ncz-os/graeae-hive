@@ -29,12 +29,22 @@ than trust.
 | 3 | high | `now` deleted from `admin_requeue_jobs` but still referenced → NameError | **FALSE POSITIVE.** `now` was never referenced in that function, on master *or* HEAD (Evidence B). `ruff F841` removed an unused binding. No NameError. |
 | 4 | high | `load_script` called with a path containing `/` → invalid module id | **FALSE POSITIVE.** `load_script(name, filename)`; the call passes `name="zeroclaw_worker_under_test"` (valid id) and the path as the *second* arg (Evidence C). Reviewer read the args in the wrong order. |
 | 5 | med | `valid_completion_proof` drops `remote_verified`/`remote_sha` | **Intended** — local git evidence is now the sole gate (docstring). No producer or consumer references either field anywhere in the tree (Evidence D). |
-| 6 | low | `QUARANTINED_HOSTS` "changed from populated set to empty set" | **FALSE POSITIVE.** Master already had `QUARANTINED_HOSTS = set()` (empty, "all hosts un-quarantined 2026-06-14"); HEAD removes the now-dead constant entirely. No live quarantine existed to disable (Evidence E). |
+| 6 | low→high | `QUARANTINED_HOSTS` removed | **FIXED (round 3 reconsidered).** Round-2 called this a false positive because the set was *empty* on master. Round 3 corrected the call: the set was empty, **but** master also used it in the serve gate (`if agent_host in QUARANTINED_HOSTS: return False, "host … is quarantined"`) — a **general** safety valve that the Spark removal took along as collateral (Evidence E). Restored the constant + the first-check gate; empty set ⇒ zero behavior change, capability preserved. |
 | 7 | low | `list_enabled_harnesses` defined but not re-exported | **FIXED.** Added `list_enabled_harnesses` + `register_external_adapter` to `hive/harness/__init__.py` imports + `__all__`. |
 | 8 | info | Doc could be read as "Phase A fully done" | **FIXED.** Added an explicit "A4/A5 PENDING" callout + ⧗ markers. |
 | 9 | low/info | Parenthesized `async with` needs Python ≥3.10 | **Acknowledged, no action.** Diff already uses PEP 604 (`X | None`) throughout, so the 3.10+ floor is a pre-existing project property. |
 | 10 | info | Large mechanical reformat dominates chunks | **Expected.** `3c0474a` is the ruff pass; semantic deltas within it are the Spark removal (documented) + F841/F401 removals (verified no-op). |
 | 11 | info | `get_harness_adapter` allows arbitrary `module:Class` import | **Acknowledged for Phase D.** No callers today (function is inert); noted in doc that dispatch must validate `harness_kind` against the registry before the fallback. |
+
+### Round-3 additions
+
+| # | Sev | Finding | Disposition |
+|---|-----|---------|-------------|
+| 12 | high | `QUARANTINED_HOSTS` "deleted but likely still referenced" | **FIXED** — same as #6 above (restored). |
+| 13 | med | "Removed local `HTTPException` import while still referenced" | **FALSE POSITIVE.** The removed local was `from fastapi import HTTPException as _HE` inside the scheduler loop — a dead alias with **0 references on master** (Evidence F). The real `HTTPException` is imported at module scope (line 30) and used 78×; unaffected. |
+| 14 | low | `WORKER_ONLY_RUNTIMES` duplicate entry silently deduplicated | **Non-issue by construction.** It is declared `WORKER_ONLY_RUNTIMES: set[str]` (line 845) — sets dedupe literal duplicates. Membership checks at line 1317 are unchanged. |
+| 15 | med | `find_active_dedup_job` tuple `async with` changes cleanup/entry semantics | **FALSE POSITIVE.** Proved with a runnable 2-context-manager harness that the parenthesized form acquires the connection **before** `db.execute(...)` is evaluated and exits cursor-before-connection — byte-identical to the nested form (Evidence G). |
+| 16 | low | Test paths assume fixtures under `tests/fixtures`, others at repo root | **FIXED** — all 15 paths now resolve via `HERE = Path(__file__).resolve().parent`, so both `tests/fixtures/*` and repo-root scripts load regardless of CWD. |
 
 ---
 
@@ -95,17 +105,45 @@ $ grep -rn "remote_verified\|remote_sha" --include='*.py' --include='*.html' .
 ```
 Only the explanatory docstring matches. Nothing writes or reads the fields.
 
-### E — `QUARANTINED_HOSTS` was already empty on master
+### E — `QUARANTINED_HOSTS` was empty but was a live gate (round-3 correction)
 ```
-$ git show origin/master:agent_bus.py | grep "QUARANTINED_HOSTS ="
-QUARANTINED_HOSTS = set()  # all hosts un-quarantined 2026-06-14: ...
-$ grep -rn "QUARANTINED_HOSTS" --include='*.py' . | wc -l
-0
+$ git show origin/master:agent_bus.py | grep -n "QUARANTINED_HOSTS"
+824:QUARANTINED_HOSTS = set()  # all hosts un-quarantined 2026-06-14: ...
+1122:        if h not in QUARANTINED_HOSTS          # (inside the Spark block — removed)
+1150:    if agent_host in QUARANTINED_HOSTS:        # serve gate — general safety valve
+         return False, f"host {agent_host} is quarantined (broken gateway)"
 ```
+Empty set ⇒ the gate never fired, but it was the *only* bus-side quarantine
+mechanism. It is general (PROTEUS/broken-gateway class of failure), not
+Spark-specific, so it is restored rather than dropped with the Spark path.
+
+### F — `HTTPException` local alias `_HE` was dead on master
+```
+$ grep -n "_HE\b" agent_bus.py                 # HEAD
+(none)
+$ git show origin/master:agent_bus.py | grep -n "_HE\b"
+1855:                        from fastapi import HTTPException as _HE   # never used
+$ grep -c "HTTPException" agent_bus.py
+78                            # module-level import at line 30 covers every use
+```
+The removed import was an unused local alias (`ruff F401`). The real
+`HTTPException` is module-scoped and used 78×.
+
+### G — parenthesized `async with` acquires connection BEFORE `db.execute`
+Runnable proof (aiosqlite `Cursor` shape: awaitable + async CM):
+```
+parenthesized: ['connection.__aenter__', 'Conn.execute() evaluated',
+                'cur.__aenter__', 'body', 'cur.__aexit__', 'connection.__aexit__']
+nested       : ['connection.__aenter__', 'Conn.execute() evaluated',
+                'cur.__aenter__', 'body', 'cur.__aexit__', 'connection.__aexit__']
+IDENTICAL    : True
+```
+The connection is entered before `db.execute(...)` is evaluated, and the
+cursor exits before the connection. No eager-evaluation defect.
 
 ---
 
 ## Next
-- Re-run `zoder review` on the round-2 response commit.
-- If verdict is `approve` (or only the documented-intended items remain),
+- Re-run `zoder review` on the round-3 response commit (scoped to the delta).
+- If verdict is `approve` (or only the documented-intended Spark items remain),
   merge `wip/hive-eff/2026-10-15` → `master` and proceed to Phase B.
