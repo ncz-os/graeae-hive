@@ -118,6 +118,38 @@ async variant; deferred to Phase D.
 - **D3:** Claim eligibility filters by capability match + priority ranking
 - **D4:** Auto-retry endpoint (item 1) re-authored per DeepSeek strategy (NOT blind cherry-pick of 89f6181)
 
+#### D5 — Unified worker loop + telemetry (operator 2026-10-15)
+
+**Transport decision.** MCP is for *interactive* participation (a human's
+claude/codex session calls `hive_job_*` tools). An autonomous **worker** is a
+*different shape* — an unattended loop — and uses **REST** (`/v1/jobs/next`,
+PATCH). **WSS is not reintroduced**: the fleet dropped it (`zc_native_build`;
+`zeroclaw_wss_worker_v2.py` is a fixture). REST-poll + SSE (`/v1/events`) covers it.
+
+**One loop, thin per-harness adapters.** `hive/workers/run.py` implements the
+loop on top of the Phase-B adapters:
+
+```
+register → heartbeat → claim → execute → complete/fail  (+ telemetry)
+   execute is harness-specific:
+     zoder  → `zoder loop …`
+     codex  → `codex exec "<job>"`     (separate harness — OpenAI subscription)
+     claude → `claude -p "<job>"`      (separate harness — Anthropic subscription)
+     opencode → its CLI
+```
+
+**Telemetry** — captured worker-side (the bus never sees the CLI/response) and
+reported in the job PATCH `quota` block (see `decision-capacity-ledger-20261015.md`):
+
+| Source | Signal |
+|---|---|
+| CLI json output | tokens in/out, cost, exit |
+| CLI usage line | subscription **%** (the only Claude Pro / ChatGPT signal) |
+| API response headers | `x-ratelimit-*` / `anthropic-ratelimit-*` (headroom) |
+| duration | timing |
+
+This replaces ad-hoc per-harness worker scripts with one loop + adapters.
+
 ### Phase E — Tests + observability
 
 - **E1:** Per-adapter unit tests (mock transport)

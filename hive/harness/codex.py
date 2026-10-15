@@ -12,9 +12,43 @@ an operator must deliberately set ``HARNESS_CODEX_AUTORUN=1`` to turn it on.
 from __future__ import annotations
 
 import os
+import subprocess
 
-from hive.harness.generic import GenericAdapter
+from hive.core.quota import extract_tokens, parse_cli_json, quota_block
+from hive.harness.generic import GenericAdapter, job_prompt
 from hive.harness.registry import _CODEX_AUTORUN_ENV
+
+
+def codex_executor(*, binary: str = "codex", timeout: int = 120, cwd: str | None = None):
+    """Executor for the unified worker: runs ``codex exec`` headless.
+
+    codex is a SEPARATE harness (OpenAI/ChatGPT subscription) — never dispatched
+    through zoder. Captures tokens from json output for the capacity ledger.
+    """
+
+    def _run(urn: str, job: dict) -> dict:
+        proc = subprocess.run(  # noqa: S603
+            [binary, "exec", job_prompt(job)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+        )
+        toks = extract_tokens(parse_cli_json(proc.stdout)) or {}
+        return {
+            "harness": "codex",
+            "summary": (proc.stdout or "").strip()[-4000:],
+            "stderr": (proc.stderr or "").strip()[-1000:],
+            "exit_code": proc.returncode,
+            "quota": quota_block(
+                provider="openai",
+                model="codex",
+                tokens_in=toks.get("in"),
+                tokens_out=toks.get("out"),
+            ),
+        }
+
+    return _run
 
 
 class CodexAdapter(GenericAdapter):

@@ -44,6 +44,13 @@ def _host_from_urn(urn: str) -> str | None:
         return parts[3]
     return None
 
+
+def job_prompt(job: dict[str, Any]) -> str:
+    """Render a job into the prompt string a harness CLI is invoked with."""
+    head = job.get("kind") or "task"
+    desc = job.get("description") or ""
+    return f"[hive job {job.get('id')}] {head}\n\n{desc}".strip()
+
 # transport(method, url, token, body) -> (status_code, parsed_json_or_None)
 Transport = Callable[[str, str, str | None, dict | None], tuple[int, dict | None]]
 
