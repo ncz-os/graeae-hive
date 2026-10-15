@@ -4284,6 +4284,12 @@ async def admin_requeue_jobs(req: RequeueRequest):
                 continue
             await db.execute(
                 """UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL,
+                   ended_at=NULL, result=NULL,
+                   claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL,
+                   claimed_cost_tier=NULL, claimed_host_caps=NULL,
+                   claim_lease_expires_at=NULL,
+                   tokens_in=NULL, tokens_out=NULL, estimated_cost_usd=NULL,
+                   result_mnemos_id=NULL,
                    retry_count=0, retry_backoff_until=NULL
                    WHERE id=?""",
                 (job_id,),
