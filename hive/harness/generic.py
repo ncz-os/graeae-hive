@@ -270,3 +270,57 @@ class GenericAdapter:
         if status not in (200, 204):
             raise RuntimeError(f"list_messages failed: status={status}")
         return (resp or {}).get("messages", [])
+
+    # -- delegation + working-set awareness -----------------------------------
+
+    def submit_job(
+        self,
+        *,
+        submitter_urn: str,
+        kind: str,
+        description: str | None = None,
+        parent_job_id: str | None = None,
+        required_capabilities: list[str] | None = None,
+        eligible_kinds: list[str] | None = None,
+        project: str | None = None,
+        max_cost_tier: str = "B",
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Submit a job for another worker to claim (offload/delegation).
+
+        Routing is capability-based: set ``required_capabilities`` /
+        ``eligible_kinds`` to steer it, and ``parent_job_id`` to record the
+        offload lineage. The bus arbitrates the claim (no double-work).
+        """
+        body: dict[str, Any] = {
+            "submitter_urn": submitter_urn,
+            "kind": kind,
+            "description": description,
+            "parent_job_id": parent_job_id,
+            "required_capabilities": required_capabilities,
+            "eligible_kinds": eligible_kinds,
+            "project": project,
+            "max_cost_tier": max_cost_tier,
+        }
+        body.update(extra)
+        status, resp = self._call("POST", "/v1/jobs", {k: v for k, v in body.items() if v is not None})
+        if status != 200:
+            raise RuntimeError(f"submit_job failed: status={status}")
+        return resp or {}
+
+    def peers_working_set(self) -> dict[str, dict[str, Any]]:
+        """Map urn -> advertised ``working_set`` for every peer that reports one.
+
+        A working_set is arbitrary metadata a worker advertises on heartbeat
+        (e.g. ``{"repo": "graeae-hive-mind", "languages": ["python"],
+        "architectures": ["arm64"], "files": ["agent_bus.py"]}``). Lets a worker
+        see what files/architectures/languages peers are touching before it
+        edits or offloads.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for agent in self.roster():
+            meta = agent.get("metadata") or {}
+            ws = meta.get("working_set") if isinstance(meta, dict) else None
+            if isinstance(ws, dict):
+                out[agent.get("urn", "")] = ws
+        return out

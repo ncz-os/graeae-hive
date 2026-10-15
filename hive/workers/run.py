@@ -41,6 +41,7 @@ class HarnessWorker:
         host: str = "",
         capabilities: list[str] | None = None,
         version: str = "0.1.0",
+        working_set: dict[str, Any] | None = None,
         poll_interval: float = 30.0,
         heartbeat_interval: float = 15.0,
         claim_timeout_retries: int = 3,
@@ -50,6 +51,9 @@ class HarnessWorker:
         self.host = host
         self.capabilities = capabilities or []
         self.version = version
+        # What this worker is touching — files/languages/architectures/repo — so
+        # peers can see it (advertised on heartbeat; read via peers_working_set).
+        self.working_set: dict[str, Any] = working_set or {}
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
         self.claim_timeout_retries = claim_timeout_retries
@@ -78,11 +82,48 @@ class HarnessWorker:
     def _maybe_heartbeat(self, *, force: bool = False) -> None:
         now = time.time()
         if force or now - self._last_heartbeat >= self.heartbeat_interval:
+            payload: dict[str, Any] = {"status": "online", "host": self.host}
+            if self.working_set:
+                payload["working_set"] = self.working_set
             try:
-                self.adapter.heartbeat(self.urn, {"status": "online", "host": self.host})
+                self.adapter.heartbeat(self.urn, payload)
                 self._last_heartbeat = now
             except Exception as e:  # noqa: BLE001 - keep the loop alive
                 logger.warning("heartbeat failed for %s: %s", self.urn, e)
+
+    def set_working_set(self, **fields: Any) -> None:
+        """Replace/merge the advertised working set; sent on the next heartbeat."""
+        self.working_set.update({k: v for k, v in fields.items() if v is not None})
+        self._maybe_heartbeat(force=True)
+
+    def offload(
+        self,
+        *,
+        kind: str,
+        description: str | None = None,
+        required_capabilities: list[str] | None = None,
+        eligible_kinds: list[str] | None = None,
+        project: str | None = None,
+        parent_job_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Hand work to another worker: submit a capability-routed sub-job.
+
+        The bus arbitrates the claim (no double-work); ``parent_job_id`` records
+        the lineage. Announce intent so peers know before the claim.
+        """
+        self.announce(
+            f"job.offered:{kind}",
+            {"by": self.urn, "kind": kind, "eligible_kinds": eligible_kinds},
+        )
+        return self.adapter.submit_job(
+            submitter_urn=self.urn,
+            kind=kind,
+            description=description,
+            required_capabilities=required_capabilities,
+            eligible_kinds=eligible_kinds,
+            project=project,
+            parent_job_id=parent_job_id,
+        )
 
     # -- awareness / communication / coordination ---------------------------
 

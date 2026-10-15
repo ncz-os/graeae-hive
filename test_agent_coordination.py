@@ -18,6 +18,7 @@ class FakeBus:
     def __init__(self):
         self.messages = []
         self.agents = []
+        self.jobs = []
         self._n = 0
 
     def transport(self, method, url, token, body):
@@ -44,6 +45,11 @@ class FakeBus:
             return 200, {"count": len(out), "messages": out}
         if method == "GET" and path == "/v1/agents":
             return 200, {"count": len(self.agents), "agents": self.agents}
+        if method == "POST" and path == "/v1/jobs":
+            self._n += 1
+            jid = f"job-{self._n}"
+            self.jobs.append({"id": jid, **body})
+            return 200, {"id": jid}
         return 200, {}
 
 
@@ -90,6 +96,61 @@ class CrossHarnessTests(unittest.TestCase):
         peers = self.zoder.roster()
         kinds = {p["kind"] for p in peers}
         self.assertEqual(kinds, {"zoder", "claude", "codex"})  # all harnesses visible
+
+
+class DelegationAndWorkingSetTests(unittest.TestCase):
+    def setUp(self):
+        self.bus = FakeBus()
+        self.zoder = _adapter("zoder", self.bus)
+
+    def test_submit_job_offloads_to_another_worker(self):
+        resp = self.zoder.submit_job(
+            submitter_urn="urn:agent:zoder:hydra:s1",
+            kind="build:compile",
+            description="cross-compile for arm64",
+            required_capabilities=["hard:linux-compile"],
+            eligible_kinds=["zeroclaw"],
+            project="graeae-hive-mind",
+        )
+        self.assertTrue(resp.get("id"))
+        job = self.bus.jobs[0]
+        self.assertEqual(job["kind"], "build:compile")
+        self.assertEqual(job["eligible_kinds"], ["zeroclaw"])
+        self.assertEqual(job["submitter_urn"], "urn:agent:zoder:hydra:s1")
+
+    def test_peers_working_set_reads_advertised_metadata(self):
+        self.bus.agents = [
+            {"urn": "urn:agent:zoder:hydra:s1", "kind": "zoder",
+             "metadata": {"working_set": {"repo": "hive", "languages": ["python"], "architectures": ["arm64"], "files": ["agent_bus.py"]}}},
+            {"urn": "urn:agent:claude:pythia:s1", "kind": "claude", "metadata": {}},
+        ]
+        ws = self.zoder.peers_working_set()
+        self.assertEqual(ws["urn:agent:zoder:hydra:s1"]["architectures"], ["arm64"])
+        self.assertNotIn("urn:agent:claude:pythia:s1", ws)  # no working_set advertised
+
+    def test_worker_offload_announces_and_submits(self):
+        from hive.workers.run import HarnessWorker
+
+        w = HarnessWorker(self.zoder, urn="urn:agent:zoder:hydra:s1", host="hydra")
+        w.offload(kind="build:compile", eligible_kinds=["zeroclaw"], project="hive")
+        topics = {m["topic"] for m in self.bus.messages}
+        self.assertIn("job.offered:build:compile", topics)  # intent announced
+        self.assertEqual(len(self.bus.jobs), 1)  # and the sub-job was submitted
+
+    def test_working_set_is_advertised_on_heartbeat(self):
+        from hive.workers.run import HarnessWorker
+
+        calls = []
+
+        class A:
+            def heartbeat(self, urn, payload):
+                calls.append(payload)
+                return {}
+
+        w = HarnessWorker(A(), urn="urn:x", heartbeat_interval=0,
+                          working_set={"repo": "hive", "languages": ["python"]})
+        w._maybe_heartbeat(force=True)
+        self.assertEqual(calls[0]["working_set"]["languages"], ["python"])
 
 
 if __name__ == "__main__":

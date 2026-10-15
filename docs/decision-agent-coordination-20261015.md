@@ -37,6 +37,40 @@ The primitives were there; **workers did not use them.**
    a worker announces intent, peers observe via `poll_messages`, and the bus's
    lease still arbitrates the actual claim.
 
+## Delegation (offloading work to another agent)
+
+Yes — an agent hands work to another by **submitting a capability-routed
+sub-job**, not by pushing to a peer directly:
+
+- `adapter.submit_job(submitter_urn, kind, required_capabilities=…,
+  eligible_kinds=…, project=…, parent_job_id=…)` → `POST /v1/jobs`.
+- `parent_job_id` records the offload lineage; `required_capabilities` /
+  `eligible_kinds` steer which worker may claim it.
+- The bus's **claim lease still arbitrates** (no double-work); delegation is
+  intent, the lease is exclusion.
+- `worker.offload(...)` = announce intent (`job.offered:<kind>`) + submit.
+
+## Working-set awareness (files / languages / architectures)
+
+A worker advertises what it is touching so peers can avoid conflicts and pick
+good offload targets:
+
+```python
+HarnessWorker(adapter, host="hydra", working_set={
+    "repo": "graeae-hive-mind",
+    "languages": ["python"],
+    "architectures": ["arm64"],
+    "files": ["agent_bus.py", "hive/bus/capacity.py"],
+})
+```
+
+- Advertised on **heartbeat** (`metadata.working_set`); the bus **merges**
+  heartbeat metadata into the agent row.
+- `worker.set_working_set(**fields)` updates + re-heartbeats immediately.
+- `adapter.peers_working_set()` → `{urn: working_set}` for every peer that
+  advertises one — the read side for "who is touching what".
+- `adapter.roster()` → the full peer rows (kind/model/provider/capabilities).
+
 ## Cross-harness / cross-model (operator 2026-10-15)
 
 Communication + coordination are **harness- and model-agnostic by construction**:
