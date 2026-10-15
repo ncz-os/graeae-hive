@@ -14,6 +14,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest import mock
 
+# Resolve every fixture/script path relative to THIS file, not the process CWD,
+# so the suite passes from any working directory (e.g. `pytest tests/`).
+HERE = Path(__file__).resolve().parent
+
 os.environ["HIVE_BUS_TOKEN"] = "test-bus-token"
 os.environ["HIVE_BUS_ADMIN_TOKEN"] = "test-admin-token"
 os.environ["MCP_BRIDGE_TOKEN"] = "test-mcp-token"
@@ -44,14 +48,14 @@ def load_script(name, filename):
     return module
 
 
-auto_restore = load_script("hive_auto_restore", "hive-auto-restore.py")
+auto_restore = load_script("hive_auto_restore", str(HERE / "hive-auto-restore.py"))
 with mock.patch("pathlib.Path.mkdir"):
-    worker = load_script("zeroclaw_worker_under_test", "tests/fixtures/zeroclaw_wss_worker_v2.py")
+    worker = load_script("zeroclaw_worker_under_test", str(HERE / "tests" / "fixtures" / "zeroclaw_wss_worker_v2.py"))
 
 
 class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_mcp2_import_registers_typed_handlers(self):
-        bridge = load_script("mcp_bridge_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_under_test", str(HERE / "mcp_bridge.py"))
         from mcp.types import PaginatedRequestParams
         self.assertEqual(bridge.MCP_VERSION.split(".", 1)[0], "2")
         handlers = getattr(bridge.server, "_request_handlers", {})
@@ -61,7 +65,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_all_mnemos_memory_tools_use_versioned_routes(self):
-        bridge = load_script("mcp_bridge_routes_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_routes_under_test", str(HERE / "mcp_bridge.py"))
         seen = []
 
         async def fake_mnemos(method, path, **kwargs):
@@ -78,7 +82,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_orchestrator_registration_uses_admin_token(self):
-        bridge = load_script("mcp_bridge_admin_auth_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_admin_auth_under_test", str(HERE / "mcp_bridge.py"))
         seen = []
 
         class Reply:
@@ -105,7 +109,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_bridge_requires_inbound_bearer_and_has_admin_scope(self):
-        bridge = load_script("mcp_bridge_inbound_auth_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_inbound_auth_under_test", str(HERE / "mcp_bridge.py"))
         self.assertTrue(bridge.app.user_middleware)
 
         async def request(token=None):
@@ -125,7 +129,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_bridge_rejects_reused_downstream_credential(self):
-        bridge = load_script("mcp_bridge_distinct_auth_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_distinct_auth_under_test", str(HERE / "mcp_bridge.py"))
         bridge.MCP_BRIDGE_TOKEN = bridge.HIVE_BUS_TOKEN
         with self.assertRaisesRegex(RuntimeError, "must be distinct"):
             async with bridge.lifespan(bridge.app):
@@ -133,7 +137,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_tool_failures_set_mcp_is_error(self):
-        bridge = load_script("mcp_bridge_error_result_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_error_result_under_test", str(HERE / "mcp_bridge.py"))
         from mcp.server.auth.middleware.auth_context import AuthenticatedUser
         from mcp.server.auth.provider import AccessToken
         from mcp.types import CallToolRequestParams
@@ -155,7 +159,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_memory_tags_are_nested_in_metadata(self):
-        bridge = load_script("mcp_bridge_tags_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_tags_under_test", str(HERE / "mcp_bridge.py"))
         seen = {}
 
         async def fake_mnemos(_method, _path, **kwargs):
@@ -173,7 +177,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_ordinary_bridge_scope_cannot_borrow_admin_bus_token(self):
-        bridge = load_script("mcp_bridge_tool_auth_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_tool_auth_under_test", str(HERE / "mcp_bridge.py"))
         outcome = await bridge.handle_call_tool(
             "hive_agent_register", {"kind": "human", "host": "test"},
         )
@@ -182,7 +186,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_worker_registration_still_uses_worker_token(self):
-        bridge = load_script("mcp_bridge_worker_auth_under_test", "mcp_bridge.py")
+        bridge = load_script("mcp_bridge_worker_auth_under_test", str(HERE / "mcp_bridge.py"))
         seen = []
 
         class Reply:
@@ -1425,7 +1429,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(auto_restore.main(), 1)
 
     def test_auto_restore_unit_loads_required_root_managed_environment(self):
-        unit = Path("hive-auto-restore.service").read_text()
+        unit = (HERE / "hive-auto-restore.service").read_text()
         self.assertIn("EnvironmentFile=/etc/graeae-hive/auto-restore.env", unit)
         self.assertNotIn("EnvironmentFile=-", unit)
         self.assertIn("UMask=0077", unit)
@@ -1445,13 +1449,13 @@ class ServiceTests(unittest.TestCase):
                 agent_bus.KNEMON_CAP_FILE = old
 
     def test_oracle_migration_targets_physical_table(self):
-        sql = Path("migrations/2026-06-03-jobs-dedup.sql").read_text()
+        sql = (HERE / "migrations" / "2026-06-03-jobs-dedup.sql").read_text()
         oracle = sql.split("-- ── SQLite", 1)[0]
         self.assertIn("ALTER TABLE HIVE_JOBS", oracle)
         self.assertIn("ON HIVE_JOBS", oracle)
 
     def test_doctor_selects_admin_credential_for_registration(self):
-        doctor = load_script("zeroclaw_doctor_auth_under_test", "zeroclaw_doctor.py")
+        doctor = load_script("zeroclaw_doctor_auth_under_test", str(HERE / "zeroclaw_doctor.py"))
         seen = {}
 
         class Reply(io.BytesIO):
@@ -1582,7 +1586,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(routing[0][2]["eligible_kinds"], ["claude", "codex"])
 
     def test_completion_outbox_is_instance_scoped_and_locked(self):
-        source = Path("tests/fixtures/zeroclaw_wss_worker_v2.py").read_text()
+        source = (HERE / "tests" / "fixtures" / "zeroclaw_wss_worker_v2.py").read_text()
         self.assertIn('hive_completion_outbox.{INSTANCE}.json', source)
         self.assertIn("fcntl.LOCK_EX", source)
 
