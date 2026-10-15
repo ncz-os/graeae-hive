@@ -101,6 +101,19 @@ scripts/                     build_repo_registry.py
 - `PROJECT_LOCATIONS.md` emitter (`build_repo_registry.py --format md`).
 - Registry rebuild cadence (systemd timer on PYTHIA).
 
+### Phase 5 — Capacity ledger + admission control
+See `docs/decision-capacity-ledger-20261015.md`. Per-service capacity
+(slots / rate / credits / cost×time) declared in the registry; enforced by a
+`hive/bus/capacity` module in the claim path; fed by worker-side per-response
+capture (token counts + rate-limit headers + optional `count_tokens` pre-flight).
+Replaces KNEMON's per-agent budget bookkeeping. First instance = the MiniMax
+slot cap (currently missing from `dequeue_next_job`).
+
+### Phase 6 — Central model + router registry
+Single source of truth (FleetOps, private) → GENERATE the bus routing tables
+AND the per-host zoder/zeroclaw TOMLs (materialized; no runtime dependency).
+Kills the bus-tables-vs-TOML drift (the `:8002` / coder-vs-reviewer incidents).
+
 ## Definition of done (per phase)
 - `ruff check` clean, `ruff format` applied.
 - `pytest` green.
