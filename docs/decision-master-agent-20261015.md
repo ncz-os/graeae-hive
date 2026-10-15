@@ -62,15 +62,31 @@ Expand it to:
 
 ## The cortex runs on a LOCAL model (operator 2026-10-15)
 
+**FOR NOW: CERBERUS `gemma4-31b` is the DO-ALL model** (operator 2026-10-15) —
+orchestration + triage + review + fix all run on it. It is durable (RTX 4500
+Ada), always-on, and already the fleet's zoder reviewer. Verified serving on
+`192.0.2.96:8080/v1` and returning clean JSON — the shape the doctor's
+action-parser needs. The doctor's phase defaults all point here.
+
+Light models (`gemma-4-E2B` / `E4B`) are **parked** (downloaded on ACHILLES,
+`~/models/gemma4/`) pending a host that can serve them:
+
+- **HYDRA/ACHILLES (Radeon 780M, ROCm)** — the light orchestration candidates —
+  are blocked: ROCm 6.4.1's LLVM has no working `amdgcn-link` device linker, so
+  the llama.cpp HIP build (latest `59d5fad`) fails. A `.so`-level toolchain fix
+  is needed (`amdgcn-link → lld` symlink did NOT suffice). When fixed, E2B
+  (~3.2 GB) can serve **on-demand** (`llama-server` started per use).
+- **CERBERUS** has only ~1.3 GB VRAM spare alongside the 31B, so a second model
+  can't co-reside; a light model there would need on-demand VRAM sharing.
+
 The brain must be **on-prem** — low latency, no metered cost, no external
-dependency. Primary is **CERBERUS** (durable); **TYDEUS is not assumed
-long-term**, so it is *not* a default:
+dependency:
 
 | Role | Model | Endpoint | Durability |
 |---|---|---|---|
-| **Primary brain** | `gemma4-31b` | **CERBERUS** `192.0.2.96:8080/v1` (RTX 4500 Ada) | durable |
-| Coder route (not default) | `qwen38` | TYDEUS `192.0.2.73:8006/v1` | **not assumed long-term** |
-| **Light orchestration** | (light model) | **HYDRA** `192.0.2.78` / **ACHILLES** `192.0.2.11` (Ryzen 8700G, **ROCm** llama-server) | cheap, always-on |
+| **Do-all brain (current)** | `gemma4-31b` | **CERBERUS** `192.0.2.96:8080/v1` | durable, always-on |
+| Light orchestration (parked) | `gemma-4-E2B`/`E4B` | HYDRA `.78` / ACHILLES `.11` (ROCm) | blocked on ROCm toolchain |
+| Coder route (not default) | `qwen38` | TYDEUS — not assumed long-term | — |
 
 The doctor's phase defaults were repointed to CERBERUS (were `gateway`/`codex`
 via the **retired `:4100`**):
