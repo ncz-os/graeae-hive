@@ -10,6 +10,17 @@ MiniMax is direct only (operator 2026-10-15) — never via together.
 
 from __future__ import annotations
 
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+
+# zoder owns the pricing catalog (`zoder pricing refresh` syncs from LiteLLM +
+# OpenRouter + an ncz peak-pricing overlay; `zoder pricing show <model>` reads
+# it). The hive CONSUMES it rather than hardcoding rates — the built-in table
+# below is a fallback for models the catalog does not carry.
+ZODER_PRICING_JSON = Path(os.environ.get("ZODER_PRICING_JSON", str(Path.home() / ".zoder" / "pricing.json")))
+
 # ── cost tiers ─────────────────────────────────────────────────────────────
 # A = FREE / local / on-prem NGC (claim-anything; no spend)
 # B = MID  (cheap paid commercial)
@@ -103,13 +114,45 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
 }
 
 
+@lru_cache(maxsize=1)
+def _zoder_catalog() -> dict[str, tuple[float, float]]:
+    """Load zoder's pricing catalog keyed by MODEL LEAF (case-insensitive).
+
+    Returns {} when the catalog is absent/unreadable, so the built-in table
+    always works. Call ``_zoder_catalog.cache_clear()`` after a refresh.
+    """
+    try:
+        data = json.loads(ZODER_PRICING_JSON.read_text())
+    except Exception:  # noqa: BLE001 - absent/stale catalog must not break routing
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for model, rate in (data.get("models") or {}).items():
+        if not isinstance(rate, dict):
+            continue
+        leaf = str(model).rsplit("/", 1)[-1].lower()
+        try:
+            out[leaf] = (
+                float(rate.get("input_usd_per_mtok", 0.0)),
+                float(rate.get("output_usd_per_mtok", 0.0)),
+            )
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def rate_for(provider: str, model: str) -> tuple[float, float]:
     p = (provider or "unknown").lower()
     m = (model or "").lower()
+    # 1) zoder's fresh catalog (authoritative) — keyed by model leaf.
+    catalog = _zoder_catalog()
+    if m and m in catalog:
+        return catalog[m]
+    # 2) curated built-in exact, then provider wildcard.
     if (p, m) in LLM_RATES:
         return LLM_RATES[(p, m)]
     if (p, "*") in LLM_RATES:
         return LLM_RATES[(p, "*")]
+    # 3) tier A providers = free; else conservative fallback.
     if cost_tier_for(p) == "A":
-        return (0.0, 0.0)  # tier A = free
-    return (1.0, 5.0)  # conservative fallback
+        return (0.0, 0.0)
+    return (1.0, 5.0)
