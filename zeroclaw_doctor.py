@@ -90,31 +90,32 @@ LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
 #             only governs any in-doctor model call labelled "fix".
 # Value is a model alias: "codex" -> local codex CLI; anything else -> the
 # OpenAI-compatible path (DOCTOR_<PHASE>_BASE_URL / DOCTOR_OPENWEIGHT_*).
-# LOCAL brain (operator 2026-10-15): the orchestrator reasons on on-prem models —
-# TYDEUS qwen38 (coder) + CERBERUS gemma4-31b (reviewer). NEVER the retired :4100.
-DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "qwen38").strip().lower()
+# LOCAL brain (operator 2026-10-15): the orchestrator reasons on on-prem models.
+# Primary = CERBERUS gemma4-31b (RTX 4500 Ada, durable). TYDEUS (qwen38) is the
+# coder route but TYDEUS is NOT assumed long-term, so it is no longer a default.
+# HYDRA (.78) / ACHILLES (.11) expose ROCm llama-server — usable as a LIGHT
+# orchestration model via DOCTOR_TRIAGE_BASE_URL / DOCTOR_OPENWEIGHT_BASE_URL.
+# NEVER the retired :4100.
+DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "gemma4-31b").strip().lower()
 DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "gemma4-31b").strip().lower()
-DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "qwen38").strip().lower()
+DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "gemma4-31b").strip().lower()
 _PHASE_MODELS = {
     "triage": DOCTOR_TRIAGE_MODEL,
     "review": DOCTOR_REVIEW_MODEL,
     "fix": DOCTOR_FIX_MODEL,
 }
-# OpenAI-compatible local endpoints used for any non-codex phase model.
-#   TYDEUS  :8006/v1  = qwen38 (coder; fleet's zoder coder route)
-#   CERBERUS :8080/v1 = gemma4-31b (reviewer; fleet's zoder reviewer route)
-# These are the LOCAL brain (operator 2026-10-15). The retired :4100 gateway and
-# codex stay available via env override but are no longer defaults.
+# OpenAI-compatible local endpoint: CERBERUS gemma4-31b (the durable brain).
 DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get(
-    "DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.73:8006/v1").rstrip("/")
-DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "qwen38")
+    "DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
+DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "gemma4-31b")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
 DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
-# Per-phase local bases: triage/fix -> TYDEUS (coder); review -> CERBERUS (reviewer).
+# Per-phase bases. All default to CERBERUS; override any phase to a LIGHT model
+# on HYDRA/ACHILLES (e.g. DOCTOR_TRIAGE_BASE_URL=http://192.0.2.78:8080/v1).
 DOCTOR_TRIAGE_BASE_URL = os.environ.get(
     "DOCTOR_TRIAGE_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 DOCTOR_REVIEW_BASE_URL = os.environ.get(
-    "DOCTOR_REVIEW_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
+    "DOCTOR_REVIEW_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 DOCTOR_FIX_BASE_URL = os.environ.get(
     "DOCTOR_FIX_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 _PHASE_BASE_URLS = {

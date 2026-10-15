@@ -62,23 +62,25 @@ Expand it to:
 
 ## The cortex runs on a LOCAL model (operator 2026-10-15)
 
-The brain must be **on-prem**, not cloud — low latency, no metered cost, no
-external dependency. Fleet local models:
+The brain must be **on-prem** — low latency, no metered cost, no external
+dependency. Primary is **CERBERUS** (durable); **TYDEUS is not assumed
+long-term**, so it is *not* a default:
 
-| Role | Model | Endpoint |
-|---|---|---|
-| **coder / planner** | `qwen38` | TYDEUS `192.0.2.73:8006/v1` |
-| **reviewer** | `gemma4-31b` | CERBERUS `192.0.2.96:8080/v1` |
+| Role | Model | Endpoint | Durability |
+|---|---|---|---|
+| **Primary brain** | `gemma4-31b` | **CERBERUS** `192.0.2.96:8080/v1` (RTX 4500 Ada) | durable |
+| Coder route (not default) | `qwen38` | TYDEUS `192.0.2.73:8006/v1` | **not assumed long-term** |
+| **Light orchestration** | (light model) | **HYDRA** `192.0.2.78` / **ACHILLES** `192.0.2.11` (Ryzen 8700G, **ROCm** llama-server) | cheap, always-on |
 
-The doctor's phase defaults were repointed accordingly (were `gateway`/`codex`
+The doctor's phase defaults were repointed to CERBERUS (were `gateway`/`codex`
 via the **retired `:4100`**):
 
-- `DOCTOR_TRIAGE_MODEL` → `qwen38` (TYDEUS) · `DOCTOR_TRIAGE_BASE_URL` → TYDEUS
-- `DOCTOR_REVIEW_MODEL` → `gemma4-31b` (CERBERUS) · `DOCTOR_REVIEW_BASE_URL` → CERBERUS
-- `DOCTOR_FIX_MODEL` → `qwen38` (TYDEUS) · `DOCTOR_FIX_BASE_URL` → TYDEUS
-- `_invoke_openweight(prompt, alias, base_url=…, model=…)` — per-phase base/model.
-- Local endpoints accept placeholder auth: a missing key is only fatal for a
-  base that is explicitly remote.
+- `DOCTOR_TRIAGE_MODEL` / `DOCTOR_REVIEW_MODEL` / `DOCTOR_FIX_MODEL` → `gemma4-31b`
+- `DOCTOR_OPENWEIGHT_BASE_URL` → CERBERUS `:8080/v1`; all phase bases default there
+- Override any phase to a **light ROCm model on HYDRA/ACHILLES**:
+  `DOCTOR_TRIAGE_BASE_URL=http://192.0.2.78:8080/v1`
+- `_invoke_openweight(prompt, alias, base_url=…, model=…)`; local endpoints accept
+  placeholder auth (a missing key is only fatal for a base that is explicitly remote)
 
 The codex CLI / gateway paths stay reachable via env override but are **no
 longer defaults**. DeepSeek/Anthropic/Together remain forbidden as the brain.
