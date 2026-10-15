@@ -3538,11 +3538,11 @@ async def dequeue_next_job(agent_urn: str):
                 if deps:
                     ph = ",".join("?" * len(deps))
                     async with db.execute(
-                        f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
+                        f"SELECT id FROM jobs WHERE id IN ({ph}) AND status='done'",
                         tuple(deps),
                     ) as dc:
-                        done_count = (await dc.fetchone())[0]
-                    if done_count < len(deps):
+                        done_ids = {row[0] async for row in dc}
+                    if len(done_ids) < len(deps):
                         continue
                 job = {
                     "id": j_id,
@@ -5532,15 +5532,15 @@ async def claim_job(job_id: str, by: str):
             if deps:
                 ph = ",".join("?" * len(deps))
                 async with db.execute(
-                    f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
+                    f"SELECT id FROM jobs WHERE id IN ({ph}) AND status='done'",
                     tuple(deps),
                 ) as dc:
-                    done_count = (await dc.fetchone())[0]
-                if done_count < len(deps):
+                    done_ids = {row[0] async for row in dc}
+                if len(done_ids) < len(deps):
                     raise HTTPException(
                         409,
                         f"job has unsatisfied DAG dependencies "
-                        f"({done_count}/{len(deps)} done)",
+                        f"({len(done_ids)}/{len(deps)} done)",
                     )
 
         agent = {
