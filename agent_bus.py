@@ -5154,15 +5154,12 @@ async def knemon_route(req: Request):
         else:
             # General coding rotation (operator 2026-09-07: deepseek-flash lead
             # struck, forbidden fleet-wide). groq qwen3 (fast coder) leads, then
-            # groq gpt-oss-120b, grok funded tail. MiniMax (hive_minimax_1, direct)
-            # REMOVED from the fleet chain -- reserved for the sole MiniMax
-            # builder (minos) via the host override below.
-            METERED_FALLBACK = ["hive_groq_2", "hive_groq_3", "hive_xai_1"]
-        # MINOS = sole MiniMax builder (operator 2026-06-19): only minos leads
-        # MiniMax ($200 plan key, TPM-limited @ 1 worker). Everyone else rotates
-        # the open-weight lineup above.
-        if "minos" in host and not review_kind:
-            METERED_FALLBACK = ["hive_minimax_1", "hive_groq_2"]
+            # groq gpt-oss-120b, grok, and MiniMax direct (hive_minimax_1).
+            # MiniMax is NOT host-gated (operator 2026-10-15): ANY zoder/zeroclaw
+            # host works ANY job it is dispatched, chosen by CAPABILITY. The
+            # MiniMax pool cap is the concurrency guard for the TPM-limited $200
+            # plan -- not a host-name rule.
+            METERED_FALLBACK = ["hive_groq_2", "hive_groq_3", "hive_xai_1", "hive_minimax_1"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
