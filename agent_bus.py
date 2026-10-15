@@ -3524,9 +3524,11 @@ async def dequeue_next_job(agent_urn: str):
                 ) as dc:
                     done_dep_ids = {row[0] async for row in dc}
 
-            # Canonical pool key for MiniMax-routed claims, so the occupancy
-            # query's provider+model filter is reliable regardless of how a
-            # worker spelled its model.
+            # Canonical pool key for MiniMax-routed claims only: is_minimax_route
+            # is an exact match on (MINIMAX_PROVIDER, MINIMAX_MODEL), so a
+            # MiniMax claim is persisted with exactly the values the occupancy
+            # query filters on. Non-MiniMax claims store the worker's raw
+            # provider/model (irrelevant to the MiniMax-scoped query).
             if sched.is_minimax_route(a_provider, a_model):
                 _claim_provider, _claim_model = sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL
             else:
