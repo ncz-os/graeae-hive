@@ -23,9 +23,11 @@ Tools:
 """
 from __future__ import annotations
 import json
+import logging
 import os
 import secrets
-import warnings
+
+logger = logging.getLogger("mcp_bridge")
 import sys
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
@@ -105,12 +107,18 @@ class BridgeBearerAuth:
             await self.app(scope, receive, send)
             return
         if not MCP_BRIDGE_TOKEN:
-            # Auth disabled (unset): admit the request as an open client, matching
-            # the unauthenticated bus. See lifespan() warning.
-            scope["user"] = AuthenticatedUser(
-                AccessToken(token="", client_id="mcp-bridge-open", scopes=["bridge:use", "bridge:admin"]),
-            )
-            await self.app(scope, receive, send)
+            # Fail closed unless anonymous access was EXPLICITLY opted into.
+            if os.environ.get("MCP_BRIDGE_ALLOW_ANONYMOUS") == "1":
+                scope["user"] = AuthenticatedUser(
+                    # least-privilege: anonymous clients get bridge:use, never admin
+                    AccessToken(token="anonymous", client_id="mcp-bridge-anonymous", scopes=["bridge:use"]),
+                )
+                await self.app(scope, receive, send)
+                return
+            await JSONResponse(
+                {"detail": "MCP bridge authentication is not configured"},
+                status_code=503,
+            )(scope, receive, send)
             return
         headers = {key.lower(): value for key, value in scope.get("headers", ())}
         scheme, _, supplied = headers.get(b"authorization", b"").decode("latin-1").partition(" ")
@@ -157,29 +165,39 @@ def _mcp_handler(method: str, params_type: type):
 
 @asynccontextmanager
 async def lifespan(app):
-    # Bridge auth is enforced ONLY when MCP_BRIDGE_TOKEN is configured. The bus
-    # (agent_bus.py) currently has no auth either, and no fleet client sends a
-    # token, so requiring one here bricks the bridge against live clients. Until
-    # the bus + every client are hardened together, an unset token means the
-    # bridge runs open (as it always has) with a loud warning.
+    # Auth is enforced by default (fail closed). Anonymous access requires the
+    # explicit opt-in MCP_BRIDGE_ALLOW_ANONYMOUS=1 and is least-privilege
+    # (bridge:use only) — never admin. The bus (agent_bus.py) currently has no
+    # auth either, so the live service sets the opt-in until the fleet hardens
+    # the bus + every client together.
+    _downstream = (
+        ("HIVE_BUS_TOKEN", HIVE_BUS_TOKEN),
+        ("HIVE_BUS_ADMIN_TOKEN", HIVE_BUS_ADMIN_TOKEN),
+        ("MNEMOS_TOKEN", MNEMOS_TOKEN),
+    )
     if not MCP_BRIDGE_TOKEN:
-        warnings.warn(
-            "MCP_BRIDGE_TOKEN unset: MCP bridge authentication DISABLED "
-            "(matches the unauthenticated bus). Set MCP_BRIDGE_TOKEN to require "
-            "bearer auth — and roll it out to every client first.",
-            stacklevel=1,
-        )
+        if os.environ.get("MCP_BRIDGE_ALLOW_ANONYMOUS") == "1":
+            logger.error(
+                "MCP bridge running OPEN: MCP_BRIDGE_ALLOW_ANONYMOUS=1 and MCP_BRIDGE_TOKEN unset. "
+                "Anonymous clients get bridge:use only. Configure MCP_BRIDGE_TOKEN + client bearers "
+                "to require auth."
+            )
+        else:
+            raise RuntimeError(
+                "MCP_BRIDGE_TOKEN must be configured "
+                "(or set MCP_BRIDGE_ALLOW_ANONYMOUS=1 to explicitly run open)"
+            )
     else:
         if MCP_BRIDGE_ADMIN_TOKEN and secrets.compare_digest(MCP_BRIDGE_TOKEN, MCP_BRIDGE_ADMIN_TOKEN):
             raise RuntimeError("MCP_BRIDGE_TOKEN and MCP_BRIDGE_ADMIN_TOKEN must be distinct")
-        for name, downstream in (
-            ("HIVE_BUS_TOKEN", HIVE_BUS_TOKEN),
-            ("HIVE_BUS_ADMIN_TOKEN", HIVE_BUS_ADMIN_TOKEN),
-            ("MNEMOS_TOKEN", MNEMOS_TOKEN),
-        ):
+        for name, downstream in _downstream:
             if downstream and secrets.compare_digest(MCP_BRIDGE_TOKEN, downstream):
                 raise RuntimeError(f"MCP_BRIDGE_TOKEN and {name} must be distinct")
-            if MCP_BRIDGE_ADMIN_TOKEN and downstream and secrets.compare_digest(MCP_BRIDGE_ADMIN_TOKEN, downstream):
+    # Admin-token distinctness runs UNCONDITIONALLY of whether the bridge token
+    # is set — an admin token equal to a downstream credential must never pass.
+    if MCP_BRIDGE_ADMIN_TOKEN:
+        for name, downstream in _downstream:
+            if downstream and secrets.compare_digest(MCP_BRIDGE_ADMIN_TOKEN, downstream):
                 raise RuntimeError(f"MCP_BRIDGE_ADMIN_TOKEN and {name} must be distinct")
     try:
         yield
