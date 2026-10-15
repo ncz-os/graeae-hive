@@ -50,7 +50,7 @@ class AdmissionTests(unittest.TestCase):
             led.acquire("minimax")
         ok, reason = led.headroom("minimax")
         self.assertFalse(ok)
-        self.assertIn("slots full", reason)
+        self.assertIn("global cap", reason)
         led.release("minimax")
         self.assertTrue(led.headroom("minimax")[0])
 

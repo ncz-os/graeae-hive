@@ -36,9 +36,22 @@ import queue_logic
 import retry_policy
 from hive import repos as repo_registry
 from hive import scheduler as sched
+from hive.bus import capacity as _capacity
 from hive.core.models import COST_TIERS, cost_tier_for, rate_for
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
+
+# Capacity ledger (Phase 5): per-service admission. MiniMax is the first service
+# with a declared capacity; its GLOBAL slot count flows through the ledger while
+# the per-worker cap stays in hive.scheduler. Add services here as they get one.
+_capacity_ledger = _capacity.CapacityLedger()
+_capacity_ledger.register(
+    _capacity.ServiceCapacity(
+        service=sched.MINIMAX_PROVIDER,
+        slots=sched.MINIMAX_GLOBAL_MAX,
+        is_subscription=True,
+    )
+)
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
@@ -3353,7 +3366,16 @@ async def dequeue_next_job(agent_urn: str):
                 ) as cur:
                     pool_rows = [tuple(r) async for r in cur]
                 pool = sched.build_pool_snapshot(pool_rows)
-                ok, reason = pool.can_assign(agent_urn)
+                # GLOBAL cap via the capacity ledger (Phase 5); the per-worker
+                # cap stays in the scheduler snapshot.
+                _capacity_ledger.in_flight[sched.MINIMAX_PROVIDER] = pool.active_assignments
+                ok, reason = _capacity_ledger.headroom(sched.MINIMAX_PROVIDER, now=now)
+                if ok and pool.leases_by_worker.get(sched._norm_str(agent_urn)):
+                    ok = False
+                    reason = (
+                        f"minimax:worker {agent_urn!r} already holds a lease "
+                        f"(per-worker cap={sched.MINIMAX_PER_WORKER_MAX})"
+                    )
                 if not ok:
                     await db.execute("ROLLBACK")
                     await emit_event(
