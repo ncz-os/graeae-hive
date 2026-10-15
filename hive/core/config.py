@@ -100,6 +100,8 @@ class Settings:
             backend=_env("HIVE_BACKEND", "sqlite").lower(),
             agent_bus_db=_env("AGENT_BUS_DB", "/srv/agent-bus/agents.db"),
             oracle_dsn=_env("ORACLE_DSN", ""),
+            # DB2_DSN wins, else HIVE_DB2_DSN — matches hive/persistence/factory
+            # and the prior inline default (both used `or`).
             db2_dsn=_env("DB2_DSN", "") or _env("HIVE_DB2_DSN", ""),
             sqlite_busy_timeout_ms=_env_int("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", 5000),
             claim_lease_seconds=_env_int("CLAIM_LEASE_SECONDS", 1800),

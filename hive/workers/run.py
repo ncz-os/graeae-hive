@@ -82,7 +82,12 @@ class HarnessWorker:
     # -- one unit of work ---------------------------------------------------
 
     def run_once(self) -> bool:
-        """Claim and run one job. Returns True if a job was handled."""
+        """Claim and run one job.
+
+        Returns True if a job was CLAIMED — whether it then succeeded or failed
+        (a handled job means the loop should poll again immediately, no sleep).
+        Returns False only when nothing was claimable.
+        """
         self._maybe_heartbeat()
         job = self.adapter.claim(self.urn)
         if not job:

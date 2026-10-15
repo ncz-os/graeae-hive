@@ -65,7 +65,12 @@ def extract_tokens(payload: Any) -> dict[str, int] | None:
 
 
 def parse_cli_json(stdout: str) -> dict[str, Any]:
-    """Parse a harness CLI's json output. Best-effort; returns {} on failure."""
+    """Parse a harness CLI's json output. Best-effort; returns {} on failure.
+
+    Assumes a SINGLE json object (tolerates surrounding log lines). Multi-object
+    stdout (e.g. a progress object then a result object) parses as {} — callers
+    that need it should emit one object or a json-lines stream.
+    """
     if not stdout:
         return {}
     text = stdout.strip()

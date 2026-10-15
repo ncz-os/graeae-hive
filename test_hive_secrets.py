@@ -28,20 +28,17 @@ class ScanTests(unittest.TestCase):
 
     def test_redact_masks_values_and_keeps_context(self):
         text = "token=glpat-abcdefghij1234567890 host=pythia"
-        out = secrets.redact(text)
-        self.assertNotIn("glpat-abcdefghij1234567890", out)
-        self.assertIn("[REDACTED:gitlab_pat]", out)
-        self.assertIn("host=pythia", out)
+        self.assertEqual(secrets.redact(text), "token=[REDACTED:gitlab_pat] host=pythia")
 
     def test_redact_no_secret_is_identity(self):
         text = "nothing here"
         self.assertEqual(secrets.redact(text), text)
 
     def test_non_overlapping(self):
-        # a gitlab pat inside a basic-auth uri should yield one span, not two
+        # a gitlab pat inside a basic-auth uri should yield ONE span, not two
         text = "https://x:glpat-abcdefghij1234567890@host/x"
-        out = secrets.redact(text)
-        self.assertNotIn("glpat-abcdefghij1234567890", out)
+        self.assertEqual(len(secrets.scan(text)), 1)
+        self.assertNotIn("glpat-abcdefghij1234567890", secrets.redact(text))
 
 
 if __name__ == "__main__":

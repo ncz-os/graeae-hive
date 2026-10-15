@@ -52,8 +52,9 @@ def scan(text: str) -> list[Finding]:
     for kind, pat in _PATTERNS:
         for m in pat.finditer(text):
             found.append(Finding(kind, m.start(), m.end()))
-    found.sort(key=lambda f: f.start)
-    # drop overlaps, keeping the earliest/longest
+    # Earliest start wins; on an equal start the LONGEST span wins, so a short
+    # overlapping pattern cannot truncate a longer secret at the same offset.
+    found.sort(key=lambda f: (f.start, -f.end))
     out: list[Finding] = []
     for f in found:
         if out and f.start < out[-1].end:

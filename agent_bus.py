@@ -2361,7 +2361,9 @@ async def health():
             status_code=503,
         )
     reaper = getattr(app.state, "reaper_task", None)
-    if reaper is not None and reaper.done():
+    # 200 only if the reaper is running: a missing task (e.g. lifespan never
+    # completed) or a finished one is unhealthy.
+    if reaper is None or reaper.done():
         return JSONResponse(
             {**base, "status": "unhealthy", "detail": "reaper task is not running"},
             status_code=503,
@@ -3440,9 +3442,9 @@ async def dequeue_next_job(agent_urn: str):
                 async with db.execute(
                     "SELECT claimed_by, id FROM jobs "
                     "WHERE status IN ('offered','claimed','running') "
-                    "AND claimed_provider=? AND claimed_model=? "
+                    "AND claimed_provider=? "
                     "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
-                    (sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL, now),
+                    (sched.MINIMAX_PROVIDER, now),
                 ) as cur:
                     pool_rows = [tuple(r) async for r in cur]
                 pool = sched.build_pool_snapshot(pool_rows)
@@ -5063,6 +5065,9 @@ def knemon_bypass_active() -> bool:
 KNEMON_CAP_FILE = "/srv/agent-bus/knemon_oauth_cap.json"
 # ChatGPT-subscription codex/gpt allowance is a rolling ~5h window (operator/Gemini 2026-06-04).
 OAUTH_CAP_RESET_SEC = 5 * 3600
+# How long a corrupt/unreadable breaker file keeps the breaker CLOSED (fail-closed)
+# before it self-heals — bounded so a transient read error can't pin it open forever.
+OAUTH_CAP_STORAGE_BACKOFF_SEC = 300
 # While the breaker is open, send a small share of eligible jobs through the
 # OAuth lead as half-open probes. PYTHIA cannot probe OpenAI locally.
 OAUTH_CAP_PROBE_RATE = 0.05
@@ -5092,9 +5097,17 @@ def oauth_cap_state() -> dict:
         return base  # no breaker file = not capped
     except Exception as e:  # noqa: BLE001
         # Corrupt/unreadable breaker file: FAIL CLOSED (assume capped) so the
-        # breaker does not silently open and burn the OAuth allowance. The forge
-        # lineage fixed this; the argonas line failed open.
-        return {**base, "capped": True, "storage_error": str(e)}
+        # breaker does not silently open and burn the OAuth allowance. BOUND it
+        # with a short capped_until so a transient read error self-heals instead
+        # of pinning the breaker open forever (capped_until=None would).
+        until = _t.time() + OAUTH_CAP_STORAGE_BACKOFF_SEC
+        return {
+            **base,
+            "capped": True,
+            "capped_until": until,
+            "remaining_sec": OAUTH_CAP_STORAGE_BACKOFF_SEC,
+            "storage_error": str(e),
+        }
     try:
         until = float(d.get("capped_until") or 0)
     except (TypeError, ValueError):

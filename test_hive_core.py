@@ -46,11 +46,11 @@ class SettingsTests(unittest.TestCase):
 
     def test_get_settings_is_cached_and_immutable(self):
         get_settings.cache_clear()
+        self.addCleanup(get_settings.cache_clear)  # order-independent cleanup
         a = get_settings()
         self.assertIs(a, get_settings())
         with self.assertRaises(dataclasses.FrozenInstanceError):
             a.hive_url = "x"  # frozen dataclass
-        get_settings.cache_clear()
 
 
 if __name__ == "__main__":

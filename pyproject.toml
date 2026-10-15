@@ -29,9 +29,10 @@ dev = ["pytest>=7", "ruff"]
 [tool.setuptools]
 packages = [
     "hive",
-    "hive.bus",
+    "hive.core",
     "hive.harness",
     "hive.persistence",
+    "hive.workers",
 ]
 
 [tool.ruff]
