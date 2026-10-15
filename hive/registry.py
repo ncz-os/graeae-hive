@@ -27,6 +27,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from hive.core.config import get_settings
+
 _API_KEYS = Path.home() / ".api_keys_master.json"
 
 # ARGONAS canonical bare-repo location, in both spellings. The directory on the
@@ -260,13 +262,14 @@ def build_registry(
     gh = keys.get("github", {})
     bk = keys.get("buildkite", {})
     cf = keys.get("cloudflare", {})
+    settings = get_settings()
 
-    gitlab_pat = gitlab_pat or os.environ.get("GITLAB_PAT") or gl.get("ncz_os_pat")
-    github_token = github_token or os.environ.get("GITHUB_PAT") or gh.get("oauth_token_perlowja")
-    buildkite_token = buildkite_token or os.environ.get("BUILDKITE_API_TOKEN") or bk.get("api_access_token")
-    r2_account_id = r2_account_id or os.environ.get("R2_ACCOUNT_ID") or cf.get("r2_ncz_apt_account_id")
-    r2_token = r2_token or os.environ.get("CLOUDFLARE_R2_API_TOKEN") or cf.get("r2_ncz_apt_token")
-    argonas_password = argonas_password or os.environ.get("ARGONAS_SSH_PASS")
+    gitlab_pat = gitlab_pat or settings.gitlab_pat or gl.get("ncz_os_pat")
+    github_token = github_token or settings.github_pat or gh.get("oauth_token_perlowja")
+    buildkite_token = buildkite_token or settings.buildkite_api_token or bk.get("api_access_token")
+    r2_account_id = r2_account_id or settings.r2_account_id or cf.get("r2_ncz_apt_account_id")
+    r2_token = r2_token or settings.cloudflare_r2_api_token or cf.get("r2_ncz_apt_token")
+    argonas_password = argonas_password or settings.argonas_ssh_pass or None
 
     forge_facts: dict[str, dict[str, Any]] = {}
     argonas_slugs: set[str] = set()
