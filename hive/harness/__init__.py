@@ -17,7 +17,9 @@ from hive.harness.registry import (
     DEFAULT_PRIORITY,
     get_harness_adapter,
     is_harness_enabled,
+    list_enabled_harnesses,
     list_harnesses,
+    register_external_adapter,
 )
 
 __all__ = [
@@ -27,5 +29,7 @@ __all__ = [
     "HarnessRegistration",
     "get_harness_adapter",
     "is_harness_enabled",
+    "list_enabled_harnesses",
     "list_harnesses",
+    "register_external_adapter",
 ]

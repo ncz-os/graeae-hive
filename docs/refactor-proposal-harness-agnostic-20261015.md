@@ -69,14 +69,21 @@ A harness-agnostic core means: any harness can register, claim, execute, report.
 
 ### Phase A — Interface (non-breaking)
 
+> **Scope of this branch:** only A1–A3 land here. **A4 and A5 are PENDING**
+> — the `agents` table is *not* yet migrated with `harness_kind` /
+> `harness_version`, and `/v1/agents` does not yet filter on them. Nothing in
+> this branch wires the adapter registry into live dispatch, so the scaffold
+> is inert until Phase B/D. Do not read the ✓ on A2/A3 as "harness support is
+> live".
+
 - **A1:** `wip/hive-eff/2026-10-15` branch (this branch) ✓
 - **A2:** `hive/harness/__init__.py` + `base.py` + `registry.py` ✓
 - **A3:** `docs/refactor-proposal-harness-agnostic-20261015.md` ✓ (this file)
-- **A4:** Schema migration: add `harness_kind` + `harness_version` to `agents` table
+- **A4:** Schema migration: add `harness_kind` + `harness_version` to `agents` table ⧗ PENDING
   - `ALTER TABLE agents ADD COLUMN harness_kind TEXT DEFAULT 'opencode'`
   - `ALTER TABLE agents ADD COLUMN harness_version TEXT DEFAULT 'unknown'`
   - backfill existing `kind='zeroclaw'` rows → `harness_kind='opencode'`
-- **A5:** `harness_kind` filter on `/v1/agents` and dashboard
+- **A5:** `harness_kind` filter on `/v1/agents` and dashboard ⧗ PENDING
 
 ### Phase B — Adapters (zoder + opencode first; codex + claude gated)
 
