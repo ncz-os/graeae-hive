@@ -1327,7 +1327,15 @@ async def require_orchestrator_submitter(submitter_urn: str) -> str:
 
 
 def valid_completion_proof(proof: dict) -> bool:
-    """Fail closed on missing Git evidence, including successful subprocesses."""
+    """Fail closed on missing Git evidence, including successful subprocesses.
+
+    NOTE (operator directive 2026-10-15): the `remote_verified` / `remote_sha`
+    checks were removed together with the Spark remote-agent path (see
+    docs/refactor-proposal-harness-agnostic-20261015.md § "Operator directive").
+    Local Git evidence is now the sole completion gate — completion is proven
+    at the bus against local repo state, not by a remote-agent attestation.
+    The gate still fails closed: every listed field must be present and exact.
+    """
     sha = proof.get("head_sha")
     commits = proof.get("commits")
     files = proof.get("files_changed")

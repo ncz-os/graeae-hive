@@ -134,6 +134,37 @@ A harness-agnostic core means: any harness can register, claim, execute, report.
 
 ---
 
+## Operator directive: Spark remote-agent removal (2026-10-15)
+
+**This section exists because commit `3c0474a`'s message did not name the
+Spark removal** — the change rode inside a "dead-code cleanup + ruff lint pass"
+commit and both the pre-merge and post-merge review flagged it as looking
+accidental. It was not accidental. It was operator-directed on 2026-10-15.
+
+Directive: the **remote Spark agent takeover path is removed from the hive**.
+The GB10 Spark is not integrated/tested with the fleet, and the OAuth-capped
+"reserve the queue for Spark" behaviour was starving real work. Removed surface
+(textual — verified with `git log -S`, so any re-introduction shows in blame):
+
+- `SPARK_*` module constants + `note_spark_seen*` take-over bookkeeping
+- `_job_queued_age` queue-age probe used only by the Spark reservation
+- `QUARANTINED_HOSTS` admission gate
+- admission `proof` fields `remote_verified` / `remote_sha`
+- dashboard Spark panel
+- `dashboard.html` `MODEL_NAMES` map (Spark provider display names)
+
+### Consequence for `valid_completion_proof` (agent_bus.py)
+
+`valid_completion_proof()` no longer checks `remote_verified` / `remote_sha`.
+Local Git evidence (`head_sha` + `commits` + `files_changed` + `worktree_clean`)
+is now the **sole** completion gate. This is correct under the harness-agnostic
+direction: completion is proven at the *bus* (local git state), not by a
+remote-agent attestation that only existed to serve the Spark path. The
+function still **fails closed** — see its docstring; the removal widened
+*which* proofs are accepted, it did not weaken the reject path.
+
+---
+
 ## Cross-references
 
 - CLAUDE.md — fleet zoder config 2026-10-01 (coder=qwen38 TYDEUS :8006, reviewer=gemma4-31b CERBERUS :8080, backup=nemotron-3-ultra-550b EIH)

@@ -7,6 +7,7 @@ __pycache__/
 mnemos/
 *.bak-*
 *.bak
+*.bak[0-9]*
 workspace_remotes.json
 *.pre-*
 *.RETIRED-*

@@ -777,7 +777,6 @@ async function refreshRealWork(){
   } catch(e) { console.warn('realwork err', e); }
 }
 
-const MODEL_NAMES={};
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
