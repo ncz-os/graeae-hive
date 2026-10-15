@@ -3508,6 +3508,20 @@ async def dequeue_next_job(agent_urn: str):
             _by_id = {r[0]: r for r in candidates}
             candidates = [_by_id[d["id"]] for d in _ordered]
 
+            # Resolve ALL candidate dependencies in ONE query (depends_on is
+            # tuple index 15). Doing it per-candidate issued N queries.
+            _all_deps: set[str] = set()
+            for _r in candidates:
+                _all_deps.update(json_list(_r[15]))
+            done_dep_ids: set[str] = set()
+            if _all_deps:
+                _ph = ",".join("?" * len(_all_deps))
+                async with db.execute(
+                    f"SELECT id FROM jobs WHERE id IN ({_ph}) AND status='done'",
+                    tuple(_all_deps),
+                ) as dc:
+                    done_dep_ids = {row[0] async for row in dc}
+
             claimed = None
             for r in candidates:
                 (
@@ -3535,15 +3549,8 @@ async def dequeue_next_job(agent_urn: str):
                     j_pr_number,
                 ) = r
                 deps = json_list(j_deps_json)
-                if deps:
-                    ph = ",".join("?" * len(deps))
-                    async with db.execute(
-                        f"SELECT id FROM jobs WHERE id IN ({ph}) AND status='done'",
-                        tuple(deps),
-                    ) as dc:
-                        done_ids = {row[0] async for row in dc}
-                    if len(done_ids) < len(deps):
-                        continue
+                if deps and not set(deps).issubset(done_dep_ids):
+                    continue
                 job = {
                     "id": j_id,
                     "kind": j_kind,
