@@ -21,7 +21,8 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from hive.harness.base import HarnessCapabilities, HarnessRegistration
 
@@ -51,13 +52,12 @@ def job_prompt(job: dict[str, Any]) -> str:
     desc = job.get("description") or ""
     return f"[hive job {job.get('id')}] {head}\n\n{desc}".strip()
 
+
 # transport(method, url, token, body) -> (status_code, parsed_json_or_None)
 Transport = Callable[[str, str, str | None, dict | None], tuple[int, dict | None]]
 
 
-def _urllib_transport(
-    method: str, url: str, token: str | None, body: dict | None
-) -> tuple[int, dict | None]:
+def _urllib_transport(method: str, url: str, token: str | None, body: dict | None) -> tuple[int, dict | None]:
     """Default sync transport (system_watcher.py pattern)."""
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
@@ -121,9 +121,7 @@ class GenericAdapter:
 
     # -- transport ------------------------------------------------------------
 
-    def _call(
-        self, method: str, path: str, body: dict | None = None
-    ) -> tuple[int, dict | None]:
+    def _call(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict | None]:
         return self._transport(method, f"{self.bus_url}{path}", self.token, body)
 
     # -- bus protocol (worker-side) ------------------------------------------
@@ -135,9 +133,7 @@ class GenericAdapter:
             "runtime": registration.harness_kind,
             "version": registration.harness_version,
             "capabilities": list(
-                self.base_capabilities
-                | self._extra_capabilities
-                | frozenset(registration.capabilities)
+                self.base_capabilities | self._extra_capabilities | frozenset(registration.capabilities)
             ),
             "cost_tier": registration.cost_tier,
             "auth_method": self.auth_method(),
@@ -145,10 +141,7 @@ class GenericAdapter:
         }
         status, resp = self._call("POST", "/v1/agents/register", body)
         if status != 200 or not resp or not resp.get("urn"):
-            raise RuntimeError(
-                f"register failed for harness {self.harness_kind!r}: "
-                f"status={status} resp={resp!r}"
-            )
+            raise RuntimeError(f"register failed for harness {self.harness_kind!r}: status={status} resp={resp!r}")
         return str(resp["urn"])
 
     def heartbeat(self, urn: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -183,16 +176,13 @@ class GenericAdapter:
         """
         if self._executor is None:
             raise NotImplementedError(
-                f"{type(self).__name__} has no executor wired; pass "
-                "executor=<callable(urn, job) -> result> (Phase D)."
+                f"{type(self).__name__} has no executor wired; pass executor=<callable(urn, job) -> result> (Phase D)."
             )
         return self._executor(urn, job)
 
     def complete(self, urn: str, job_id: str, result: dict[str, Any]) -> None:
         """PATCH /v1/jobs/<id> status=done with result."""
-        status, _ = self._call(
-            "PATCH", f"/v1/jobs/{job_id}", {"status": "done", "result": result, "claimed_by": urn}
-        )
+        status, _ = self._call("PATCH", f"/v1/jobs/{job_id}", {"status": "done", "result": result, "claimed_by": urn})
         if status != 200:
             raise RuntimeError(f"complete failed for {job_id!r}: status={status}")
 
@@ -225,9 +215,7 @@ class GenericAdapter:
         if resp is None:
             return {}
         if not isinstance(resp, dict):
-            raise RuntimeError(
-                f"status for {urn!r}: unexpected response type {type(resp).__name__}"
-            )
+            raise RuntimeError(f"status for {urn!r}: unexpected response type {type(resp).__name__}")
         for agent in resp.get("agents", []):
             if isinstance(agent, dict) and agent.get("urn") == urn:
                 return agent

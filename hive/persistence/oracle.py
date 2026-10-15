@@ -342,7 +342,7 @@ class BackendCursor:
                 )
             elif isinstance(value, _dt.datetime):
                 if value.tzinfo is None:
-                    value = value.replace(tzinfo=_dt.timezone.utc)
+                    value = value.replace(tzinfo=_dt.UTC)
                 out.append(value.timestamp())
             elif isinstance(value, (bytes, bytearray)) and len(value) == 16:
                 out.append(str(_uuid.UUID(bytes=bytes(value))))

@@ -46,7 +46,6 @@ ignore = [
     "E501",   # line length handled by the formatter
     "SIM117", # nested async-with is intentional in the persistence layer
     "B008",   # FastAPI Depends() in defaults is the framework idiom
-    "UP038",  # isinstance tuple vs X | Y is a wash
 ]
 
 [tool.ruff.lint.per-file-ignores]

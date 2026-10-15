@@ -32,9 +32,7 @@ _CACHE: dict[str, Any] = {"catalog": None, "mtime": None, "path": None, "meta": 
 _LOCK = threading.Lock()
 
 
-def load_catalog(
-    path: str | os.PathLike | None = None, *, force: bool = False
-) -> dict[str, dict[str, Any]]:
+def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False) -> dict[str, dict[str, Any]]:
     """Load + cache the catalog (id -> entry). Reloads when the file mtime changes."""
     p = _catalog_path(path)
     with _LOCK:
@@ -42,12 +40,7 @@ def load_catalog(
             mtime = p.stat().st_mtime
         except FileNotFoundError:
             raise FileNotFoundError(f"repo catalog not found: {p}") from None
-        if (
-            not force
-            and _CACHE["catalog"] is not None
-            and _CACHE["path"] == str(p)
-            and _CACHE["mtime"] == mtime
-        ):
+        if not force and _CACHE["catalog"] is not None and _CACHE["path"] == str(p) and _CACHE["mtime"] == mtime:
             return _CACHE["catalog"]
         data = json.loads(p.read_text())
         entries = {e["id"]: e for e in data.get("repos", []) if e.get("id")}

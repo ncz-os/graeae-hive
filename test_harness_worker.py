@@ -4,7 +4,7 @@ import unittest
 from unittest import mock
 
 from hive.core import quota
-from hive.harness.codex import CodexAdapter, codex_executor
+from hive.harness.codex import codex_executor
 from hive.workers.run import HarnessWorker
 
 
@@ -81,29 +81,38 @@ class WorkerLoopTests(unittest.TestCase):
 
 class TelemetryTests(unittest.TestCase):
     def test_ratelimit_headers_parsed(self):
-        out = quota.parse_ratelimit_headers({
-            "x-ratelimit-remaining-tokens": "31877",
-            "x-ratelimit-limit-tokens": "40000",
-            "anthropic-ratelimit-tokens-remaining": "95000",
-            "content-type": "application/json",
-        })
+        out = quota.parse_ratelimit_headers(
+            {
+                "x-ratelimit-remaining-tokens": "31877",
+                "x-ratelimit-limit-tokens": "40000",
+                "anthropic-ratelimit-tokens-remaining": "95000",
+                "content-type": "application/json",
+            }
+        )
         self.assertEqual(out["remaining-tokens"], 31877)
         self.assertEqual(out["limit-tokens"], 40000)
         self.assertEqual(out["tokens-remaining"], 95000)
         self.assertNotIn("content-type", out)
 
     def test_extract_tokens_shapes(self):
-        self.assertEqual(quota.extract_tokens({"usage": {"prompt_tokens": 5, "completion_tokens": 7}}), {"in": 5, "out": 7})
+        self.assertEqual(
+            quota.extract_tokens({"usage": {"prompt_tokens": 5, "completion_tokens": 7}}), {"in": 5, "out": 7}
+        )
         self.assertEqual(quota.extract_tokens({"input_tokens": 3, "output_tokens": 4}), {"in": 3, "out": 4})
         self.assertEqual(quota.extract_tokens({"tokens_in": 1, "tokens_out": 2}), {"in": 1, "out": 2})
         self.assertIsNone(quota.extract_tokens({"nope": 1}))
 
     def test_parse_cli_json_embedded(self):
-        self.assertEqual(quota.parse_cli_json('log line\n{"usage":{"prompt_tokens":2,"completion_tokens":3}}\ntrailing'), {"usage": {"prompt_tokens": 2, "completion_tokens": 3}})
+        self.assertEqual(
+            quota.parse_cli_json('log line\n{"usage":{"prompt_tokens":2,"completion_tokens":3}}\ntrailing'),
+            {"usage": {"prompt_tokens": 2, "completion_tokens": 3}},
+        )
         self.assertEqual(quota.parse_cli_json("no json here"), {})
 
     def test_quota_block_shape(self):
-        b = quota.quota_block(provider="openai", model="codex", tokens_in=2, tokens_out=3, ratelimit={"remaining-tokens": 9})
+        b = quota.quota_block(
+            provider="openai", model="codex", tokens_in=2, tokens_out=3, ratelimit={"remaining-tokens": 9}
+        )
         self.assertEqual(b["provider"], "openai")
         self.assertEqual(b["tokens"], {"in": 2, "out": 3})
         self.assertEqual(b["ratelimit"], {"remaining-tokens": 9})

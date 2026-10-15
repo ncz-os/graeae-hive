@@ -87,10 +87,7 @@ def discover_gitlab(pat: str, base: str = "https://gitlab.com") -> dict[str, dic
     out: dict[str, dict[str, Any]] = {}
     page = 1
     while True:
-        url = (
-            f"{base}/api/v4/projects?membership=true&per_page=100&simple=true"
-            f"&order_by=name&page={page}"
-        )
+        url = f"{base}/api/v4/projects?membership=true&per_page=100&simple=true&order_by=name&page={page}"
         status, body = _http_json(url, {"PRIVATE-TOKEN": pat})
         if status != 200 or not isinstance(body, list) or not body:
             break
@@ -150,8 +147,17 @@ def discover_argonas(
     git_dir: str = ARGONAS_GIT_PATH_SSH,
 ) -> set[str]:
     """Canonical bare repos present on ARGONAS (`ls *.git`). Returns slugs."""
-    ssh = ["ssh", "-o", "PubkeyAuthentication=no", "-o", "StrictHostKeyChecking=no",
-           "-o", "ConnectTimeout=10", f"{user}@{host}", f"ls -d {git_dir}/*.git 2>/dev/null"]
+    ssh = [
+        "ssh",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "ConnectTimeout=10",
+        f"{user}@{host}",
+        f"ls -d {git_dir}/*.git 2>/dev/null",
+    ]
     cmd = ssh
     if password:
         cmd = ["sshpass", "-p", password, *ssh]
@@ -167,9 +173,7 @@ def discover_argonas(
     return slugs
 
 
-def discover_buildkite(
-    token: str, org: str = "ncz-os"
-) -> dict[str, dict[str, Any]]:
+def discover_buildkite(token: str, org: str = "ncz-os") -> dict[str, dict[str, Any]]:
     """Buildkite pipelines for an org. Keyed by repo slug (from the pipeline repo URL)."""
     out: dict[str, dict[str, Any]] = {}
     headers = {"Authorization": f"Bearer {token}"}
@@ -222,9 +226,7 @@ def correlate(*sources: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return merged
 
 
-def merge_overlay(
-    entries: dict[str, dict[str, Any]], overlay: dict[str, dict[str, Any]]
-) -> dict[str, dict[str, Any]]:
+def merge_overlay(entries: dict[str, dict[str, Any]], overlay: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
     """Apply curated overlay fields onto discovered entries.
 
     Overlay keys win for curated facets (commands/live/mnemos/deps/notes/etc.);

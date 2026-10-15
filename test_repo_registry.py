@@ -180,7 +180,9 @@ class BuiltCatalogTests(unittest.TestCase):
         for e in data["repos"]:
             for alias in e.get("aliases", []):
                 self.assertNotIn(alias, ids - {e["id"]}, f"alias {alias!r} collides with a repo id")
-                self.assertNotIn(alias, seen_aliases, f"alias {alias!r} shared by {seen_aliases.get(alias)} and {e['id']}")
+                self.assertNotIn(
+                    alias, seen_aliases, f"alias {alias!r} shared by {seen_aliases.get(alias)} and {e['id']}"
+                )
                 seen_aliases[alias] = e["id"]
 
 

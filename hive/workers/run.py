@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from collections.abc import Callable
 
 from hive.harness.base import HarnessRegistration
 from hive.harness.generic import GenericAdapter

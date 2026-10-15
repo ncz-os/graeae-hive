@@ -30,7 +30,7 @@ def parse_ratelimit_headers(headers: dict[str, str]) -> dict[str, Any]:
         short = lk
         for p in _HEADER_PREFIXES:
             if lk.startswith(p):
-                short = lk[len(p):]
+                short = lk[len(p) :]
                 break
         # numeric where possible, else keep the raw (e.g. reset timestamps)
         try:

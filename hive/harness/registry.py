@@ -77,9 +77,7 @@ def is_harness_enabled(harness_kind: str) -> bool:
     """
     if harness_kind == "codex":
         return os.environ.get(_CODEX_AUTORUN_ENV, "0") == "1"
-    if harness_kind not in _BUILTIN_ADAPTERS:
-        return False  # unknown kinds default to disabled
-    return True
+    return harness_kind in _BUILTIN_ADAPTERS
 
 
 def list_harnesses() -> list[str]:

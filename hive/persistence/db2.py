@@ -8,7 +8,7 @@ import json as _json
 import os
 import re
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from decimal import Decimal as _Decimal
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -466,7 +466,7 @@ class _Db2Cursor:
                 )
             elif isinstance(value, _dt.datetime):
                 if value.tzinfo is None:
-                    value = value.replace(tzinfo=_dt.timezone.utc)
+                    value = value.replace(tzinfo=_dt.UTC)
                 out.append(value.timestamp())
             elif isinstance(value, (bytes, bytearray)):
                 out.append(value.decode("utf-8", errors="replace"))
@@ -669,10 +669,8 @@ class _Db2Pool:
             async with self._lock:
                 self._in_use.discard(conn)
                 if self._closed or not reusable:
-                    try:
+                    with suppress(Exception):
                         await conn.close()
-                    except Exception:
-                        pass
                 else:
                     self._idle.append(conn)
                 self._not_full.notify()
@@ -826,7 +824,7 @@ class Db2HiveRepository(SqliteHiveRepository):
         if 1 not in applied:
             await db.execute(
                 "INSERT INTO hive_schema_migrations (version, applied_at) VALUES (?, ?)",
-                (1, _dt.datetime.now(tz=_dt.timezone.utc).timestamp()),
+                (1, _dt.datetime.now(tz=_dt.UTC).timestamp()),
             )
 
         # Version 2 supplies the concurrency guarantee used by create_job.
@@ -844,7 +842,7 @@ class Db2HiveRepository(SqliteHiveRepository):
         ) as cur:
             active = await cur.fetchall()
         seen_hashes: set[str] = set()
-        now = _dt.datetime.now(tz=_dt.timezone.utc).timestamp()
+        now = _dt.datetime.now(tz=_dt.UTC).timestamp()
         migration_result = _json.dumps(
             {
                 "dead_letter": True,
@@ -870,7 +868,7 @@ class Db2HiveRepository(SqliteHiveRepository):
         if 2 not in applied:
             await db.execute(
                 "INSERT INTO hive_schema_migrations (version, applied_at) VALUES (?, ?)",
-                (2, _dt.datetime.now(tz=_dt.timezone.utc).timestamp()),
+                (2, _dt.datetime.now(tz=_dt.UTC).timestamp()),
             )
 
     async def _verify_schema(self, db: Any) -> None:

@@ -1,5 +1,6 @@
 """Tests for hive.core.config (typed settings)."""
 
+import dataclasses
 import os
 import unittest
 from unittest import mock
@@ -47,7 +48,7 @@ class SettingsTests(unittest.TestCase):
         get_settings.cache_clear()
         a = get_settings()
         self.assertIs(a, get_settings())
-        with self.assertRaises(Exception):
+        with self.assertRaises(dataclasses.FrozenInstanceError):
             a.hive_url = "x"  # frozen dataclass
         get_settings.cache_clear()
 
