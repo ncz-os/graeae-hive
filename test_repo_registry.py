@@ -89,7 +89,18 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(repos.get_repo("mnemos")["required_mnemos_queries"], [])
 
     def test_resolve_is_capped(self):
-        self.assertLessEqual(len(repos.resolve("e", limit=1)), 1)
+        # 'e' matches every entry's id/display/alias here; cap must apply and
+        # the result must be non-empty.
+        capped = repos.resolve("e", limit=1)
+        self.assertEqual(len(capped), 1)
+        self.assertGreater(len(repos.resolve("e", limit=10)), 1)
+
+    def test_alias_does_not_collide_with_own_id(self):
+        # every alias that exists must not equal another entry's id (ambiguity rule)
+        ids = {e["id"] for e in repos.list_repos()}
+        for entry in repos.list_repos():
+            for alias in entry["aliases"]:
+                self.assertNotIn(alias, ids - {entry["id"]}, f"alias {alias!r} collides with a repo id")
 
     def test_resolve_ranks_exact_then_prefix(self):
         ids = [e["id"] for e in repos.resolve("hive")]
@@ -152,6 +163,16 @@ class BuiltCatalogTests(unittest.TestCase):
             self.assertIn("id", e)
             self.assertIn("sources", e)
             self.assertIsInstance(e["sources"], list)
+
+    def test_shipped_catalog_has_no_alias_id_collisions(self):
+        path = Path(__file__).resolve().parent / "data" / "repos.json"
+        if not path.exists():
+            self.skipTest("data/repos.json not built yet")
+        data = json.loads(path.read_text())
+        ids = {e["id"] for e in data["repos"]}
+        for e in data["repos"]:
+            for alias in e.get("aliases", []):
+                self.assertNotIn(alias, ids - {e["id"]}, f"alias {alias!r} collides with a repo id")
 
 
 if __name__ == "__main__":

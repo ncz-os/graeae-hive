@@ -161,7 +161,8 @@ def list_repos(
     return sorted(out, key=lambda e: e["id"])
 
 
-def get_repo(repo_id: str, *, host: str | None = None) -> dict[str, Any] | None:
+def _raw_entry(repo_id: str) -> dict[str, Any] | None:
+    """Raw cached catalog entry (not through to_dict). Exact id first, then alias."""
     catalog = load_catalog()
     entry = catalog.get(repo_id)
     if entry is None:
@@ -170,8 +171,12 @@ def get_repo(repo_id: str, *, host: str | None = None) -> dict[str, Any] | None:
             names = {candidate["id"].lower(), (candidate.get("display_name") or "").lower()}
             names |= {a.lower() for a in candidate.get("aliases", [])}
             if key in names:
-                entry = candidate
-                break
+                return candidate
+    return entry
+
+
+def get_repo(repo_id: str, *, host: str | None = None) -> dict[str, Any] | None:
+    entry = _raw_entry(repo_id)
     return to_dict(entry, host=host) if entry else None
 
 
@@ -207,11 +212,13 @@ def resolve(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
 
 
 def required_mnemos_queries(repo_id: str) -> list[str]:
-    """The MNEMOS searches an agent MUST run before working this repo."""
-    entry = get_repo(repo_id)
-    if entry is None:
-        return []
-    return list(entry.get("required_mnemos_queries") or [])
+    """The MNEMOS searches an agent MUST run before working this repo.
+
+    Computes from the RAW entry so it does not depend on to_dict having been
+    applied to the caller's dict.
+    """
+    entry = _raw_entry(repo_id)
+    return _required_mnemos_queries(entry) if entry else []
 
 
 def catalog_meta() -> dict[str, Any]:

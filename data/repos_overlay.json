@@ -1,6 +1,7 @@
 {
   "_meta": {
     "description": "Curated overlay merged onto discovered registry facts. Only authorship knowledge lives here (live host, build/test commands, required MNEMOS queries, deps, notes). Everything discoverable (forges, ARGONAS presence, Buildkite pipelines, R2 buckets) is NOT duplicated here.",
+    "alias_rule": "An alias MUST NOT equal another entry's id. `graeae-hive`, `meta-base`, `meta-nclawzero` were removed as aliases (2026-10-15) because they are separate real repos — keeping them here made get_repo/resolve ambiguous. resolve() now returns each to its own entry.",
     "last_curated": "2026-10-15"
   },
   "repos": {
@@ -87,7 +88,7 @@
     },
     "zeroclaw": {
       "display_name": "zeroclaw",
-      "aliases": ["zc", "zeroclaw-contrib"],
+      "aliases": ["zc"],
       "language": "rust",
       "owner": "zeroclaw-labs",
       "status": "active",
@@ -108,7 +109,7 @@
     },
     "fleet-config": {
       "display_name": "fleet-config",
-      "aliases": ["gitops", "fleet-ops"],
+      "aliases": ["gitops"],
       "owner": "ncz-os",
       "status": "active",
       "deps": [],
@@ -127,7 +128,7 @@
     },
     "meta-cix": {
       "display_name": "meta-cix (Yocto)",
-      "aliases": ["meta-cix-full", "nclawzero-yocto"],
+      "aliases": ["nclawzero-yocto"],
       "owner": "ncz-os",
       "status": "active",
       "live": [{"host": "argos", "path": "/mnt/argonas/datapool/projects/nclawzero-yocto"}],
@@ -156,7 +157,7 @@
     },
     "nclawzero-debs": {
       "display_name": "nclawzero debs",
-      "aliases": ["debs"],
+      "aliases": ["nclawzero-debs-internal"],
       "owner": "ncz-os",
       "status": "active",
       "live": [{"host": "argos", "path": "/mnt/argonas/datapool/projects/nclawzero-debs"}],
