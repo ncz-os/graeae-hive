@@ -220,3 +220,53 @@ class GenericAdapter:
             if isinstance(agent, dict) and agent.get("urn") == urn:
                 return agent
         return {}
+
+    # -- agent-to-agent: awareness / communication / coordination --------------
+
+    def roster(self, *, include_offline: bool = False) -> list[dict[str, Any]]:
+        """List registered agents so a worker can see its peers (awareness)."""
+        query = "/v1/agents?include_offline=true" if include_offline else "/v1/agents"
+        status, resp = self._call("GET", query)
+        if status not in (200, 204):
+            raise RuntimeError(f"roster failed: status={status}")
+        return (resp or {}).get("agents", [])
+
+    def publish_message(
+        self,
+        *,
+        from_urn: str,
+        topic: str,
+        payload: dict[str, Any],
+        to_urn: str | None = None,
+        in_reply_to: str | None = None,
+    ) -> dict[str, Any]:
+        """Publish a Hive message. ``to_urn=None`` broadcasts to every worker."""
+        body = {
+            "from_urn": from_urn,
+            "topic": topic,
+            "payload": payload,
+            "to_urn": to_urn,
+            "in_reply_to": in_reply_to,
+        }
+        status, resp = self._call("POST", "/v1/messages", body)
+        if status != 200:
+            raise RuntimeError(f"publish_message failed: status={status}")
+        return resp or {}
+
+    def list_messages(
+        self,
+        *,
+        to_urn: str | None = None,
+        topic: str | None = None,
+        since: float | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Poll messages addressed to this worker (+ broadcasts since ``since``)."""
+        params = {
+            k: v for k, v in {"to_urn": to_urn, "topic": topic, "since": since, "limit": limit}.items() if v is not None
+        }
+        query = urllib.parse.urlencode(params)
+        status, resp = self._call("GET", f"/v1/messages?{query}")
+        if status not in (200, 204):
+            raise RuntimeError(f"list_messages failed: status={status}")
+        return (resp or {}).get("messages", [])

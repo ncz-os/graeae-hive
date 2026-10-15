@@ -41,6 +41,16 @@ class FakeAdapter:
     def fail(self, urn, job_id, error):
         self.calls.append(("fail", job_id, error))
 
+    def publish_message(self, *, from_urn, topic, payload, to_urn=None, in_reply_to=None):
+        self.calls.append(("publish", topic, payload, to_urn))
+        return {"id": "msg-1"}
+
+    def list_messages(self, *, to_urn=None, topic=None, since=None, limit=50):
+        self.calls.append(("list_messages", to_urn, since))
+        return list(self._messages)
+
+    _messages: list = []
+
 
 class WorkerLoopTests(unittest.TestCase):
     def test_register_sets_urn(self):
@@ -77,6 +87,32 @@ class WorkerLoopTests(unittest.TestCase):
         with mock.patch("hive.workers.run.time.sleep"):
             w.run_forever(max_iterations=3)
         self.assertEqual(len([c for c in a.calls if c[0] == "claim"]), 3)
+
+
+class AwarenessTests(unittest.TestCase):
+    def test_poll_messages_delivers_and_advances_cursor(self):
+        a = FakeAdapter()
+        a._messages = [{"id": "m1", "ts": 10.0}, {"id": "m2", "ts": 20.0}]
+        w = HarnessWorker(a, urn="urn:x")
+        seen = []
+        w.on_message = lambda m: seen.append(m["id"])
+        self.assertEqual(len(w.poll_messages()), 2)
+        self.assertEqual(seen, ["m1", "m2"])
+        self.assertEqual(w._last_message_ts, 20.0)
+
+    def test_announce_publishes(self):
+        a = FakeAdapter()
+        w = HarnessWorker(a, urn="urn:x")
+        w.announce("worker.online", {"host": "h"})
+        pubs = [c for c in a.calls if c[0] == "publish"]
+        self.assertEqual(len(pubs), 1)
+        self.assertEqual(pubs[0][1], "worker.online")
+
+    def test_poll_messages_survives_adapter_error(self):
+        a = FakeAdapter()
+        a.list_messages = mock.Mock(side_effect=RuntimeError("bus down"))
+        w = HarnessWorker(a, urn="urn:x")
+        self.assertEqual(w.poll_messages(), [])  # never raises
 
 
 class TelemetryTests(unittest.TestCase):

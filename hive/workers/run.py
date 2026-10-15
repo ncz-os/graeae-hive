@@ -53,6 +53,10 @@ class HarnessWorker:
         self.heartbeat_interval = heartbeat_interval
         self.claim_timeout_retries = claim_timeout_retries
         self._last_heartbeat = 0.0
+        self._last_message_ts = 0.0
+        # Optional peer-message callback (awareness/coordination): called with
+        # each new message addressed to this worker (+ broadcasts).
+        self.on_message: Callable[[dict[str, Any]], None] | None = None
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -78,6 +82,39 @@ class HarnessWorker:
                 self._last_heartbeat = now
             except Exception as e:  # noqa: BLE001 - keep the loop alive
                 logger.warning("heartbeat failed for %s: %s", self.urn, e)
+
+    # -- awareness / communication / coordination ---------------------------
+
+    def announce(self, topic: str, payload: dict[str, Any], *, to_urn: str | None = None) -> None:
+        """Publish a Hive message (to_urn=None broadcasts) so peers can react."""
+        try:
+            self.adapter.publish_message(from_urn=self.urn, topic=topic, payload=payload, to_urn=to_urn)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("announce(%s) failed: %s", topic, e)
+
+    def poll_messages(self) -> list[dict[str, Any]]:
+        """Fetch messages for this worker (+ broadcasts) since the last poll.
+
+        Each new message is delivered to ``self.on_message`` if set. Returns the
+        raw list. Never raises — a message-poll failure must not stop work.
+        """
+        try:
+            msgs = self.adapter.list_messages(
+                to_urn=self.urn,
+                since=self._last_message_ts or None,
+                limit=50,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("message poll failed: %s", e)
+            return []
+        for m in msgs:
+            self._last_message_ts = max(self._last_message_ts, float(m.get("ts") or 0))
+            if self.on_message is not None:
+                try:
+                    self.on_message(m)
+                except Exception:  # noqa: BLE001
+                    logger.exception("on_message handler raised for %r", m.get("id"))
+        return msgs
 
     # -- one unit of work ---------------------------------------------------
 
@@ -113,9 +150,14 @@ class HarnessWorker:
         """Poll-claim-execute until stopped. Sleeps ``poll_interval`` when idle."""
         self.register()
         self._maybe_heartbeat(force=True)
+        self.announce(
+            "worker.online",
+            {"host": self.host, "capabilities": self.capabilities, "urn": self.urn},
+        )
         iterations = 0
         while max_iterations is None or iterations < max_iterations:
             iterations += 1
+            self.poll_messages()
             try:
                 handled = self.run_once()
             except KeyboardInterrupt:
