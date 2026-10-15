@@ -37,6 +37,15 @@ import retry_policy
 from hive import repos as repo_registry
 from hive import scheduler as sched
 from hive.bus import capacity as _capacity
+from hive.bus.domain.eligibility import (
+    RUNTIME_KIND_MAP,
+    THROTTLE_HEADROOM,
+    _norm_str,
+    _norm_str_set,
+    agent_kind_aliases,
+    heavy_repo_required_for_kind,
+    job_agent_eligible,
+)
 from hive.bus.schemas import (
     AgentHeartbeat,
     AgentRegister,
@@ -49,16 +58,7 @@ from hive.bus.schemas import (
     RequeueRequest,
     ScheduleCreate,
 )
-from hive.bus.domain.eligibility import (
-    RUNTIME_KIND_MAP,
-    THROTTLE_HEADROOM,
-    _norm_str,
-    _norm_str_set,
-    agent_kind_aliases,
-    heavy_repo_required_for_kind,
-    job_agent_eligible,
-)
-from hive.core.models import COST_TIERS, cost_tier_for, rate_for
+from hive.core.models import COST_TIERS, cost_tier_for, knemon_candidates, rate_for
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
 
@@ -4564,84 +4564,8 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
 # alias = the hive_* agent alias the wss worker dispatches to (gateway maps it
 # to provider+model). Returned so the worker can consume a chain shaped exactly
 # like its local TIER_CHAINS values.
-KNEMON_PROVIDERS: list[dict[str, Any]] = [
-    # provider,         model,                 alias,                  in,    out
-    {"provider": "groq", "model": "gpt-oss-20b", "alias": "hive_groq_1", "tier": "B"},
-    {
-        "provider": "gemini",
-        "model": "gemini-2.5-flash-lite",
-        "alias": "hive_gemini_1",
-        "tier": "B",
-    },
-    # FORBIDDEN 2026-09-07 (operator): neither deepseek nor siliconflow may be
-    # used directly, fleet-wide. Both providers removed from the candidate
-    # pool (siliconflow was already disabled 2026-06-03 for an invalid key;
-    # deepseek-direct's two aliases hive_deepseek_1/hive_deepseek_pro_1 are
-    # struck below, not just disabled).
-    {
-        "provider": "minimax",  # MiniMax DIRECT (operator 2026-10-15: never via together)
-        "model": "minimax-m3",
-        "alias": "hive_minimax_1",
-        "tier": "B",
-    },
-    {"provider": "xai", "model": "grok-4.1-fast", "alias": "hive_xai_1", "tier": "B"},
-    # REMOVED 2026-06-17 (operator: "remove ngc-review from all agents" +
-    # compute edict: EIH frontier forbidden). hive_ngc_1 (ngc-proxy gpt-5.5 via
-    # the .4 EIH gateway) is no longer a coding/review candidate for any agent.
-    # Bedrock Nova (funded AWS creds, worker agents shipped 2026-06-02):
-    # cheap metered fallbacks (lite 0.06/0.24, micro 0.035/0.14).
-    {
-        "provider": "bedrock",
-        "model": "amazon.nova-lite-v1:0",
-        "alias": "hive_nova_1",
-        "tier": "B",
-    },
-    {
-        "provider": "bedrock",
-        "model": "amazon.nova-micro-v1:0",
-        "alias": "hive_nova_2",
-        "tier": "B",
-    },
-]
 
 
-def knemon_candidates(max_tier: str, kind: str = "") -> list[dict[str, Any]]:
-    """Ordered provider/model candidates within budget, cheapest-acceptable first.
-
-    Cheapest-first is keyed on the per-provider/model OUTPUT rate from LLM_RATES
-    (output dominates code-gen spend), then input rate, then provider name for a
-    stable deterministic tie-break. Providers whose cost tier exceeds the budget
-    ceiling are excluded.
-    """
-    ceiling_idx = (
-        COST_TIERS.index(max_tier) if max_tier in COST_TIERS else len(COST_TIERS) - 1
-    )
-    out: list[dict[str, Any]] = []
-    for p in KNEMON_PROVIDERS:
-        # Effective cost tier is the per-entry, MODEL-SPECIFIC tier hint
-        # (e.g. gemini-flash-lite=B even though PROVIDER_COST_TIER['gemini']=C,
-        # which is the gemini-PRO tier; siliconflow isn't in the static map at
-        # all -> defaults to C). The static provider tier is only a fallback
-        # when an entry omits its hint. This keeps cheap model variants from
-        # being wrongly excluded under a tight budget.
-        eff_tier = (p.get("tier") or cost_tier_for(p["provider"])).upper()
-        if eff_tier not in COST_TIERS:
-            eff_tier = cost_tier_for(p["provider"])
-        if COST_TIERS.index(eff_tier) > ceiling_idx:
-            continue
-        in_rate, out_rate = rate_for(p["provider"], p["model"])
-        out.append(
-            {
-                "provider": p["provider"],
-                "model": p["model"],
-                "alias": p["alias"],
-                "cost_tier": eff_tier,
-                "rate_in_per_1m": in_rate,
-                "rate_out_per_1m": out_rate,
-            }
-        )
-    out.sort(key=lambda c: (c["rate_out_per_1m"], c["rate_in_per_1m"], c["provider"]))
-    return out
 
 
 # ── HIVE-LEVEL KNEMON BYPASS FLAG (operator 2026-06-03) ──────────────────
