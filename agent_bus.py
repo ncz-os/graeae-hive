@@ -4996,30 +4996,39 @@ def oauth_cap_state() -> dict:
     import json as _j
     import time as _t
 
+    base = {
+        "capped": False,
+        "capped_until": None,
+        "hit_at": None,
+        "model": None,
+        "reporter": None,
+        "verified": False,
+        "remaining_sec": 0,
+    }
     try:
         with open(KNEMON_CAP_FILE) as f:
             d = _j.load(f)
+    except FileNotFoundError:
+        return base  # no breaker file = not capped
+    except Exception as e:  # noqa: BLE001
+        # Corrupt/unreadable breaker file: FAIL CLOSED (assume capped) so the
+        # breaker does not silently open and burn the OAuth allowance. The forge
+        # lineage fixed this; the argonas line failed open.
+        return {**base, "capped": True, "storage_error": str(e)}
+    try:
         until = float(d.get("capped_until") or 0)
-        now = _t.time()
-        return {
-            "capped": now < until,
-            "capped_until": until,
-            "hit_at": d.get("hit_at"),
-            "model": d.get("model"),
-            "reporter": d.get("reporter"),
-            "verified": False,
-            "remaining_sec": max(0, int(until - now)),
-        }
-    except Exception:
-        return {
-            "capped": False,
-            "capped_until": None,
-            "hit_at": None,
-            "model": None,
-            "reporter": None,
-            "verified": False,
-            "remaining_sec": 0,
-        }
+    except (TypeError, ValueError):
+        return {**base, "capped": True, "storage_error": "invalid capped_until"}
+    now = _t.time()
+    return {
+        "capped": now < until,
+        "capped_until": until,
+        "hit_at": d.get("hit_at"),
+        "model": d.get("model"),
+        "reporter": d.get("reporter"),
+        "verified": False,
+        "remaining_sec": max(0, int(until - now)),
+    }
 
 
 def clear_oauth_cap() -> str | None:
