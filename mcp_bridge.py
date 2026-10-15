@@ -71,6 +71,11 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 MCP_BRIDGE_TOKEN = os.environ.get("MCP_BRIDGE_TOKEN", "")
 MCP_BRIDGE_ADMIN_TOKEN = os.environ.get("MCP_BRIDGE_ADMIN_TOKEN", "")
+# Single source of truth for the anonymous-access policy (read once at import).
+# Anonymous mode is least-privilege: bridge:use only, never admin.
+ALLOW_ANONYMOUS = os.environ.get("MCP_BRIDGE_ALLOW_ANONYMOUS") == "1"
+ANON_TOKEN = "anonymous"  # sentinel, NOT a credential
+ANON_CLIENT_ID = "mcp-bridge-anonymous"
 MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.0.2.67:5002")
 # MNEMOS bearer token comes from env. No source-baked default — having a
 # token literal in source meant every clone of this repo carried a working
@@ -107,17 +112,19 @@ class BridgeBearerAuth:
             await self.app(scope, receive, send)
             return
         if not MCP_BRIDGE_TOKEN:
-            # Fail closed unless anonymous access was EXPLICITLY opted into.
-            if os.environ.get("MCP_BRIDGE_ALLOW_ANONYMOUS") == "1":
+            # lifespan() has already validated this state: either anonymous is
+            # explicitly allowed, or startup failed. This branch is defense-in-
+            # depth only (e.g. env changed after startup).
+            if ALLOW_ANONYMOUS:
+                # least-privilege: anonymous clients get bridge:use, never admin
                 scope["user"] = AuthenticatedUser(
-                    # least-privilege: anonymous clients get bridge:use, never admin
-                    AccessToken(token="anonymous", client_id="mcp-bridge-anonymous", scopes=["bridge:use"]),
+                    AccessToken(token=ANON_TOKEN, client_id=ANON_CLIENT_ID, scopes=["bridge:use"]),
                 )
                 await self.app(scope, receive, send)
                 return
             await JSONResponse(
                 {"detail": "MCP bridge authentication is not configured"},
-                status_code=503,
+                status_code=500,
             )(scope, receive, send)
             return
         headers = {key.lower(): value for key, value in scope.get("headers", ())}
@@ -168,34 +175,33 @@ async def lifespan(app):
     # Auth is enforced by default (fail closed). Anonymous access requires the
     # explicit opt-in MCP_BRIDGE_ALLOW_ANONYMOUS=1 and is least-privilege
     # (bridge:use only) — never admin. The bus (agent_bus.py) currently has no
-    # auth either, so the live service sets the opt-in until the fleet hardens
-    # the bus + every client together.
+    # auth either, so the live service opts in until the fleet hardens the bus +
+    # every client together.
     _downstream = (
         ("HIVE_BUS_TOKEN", HIVE_BUS_TOKEN),
         ("HIVE_BUS_ADMIN_TOKEN", HIVE_BUS_ADMIN_TOKEN),
         ("MNEMOS_TOKEN", MNEMOS_TOKEN),
     )
     if not MCP_BRIDGE_TOKEN:
-        if os.environ.get("MCP_BRIDGE_ALLOW_ANONYMOUS") == "1":
-            logger.error(
-                "MCP bridge running OPEN: MCP_BRIDGE_ALLOW_ANONYMOUS=1 and MCP_BRIDGE_TOKEN unset. "
-                "Anonymous clients get bridge:use only. Configure MCP_BRIDGE_TOKEN + client bearers "
-                "to require auth."
-            )
-        else:
+        if not ALLOW_ANONYMOUS:
             raise RuntimeError(
                 "MCP_BRIDGE_TOKEN must be configured "
                 "(or set MCP_BRIDGE_ALLOW_ANONYMOUS=1 to explicitly run open)"
             )
+        logger.error(
+            "MCP bridge running OPEN: MCP_BRIDGE_ALLOW_ANONYMOUS=1 and MCP_BRIDGE_TOKEN unset. "
+            "Anonymous clients get bridge:use only. Configure MCP_BRIDGE_TOKEN + client bearers "
+            "to require auth."
+        )
     else:
-        if MCP_BRIDGE_ADMIN_TOKEN and secrets.compare_digest(MCP_BRIDGE_TOKEN, MCP_BRIDGE_ADMIN_TOKEN):
-            raise RuntimeError("MCP_BRIDGE_TOKEN and MCP_BRIDGE_ADMIN_TOKEN must be distinct")
         for name, downstream in _downstream:
             if downstream and secrets.compare_digest(MCP_BRIDGE_TOKEN, downstream):
                 raise RuntimeError(f"MCP_BRIDGE_TOKEN and {name} must be distinct")
-    # Admin-token distinctness runs UNCONDITIONALLY of whether the bridge token
-    # is set — an admin token equal to a downstream credential must never pass.
+    # Admin-token distinctness is UNCONDITIONAL: it must differ from the bridge
+    # token (when set) AND from every downstream credential.
     if MCP_BRIDGE_ADMIN_TOKEN:
+        if MCP_BRIDGE_TOKEN and secrets.compare_digest(MCP_BRIDGE_ADMIN_TOKEN, MCP_BRIDGE_TOKEN):
+            raise RuntimeError("MCP_BRIDGE_ADMIN_TOKEN and MCP_BRIDGE_TOKEN must be distinct")
         for name, downstream in _downstream:
             if downstream and secrets.compare_digest(MCP_BRIDGE_ADMIN_TOKEN, downstream):
                 raise RuntimeError(f"MCP_BRIDGE_ADMIN_TOKEN and {name} must be distinct")
