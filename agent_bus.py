@@ -2329,6 +2329,7 @@ async def lifespan(app: FastAPI):
             await db.execute(stmt)
         await db.commit()
     task = asyncio.create_task(reaper_task(app))
+    app.state.reaper_task = task
     try:
         yield
     finally:
@@ -2345,12 +2346,27 @@ app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "ts": time.time(),
-        "service": "graeae-hive-mind",
-        "version": "0.1.0",
-    }
+    """Liveness — 200 only if the DB probe succeeds AND the reaper is running.
+
+    Returning 200 unconditionally (as the argonas line did) hides a downed DB or
+    a stopped reaper from any external monitor. 503 carries the reason."""
+    base = {"ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
+    try:
+        async with connect_db() as db:
+            async with db.execute("SELECT 1") as cur:
+                await cur.fetchone()
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(
+            {**base, "status": "unhealthy", "detail": f"database probe failed: {e}"},
+            status_code=503,
+        )
+    reaper = getattr(app.state, "reaper_task", None)
+    if reaper is not None and reaper.done():
+        return JSONResponse(
+            {**base, "status": "unhealthy", "detail": "reaper task is not running"},
+            status_code=503,
+        )
+    return {**base, "status": "healthy"}
 
 
 @app.get("/")
@@ -5557,6 +5573,7 @@ async def list_jobs(
     parent_job_id: str | None = None,
     since: float | None = None,
     limit: int = 100,
+    include_result: bool = True,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
     if status:
@@ -5619,31 +5636,34 @@ async def list_jobs(
             total = row[0] if row else 0
         async with db.execute(sql, args) as cur:
             async for r in cur:
-                rows.append(
-                    {
-                        "id": r[0],
-                        "submitter_urn": r[1],
-                        "parent_job_id": r[2],
-                        "kind": r[3],
-                        "description": r[4],
-                        "priority": r[5],
-                        "status": r[6],
-                        "claimed_by": r[7],
-                        "started_at": r[8],
-                        "ended_at": r[9],
-                        "result": json.loads(r[10]) if r[10] else None,
-                        "estimated_cost_usd": r[11],
-                        "required_capabilities": json.loads(r[12]) if r[12] else None,
-                        "eligible_kinds": json.loads(r[13]) if r[13] else None,
-                        "eligible_hosts": json.loads(r[14]) if r[14] else None,
-                        "site": r[15],
-                        "repo": r[16],
-                        "head_branch": r[17],
-                        "pr_number": r[18],
-                        "max_retries": r[19],
-                        "retry_count": r[20],
-                    }
-                )
+                job = {
+                    "id": r[0],
+                    "submitter_urn": r[1],
+                    "parent_job_id": r[2],
+                    "kind": r[3],
+                    "description": r[4],
+                    "priority": r[5],
+                    "status": r[6],
+                    "claimed_by": r[7],
+                    "started_at": r[8],
+                    "ended_at": r[9],
+                    "result": json.loads(r[10]) if r[10] else None,
+                    "estimated_cost_usd": r[11],
+                    "required_capabilities": json.loads(r[12]) if r[12] else None,
+                    "eligible_kinds": json.loads(r[13]) if r[13] else None,
+                    "eligible_hosts": json.loads(r[14]) if r[14] else None,
+                    "site": r[15],
+                    "repo": r[16],
+                    "head_branch": r[17],
+                    "pr_number": r[18],
+                    "max_retries": r[19],
+                    "retry_count": r[20],
+                }
+                # Opt-in projection: result can be large; listings that only
+                # need metadata can drop it. Default True (unchanged behavior).
+                if not include_result:
+                    job.pop("result", None)
+                rows.append(job)
     return {"count": len(rows), "total": total, "jobs": rows}
 
 
