@@ -1,0 +1,115 @@
+"""Model + pricing registry — the bus's canonical model table.
+
+Extracted from agent_bus.py (Phase 1a / Phase 6 seed). The long-term home is a
+central registry that GENERATES this + the per-host zoder/zeroclaw TOMLs
+(see docs/refactor-plan-20261015.md Phase 6); today it is the single in-repo
+source for cost tiers + per-MTok rates.
+
+MiniMax is direct only (operator 2026-10-15) — never via together.
+"""
+
+from __future__ import annotations
+
+# ── cost tiers ─────────────────────────────────────────────────────────────
+# A = FREE / local / on-prem NGC (claim-anything; no spend)
+# B = MID  (cheap paid commercial)
+# C = PREMIUM (expensive, reserve)
+PROVIDER_COST_TIER: dict[str, str] = {
+    "ngc": "A",
+    "nvidia": "A",
+    "nvidia-ngc": "A",
+    "local-llamacpp": "A",
+    "local-vllm": "A",
+    "ollama": "A",
+    "ollama-cerberus": "A",
+    "local": "A",
+    "pantheon": "A",
+    "groq": "B",
+    "xai": "B",
+    "deepseek": "B",
+    "deepseek-direct": "B",
+    "together": "B",
+    "bedrock": "B",
+    "gemini-flash": "B",
+    "openai-mini": "B",
+    "perplexity": "B",
+    "anthropic": "C",
+    "claude": "C",
+    "openai": "C",
+    "openai-pro": "C",
+    "openai-gpt55": "C",
+    "gemini": "C",
+    "gemini-pro": "C",
+    "together-pro": "C",
+    "unknown": "A",
+}
+COST_TIERS = ["A", "B", "C"]
+
+
+def cost_tier_for(provider: str) -> str:
+    return PROVIDER_COST_TIER.get((provider or "unknown").lower(), "C")
+
+
+# ── per-MTok rates (USD): (input, output) ──────────────────────────────────
+# Source: ~/.claude/rules/llm-usage-policy-2026-05-22.md
+LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
+    ("anthropic", "claude-opus-4-7"): (5.00, 25.00),
+    ("anthropic", "claude-opus-4-6"): (5.00, 25.00),
+    ("anthropic", "claude-sonnet-4-6"): (3.00, 15.00),
+    ("anthropic", "claude-sonnet-4-7"): (3.00, 15.00),
+    ("anthropic", "claude-haiku-4-5"): (1.00, 5.00),
+    ("anthropic", "*"): (3.00, 15.00),
+    ("openai", "gpt-5.5"): (5.00, 30.00),
+    ("openai", "gpt-5.5-pro"): (30.00, 180.00),
+    ("openai", "gpt-5.4-nano"): (0.20, 1.25),
+    ("openai", "o4-mini"): (0.55, 2.20),
+    ("openai", "o3"): (2.00, 8.00),
+    ("openai", "*"): (5.00, 30.00),
+    ("xai", "grok-4.3"): (1.25, 2.50),
+    ("xai", "grok-4.1-fast"): (0.20, 0.50),
+    ("xai", "grok-4.20"): (2.00, 6.00),
+    ("xai", "*"): (1.25, 2.50),
+    ("groq", "llama-3.3-70b-versatile"): (0.59, 0.79),
+    ("groq", "llama-3.1-8b-instant"): (0.05, 0.08),
+    ("groq", "llama-4-scout-17b"): (0.11, 0.34),
+    ("groq", "qwen3-32b"): (0.29, 0.59),
+    ("groq", "gpt-oss-120b"): (0.15, 0.60),
+    ("groq", "gpt-oss-20b"): (0.075, 0.30),
+    ("groq", "*"): (0.29, 0.59),
+    ("ngc-proxy", "gpt-5.5"): (0.0, 0.0),
+    ("ngc-proxy", "*"): (0.0, 0.0),
+    ("deepseek-direct", "deepseek-v4-pro"): (0.435, 0.87),
+    ("deepseek-direct", "deepseek-v4-flash"): (0.14, 0.28),
+    ("deepseek-direct", "*"): (0.435, 0.87),
+    ("deepseek", "*"): (0.435, 0.87),
+    ("minimax", "minimax-m3"): (0.40, 1.20),  # MiniMax DIRECT — never via together
+    ("minimax", "*"): (0.40, 1.20),
+    ("together", "deepseek-v4-pro"): (2.10, 4.40),
+    ("together", "kimi-k2.6"): (1.20, 4.40),
+    ("together", "glm-3.5-90"): (0.10, 0.15),
+    ("together", "qwen2.5-coder-32b"): (0.05, 0.12),
+    ("together", "*"): (0.40, 1.20),
+    ("bedrock", "amazon.nova-micro-v1:0"): (0.035, 0.14),
+    ("bedrock", "amazon.nova-lite-v1:0"): (0.06, 0.24),
+    ("bedrock", "amazon.nova-pro-v1:0"): (0.80, 3.20),
+    ("bedrock", "*"): (0.06, 0.24),
+    ("gemini", "gemini-2.5-flash-lite"): (0.10, 0.40),
+    ("gemini", "gemini-2.5-flash"): (0.30, 2.50),
+    ("gemini", "gemini-3.1-pro"): (2.00, 12.00),
+    ("gemini", "*"): (1.25, 10.00),
+    ("perplexity", "sonar"): (1.00, 1.00),
+    ("perplexity", "sonar-pro"): (3.00, 15.00),
+    ("perplexity", "*"): (1.00, 1.00),
+}
+
+
+def rate_for(provider: str, model: str) -> tuple[float, float]:
+    p = (provider or "unknown").lower()
+    m = (model or "").lower()
+    if (p, m) in LLM_RATES:
+        return LLM_RATES[(p, m)]
+    if (p, "*") in LLM_RATES:
+        return LLM_RATES[(p, "*")]
+    if cost_tier_for(p) == "A":
+        return (0.0, 0.0)  # tier A = free
+    return (1.0, 5.0)  # conservative fallback
