@@ -87,11 +87,21 @@ A harness-agnostic core means: any harness can register, claim, execute, report.
 
 ### Phase B — Adapters (zoder + opencode first; codex + claude gated)
 
-- **B1:** `hive/harness/zoder.py` — ZoderAdapter (zeroclaw engine, see CLAUDE.md fleet zoder config 2026-10-01)
-- **B2:** `hive/harness/opencode.py` — OpenCodeAdapter (MCP + zc_native_build, fleet-config paths)
-- **B3:** `hive/harness/codex.py` — CodexAdapter (CLI, gated by `HARNESS_CODEX_AUTORUN=0`)
-- **B4:** `hive/harness/claude.py` — ClaudeAdapter (OAuth, Claude Pro subscription)
-- **B5:** `hive/harness/generic.py` — GenericAdapter (any harness that speaks the protocol)
+**Status: DONE** on `wip/hive-eff/2026-10-15`. Design decision (recorded): the
+adapter is a **worker-side** contract — a harness worker instantiates its
+adapter to register/heartbeat/claim/execute/report. Transport is **sync
+`urllib`**, mirroring the live worker pattern (`system_watcher.py`); the bus
+stays async and never instantiates adapters. Engine wiring (`execute`) takes an
+injected `executor` callable — Phase D supplies it. Trade-off: if a future bus
+component wants to drive adapters in-process, the sync methods would need an
+async variant; deferred to Phase D.
+
+- **B1:** `hive/harness/zoder.py` — ZoderAdapter (priority 0; 15 caps) ✓
+- **B2:** `hive/harness/opencode.py` — OpenCodeAdapter (priority 1; 12 caps) ✓
+- **B3:** `hive/harness/codex.py` — CodexAdapter (priority 2; `is_enabled()` gated by `HARNESS_CODEX_AUTORUN=1`) ✓
+- **B4:** `hive/harness/claude.py` — ClaudeAdapter (priority 3; `auth_scheme=oauth`, `cost_tier=subscription`) ✓
+- **B5:** `hive/harness/generic.py` — GenericAdapter (priority 99; base for all) ✓
+- **B-tests:** `test_harness_adapters.py` — 12 tests (priority order, codex gate, transport injection, method→HTTP mapping) ✓
 
 ### Phase C — Auth plugins
 
