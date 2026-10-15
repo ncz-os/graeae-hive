@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graeae-hive-mind"
+version = "0.2.0"
+description = "GRAEAE Hive Mind — agent coordination + triage queue"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "fastapi",
+    "starlette",
+    "uvicorn",
+    "pydantic",
+    "httpx",
+    "sse-starlette",
+    "aiosqlite",
+    "mcp>=2,<3",
+]
+
+[project.optional-dependencies]
+# Backend-specific drivers — installed only where that backend is used.
+oracle = ["oracledb"]
+db2 = ["ibm_db_dbi"]
+dev = ["pytest>=7", "ruff"]
+
+[tool.setuptools]
+packages = [
+    "hive",
+    "hive.bus",
+    "hive.harness",
+    "hive.persistence",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["tests/fixtures"]
+
+[tool.ruff.lint]
+# The fleet standard is `ruff check --fix && ruff format`.
+select = ["E", "F", "W", "I", "SIM", "UP", "B"]
+ignore = [
+    "E501",   # line length handled by the formatter
+    "SIM117", # nested async-with is intentional in the persistence layer
+    "B008",   # FastAPI Depends() in defaults is the framework idiom
+    "UP038",  # isinstance tuple vs X | Y is a wash
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = ["B011"]  # assert False is fine in tests
+"tests/*" = ["B011"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "."]
+python_files = ["test_*.py"]
+python_classes = ["*Tests"]
+python_functions = ["test_*"]
+# Async tests use unittest.IsolatedAsyncioTestCase — no pytest-asyncio required.
+addopts = "-q"
