@@ -37,6 +37,26 @@ The primitives were there; **workers did not use them.**
    a worker announces intent, peers observe via `poll_messages`, and the bus's
    lease still arbitrates the actual claim.
 
+## Cross-harness / cross-model (operator 2026-10-15)
+
+Communication + coordination are **harness- and model-agnostic by construction**:
+
+- The bus has **no notion of harness**: `/v1/messages` is `(from_urn, to_urn,
+  topic, payload)`; `/v1/agents` lists *every* registered agent. Nothing filters
+  by harness, model, or provider.
+- The agent-to-agent methods live on the **shared `GenericAdapter`** every
+  harness subclasses (zoder, opencode, codex, claude, generic), so a zoder worker
+  and a claude worker use the *identical* call surface.
+- A URN carries only `kind:host:session` — peers discover each other's **model /
+  provider / capabilities** from the roster row, not from the message channel.
+- Consequence: a MiniMax (zoder) worker, an Anthropic (claude) worker, and an
+  OpenAI (codex) worker can all announce, poll, and coordinate in the same
+  topics. Isolation is **not** imposed at the harness layer.
+
+Guardrail: harness *execution* stays separate (codex/claude are not reachable via
+zoder — see `docs/decision-capacity-ledger-20261015.md`); only *communication*
+is shared.
+
 ## Not (yet) built — candidates if needed
 - Topic conventions doc + a typed message schema.
 - Advisory soft-locks ("claiming kind X on host Y") as messages.
