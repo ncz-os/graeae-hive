@@ -98,10 +98,9 @@ class CapacityLedger:
             return False, f"{service}: limited until {int(until - now)}s (rate/usage window)"
         if cap.slots is not None and self.in_flight.get(service, 0) >= cap.slots:
             return False, f"{service}: slots full ({self.in_flight.get(service, 0)}/{cap.slots})"
-        if cap.tpm is not None and est_tokens:
+        if cap.tpm is not None and est_tokens and self.tokens_used.get(service, 0) + est_tokens > cap.tpm:
             # admit only if the projected minute usage stays under the ceiling
-            if self.tokens_used.get(service, 0) + est_tokens > cap.tpm:
-                return False, f"{service}: token rate would exceed {cap.tpm}/min"
+            return False, f"{service}: token rate would exceed {cap.tpm}/min"
         if cap.credit_cap_usd is not None:
             projected = self.spent_usd.get(service, 0.0) + est_cost_usd * time_multiplier(service, now)
             if projected > cap.credit_cap_usd:

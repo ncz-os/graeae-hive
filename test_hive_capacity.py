@@ -14,7 +14,7 @@ from hive.bus.capacity import (
 
 def _ledger(**caps):
     led = CapacityLedger()
-    for name, c in caps.items():
+    for _name, c in caps.items():
         led.register(c)
     return led
 
