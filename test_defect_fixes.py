@@ -212,6 +212,11 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
 
+@unittest.skip(
+    "Bus bearer-token auth (require_bus_auth / browser sessions) is not "
+    "implemented on the argonas line — the fleet is local-LAN only and does not "
+    "require auth (operator 2026-10-15). These tests target the forge lineage."
+)
 class AuthTests(unittest.IsolatedAsyncioTestCase):
     async def _request(self, path, token=None, method="GET", cookie=None, call_next=None):
         headers = []
