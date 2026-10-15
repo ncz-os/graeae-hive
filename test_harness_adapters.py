@@ -46,18 +46,21 @@ class RegistryTests(unittest.TestCase):
                 self.assertEqual(adapter.capabilities().priority, priority)
 
     def test_codex_is_operator_gated(self):
-        # Disabled by default...
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("HARNESS_CODEX_AUTORUN", None)
-            self.assertFalse(is_harness_enabled("codex"))
-            self.assertNotIn("codex", list_enabled_harnesses())
-            self.assertFalse(get_harness_adapter("codex").is_enabled())
-            # ...enabled only with the explicit env.
-            os.environ["HARNESS_CODEX_AUTORUN"] = "1"
+        # Disabled by default and for every non-"1" value...
+        for value in (None, "0", "", "true", "yes", "1 "):
+            with self.subTest(value=value):
+                with mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop("HARNESS_CODEX_AUTORUN", None)
+                    if value is not None:
+                        os.environ["HARNESS_CODEX_AUTORUN"] = value
+                    self.assertFalse(is_harness_enabled("codex"))
+                    self.assertNotIn("codex", list_enabled_harnesses())
+                    self.assertFalse(get_harness_adapter("codex").is_enabled())
+        # ...enabled ONLY with the exact string "1".
+        with mock.patch.dict(os.environ, {"HARNESS_CODEX_AUTORUN": "1"}, clear=False):
             self.assertTrue(is_harness_enabled("codex"))
             self.assertIn("codex", list_enabled_harnesses())
             self.assertTrue(get_harness_adapter("codex").is_enabled())
-            os.environ.pop("HARNESS_CODEX_AUTORUN", None)
 
     def test_unknown_kind_raises_keyerror(self):
         with self.assertRaises(KeyError):
@@ -103,7 +106,7 @@ class BusProtocolTests(unittest.TestCase):
     def test_claim_maps_204_to_none(self):
         adapter, rec = self._adapter(responses={"POST": (204, None)})
         self.assertIsNone(adapter.claim("urn:agent:zoder:h:s"))
-        self.assertIn("?agent_urn=urn:agent:zoder:h:s", rec.calls[0][1])
+        self.assertIn("?agent_urn=urn%3Aagent%3Azoder%3Ah%3As", rec.calls[0][1])
 
     def test_complete_and_fail_patch_job(self):
         adapter, rec = self._adapter()
@@ -131,6 +134,32 @@ class BusProtocolTests(unittest.TestCase):
         adapter._executor = executor
         self.assertEqual(adapter.execute("urn:x", {"id": "job"}), {"summary": "ran"})
         self.assertEqual(seen, {"urn": "urn:x", "job": {"id": "job"}})
+
+    def test_register_auth_method_derived_from_auth_scheme(self):
+        # claude is oauth -> "subscription"; bearer/api_key -> "api".
+        cases = {"zoder": "api", "opencode": "api", "claude": "subscription", "codex": "api"}
+        for kind, expected in cases.items():
+            with self.subTest(kind=kind):
+                adapter, rec = self._adapter(kind, responses={"POST": (200, {"urn": "u"})})
+                adapter.register(HarnessRegistration(harness_kind=kind, harness_version="1"))
+                self.assertEqual(rec.calls[0][2]["auth_method"], expected)
+
+    def test_claim_url_encodes_urn(self):
+        adapter, rec = self._adapter(responses={"POST": (204, None)})
+        adapter.claim("urn:agent:zoder:h:s")
+        self.assertIn("agent_urn=urn%3Aagent%3Azoder%3Ah%3As", rec.calls[0][1])
+
+    def test_heartbeat_accepts_204_empty_body(self):
+        adapter, _ = self._adapter(responses={"POST": (204, None)})
+        self.assertEqual(adapter.heartbeat("urn:x", {"status": "online"}), {})
+
+    def test_status_lists_and_filters_by_urn(self):
+        adapter, rec = self._adapter(
+            responses={"GET": (200, {"agents": [{"urn": "a"}, {"urn": "b"}]})}
+        )
+        self.assertEqual(adapter.status("b"), {"urn": "b"})
+        self.assertEqual(adapter.status("absent"), {})
+        self.assertIn("include_offline=true", rec.calls[0][1])
 
 
 if __name__ == "__main__":

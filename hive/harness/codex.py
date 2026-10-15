@@ -1,8 +1,12 @@
 """CodexAdapter — priority 2 (secondary/escalation only).
 
-Operator-gated: CLAUDE.md 2026-10-10 says codex must NEVER auto-run. The adapter
-is registered so operators can debug it, but ``is_enabled()`` is False unless
-``HARNESS_CODEX_AUTORUN=1`` is explicitly set in the environment.
+Operator-gated: CLAUDE.md 2026-10-10 says codex must NEVER auto-run.
+
+Gate semantics (unambiguous): ``HARNESS_CODEX_AUTORUN`` is a POSITIVE opt-in
+named for the action it enables. The adapter is DISABLED unless the variable is
+exactly the string ``"1"``. Unset, ``"0"``, ``""``, ``"true"``, ``"yes"`` — all
+mean disabled. This is the safe default: nothing enables codex by accident, and
+an operator must deliberately set ``HARNESS_CODEX_AUTORUN=1`` to turn it on.
 """
 
 from __future__ import annotations

@@ -19,12 +19,22 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
 from hive.harness.base import HarnessCapabilities, HarnessRegistration
 
 DEFAULT_BUS_URL = "http://127.0.0.1:5005"
+
+# Map the adapter auth_scheme vocabulary onto the bus's AUTH_METHODS
+# ({"subscription","api","free","unknown"}). See agent_bus.AUTH_METHODS.
+_AUTH_METHOD_MAP: dict[str, str] = {
+    "bearer": "api",  # pay-per-token
+    "api_key": "api",
+    "oauth": "subscription",  # OAuth subscription (e.g. Claude Pro)
+    "none": "free",
+}
 
 # transport(method, url, token, body) -> (status_code, parsed_json_or_None)
 Transport = Callable[[str, str, str | None, dict | None], tuple[int, dict | None]]
@@ -90,6 +100,10 @@ class GenericAdapter:
         """Whether this harness may run. Default True; codex overrides."""
         return True
 
+    def auth_method(self) -> str:
+        """Bus AUTH_METHODS value for this adapter (derived from auth_scheme)."""
+        return _AUTH_METHOD_MAP.get(self.auth_scheme, "unknown")
+
     # -- transport ------------------------------------------------------------
 
     def _call(
@@ -111,7 +125,7 @@ class GenericAdapter:
                 | frozenset(registration.capabilities)
             ),
             "cost_tier": registration.cost_tier,
-            "auth_method": "api",
+            "auth_method": self.auth_method(),
             "metadata": registration.metadata,
         }
         status, resp = self._call("POST", "/v1/agents/register", body)
@@ -123,10 +137,10 @@ class GenericAdapter:
         return str(resp["urn"])
 
     def heartbeat(self, urn: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """POST /v1/agents/heartbeat."""
+        """POST /v1/agents/heartbeat. A 200-with-body or 204-empty both succeed."""
         body = {"urn": urn, **payload}
         status, resp = self._call("POST", "/v1/agents/heartbeat", body)
-        if status != 200:
+        if status not in (200, 204):
             raise RuntimeError(f"heartbeat failed for {urn!r}: status={status}")
         return resp or {}
 
@@ -138,7 +152,8 @@ class GenericAdapter:
         by the default transport.
         """
         _ = jobs
-        status, resp = self._call("POST", f"/v1/jobs/next?agent_urn={urn}")
+        q = urllib.parse.quote(urn, safe="")
+        status, resp = self._call("POST", f"/v1/jobs/next?agent_urn={q}")
         if status == 204 or not resp:
             return None
         if status != 200:
@@ -177,8 +192,15 @@ class GenericAdapter:
             raise RuntimeError(f"fail-report failed for {job_id!r}: status={status}")
 
     def status(self, urn: str) -> dict[str, Any]:
-        """GET-style status: reuses /v1/agents?urn=<urn> listing."""
-        status, resp = self._call("GET", f"/v1/agents?urn={urn}")
-        if status != 200:
+        """Return this agent's row (model/provider/caps/last_heartbeat/...).
+
+        The bus has no single-agent GET (``/v1/agents`` takes filters but not
+        ``urn``), so list agents and match client-side. Absent ⇒ {}.
+        """
+        status, resp = self._call("GET", "/v1/agents?include_offline=true")
+        if status not in (200, 204):
             raise RuntimeError(f"status failed for {urn!r}: status={status}")
-        return resp or {}
+        for agent in (resp or {}).get("agents", []):
+            if agent.get("urn") == urn:
+                return agent
+        return {}

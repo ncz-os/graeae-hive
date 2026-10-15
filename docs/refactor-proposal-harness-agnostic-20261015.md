@@ -98,7 +98,7 @@ async variant; deferred to Phase D.
 
 - **B1:** `hive/harness/zoder.py` — ZoderAdapter (priority 0; 15 caps) ✓
 - **B2:** `hive/harness/opencode.py` — OpenCodeAdapter (priority 1; 12 caps) ✓
-- **B3:** `hive/harness/codex.py` — CodexAdapter (priority 2; `is_enabled()` gated by `HARNESS_CODEX_AUTORUN=1`) ✓
+- **B3:** `hive/harness/codex.py` — CodexAdapter (priority 2; `is_enabled()` is **False by default**, requires the explicit positive opt-in `HARNESS_CODEX_AUTORUN=1`) ✓
 - **B4:** `hive/harness/claude.py` — ClaudeAdapter (priority 3; `auth_scheme=oauth`, `cost_tier=subscription`) ✓
 - **B5:** `hive/harness/generic.py` — GenericAdapter (priority 99; base for all) ✓
 - **B-tests:** `test_harness_adapters.py` — 12 tests (priority order, codex gate, transport injection, method→HTTP mapping) ✓
