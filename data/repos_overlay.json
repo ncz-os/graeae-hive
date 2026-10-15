@@ -1,0 +1,176 @@
+{
+  "_meta": {
+    "description": "Curated overlay merged onto discovered registry facts. Only authorship knowledge lives here (live host, build/test commands, required MNEMOS queries, deps, notes). Everything discoverable (forges, ARGONAS presence, Buildkite pipelines, R2 buckets) is NOT duplicated here.",
+    "last_curated": "2026-10-15"
+  },
+  "repos": {
+    "graeae-hive-mind": {
+      "display_name": "GRAEAE Hive Mind",
+      "aliases": ["hive", "hive-mind", "agent-bus", "graeae-hive"],
+      "language": "python",
+      "owner": "ncz-os",
+      "status": "active",
+      "live": [{"host": "pythia", "path": "/srv/agent-bus", "service": "graeae-hive.service"}],
+      "commands": {
+        "test": "python3 -m unittest test_defect_fixes test_harness_adapters test_queue_logic",
+        "lint": "ruff check --fix && ruff format"
+      },
+      "deps": ["mnemos", "graeae"],
+      "mnemos": {
+        "required": true,
+        "tags": ["graeae-hive", "hive-mind"],
+        "queries": ["graeae-hive-mind architecture job lifecycle", "hive harness-agnostic refactor"]
+      },
+      "notes": "The bus. Live PYTHIA :5005 via /srv/agent-bus; 10-min auto-commit daemon pushes HEAD:master; backend=oracle. Deploy: ff /srv/agent-bus to origin/master + restart graeae-hive.service."
+    },
+    "mnemos": {
+      "display_name": "MNEMOS",
+      "aliases": ["mnemos-production", "mnemos-api"],
+      "language": "python",
+      "owner": "ncz-os",
+      "status": "active",
+      "live": [{"host": "pythia", "path": "(container)", "service": "mnemos-api"}],
+      "deps": [],
+      "mnemos": {
+        "required": true,
+        "tags": ["mnemos"],
+        "queries": ["mnemos architecture providers persistence", "mnemos memory schema"]
+      },
+      "notes": "Cross-session memory authority, :5002. Backends: PostgreSQL + Oracle 23ai + SQLite edge replicas. Hot dev branch feat/db2-native. R2 bucket 'mnemos' backs StyX."
+    },
+    "graeae": {
+      "display_name": "GRAEAE consensus",
+      "language": "python",
+      "owner": "ncz-os",
+      "status": "active",
+      "live": [{"host": "pythia", "path": "(container)", "service": "mnemos-api"}],
+      "deps": ["mnemos"],
+      "mnemos": {
+        "required": true,
+        "tags": ["graeae"],
+        "queries": ["graeae consensus consultation engine", "graeae provider budget pricing"]
+      },
+      "notes": "Multi-LLM consensus PYTHIA :5002/v1/consultations + PANTHEON router. Provider rates come from each provider's own TOML block."
+    },
+    "riskyeats": {
+      "display_name": "RiskyEats",
+      "language": "python",
+      "owner": "argonautsystems",
+      "status": "active",
+      "live": [{"host": "argos", "path": "/mnt/argonas/datapool/projects/riskyeats", "service": "render+cron"}],
+      "commands": {"test": "affected tests + preflight dimensions + zoder approval"},
+      "deps": [],
+      "mnemos": {
+        "required": true,
+        "tags": ["riskyeats"],
+        "queries": ["riskyeats pipeline render publish", "riskyeats dbpr stall gate"]
+      },
+      "notes": "ARGOS production: ONE heavy Python job max; never git add -A; do not commit from pipeline runners. Never use gold_master* or RiskyEats_Pipeline (retired)."
+    },
+    "ic-engine": {
+      "display_name": "ic-engine",
+      "language": "python",
+      "owner": "argonautsystems",
+      "status": "active",
+      "live": [{"host": "typhon", "path": "(container)", "service": "ic-engine"}],
+      "deps": ["mnemos-ic-runtime", "clio", "InvestorClaw"],
+      "mnemos": {"required": true, "tags": ["ic-engine", "investorclaw"], "queries": ["ic-engine investorclaw pipeline"]},
+      "notes": "Live TYPHON ic-engine container. clio is a PRIVATE dep (needs CI_JOB_TOKEN for gitlab pulls)."
+    },
+    "InvestorClaw": {
+      "display_name": "InvestorClaw (umbrella)",
+      "owner": "argonautsystems",
+      "status": "active",
+      "deps": [],
+      "mnemos": {"required": true, "tags": ["investorclaw"], "queries": ["InvestorClaw umbrella read-only"]},
+      "notes": "HAND-AUTHORED — read-only for agents (CLAUDE.md directive 6)."
+    },
+    "zeroclaw": {
+      "display_name": "zeroclaw",
+      "aliases": ["zc", "zeroclaw-contrib"],
+      "language": "rust",
+      "owner": "zeroclaw-labs",
+      "status": "active",
+      "commands": {"build": "cargo build --release", "test": "cargo test", "lint": "cargo fmt --all"},
+      "deps": [],
+      "mnemos": {"required": true, "tags": ["zeroclaw", "zoder"], "queries": ["zoder zeroclaw engine routing", "zeroclaw WSS gateway"]},
+      "notes": "Primary engine behind zoder. Anthropic forbidden as provider in this stack. Builds on a build host, never STUDIO."
+    },
+    "zoder": {
+      "display_name": "zoder",
+      "language": "rust",
+      "owner": "ncz-os",
+      "status": "active",
+      "commands": {"build": "cargo build --release", "test": "cargo test", "lint": "cargo fmt --all"},
+      "deps": ["zeroclaw"],
+      "mnemos": {"required": true, "tags": ["zoder"], "queries": ["zoder config routes providers", "zoder review paid gate"]},
+      "notes": "Fleet's long-range coding tool + adversarial reviewer. FIXES to zoder are authored by opencode, built on a build host, reviewed by zoder before MR. zoder never authors its own fixes."
+    },
+    "fleet-config": {
+      "display_name": "fleet-config",
+      "aliases": ["gitops", "fleet-ops"],
+      "owner": "ncz-os",
+      "status": "active",
+      "deps": [],
+      "mnemos": {"required": true, "tags": ["fleet-config", "gitops"], "queries": ["fleet zoder-config routes providers", "gitops fleet opencode-config"]},
+      "notes": "FleetOps: gitops/fleet/zoder-config/, gitops/fleet/opencode-config/. REDACT credentials; inject into live host config only."
+    },
+    "pi-gen": {
+      "display_name": "pi-gen",
+      "language": "bash",
+      "owner": "ncz-os",
+      "status": "active",
+      "live": [{"host": "argos", "path": "/mnt/argonas/datapool/projects/pi-gen-nclawzero"}],
+      "deps": [],
+      "mnemos": {"required": true, "tags": ["pi-gen", "yocto"], "queries": ["pi-gen nclawzero image build", "cixmini image build"]},
+      "notes": "Builds on ARGOS only. Never build images on STUDIO."
+    },
+    "meta-cix": {
+      "display_name": "meta-cix (Yocto)",
+      "aliases": ["meta-nclawzero", "meta-base", "nclawzero-yocto"],
+      "owner": "ncz-os",
+      "status": "active",
+      "live": [{"host": "argos", "path": "/mnt/argonas/datapool/projects/nclawzero-yocto"}],
+      "deps": [],
+      "mnemos": {"required": true, "tags": ["yocto", "cix", "npu"], "queries": ["cixmini yocto BSP cix-npu-kmd", "CIX Sky1 NPU runtime gates"]},
+      "notes": "Yocto/kernel builds on ARGOS only — never oversubscribe ARGOS. Kernelwatch rules apply."
+    },
+    "clio": {
+      "display_name": "clio",
+      "owner": "ncz-os",
+      "visibility": "private",
+      "status": "active",
+      "deps": [],
+      "mnemos": {"required": false, "tags": ["clio"]},
+      "notes": "PRIVATE dep of ic-engine — needs CI_JOB_TOKEN for gitlab pulls."
+    },
+    "mnemos-rs": {
+      "display_name": "mnemos-rs",
+      "language": "rust",
+      "owner": "ncz-os",
+      "status": "active",
+      "commands": {"build": "cargo build --release", "test": "cargo test", "lint": "cargo fmt --all"},
+      "deps": [],
+      "mnemos": {"required": false, "tags": ["mnemos-rs"]},
+      "notes": "Heavy Rust builds go to a build host (ULTRA arm64 / x86 pool), never STUDIO."
+    },
+    "nclawzero-debs": {
+      "display_name": "nclawzero debs",
+      "aliases": ["debs"],
+      "owner": "ncz-os",
+      "status": "active",
+      "live": [{"host": "argos", "path": "/mnt/argonas/datapool/projects/nclawzero-debs"}],
+      "deps": [],
+      "mnemos": {"required": false, "tags": ["nclawzero-debs"], "queries": ["ncz-apt R2 bucket debs"]},
+      "notes": "Internal apt staging → R2 bucket 'ncz-apt'."
+    },
+    "fleet-auth": {
+      "display_name": "fleet-auth",
+      "owner": "ncz-os",
+      "status": "active",
+      "deps": [],
+      "mnemos": {"required": false, "tags": ["fleet-auth"]},
+      "notes": "root-owned; sshpass+root for push."
+    }
+  }
+}

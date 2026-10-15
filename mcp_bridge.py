@@ -303,6 +303,30 @@ async def handle_list_tools() -> list[Tool]:
                               "limit": {"type": "integer", "default": 10},
                               "min_score": {"type": "number"},
                           }, "required": ["query"]}),
+        # ---- repo registry (project catalog) ----
+        Tool(name="hive_repo_list",
+             description="List repos in the Hive project registry (built from GitLab/GitHub/ARGONAS/Buildkite/R2). Filter by status/language/owner/tag/source; pass host for per-host load instructions.",
+             inputSchema={"type": "object", "properties": {
+                 "status": {"type": "string"},
+                 "language": {"type": "string"},
+                 "owner": {"type": "string"},
+                 "tag": {"type": "string"},
+                 "source": {"type": "string", "description": "gitlab/github/argonas/buildkite/overlay"},
+                 "host": {"type": "string"},
+             }}),
+        Tool(name="hive_repo_get",
+             description="Get one repo: location, remotes, forges, Buildkite pipeline, per-host load recipe (pass host), and the REQUIRED MNEMOS queries.",
+             inputSchema={"type": "object", "properties": {
+                 "repo_id": {"type": "string"},
+                 "host": {"type": "string"},
+             }, "required": ["repo_id"]}),
+        Tool(name="hive_repo_context",
+             description="Full project awareness in one call: a repo's location/load recipe PLUS the results of its REQUIRED MNEMOS memory searches. Run this BEFORE working any project.",
+             inputSchema={"type": "object", "properties": {
+                 "repo_id": {"type": "string"},
+                 "host": {"type": "string"},
+                 "mnemos_limit": {"type": "integer", "default": 5},
+             }, "required": ["repo_id"]}),
         Tool(name="mnemos_memory_create",
              description="Save a memory to MNEMOS. Category: infrastructure/solutions/patterns/decisions/projects/standards.",
              inputSchema={"type": "object",
@@ -381,6 +405,26 @@ async def handle_call_tool(
             r = await _hive("POST", "/v1/messages", json=args)
         elif name == "hive_message_list":
             r = await _hive("GET", "/v1/messages", params={k: v for k, v in args.items() if v})
+        elif name == "hive_repo_list":
+            r = await _hive("GET", "/v1/repos", params={k: v for k, v in args.items() if v})
+        elif name == "hive_repo_get":
+            rid = args["repo_id"]
+            params = {k: v for k, v in args.items() if k != "repo_id" and v}
+            r = await _hive("GET", f"/v1/repos/{rid}", params=params)
+        elif name == "hive_repo_context":
+            rid = args["repo_id"]
+            host = args.get("host")
+            limit = args.get("mnemos_limit", 5)
+            repo = await _hive("GET", f"/v1/repos/{rid}", params={"host": host} if host else {})
+            queries = (repo or {}).get("required_mnemos_queries") or []
+            memory: list[dict[str, Any]] = []
+            for q in queries:
+                try:
+                    hits = await _mnemos("POST", "/v1/memories/search", json={"query": q, "limit": limit})
+                    memory.append({"query": q, "results": hits})
+                except Exception as e:  # noqa: BLE001 - surface, don't fail the whole context
+                    memory.append({"query": q, "error": str(e)})
+            r = {"repo": repo, "required_mnemos_queries": queries, "mnemos": memory}
         elif name == "mnemos_memory_search":
             r = await _mnemos("POST", "/v1/memories/search", json=args)
         elif name == "mnemos_memory_create":
