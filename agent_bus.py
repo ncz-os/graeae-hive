@@ -3377,7 +3377,7 @@ async def dequeue_next_job(agent_urn: str):
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute(
                 "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-                "auth_method, plan_cap_usd, plan_period_used_usd, status "
+                "auth_method, plan_cap_usd, plan_period_used_usd, status, current_load "
                 "FROM agents WHERE urn=?",
                 (agent_urn,),
             ) as cur:
@@ -3398,6 +3398,7 @@ async def dequeue_next_job(agent_urn: str):
                 a_cap,
                 a_used,
                 agent_status,
+                agent_current_load,
             ) = agent_row
             if agent_status not in ACTIVE_AGENT_STATUSES:
                 await db.execute("ROLLBACK")
@@ -3479,24 +3480,33 @@ async def dequeue_next_job(agent_urn: str):
                 (agent_urn, now, CLAIM_SCAN_WINDOW),
             ) as cur:
                 candidates = [tuple(r) async for r in cur]
-            candidates = [
-                r
-                for _idx, r in sorted(
-                    enumerate(candidates),
-                    key=lambda item: (
-                        item[1][5] or 0,
-                        job_agent_preference_score(
-                            {
-                                "preferred_providers": json_list(item[1][12]),
-                                "preferred_models": json_list(item[1][13]),
-                            },
-                            agent,
-                        ),
-                        -item[0],
-                    ),
-                    reverse=True,
-                )
+            # Role-aware ordering — hive.scheduler is the single source of
+            # truth for role resolution + candidate scoring (build-required
+            # jobs prefer build-role workers and vice-versa, then
+            # utilization/deficit/age, deterministic id tie-break).
+            worker_profile = sched.worker_profile_from_metadata(
+                urn=agent_urn,
+                host=agent_host,
+                capabilities=agent_caps,
+                current_load=(
+                    json.loads(agent_current_load) if agent_current_load else None
+                ),
+            )
+            _job_dicts = [
+                {
+                    "id": r[0],
+                    "submitter_urn": r[1],
+                    "kind": r[3],
+                    "priority": r[5],
+                    "required_capabilities": json_list(r[7]),
+                }
+                for r in candidates
             ]
+            _ordered = sched.order_candidates_for_worker(
+                candidates=_job_dicts, worker=worker_profile, now=now
+            )
+            _by_id = {r[0]: r for r in candidates}
+            candidates = [_by_id[d["id"]] for d in _ordered]
 
             claimed = None
             for r in candidates:
