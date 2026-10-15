@@ -35,6 +35,9 @@ data/ docs/ migrations/ scripts/
 ```
 pyproject.toml               project metadata, ruff + pytest config, entrypoints
 hive/
+  core/                      NEW (see docs/analysis-mnemos-reuse-20261015.md)
+    config.py                typed get_settings() — replaces 106 scattered os.environ reads
+    secrets.py               credential-shape detection (adapted from MNEMOS)
   bus/                       the FastAPI app, decomposed
     app.py                   create_app() + lifespan
     routers/                 agents.py jobs.py messages.py schedules.py
@@ -72,6 +75,10 @@ scripts/                     build_repo_registry.py
   (currently 58 ran / 13 fail / 28 error per session notes — make it green or
   document each failure with a tracking note).
 - **0c** Move root `test_*.py` → `tests/`; fix imports; wire `pytest`.
+- **0d** `hive/core/`: typed `get_settings()` (pydantic-settings + TOML)
+  replacing the 106 scattered `os.environ` reads; `secrets.py` credential
+  detection; `_coerce_text` CLOB helper. Adapted from MNEMOS —
+  see `docs/analysis-mnemos-reuse-20261015.md`.
 
 ### Phase 1 — Decompose `agent_bus.py`
 - **1a** Extract pure domain logic (eligibility, routing, cost, validation) into
