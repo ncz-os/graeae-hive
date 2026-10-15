@@ -218,7 +218,7 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         if _needs_llm and not any(c.startswith("llm-") for c in agent_caps):
             return (
                 False,
-                "agent has no live llm-* provider capability (kind %s needs an LLM)" % j_kind,
+                f"agent has no live llm-* provider capability (kind {j_kind} needs an LLM)",
             )
 
     job_max_tier = (job.get("max_cost_tier") or "B").upper()
