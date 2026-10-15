@@ -36,6 +36,8 @@ from typing import Any
 import httpx
 import uvicorn
 
+from hive.core.roles import ORCHESTRATOR_RUNTIMES
+
 try:
     MCP_VERSION = version("mcp")
 except PackageNotFoundError as exc:
@@ -193,10 +195,8 @@ async def _hive(method: str, path: str, *, admin_authorized: bool = False, **kw)
     registering_orchestrator = (
         path == "/v1/agents/register"
         and isinstance(body, dict)
-        and str(body.get("runtime") or body.get("kind") or "").lower() in {
-            "claude-code", "claude-cli", "claude", "human", "mnemos",
-            "doctor", "dream-walker", "unknown",
-        }
+        and str(body.get("runtime") or body.get("kind") or "").lower()
+        in ORCHESTRATOR_RUNTIMES  # shared with agent_bus (hive.core.roles)
     )
     if registering_orchestrator and not admin_authorized:
         raise PermissionError("administrator MCP bridge credential required for orchestrator registration")

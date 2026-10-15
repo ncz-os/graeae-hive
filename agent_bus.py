@@ -35,6 +35,7 @@ from sse_starlette.sse import EventSourceResponse
 import queue_logic
 import retry_policy
 from hive import repos as repo_registry
+from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
@@ -843,28 +844,9 @@ ACTIVE_AGENT_STATUSES = {"online", "idle"}
 # ROLE SPLIT (user directive 2026-05-23): opencode + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
 # Orchestrators include a distinct Codex role. Ordinary Codex workers stay claim-only.
-WORKER_ONLY_RUNTIMES: set[str] = {
-    "opencode",
-    "opencode-cli",
-    "codex",
-    "codex-cli",
-    "hermes",
-    "zeroclaw",
-    "openclaw",
-    "ic-engine",
-    "system",  # fleet hosts (system-watcher daemons) — sensors + optional build/ci workers, never submitters
-}
-ORCHESTRATOR_RUNTIMES: set[str] = {
-    "claude-code",
-    "claude-cli",
-    "claude",
-    "codex-orchestrator",
-    "human",
-    "mnemos",
-    "doctor",  # PYTHIA triage authority — submits codex sub-jobs + auto-triage
-    "dream-walker",  # zeropi Dream Walker — dispatches hourly analysis jobs
-    "unknown",
-}
+# WORKER_ONLY_RUNTIMES / ORCHESTRATOR_RUNTIMES now live in hive.core.roles
+# (single source of truth, shared with mcp_bridge.py). Imported above.
+
 
 # HOST AFFINITY — automatic eligible_hosts injection based on job kind prefix.
 # When a job kind matches a prefix, the server adds eligible_hosts if not already set.
@@ -1402,7 +1384,8 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
     ("deepseek-direct", "deepseek-v4-flash"): (0.14, 0.28),
     ("deepseek-direct", "*"): (0.435, 0.87),
     ("deepseek", "*"): (0.435, 0.87),
-    ("together", "minimax-m2.7"): (0.40, 1.20),
+    ("minimax", "minimax-m3"): (0.40, 1.20),  # MiniMax DIRECT (api.minimax.io) — never via together
+    ("minimax", "*"): (0.40, 1.20),
     ("together", "deepseek-v4-pro"): (2.10, 4.40),
     ("together", "kimi-k2.6"): (1.20, 4.40),
     ("together", "glm-3.5-90"): (0.10, 0.15),
@@ -4845,7 +4828,7 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
             "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
             "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
             "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
-            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_together%' THEN 'together' "
+            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_minimax%' THEN 'minimax' "
             "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
             "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
             "ELSE COALESCE(claimed_provider,'unknown') END"
@@ -4935,9 +4918,9 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     # deepseek-direct's two aliases hive_deepseek_1/hive_deepseek_pro_1 are
     # struck below, not just disabled).
     {
-        "provider": "together",
-        "model": "minimax-m2.7",
-        "alias": "hive_together_1",
+        "provider": "minimax",  # MiniMax DIRECT (operator 2026-10-15: never via together)
+        "model": "minimax-m3",
+        "alias": "hive_minimax_1",
         "tier": "B",
     },
     {"provider": "xai", "model": "grok-4.1-fast", "alias": "hive_xai_1", "tier": "B"},
@@ -5160,7 +5143,7 @@ async def knemon_route(req: Request):
         # driver AND $0. deepseek/nova/grok follow. (NGC nemotron stays as the
         # ngc-review CLI's direct-prompt reviewer, separate from this chain.)
         # ngc/EIH removed 2026-06-17. Open-weight lineup leads (cheap flash first;
-        # minimax via hive_together_1 kept in chain -> promote to lead once the
+        # minimax is DIRECT (hive_minimax_1); never via together (operator 2026-10-15).
         # direct $200 MiniMax key is wired into the .4 gateway alias).
         if review_kind:
             METERED_FALLBACK = ["hive_groq_3", "hive_xai_1"]
@@ -5171,7 +5154,7 @@ async def knemon_route(req: Request):
         else:
             # General coding rotation (operator 2026-09-07: deepseek-flash lead
             # struck, forbidden fleet-wide). groq qwen3 (fast coder) leads, then
-            # groq gpt-oss-120b, grok funded tail. MiniMax (hive_together_1)
+            # groq gpt-oss-120b, grok funded tail. MiniMax (hive_minimax_1, direct)
             # REMOVED from the fleet chain -- reserved for the sole MiniMax
             # builder (minos) via the host override below.
             METERED_FALLBACK = ["hive_groq_2", "hive_groq_3", "hive_xai_1"]
@@ -5179,7 +5162,7 @@ async def knemon_route(req: Request):
         # MiniMax ($200 plan key, TPM-limited @ 1 worker). Everyone else rotates
         # the open-weight lineup above.
         if "minos" in host and not review_kind:
-            METERED_FALLBACK = ["hive_together_1", "hive_groq_2"]
+            METERED_FALLBACK = ["hive_minimax_1", "hive_groq_2"]
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
