@@ -37,9 +37,6 @@ from hive.persistence.oracle import (
     _ORACLE_REQUIRED_JOB_COLUMNS,
     OracleHiveRepository,
 )
-from hive.persistence.oracle import (
-    _translate_sql as _translate_oracle_sql,
-)
 from hive.persistence.sqlite import SqliteHiveRepository
 
 
@@ -802,12 +799,9 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("MERGE INTO hive_cache", cache_sql)
 
     async def test_admin_requeue_clears_stale_execution_and_result_fields(self):
-        seen = []
+        captured = {}
 
-        class Cursor:
-            def __init__(self, row=None):
-                self.row = row
-
+        class _Cursor:
             async def __aenter__(self):
                 return self
 
@@ -815,53 +809,50 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             async def fetchone(self):
-                return self.row
+                return ("failed",)
 
-        class Db:
+        class _Tx:
             def execute(self, sql, params=None):
-                seen.append((sql, tuple(params or ())))
-                cursor = Cursor(("failed",) if sql.startswith("SELECT status") else None)
-                if sql.startswith("SELECT status"):
-                    return cursor
-
-                async def executed():
-                    return cursor
-
-                return executed()
+                return _Cursor()
 
             async def commit(self):
                 return None
 
-        @asynccontextmanager
-        async def connection():
-            yield Db()
+        class _Repo:
+            def connection(self):
+                @asynccontextmanager
+                async def _c():
+                    yield _Tx()
 
-        with mock.patch.object(hive_admin_router, "connect_db", connection):
+                return _c()
+
+            async def patch_job_status(self, tx, job_id, *, sets):
+                captured["job_id"] = job_id
+                captured["sets"] = sets
+                return 1
+
+        with mock.patch.object(hive_admin_router, "hive_repo", lambda: _Repo()):
             result = await agent_bus.admin_requeue_jobs(
                 agent_bus.RequeueRequest(job_ids=["job-1"]),
             )
         self.assertEqual(result["ok"], ["job-1"])
-        update = next(sql for sql, _params in seen if sql.lstrip().startswith("UPDATE jobs"))
-        for fragment in (
-            "ended_at=NULL",
-            "result=NULL",
-            "claimed_runtime=NULL",
-            "claimed_host_caps=NULL",
-            "claim_lease_expires_at=NULL",
-            "tokens_in=NULL",
-            "tokens_out=NULL",
-            "estimated_cost_usd=NULL",
-            "result_mnemos_id=NULL",
+        sets = captured["sets"]
+        # stale execution + result fields are cleared (None -> SQL NULL)
+        for col in (
+            "ended_at",
+            "result",
+            "claimed_runtime",
+            "claimed_host_caps",
+            "claim_lease_expires_at",
+            "tokens_in",
+            "tokens_out",
+            "estimated_cost_usd",
+            "result_mnemos_id",
         ):
-            self.assertIn(fragment, update)
-        oracle_sql, oracle_params = _translate_oracle_sql(update, seen[-1][1])
-        db2_sql, db2_params = _adapt_sql(update, seen[-1][1])
-        self.assertIn("UPDATE hive_jobs", oracle_sql)
-        self.assertIn(":1", oracle_sql)
-        self.assertEqual(oracle_params, seen[-1][1])
-        self.assertIn("UPDATE hive_jobs", db2_sql)
-        self.assertIn("?", db2_sql)
-        self.assertEqual(db2_params, seen[-1][1])
+            self.assertIn(col, sets)
+            self.assertIsNone(sets[col])
+        self.assertEqual(sets["status"], "queued")
+        self.assertEqual(sets["retry_count"], 0)
 
     async def test_admin_requeue_resets_real_default_sqlite_row(self):
         with tempfile.TemporaryDirectory() as td:
@@ -890,7 +881,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                     ),
                 )
                 await db.commit()
-            with mock.patch.object(hive_admin_router, "connect_db", repo.connection):
+            with mock.patch.object(hive_admin_router, "hive_repo", lambda: repo):
                 result = await agent_bus.admin_requeue_jobs(
                     agent_bus.RequeueRequest(job_ids=["job-real"]),
                 )

@@ -16,6 +16,7 @@ from hive.bus.deps import (
     _cascade_delete_jobs,
     connect_db,
     emit_event,
+    hive_repo,
     require_mutation_actor,
 )
 from hive.bus.schemas import (
@@ -37,9 +38,10 @@ RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
 async def admin_requeue_jobs(req: RequeueRequest):
     """Force-requeue terminal (failed/cancelled) or any non-done jobs back to queued."""
     results = {"ok": [], "not_found": [], "skipped_done": []}
-    async with connect_db() as db:
+    # Storage via the HiveMindRepository ABC on one transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
         for job_id in req.job_ids:
-            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+            async with tx.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -47,20 +49,31 @@ async def admin_requeue_jobs(req: RequeueRequest):
             if row[0] == "done":
                 results["skipped_done"].append(job_id)
                 continue
-            await db.execute(
-                """UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL,
-                   ended_at=NULL, result=NULL,
-                   claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL,
-                   claimed_cost_tier=NULL, claimed_host_caps=NULL,
-                   claim_lease_expires_at=NULL,
-                   tokens_in=NULL, tokens_out=NULL, estimated_cost_usd=NULL,
-                   result_mnemos_id=NULL,
-                   retry_count=0, retry_backoff_until=NULL
-                   WHERE id=?""",
-                (job_id,),
+            await hive_repo().patch_job_status(
+                tx,
+                job_id,
+                sets={
+                    "status": "queued",
+                    "claimed_by": None,
+                    "claimed_at": None,
+                    "ended_at": None,
+                    "result": None,
+                    "claimed_runtime": None,
+                    "claimed_model": None,
+                    "claimed_provider": None,
+                    "claimed_cost_tier": None,
+                    "claimed_host_caps": None,
+                    "claim_lease_expires_at": None,
+                    "tokens_in": None,
+                    "tokens_out": None,
+                    "estimated_cost_usd": None,
+                    "result_mnemos_id": None,
+                    "retry_count": 0,
+                    "retry_backoff_until": None,
+                },
             )
-            await db.commit()
             results["ok"].append(job_id)
+        await tx.commit()
     return results
 
 
@@ -251,9 +264,10 @@ async def admin_reclassify_jobs(req: ReclassifyRequest):
     if req.status not in RECLASSIFY_ALLOWED_TARGETS:
         raise HTTPException(422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}")
     results: dict = {"ok": [], "not_found": [], "skipped_done": []}
-    async with connect_db() as db:
+    # Storage via the HiveMindRepository ABC on one transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
         for job_id in req.job_ids:
-            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
+            async with tx.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -263,23 +277,24 @@ async def admin_reclassify_jobs(req: ReclassifyRequest):
                 continue
             if req.status == "queued":
                 # full requeue semantics (reset claim + retry/backoff)
-                await db.execute(
-                    "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
-                    "retry_count=0, retry_backoff_until=NULL WHERE id=?",
-                    (job_id,),
-                )
+                sets = {
+                    "status": "queued",
+                    "claimed_by": None,
+                    "claimed_at": None,
+                    "retry_count": 0,
+                    "retry_backoff_until": None,
+                }
             else:
-                await db.execute(
-                    "UPDATE jobs SET status=?, claimed_by=NULL, claimed_at=NULL WHERE id=?",
-                    (req.status, job_id),
-                )
-            await db.commit()
+                sets = {"status": req.status, "claimed_by": None, "claimed_at": None}
+            await hive_repo().patch_job_status(tx, job_id, sets=sets)
             results["ok"].append(job_id)
-    async with connect_db() as event_db:
+        await tx.commit()
+    async with hive_repo().connection() as event_tx:
         for job_id in results["ok"]:
             await emit_event(
-                event_db,
+                event_tx,
                 "job.reclassified",
                 {"id": job_id, "new_status": req.status, "reason": req.reason},
             )
+        await event_tx.commit()
     return results
