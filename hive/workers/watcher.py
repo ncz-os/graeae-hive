@@ -41,6 +41,7 @@ HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 CLAIM_JOBS = os.environ.get("CLAIM_JOBS", "0") == "1"
 
 _urn: str = ""
+_STATIC_SPECS: dict = {}  # captured at register; reused by the heartbeat target calc
 _running = True
 
 
@@ -461,9 +462,36 @@ def capabilities_from_specs(specs: dict) -> list[str]:
     return caps
 
 
+def _target_workers(specs: dict, load: dict) -> int:
+    """Capacity-derived zeroclaw fan-out for this host, recomputed each heartbeat.
+
+    Uses the shared policy (hive.workers.fanout) when importable, else an inline
+    equivalent so a standalone watcher copy still reports a sane target.
+    """
+    cpu = int(specs.get("cpu_count") or os.cpu_count() or 1)
+    ram_gb = float(specs.get("ram_gb") or 0)
+    load1 = float(load.get("load_1min") or 0.0)
+    load_per_cpu = load1 / max(1, cpu)
+    gpus = len(specs.get("gpus") or load.get("gpus") or []) if isinstance(specs.get("gpus") or load.get("gpus"), list) else 0
+    try:
+        from hive.workers.fanout import desired_worker_count
+
+        return desired_worker_count(cpu_count=cpu, mem_gb=ram_gb, load_per_cpu=load_per_cpu, gpus=gpus)
+    except Exception:  # standalone copy — same policy, inline
+        by_cpu, by_ram = max(1, cpu // 2), max(1, int(ram_gb // 2))
+        base = min(by_cpu, by_ram) + gpus
+        if load_per_cpu >= 0.9:
+            base -= 2
+        elif load_per_cpu >= 0.7:
+            base -= 1
+        return max(1, min(base, 16))
+
+
 def register():
     global _urn
     specs = static_specs()
+    _STATIC_SPECS.clear()
+    _STATIC_SPECS.update(specs)
     caps = capabilities_from_specs(specs)
     load = dynamic_load()
     body = {
@@ -480,6 +508,7 @@ def register():
             "specs": specs,
             "load": load,
             "daemon": "system_watcher.py",
+            "target_workers": _target_workers(specs, load),
         },
     }
     # system is a NEW runtime — RUNTIME_KIND_MAP may not include it; service falls back to allowing kind==runtime
@@ -494,11 +523,12 @@ def register():
 
 def heartbeat():
     load = dynamic_load()
-    # Push fresh load into agent metadata so /v1/hosts always has current data.
-    # Heartbeat endpoint merges {"load": load} into existing metadata (server-side update).
+    # Push fresh load + a capacity-derived worker target into agent metadata so
+    # /v1/hosts always has current data and the host reconcile can size its
+    # zeroclaw fan-out dynamically (not a fixed count).
     _http("POST", "/v1/agents/heartbeat", {
         "urn": _urn,
-        "metadata": {"load": load},
+        "metadata": {"load": load, "target_workers": _target_workers(_STATIC_SPECS, load)},
     })
     # NOTE: previous code also POSTed to /v1/messages as topic=system.load,
     # but that flooded the bus (11 hosts × 4 msgs/min = 2640/hr of pure
