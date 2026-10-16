@@ -920,6 +920,24 @@ class SqliteHiveRepository(HiveMindRepository):
                 )
         return {"totals": totals, "top_entries": entries}
 
+    async def spend_summary(self, tx: Transaction, *, cutoff: float) -> dict[str, Any]:
+        """Aggregate estimated spend over a window (GET /v1/knemon/spend)."""
+        db = tx
+        async with db.execute(
+            "SELECT COUNT(*), ROUND(SUM(COALESCE(estimated_cost_usd,0)),4), "
+            "SUM(COALESCE(tokens_in,0)), SUM(COALESCE(tokens_out,0)) "
+            "FROM jobs WHERE ended_at IS NOT NULL AND ended_at >= ? "
+            "AND estimated_cost_usd IS NOT NULL",
+            (cutoff,),
+        ) as cur:
+            r = await cur.fetchone()
+        return {
+            "jobs_with_cost": (r[0] or 0) if r else 0,
+            "estimated_cost_usd": (r[1] or 0.0) if r else 0.0,
+            "tokens_in": (r[2] or 0) if r else 0,
+            "tokens_out": (r[3] or 0) if r else 0,
+        }
+
     async def cost_stats_rows(
         self, tx: Transaction, *, group_by: str, cutoff: float
     ) -> list[dict[str, Any]]:

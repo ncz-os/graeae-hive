@@ -210,6 +210,9 @@ class HiveMindRepository(ABC):
         self, tx: Transaction, *, group_by: str, cutoff: float
     ) -> list[dict[str, Any]]: ...
 
+    @abstractmethod
+    async def spend_summary(self, tx: Transaction, *, cutoff: float) -> dict[str, Any]: ...
+
     # ---- messages ----
     @abstractmethod
     async def post_message(self, tx: Transaction, **fields: Any) -> None: ...

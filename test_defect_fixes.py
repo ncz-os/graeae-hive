@@ -31,6 +31,7 @@ import agent_bus
 from hive import scheduler as sched
 from hive.bus.routers import admin as hive_admin_router
 from hive.bus.routers import jobs as hive_jobs_router
+from hive.bus.routers import knemon as hive_knemon_router
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
 from hive.persistence.oracle import (
     _ORACLE_JOB_ADDITIONS,
@@ -1840,16 +1841,16 @@ class ServiceTests(unittest.TestCase):
     def test_oauth_cap_parse_failure_fails_closed(self):
         with tempfile.TemporaryDirectory() as td:
             cap = Path(td) / "cap.json"
-            old = agent_bus.KNEMON_CAP_FILE
-            agent_bus.KNEMON_CAP_FILE = str(cap)
+            old = hive_knemon_router.KNEMON_CAP_FILE
+            hive_knemon_router.KNEMON_CAP_FILE = str(cap)
             try:
-                self.assertFalse(agent_bus.oauth_cap_state()["capped"])
+                self.assertFalse(hive_knemon_router.oauth_cap_state()["capped"])
                 cap.write_text("not-json")
-                state = agent_bus.oauth_cap_state()
+                state = hive_knemon_router.oauth_cap_state()
                 self.assertTrue(state["capped"])
                 self.assertIn("storage_error", state)
             finally:
-                agent_bus.KNEMON_CAP_FILE = old
+                hive_knemon_router.KNEMON_CAP_FILE = old
 
     def test_oracle_migration_targets_physical_table(self):
         sql = (HERE / "migrations" / "2026-06-03-jobs-dedup.sql").read_text()
@@ -1938,10 +1939,10 @@ class ServiceTests(unittest.TestCase):
             )
             request.state.auth_role = "worker"
             with (
-                mock.patch.object(agent_bus, "clear_oauth_cap", return_value=None),
-                mock.patch.object(agent_bus, "oauth_cap_state", return_value={"capped": False}),
+                mock.patch.object(hive_knemon_router, "clear_oauth_cap", return_value=None),
+                mock.patch.object(hive_knemon_router, "oauth_cap_state", return_value={"capped": False}),
             ):
-                return await agent_bus.knemon_cap_set(request)
+                return await hive_knemon_router.knemon_cap_set(request)
 
         result = asyncio.run(run())
         self.assertTrue(result["cleared"])
