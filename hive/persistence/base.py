@@ -134,6 +134,38 @@ class HiveMindRepository(ABC):
     @abstractmethod
     async def agent_kind_runtimes(self, tx: Transaction) -> list[Row]: ...
 
+    # ---- dequeue storage primitives (algorithm stays in the router) ----
+    @abstractmethod
+    async def agent_claim_context(self, tx: Transaction, urn: str) -> Row | None: ...
+
+    @abstractmethod
+    async def pool_occupancy(
+        self, tx: Transaction, *, provider: str, model: str, now: float
+    ) -> list[Row]: ...
+
+    @abstractmethod
+    async def queued_candidates(
+        self, tx: Transaction, *, agent_urn: str, now: float, limit: int
+    ) -> list[Row]: ...
+
+    @abstractmethod
+    async def completed_job_ids(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]: ...
+
+    @abstractmethod
+    async def claim_job(
+        self,
+        tx: Transaction,
+        *,
+        job_id: str,
+        agent_urn: str,
+        now: float,
+        lease_expires_at: float,
+        runtime: str,
+        model: str,
+        provider: str,
+        cost_tier: str,
+    ) -> int: ...
+
     # ---- messages ----
     @abstractmethod
     async def post_message(self, tx: Transaction, **fields: Any) -> None: ...

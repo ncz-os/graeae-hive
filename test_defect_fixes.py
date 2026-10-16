@@ -466,29 +466,23 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
 
-            dependency_queries = []
+            dep_calls = {"n": 0}
+            _orig_completed = repo.completed_job_ids
 
-            @asynccontextmanager
-            async def traced_connection():
-                async with repo.connection() as db:
-                    original_execute = db.execute
-
-                    def traced_execute(sql, parameters=None):
-                        if "SELECT id FROM jobs WHERE id IN" in sql and "status='done'" in sql:
-                            dependency_queries.append(sql)
-                        return original_execute(sql, parameters) if parameters is not None else original_execute(sql)
-
-                    db.execute = traced_execute
-                    yield db
+            async def _counting_completed(tx, *, ids):
+                dep_calls["n"] += 1
+                return await _orig_completed(tx, ids=ids)
 
             with (
-                mock.patch.object(agent_bus, "connect_db", traced_connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(repo, "completed_job_ids", _counting_completed),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                claimed = await agent_bus.dequeue_next_job("urn:agent:zeroclaw:host:session")
+                claimed = await hive_jobs_router.dequeue_next_job("urn:agent:zeroclaw:host:session")
 
             self.assertEqual(claimed["id"], "ready")
-            self.assertEqual(len(dependency_queries), 1)
+            # ONE batched dependency resolution via the ABC (not N per-candidate).
+            self.assertEqual(dep_calls["n"], 1)
 
     async def test_fresh_sqlite_has_dedup_column_and_active_unique_index(self):
         with tempfile.TemporaryDirectory() as td:
@@ -971,10 +965,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 jobs=jobs,
             )
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                claimed = await agent_bus.dequeue_next_job(
+                claimed = await hive_jobs_router.dequeue_next_job(
                     "urn:agent:zeroclaw:typhon:s1",
                 )
             self.assertEqual(claimed["id"], "job-ord")
@@ -997,10 +991,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 ],
             )
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                claimed = await agent_bus.dequeue_next_job(
+                claimed = await hive_jobs_router.dequeue_next_job(
                     "urn:agent:zeroclaw:hydra:s1",
                 )
             self.assertEqual(claimed["id"], "job-build")
@@ -1074,10 +1068,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             from fastapi.responses import Response
 
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                response = await agent_bus.dequeue_next_job(
+                response = await hive_jobs_router.dequeue_next_job(
                     "urn:agent:zeroclaw:w6:s1",
                 )
             # 6th MiniMax worker hits the global cap; we expect a 204 No
@@ -1146,10 +1140,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                claimed = await agent_bus.dequeue_next_job(urn)
+                claimed = await hive_jobs_router.dequeue_next_job(urn)
             self.assertEqual(claimed["id"], "job-local")
 
     async def test_dequeue_role_penalty_deprioritises_build_job_for_general_worker(self):
@@ -1230,10 +1224,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             # General worker polls first — it gets the non-build job because
             # role-aware scoring de-prioritises build: jobs for non-builders.
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                general_claim = await agent_bus.dequeue_next_job(
+                general_claim = await hive_jobs_router.dequeue_next_job(
                     "urn:agent:zeroclaw:typhon:s-gen",
                 )
             self.assertEqual(general_claim["id"], "job-ord-only")
@@ -1304,10 +1298,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                claimed = await agent_bus.dequeue_next_job(urn_starved)
+                claimed = await hive_jobs_router.dequeue_next_job(urn_starved)
             self.assertIn(claimed["id"], ("job-aa", "job-bb"))
 
     async def test_dequeue_local_eih_routes_share_pool_with_general_workers(self):
@@ -1384,10 +1378,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     )
                 await db.commit()
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                claimed = await agent_bus.dequeue_next_job(urn)
+                claimed = await hive_jobs_router.dequeue_next_job(urn)
             # Pool saturated (5/5 MiniMax leases) but a general worker on
             # the grok-4.3/xai route is unaffected — it claims the highest-
             # priority queued job from the local/EIH pool.
@@ -1469,10 +1463,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 captured_events.append((kind, payload))
 
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", fake_emit),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", fake_emit),
             ):
-                response = await agent_bus.dequeue_next_job(urn)
+                response = await hive_jobs_router.dequeue_next_job(urn)
             self.assertIsInstance(response, Response)
             self.assertEqual(response.status_code, 204)
             denied = [e for e in captured_events if e[0] == "minimax.pool.denied"]
@@ -1533,13 +1527,13 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
 
             results: list = []
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
                 # Sequential polls — under BEGIN IMMEDIATE the second claim
                 # observes status='claimed' and returns 204.
-                a = await agent_bus.dequeue_next_job(urn_a)
-                b = await agent_bus.dequeue_next_job(urn_b)
+                a = await hive_jobs_router.dequeue_next_job(urn_a)
+                b = await hive_jobs_router.dequeue_next_job(urn_b)
                 results = [a, b]
             # Exactly one worker got the job; the other got a 204 Response.
             claimed = [r for r in results if not isinstance(r, Response)]
@@ -1636,10 +1630,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
 
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                response = await agent_bus.dequeue_next_job(urn_6)
+                response = await hive_jobs_router.dequeue_next_job(urn_6)
             self.assertIsInstance(response, _Response)
             self.assertEqual(response.status_code, 204)
             self.assertEqual(
@@ -1700,10 +1694,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                response = await agent_bus.dequeue_next_job(urn)
+                response = await hive_jobs_router.dequeue_next_job(urn)
             self.assertIsInstance(response, _Response)
             self.assertEqual(response.status_code, 204)
             # Per-worker cap is the reason (not global cap — only 1
@@ -1766,10 +1760,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
             with (
-                mock.patch.object(agent_bus, "connect_db", repo.connection),
-                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+                mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+                mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
-                claimed = await agent_bus.dequeue_next_job(urn)
+                claimed = await hive_jobs_router.dequeue_next_job(urn)
             # Stale offered lease does NOT count — worker claims the fresh
             # MiniMax job. The claim must succeed (return a dict, not a
             # 204 Response with minimax_pool_saturated).

@@ -598,6 +598,100 @@ class SqliteHiveRepository(HiveMindRepository):
         async with db.execute("SELECT kind, runtime FROM agents") as cur:
             return [(r[0], r[1]) async for r in cur]
 
+    async def agent_claim_context(self, tx: Transaction, urn: str) -> tuple[Any, ...] | None:
+        """The agent row fields the dequeue eligibility check needs."""
+        db = tx
+        async with db.execute(
+            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
+            "auth_method, plan_cap_usd, plan_period_used_usd, status, current_load "
+            "FROM agents WHERE urn=?",
+            (urn,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def pool_occupancy(
+        self, tx: Transaction, *, provider: str, model: str, now: float
+    ) -> list[tuple[Any, ...]]:
+        """Active (claimed_by, id) leases for a (provider, model) pool."""
+        db = tx
+        async with db.execute(
+            "SELECT claimed_by, id FROM jobs "
+            "WHERE status IN ('offered','claimed','running') "
+            "AND claimed_provider=? AND claimed_model=? "
+            "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
+            (provider, model, now),
+        ) as cur:
+            return [tuple(r) async for r in cur]
+
+    async def queued_candidates(
+        self, tx: Transaction, *, agent_urn: str, now: float, limit: int
+    ) -> list[tuple[Any, ...]]:
+        """The dequeue candidate scan (queued, plus this agent's own offered)."""
+        db = tx
+        async with db.execute(
+            "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
+            "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
+            "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at, "
+            "site, repo, head_branch, pr_number "
+            "FROM jobs WHERE (status='queued' OR (status='offered' AND claimed_by=?)) "
+            "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
+            "ORDER BY priority DESC, started_at ASC LIMIT ?",
+            (agent_urn, now, limit),
+        ) as cur:
+            return [tuple(r) async for r in cur]
+
+    async def completed_job_ids(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]:
+        """Of ``ids``, which are status='done'? (dependency gate)."""
+        if not ids:
+            return set()
+        db = tx
+        placeholders = ",".join("?" * len(ids))
+        async with db.execute(
+            f"SELECT id FROM jobs WHERE id IN ({placeholders}) AND status='done'",
+            tuple(ids),
+        ) as cur:
+            return {row[0] async for row in cur}
+
+    async def claim_job(
+        self,
+        tx: Transaction,
+        *,
+        job_id: str,
+        agent_urn: str,
+        now: float,
+        lease_expires_at: float,
+        runtime: str,
+        model: str,
+        provider: str,
+        cost_tier: str,
+    ) -> int:
+        """Atomic claim: queued -> claimed, or this agent's own offered -> claimed.
+
+        The compare-and-set predicate is what makes it race-safe (rowcount 0 =
+        lost the race / not claimable). No commit — the caller owns the tx.
+        """
+        db = tx
+        cur = await db.execute(
+            "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
+            "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
+            "claim_lease_expires_at=?, last_update_at=?, "
+            "ended_at=NULL, result=NULL "
+            "WHERE id=? AND (status='queued' OR (status='offered' AND claimed_by=?))",
+            (
+                agent_urn,
+                now,
+                runtime,
+                model,
+                provider,
+                cost_tier,
+                lease_expires_at,
+                now,
+                job_id,
+                agent_urn,
+            ),
+        )
+        return cur.rowcount
+
     async def post_message(self, tx: Transaction, **fields: Any) -> None:
         db = tx
         await db.execute(

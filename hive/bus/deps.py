@@ -140,6 +140,9 @@ async def require_orchestrator_submitter(submitter_urn: str) -> str:
 
 
 ACTIVE_JOB_STATUSES = ("queued", "offered", "claimed", "running", "needs-review")
+#: Dequeue candidate scan depth (bounded on both sides so a huge queue cannot
+#: turn a claim into a full scan). See the dequeue route comment.
+CLAIM_SCAN_WINDOW = int(os.environ.get("CLAIM_SCAN_WINDOW", "10000"))
 VALID_JOB_STATUSES = {
     "queued",
     "offered",

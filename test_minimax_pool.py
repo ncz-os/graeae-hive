@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import agent_bus
+from hive.bus.routers import jobs as hive_jobs_router
 from hive.persistence.sqlite import SqliteHiveRepository
 
 MINIMAX_WORKER = (
@@ -44,9 +45,9 @@ class MiniMaxPoolWritePathTests(unittest.IsolatedAsyncioTestCase):
                 await db.execute(MINIMAX_JOB, ("job-a", now))
                 await db.commit()
 
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
-                claimed = await agent_bus.dequeue_next_job(first)
+            with mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo), \
+                    mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()):
+                claimed = await hive_jobs_router.dequeue_next_job(first)
 
             # the claim must have written the provider the pool query filters on
             self.assertEqual(claimed.get("id"), "job-a")
@@ -76,9 +77,9 @@ class MiniMaxPoolWritePathTests(unittest.IsolatedAsyncioTestCase):
                 await db.execute(MINIMAX_JOB, ("job-6", now))
                 await db.commit()
 
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
-                denied = await agent_bus.dequeue_next_job(sixth)
+            with mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo), \
+                    mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()):
+                denied = await hive_jobs_router.dequeue_next_job(sixth)
             self.assertEqual(denied.status_code, 204)
             self.assertEqual(denied.headers.get("X-Hive-Claim-Result"), "minimax_pool_saturated")
 

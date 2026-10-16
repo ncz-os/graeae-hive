@@ -24,7 +24,7 @@ from typing import Any
 try:
     import aiosqlite
 except ModuleNotFoundError:
-    from hive.persistence import _sqlite_async as aiosqlite
+    pass
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -32,7 +32,6 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 import retry_policy
-from hive import scheduler as sched
 from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
     EVENT_QUEUE,
@@ -48,7 +47,6 @@ from hive.bus.deps import (
 )
 
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
-from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
     THROTTLE_HEADROOM,
     agent_kind_aliases,
@@ -64,6 +62,7 @@ from hive.bus.domain.jobs import (
     cache_store,
     estimate_cost,
     hallucination_check,
+    json_list,
     normalize_result_payload,
     valid_completion_proof,
 )
@@ -850,7 +849,7 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 #: therefore starves any agent whose work sits behind rows it is ineligible
 #: for: it gets 204 forever while claimable work sits queued. Scan deeper,
 #: bounded on both sides so a huge queue cannot turn a claim into a scan.
-CLAIM_SCAN_WINDOW = int(os.environ.get("CLAIM_SCAN_WINDOW", "10000"))
+# CLAIM_SCAN_WINDOW moved to hive.bus.deps (imported above).
 # Hosts the bus refuses to offer jobs to — typically because their workers
 # have a broken config (e.g. enc2 secret-key mismatch) and would fail any
 # claim immediately. User directive 2026-05-26: pegasus (.79) is flooding
@@ -867,14 +866,7 @@ CLAIM_SCAN_WINDOW = int(os.environ.get("CLAIM_SCAN_WINDOW", "10000"))
 # cost_tier_for moved to hive.core.models (imported above).
 
 
-def json_list(raw: str | None) -> list[Any]:
-    if not raw:
-        return []
-    try:
-        val = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        return []
-    return [x for x in val if isinstance(x, str)] if isinstance(val, list) else []
+# json_list moved to hive.bus.domain.jobs (imported above).
 
 
 def field_was_set(model: BaseModel, name: str) -> bool:
@@ -1527,322 +1519,7 @@ async def dashboard():
 # POST /v1/jobs (create_job) moved to hive.bus.routers.jobs (Phase 1c).
 
 
-@app.post("/v1/jobs/next")
-async def dequeue_next_job(agent_urn: str):
-    """Atomic dequeue: highest-priority queued job that this agent is eligible for.
-
-    Self-assignment for swarm: agent calls this in its main loop. Server:
-      1. Looks up agent's kind + capabilities.
-      2. Finds top-priority queued job where (eligible_kinds covers agent kind) AND (required_capabilities subset of agent capabilities).
-      3. Atomically claims it (status='claimed', claimed_by=agent_urn, claimed_at=now).
-      4. Returns job to caller; or 204 No Content if nothing matches.
-
-    Race-safe via SQLite immediate-mode UPDATE...WHERE rowid=(SELECT...LIMIT 1) under a transaction.
-    """
-    now = time.time()
-    urn_parts = agent_urn.split(":")
-    agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
-    if agent_host in HOST_DENYLIST:
-        from fastapi.responses import Response as _DRsp
-
-        return _DRsp(
-            status_code=204,
-            headers={
-                "X-Hive-Claim-Result": "host_denylisted",
-                "X-Hive-Claim-Detail": f"host {agent_host} is in HIVE_HOST_DENYLIST",
-            },
-        )
-
-    try:
-        async with connect_db() as db:
-            await db.execute("BEGIN IMMEDIATE")
-            async with db.execute(
-                "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-                "auth_method, plan_cap_usd, plan_period_used_usd, status, current_load "
-                "FROM agents WHERE urn=?",
-                (agent_urn,),
-            ) as cur:
-                agent_row = await cur.fetchone()
-            if not agent_row:
-                await db.execute("ROLLBACK")
-                raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
-            (
-                agent_kind,
-                caps_json,
-                a_runtime,
-                a_model,
-                a_provider,
-                a_tier,
-                a_auth,
-                a_cap,
-                a_used,
-                agent_status,
-                agent_current_load,
-            ) = agent_row
-            if agent_status not in ACTIVE_AGENT_STATUSES:
-                await db.execute("ROLLBACK")
-                raise HTTPException(
-                    409,
-                    f"claim failed: agent status is {agent_status!r}, not online/idle: {agent_urn}",
-                )
-            agent_caps = set(json.loads(caps_json)) if caps_json else set()
-            a_tier = (a_tier or "C").upper()
-            if a_tier not in COST_TIERS:
-                a_tier = "C"
-            a_auth = (a_auth or "unknown").lower()
-            agent = {
-                "urn": agent_urn,
-                "host": agent_host,
-                "kind": agent_kind,
-                "runtime": a_runtime,
-                "model": a_model,
-                "provider": a_provider,
-                "cost_tier": a_tier,
-                "capabilities": agent_caps,
-                "eligible_aliases": agent_kind_aliases(agent_kind, a_runtime),
-                "subscription_throttled": (
-                    a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
-                ),
-            }
-
-            # MiniMax capacity pool (the first capacity-ledger instance). A
-            # MiniMax-ROUTED worker may not start a session when the pool is
-            # full: global cap = MINIMAX_GLOBAL_MAX concurrent OR ASSIGNED
-            # sessions (lease unexpired), per-worker cap = MINIMAX_PER_WORKER_MAX.
-            # Pool math lives in hive.scheduler; the dequeue supplies the
-            # snapshot. Denial = 204 minimax_pool_saturated (NOT a silent
-            # no_jobs) so the worker falls through to a non-MiniMax chain.
-            if sched.is_minimax_route(a_provider, a_model):
-                async with db.execute(
-                    "SELECT claimed_by, id FROM jobs "
-                    "WHERE status IN ('offered','claimed','running') "
-                    "AND claimed_provider=? AND claimed_model=? "
-                    "AND (claim_lease_expires_at IS NULL OR claim_lease_expires_at > ?)",
-                    (sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL, now),
-                ) as cur:
-                    pool_rows = [tuple(r) async for r in cur]
-                pool = sched.build_pool_snapshot(pool_rows)
-                # GLOBAL cap via the capacity ledger (Phase 5); the per-worker
-                # cap stays in the scheduler snapshot.
-                _capacity_ledger.in_flight[sched.MINIMAX_PROVIDER] = pool.active_assignments
-                ok, reason = _capacity_ledger.headroom(sched.MINIMAX_PROVIDER, now=now)
-                if ok and pool.leases_by_worker.get(sched._norm_str(agent_urn)):
-                    ok = False
-                    reason = (
-                        f"minimax:worker {agent_urn!r} already holds a lease "
-                        f"(per-worker cap={sched.MINIMAX_PER_WORKER_MAX})"
-                    )
-                if not ok:
-                    await db.execute("ROLLBACK")
-                    await emit_event(
-                        db,
-                        "minimax.pool.denied",
-                        {
-                            "urn": agent_urn,
-                            "pool_active": pool.active_assignments,
-                            "pool_cap": sched.MINIMAX_GLOBAL_MAX,
-                            "reason": reason,
-                        },
-                    )
-                    from fastapi.responses import Response as _PoolRsp
-
-                    return _PoolRsp(
-                        status_code=204,
-                        headers={
-                            "X-Hive-Claim-Result": "minimax_pool_saturated",
-                            "X-Hive-Claim-Detail": f"minimax pool saturated: {reason}",
-                        },
-                    )
-
-            async with db.execute(
-                "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-                "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
-                "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at, "
-                "site, repo, head_branch, pr_number "
-                "FROM jobs WHERE (status='queued' OR (status='offered' AND claimed_by=?)) "
-                "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-                "ORDER BY priority DESC, started_at ASC LIMIT ?",
-                (agent_urn, now, CLAIM_SCAN_WINDOW),
-            ) as cur:
-                candidates = [tuple(r) async for r in cur]
-            # Role-aware ordering — hive.scheduler is the single source of
-            # truth for role resolution + candidate scoring (build-required
-            # jobs prefer build-role workers and vice-versa, then
-            # utilization/deficit/age, deterministic id tie-break).
-            worker_profile = sched.worker_profile_from_metadata(
-                urn=agent_urn,
-                host=agent_host,
-                capabilities=agent_caps,
-                current_load=(json.loads(agent_current_load) if agent_current_load else None),
-            )
-            _job_dicts = [
-                {
-                    "id": r[0],
-                    "submitter_urn": r[1],
-                    "kind": r[3],
-                    "priority": r[5],
-                    "required_capabilities": json_list(r[7]),
-                }
-                for r in candidates
-            ]
-            _ordered = sched.order_candidates_for_worker(candidates=_job_dicts, worker=worker_profile, now=now)
-            _by_id = {r[0]: r for r in candidates}
-            candidates = [_by_id[d["id"]] for d in _ordered]
-
-            # Resolve ALL candidate dependencies in ONE query (depends_on is
-            # tuple index 15). Doing it per-candidate issued N queries.
-            _all_deps: set[str] = set()
-            for _r in candidates:
-                _all_deps.update(json_list(_r[15]))
-            done_dep_ids: set[str] = set()
-            if _all_deps:
-                _ph = ",".join("?" * len(_all_deps))
-                async with db.execute(
-                    f"SELECT id FROM jobs WHERE id IN ({_ph}) AND status='done'",
-                    tuple(_all_deps),
-                ) as dc:
-                    done_dep_ids = {row[0] async for row in dc}
-
-            # Canonical pool key for MiniMax-routed claims only: is_minimax_route
-            # is an exact match on (MINIMAX_PROVIDER, MINIMAX_MODEL), so a
-            # MiniMax claim is persisted with exactly the values the occupancy
-            # query filters on. Non-MiniMax claims store the worker's raw
-            # provider/model (irrelevant to the MiniMax-scoped query).
-            if sched.is_minimax_route(a_provider, a_model):
-                _claim_provider, _claim_model = sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL
-            else:
-                _claim_provider, _claim_model = a_provider, a_model
-
-            claimed = None
-            for r in candidates:
-                (
-                    j_id,
-                    j_submitter,
-                    j_parent,
-                    j_kind,
-                    j_desc,
-                    j_priority,
-                    j_deadline,
-                    j_caps_json,
-                    j_kinds_json,
-                    j_hosts_json,
-                    j_project,
-                    j_max_tier,
-                    j_pref_providers,
-                    j_pref_models,
-                    j_mnemos_refs,
-                    j_deps_json,
-                    _j_retry_backoff_until,
-                    j_started_at,
-                    j_site,
-                    j_repo,
-                    j_head_branch,
-                    j_pr_number,
-                ) = r
-                deps = json_list(j_deps_json)
-                if deps and not set(deps).issubset(done_dep_ids):
-                    continue
-                job = {
-                    "id": j_id,
-                    "kind": j_kind,
-                    "required_capabilities": json_list(j_caps_json),
-                    "eligible_kinds": json_list(j_kinds_json),
-                    "eligible_hosts": json_list(j_hosts_json),
-                    "max_cost_tier": j_max_tier,
-                    "preferred_providers": json_list(j_pref_providers),
-                    "preferred_models": json_list(j_pref_models),
-                    "queued_at": j_started_at,
-                }
-                eligible, _reason = job_agent_eligible(job, agent)
-                if not eligible:
-                    continue
-                cur2 = await db.execute(
-                    "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
-                    "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
-                    "claim_lease_expires_at=?, last_update_at=?, "
-                    "ended_at=NULL, result=NULL "
-                    "WHERE id=? AND (status='queued' OR (status='offered' AND claimed_by=?))",
-                    (
-                        agent_urn,
-                        now,
-                        a_runtime,
-                        _claim_model,
-                        _claim_provider,
-                        a_tier,
-                        now + CLAIM_LEASE_SECONDS,
-                        now,
-                        j_id,
-                        agent_urn,
-                    ),
-                )
-                if cur2.rowcount == 0:
-                    continue
-                claimed = {
-                    "id": j_id,
-                    "submitter_urn": j_submitter,
-                    "parent_job_id": j_parent,
-                    "kind": j_kind,
-                    "description": j_desc,
-                    "priority": j_priority,
-                    "deadline": j_deadline,
-                    "required_capabilities": json_list(j_caps_json),
-                    "eligible_kinds": json_list(j_kinds_json),
-                    "eligible_hosts": json_list(j_hosts_json),
-                    "project": j_project,
-                    "max_cost_tier": j_max_tier,
-                    "preferred_providers": json_list(j_pref_providers),
-                    "preferred_models": json_list(j_pref_models),
-                    "mnemos_refs": json_list(j_mnemos_refs),
-                    "site": j_site,
-                    "repo": j_repo,
-                    "head_branch": j_head_branch,
-                    "pr_number": j_pr_number,
-                    "status": "claimed",
-                    "claimed_by": agent_urn,
-                    "claimed_at": now,
-                    "claim_lease_expires_at": now + CLAIM_LEASE_SECONDS,
-                    "claimed_resources": {
-                        "runtime": a_runtime,
-                        "model": a_model,
-                        "provider": a_provider,
-                        "cost_tier": a_tier,
-                    },
-                }
-                break
-            await db.commit()
-            if claimed:
-                resources = claimed.get("claimed_resources") or {}
-                await emit_event(
-                    db,
-                    "job.claimed",
-                    {
-                        "id": claimed["id"],
-                        "claimed_by": agent_urn,
-                        "kind": claimed["kind"],
-                        "runtime": resources.get("runtime"),
-                        "model": resources.get("model"),
-                        "provider": resources.get("provider"),
-                        "cost_tier": resources.get("cost_tier"),
-                    },
-                )
-                return claimed
-    except HTTPException:
-        raise
-    except aiosqlite.Error as e:
-        raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
-
-    # HTTP 204 = No Content. By spec the response body must be EMPTY.
-    # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
-    # contract and triggers h11 LocalProtocolError. Use Response (no body).
-    from fastapi.responses import Response as _Response
-
-    return _Response(
-        status_code=204,
-        headers={
-            "X-Hive-Claim-Result": "no_jobs_available",
-            "X-Hive-Claim-Detail": "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier",
-        },
-    )
+# POST /v1/jobs/next (dequeue_next_job) moved to hive.bus.routers.jobs (Phase 1c).
 
 
 @app.patch("/v1/jobs/{job_id}")

@@ -23,6 +23,17 @@ def is_dedup_violation(exc: BaseException) -> bool:
         "unique constraint failed" in m.lower() and "dedup_hash" in m.lower()
     )
 
+
+def json_list(raw: str | None) -> list:
+    """Parse a JSON-array-of-strings column; [] on any malformed/None input."""
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    return [x for x in val if isinstance(x, str)] if isinstance(val, list) else []
+
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.

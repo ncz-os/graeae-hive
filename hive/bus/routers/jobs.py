@@ -10,9 +10,20 @@ import json
 import time
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 
 import queue_logic
+
+try:
+    import aiosqlite
+except ModuleNotFoundError:
+    from hive.persistence import _sqlite_async as aiosqlite
+
+from hive import scheduler as sched
 from hive.bus.deps import (
+    ACTIVE_AGENT_STATUSES,
+    CLAIM_SCAN_WINDOW,
+    HOST_DENYLIST,
     VALID_JOB_STATUSES,
     clamp_limit,
     connect_db,
@@ -21,16 +32,21 @@ from hive.bus.deps import (
     require_orchestrator_submitter,
     uuidv7,
 )
+from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
+    THROTTLE_HEADROOM,
     _norm_str,
     _norm_str_set,
     agent_kind_aliases,
     heavy_repo_required_for_kind,
+    job_agent_eligible,
 )
 from hive.bus.domain.jobs import (
     CACHE_TTL_SECONDS,
+    CLAIM_LEASE_SECONDS,
     cache_key_for,
     is_dedup_violation,
+    json_list,
 )
 from hive.bus.domain.workspace import resolve_workspace_shadow
 from hive.bus.schemas import JobCreate
@@ -400,3 +416,258 @@ async def create_job(req: JobCreate):
         )
         await tx.commit()
     return {"id": job_id, "created_at": now, "mnemos_refs": req.mnemos_refs}
+
+
+@router.post("/v1/jobs/next")
+async def dequeue_next_job(agent_urn: str):
+    """Atomic dequeue: highest-priority queued job that this agent is eligible for.
+
+    Algorithm (eligibility / MiniMax pool / role-aware ordering) lives here in the
+    router; every storage op goes through the HiveMindRepository ABC on ONE
+    transaction (agent_claim_context -> pool_occupancy -> queued_candidates ->
+    completed_job_ids -> claim_job -> emit_event).
+    """
+    now = time.time()
+    urn_parts = agent_urn.split(":")
+    agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
+    if agent_host in HOST_DENYLIST:
+        return Response(
+            status_code=204,
+            headers={
+                "X-Hive-Claim-Result": "host_denylisted",
+                "X-Hive-Claim-Detail": f"host {agent_host} is in HIVE_HOST_DENYLIST",
+            },
+        )
+
+    try:
+        async with hive_repo().connection() as tx:
+            agent_row = await hive_repo().agent_claim_context(tx, agent_urn)
+            if not agent_row:
+                raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
+            (
+                agent_kind,
+                caps_json,
+                a_runtime,
+                a_model,
+                a_provider,
+                a_tier,
+                a_auth,
+                a_cap,
+                a_used,
+                agent_status,
+                agent_current_load,
+            ) = agent_row
+            if agent_status not in ACTIVE_AGENT_STATUSES:
+                raise HTTPException(
+                    409,
+                    f"claim failed: agent status is {agent_status!r}, not online/idle: {agent_urn}",
+                )
+            agent_caps = set(json.loads(caps_json)) if caps_json else set()
+            a_tier = (a_tier or "C").upper()
+            if a_tier not in COST_TIERS:
+                a_tier = "C"
+            a_auth = (a_auth or "unknown").lower()
+            agent = {
+                "urn": agent_urn,
+                "host": agent_host,
+                "kind": agent_kind,
+                "runtime": a_runtime,
+                "model": a_model,
+                "provider": a_provider,
+                "cost_tier": a_tier,
+                "capabilities": agent_caps,
+                "eligible_aliases": agent_kind_aliases(agent_kind, a_runtime),
+                "subscription_throttled": (
+                    a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
+                ),
+            }
+
+            # MiniMax capacity pool: a MiniMax-routed worker may not start a
+            # session when the pool is full (global cap OR per-worker cap).
+            if sched.is_minimax_route(a_provider, a_model):
+                pool_rows = await hive_repo().pool_occupancy(
+                    tx, provider=sched.MINIMAX_PROVIDER, model=sched.MINIMAX_MODEL, now=now
+                )
+                pool = sched.build_pool_snapshot(pool_rows)
+                _capacity_ledger.in_flight[sched.MINIMAX_PROVIDER] = pool.active_assignments
+                ok, reason = _capacity_ledger.headroom(sched.MINIMAX_PROVIDER, now=now)
+                if ok and pool.leases_by_worker.get(sched._norm_str(agent_urn)):
+                    ok = False
+                    reason = (
+                        f"minimax:worker {agent_urn!r} already holds a lease "
+                        f"(per-worker cap={sched.MINIMAX_PER_WORKER_MAX})"
+                    )
+                if not ok:
+                    await emit_event(
+                        tx,
+                        "minimax.pool.denied",
+                        {
+                            "urn": agent_urn,
+                            "pool_active": pool.active_assignments,
+                            "pool_cap": sched.MINIMAX_GLOBAL_MAX,
+                            "reason": reason,
+                        },
+                    )
+                    return Response(
+                        status_code=204,
+                        headers={
+                            "X-Hive-Claim-Result": "minimax_pool_saturated",
+                            "X-Hive-Claim-Detail": f"minimax pool saturated: {reason}",
+                        },
+                    )
+
+            candidates = await hive_repo().queued_candidates(
+                tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW
+            )
+            # Role-aware ordering (hive.scheduler is the single source of truth).
+            worker_profile = sched.worker_profile_from_metadata(
+                urn=agent_urn,
+                host=agent_host,
+                capabilities=agent_caps,
+                current_load=(json.loads(agent_current_load) if agent_current_load else None),
+            )
+            _job_dicts = [
+                {
+                    "id": r[0],
+                    "submitter_urn": r[1],
+                    "kind": r[3],
+                    "priority": r[5],
+                    "required_capabilities": json_list(r[7]),
+                }
+                for r in candidates
+            ]
+            _ordered = sched.order_candidates_for_worker(candidates=_job_dicts, worker=worker_profile, now=now)
+            _by_id = {r[0]: r for r in candidates}
+            candidates = [_by_id[d["id"]] for d in _ordered]
+
+            # Resolve ALL candidate dependencies in ONE ABC query (depends_on is
+            # tuple index 15).
+            _all_deps: set[str] = set()
+            for _r in candidates:
+                _all_deps.update(json_list(_r[15]))
+            done_dep_ids = await hive_repo().completed_job_ids(tx, ids=list(_all_deps)) if _all_deps else set()
+
+            # Canonical pool key for MiniMax-routed claims only.
+            if sched.is_minimax_route(a_provider, a_model):
+                _claim_provider, _claim_model = sched.MINIMAX_PROVIDER, sched.MINIMAX_MODEL
+            else:
+                _claim_provider, _claim_model = a_provider, a_model
+
+            claimed = None
+            for r in candidates:
+                (
+                    j_id,
+                    j_submitter,
+                    j_parent,
+                    j_kind,
+                    j_desc,
+                    j_priority,
+                    j_deadline,
+                    j_caps_json,
+                    j_kinds_json,
+                    j_hosts_json,
+                    j_project,
+                    j_max_tier,
+                    j_pref_providers,
+                    j_pref_models,
+                    j_mnemos_refs,
+                    j_deps_json,
+                    _j_retry_backoff_until,
+                    j_started_at,
+                    j_site,
+                    j_repo,
+                    j_head_branch,
+                    j_pr_number,
+                ) = r
+                deps = json_list(j_deps_json)
+                if deps and not set(deps).issubset(done_dep_ids):
+                    continue
+                job = {
+                    "id": j_id,
+                    "kind": j_kind,
+                    "required_capabilities": json_list(j_caps_json),
+                    "eligible_kinds": json_list(j_kinds_json),
+                    "eligible_hosts": json_list(j_hosts_json),
+                    "max_cost_tier": j_max_tier,
+                    "preferred_providers": json_list(j_pref_providers),
+                    "preferred_models": json_list(j_pref_models),
+                    "queued_at": j_started_at,
+                }
+                eligible, _reason = job_agent_eligible(job, agent)
+                if not eligible:
+                    continue
+                rc = await hive_repo().claim_job(
+                    tx,
+                    job_id=j_id,
+                    agent_urn=agent_urn,
+                    now=now,
+                    lease_expires_at=now + CLAIM_LEASE_SECONDS,
+                    runtime=a_runtime,
+                    model=_claim_model,
+                    provider=_claim_provider,
+                    cost_tier=a_tier,
+                )
+                if rc == 0:
+                    continue
+                claimed = {
+                    "id": j_id,
+                    "submitter_urn": j_submitter,
+                    "parent_job_id": j_parent,
+                    "kind": j_kind,
+                    "description": j_desc,
+                    "priority": j_priority,
+                    "deadline": j_deadline,
+                    "required_capabilities": json_list(j_caps_json),
+                    "eligible_kinds": json_list(j_kinds_json),
+                    "eligible_hosts": json_list(j_hosts_json),
+                    "project": j_project,
+                    "max_cost_tier": j_max_tier,
+                    "preferred_providers": json_list(j_pref_providers),
+                    "preferred_models": json_list(j_pref_models),
+                    "mnemos_refs": json_list(j_mnemos_refs),
+                    "site": j_site,
+                    "repo": j_repo,
+                    "head_branch": j_head_branch,
+                    "pr_number": j_pr_number,
+                    "status": "claimed",
+                    "claimed_by": agent_urn,
+                    "claimed_at": now,
+                    "claim_lease_expires_at": now + CLAIM_LEASE_SECONDS,
+                    "claimed_resources": {
+                        "runtime": a_runtime,
+                        "model": a_model,
+                        "provider": a_provider,
+                        "cost_tier": a_tier,
+                    },
+                }
+                break
+            await tx.commit()
+            if claimed:
+                resources = claimed.get("claimed_resources") or {}
+                await emit_event(
+                    tx,
+                    "job.claimed",
+                    {
+                        "id": claimed["id"],
+                        "claimed_by": agent_urn,
+                        "kind": claimed["kind"],
+                        "runtime": resources.get("runtime"),
+                        "model": resources.get("model"),
+                        "provider": resources.get("provider"),
+                        "cost_tier": resources.get("cost_tier"),
+                    },
+                )
+                return claimed
+    except HTTPException:
+        raise
+    except aiosqlite.Error as e:
+        raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
+
+    # HTTP 204 = No Content. By spec the response body must be EMPTY.
+    return Response(
+        status_code=204,
+        headers={
+            "X-Hive-Claim-Result": "no_jobs_available",
+            "X-Hive-Claim-Detail": "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier",
+        },
+    )
