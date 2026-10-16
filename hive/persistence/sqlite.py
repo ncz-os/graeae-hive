@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -400,25 +400,23 @@ class SqliteHiveRepository(HiveMindRepository):
                 if not committed:
                     await db.execute("ROLLBACK")
 
-    async def patch_job_status(self, **fields: Any) -> int:
-        """Backend-neutral UPDATE of one job row.
+    async def patch_job_status(
+        self, tx: Transaction, job_id: str, *, sets: Mapping[str, Any]
+    ) -> int:
+        """Backend-neutral UPDATE of one job row, on the caller's transaction.
 
-        fields: job_id (required) + sets (dict of column -> value; None renders
-        SQL NULL). Returns rowcount. Callers own the business logic; the facade
-        owns the dialect. `sets` keys are column names (never caller input) and
-        every VALUE is bound.
+        Follows the EPIMONE/MNEMOS convention: the method takes the `tx` handle
+        the caller opened (`async with repo.connection() as tx:`) so multi-step
+        writes stay atomic. Column names come from code (never caller input);
+        every VALUE is bound; None renders SQL NULL. Returns rowcount.
         """
-        job_id = fields["job_id"]
-        sets: dict[str, Any] = dict(fields.get("sets") or {})
         if not sets:
             return 0
         assign = ", ".join(f"{col}=?" for col in sets)
         args = list(sets.values())
         args.append(job_id)
-        async with self.connection() as db:
-            cur = await db.execute(f"UPDATE jobs SET {assign} WHERE id=?", args)
-            await db.commit()
-            return cur.rowcount
+        cur = await tx.execute(f"UPDATE jobs SET {assign} WHERE id=?", args)
+        return cur.rowcount
 
     async def get_job(self, *, job_id: str) -> tuple[Any, ...] | None:
         async with self.connection() as db:

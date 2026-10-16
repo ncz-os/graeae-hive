@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol, runtime_checkable
 
@@ -87,7 +88,9 @@ class HiveMindRepository(ABC):
     ) -> dict[str, Any] | None: ...
 
     @abstractmethod
-    async def patch_job_status(self, **fields: Any) -> int: ...
+    async def patch_job_status(
+        self, tx: Transaction, job_id: str, *, sets: Mapping[str, Any]
+    ) -> int: ...
 
     @abstractmethod
     async def get_job(self, *, job_id: str) -> Row | None: ...
