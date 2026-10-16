@@ -388,6 +388,11 @@ let _sessionPromise = null;
 
 // ── helpers ──────────────────────────────────────────────────────────
 function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+// Per-panel change detection: JSON signature of a panel's data. If a refresh
+// produced the SAME data, the panel skips its innerHTML rebuild entirely (no
+// flicker, no lost scroll/expansion, no needless reflow).
+const _panelSig={};
+function unchanged(key,data){const s=JSON.stringify(data);if(_panelSig[key]===s)return true;_panelSig[key]=s;return false;}
 function td(html,cls=''){const t=document.createElement('td');t.className=cls;if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
 async function establishSession(){
   if(_sessionPromise)return _sessionPromise;
@@ -627,6 +632,7 @@ async function refreshAgents(){
     else groups.set(k,{...a,count:1});
   }
   const rows=[...groups.values()].sort((a,b)=>(a.kind+a.host).localeCompare(b.kind+b.host));
+  if(unchanged('agents',[rows,d.count]))return;
   document.getElementById('agent-count').textContent=`${rows.length} pools · ${d.count} instances`;
   const tb=document.querySelector('#agent-tbl tbody');tb.innerHTML='';
   const AKC={claude:'#ffa657',zeroclaw:'#79c0ff',openclaw:'#d2a8ff',opencode:'#7ee787',codex:'#e3b341',doctor:'#f85149','dream-walker':'#ff7bd5',system:'#8b949e',human:'#c9d1d9',hermes:'#56d4dd'};
@@ -646,6 +652,7 @@ async function refreshJobs(){
     api('GET','/v1/jobs?status=offered&limit=25').catch(()=>({jobs:[]})),
   ]);
   const all=[...(q.jobs||[]),...(offered.jobs||[])].sort((a,b)=>b.priority-a.priority);
+  if(unchanged('jobs',all))return;
   const cnt=all.length;
   document.getElementById('queue-cnt').textContent=`(${cnt})`;
   document.getElementById('meta-queue').textContent=cnt?cnt+' queued':'queue clear';
@@ -700,8 +707,6 @@ async function refreshRunning(){
   }
   let list=Object.values(hosts);
   let degraded=false;
-  // degraded fallback: agents fetch failed but jobs run -> group the ZEROCLAW-claimed
-  // running jobs (this panel is the zeroclaw pool) by claimer host.
   if(!list.length && jobs.length){
     degraded=true;
     const hg=Object.create(null);
@@ -714,6 +719,7 @@ async function refreshRunning(){
     }
     list=Object.values(hg);
   }
+  if(unchanged('running',[list,degraded]))return;
   const grid=document.getElementById('workers-grid');
   const empty=document.getElementById('workers-empty');
   const totW=list.reduce((n,h)=>n+h.total,0);
@@ -780,6 +786,7 @@ async function refreshRealWork(){
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
+  if(unchanged('results',jobs))return;
   const rtotal=d.total||jobs.length;
   document.getElementById('results-cnt').textContent=`(${rtotal})`;
   const el=document.getElementById('results-list');
@@ -903,6 +910,7 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
     _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
     const order={'dead-letter':0,failed:1,running:2,claimed:3,offered:4,queued:5};
     jobs.sort((a,b)=>{const ao=order[a.status]??9,bo=order[b.status]??9;if(ao!==bo)return ao-bo;return (b.priority||0)-(a.priority||0);});
+    if(unchanged('failed',jobs))return;
     const cntEl=document.getElementById('failed-cnt');
     if(cntEl)cntEl.textContent=`(${jobs.length})`;
     const el=document.getElementById('failed-list');
@@ -997,6 +1005,7 @@ async function dismissFailed(id,e){
 
 async function refreshCosts(){
   const d=await api('GET','/v1/stats/costs?group_by=provider&since_hours=24');
+  if(unchanged('costs',d))return;
   const tot=d.totals||{};
   document.getElementById('cost-totals').innerHTML=
     `<span class="stat">jobs <b>${tot.job_count||0}</b></span>`+
@@ -1013,6 +1022,7 @@ async function refreshCosts(){
 
 async function refreshWorkers(){
   const d=await api('GET','/v1/stats/workers?top_n=20');
+  if(unchanged('workers',d))return;
   const tb=document.querySelector('#wstats-tbl tbody');tb.innerHTML='';
   for(const w of (d.workers||[]).slice(0,15)){
     const parts=(w.urn||'').split(':');
@@ -1029,6 +1039,7 @@ async function refreshWorkers(){
 
 async function refreshSchedules(){
   const d=await api('GET','/v1/schedules');
+  if(unchanged('schedules',d))return;
   const tb=document.querySelector('#sched-tbl tbody');tb.innerHTML='';
   for(const s of (d.schedules||[])){
     const r=tb.insertRow();
@@ -1058,6 +1069,7 @@ async function refreshGPU(){
     }
   }
   document.getElementById('gpu-cnt').textContent = `(${rows.length} GPU${rows.length===1?'':'s'} reporting)`;
+  if(unchanged('gpu',rows))return;
   const tb = document.querySelector('#gpu-tbl tbody'); tb.innerHTML = '';
   for (const r of rows) {
     const tr = tb.insertRow();
@@ -1086,6 +1098,7 @@ async function refreshHosts(){
   const d=await api('GET','/v1/hosts?include_stale=true').catch(()=>({hosts:[]}));
   const hosts=d.hosts||[];
   document.getElementById('hosts-cnt').textContent=`(${hosts.filter(h=>!h.stale).length} live · ${hosts.length} total)`;
+  if(unchanged('hosts',hosts))return;
   const tb=document.querySelector('#hosts-tbl tbody');tb.innerHTML='';
   for(const h of hosts){
     const r=tb.insertRow();
