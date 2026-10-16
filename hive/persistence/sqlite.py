@@ -692,6 +692,35 @@ class SqliteHiveRepository(HiveMindRepository):
         )
         return cur.rowcount
 
+    async def job_update_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
+        """The PATCH pre-read: status/claim/retry/decline/kind/repo for one job."""
+        db = tx
+        async with db.execute(
+            "SELECT status, claimed_by, claimed_provider, claimed_model, retry_count, "
+            "max_retries, COALESCE(decline_count, 0), kind, repo FROM jobs WHERE id=?",
+            (job_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def job_stats_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
+        """The terminal-stats pre-read (worker_kind_stats + usage_ledger inputs)."""
+        db = tx
+        async with db.execute(
+            "SELECT kind, description, max_cost_tier, required_capabilities, "
+            "claimed_model, claimed_provider, claimed_by, result, started_at "
+            "FROM jobs WHERE id=?",
+            (job_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def agent_spend_add(self, tx: Transaction, *, urn: str, delta: float) -> None:
+        """Roll MTD spend onto the claiming agent (subscription-throttle input)."""
+        db = tx
+        await db.execute(
+            "UPDATE agents SET plan_period_used_usd = COALESCE(plan_period_used_usd,0) + ? WHERE urn=?",
+            (delta, urn),
+        )
+
     async def post_message(self, tx: Transaction, **fields: Any) -> None:
         db = tx
         await db.execute(
