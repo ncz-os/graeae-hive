@@ -11,9 +11,14 @@ import time
 
 from fastapi import APIRouter
 
-from hive.bus.deps import connect_db, emit_event, require_registered_agent, uuidv7
+from hive.bus.deps import (
+    clamp_limit,
+    connect_db,
+    emit_event,
+    require_registered_agent,
+    uuidv7,
+)
 from hive.bus.schemas import MessagePublish
-from hive.bus.deps import clamp_limit
 
 router = APIRouter()
 
@@ -25,8 +30,7 @@ async def publish_message(req: MessagePublish):
     await require_registered_agent(req.from_urn, active_only=True)
     async with connect_db() as db:
         await db.execute(
-            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 msg_id,
                 req.from_urn,

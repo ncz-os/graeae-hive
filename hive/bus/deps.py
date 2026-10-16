@@ -11,6 +11,7 @@ so the two stay in step (the live deploy sets them once per process).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import secrets
@@ -25,9 +26,7 @@ from hive.persistence.factory import get_hive_repository
 # ---- config (mirrors agent_bus.py) --------------------------------------
 _DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 _HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
-_ORACLE_DSN = os.environ.get(
-    "ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1"
-)
+_ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
 _SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 
 ACTIVE_AGENT_STATUSES = {"online", "idle"}
@@ -67,10 +66,8 @@ async def emit_event(db, kind: str, payload: dict) -> None:
     await db.commit()
     # broadcast to live SSE subscribers
     for q in list(EVENT_QUEUE.values()):
-        try:
+        with contextlib.suppress(asyncio.QueueFull):
             q.put_nowait({"kind": kind, "ts": ts, "payload": payload})
-        except asyncio.QueueFull:
-            pass
 
 
 def uuidv7() -> str:
@@ -78,13 +75,7 @@ def uuidv7() -> str:
     ts_ms = int(time.time() * 1000)
     rand_a = secrets.randbits(12)
     rand_b = secrets.randbits(62)
-    val = (
-        (ts_ms & ((1 << 48) - 1)) << 80
-        | (0x7 << 76)
-        | (rand_a << 64)
-        | (0x2 << 62)
-        | rand_b
-    )
+    val = (ts_ms & ((1 << 48) - 1)) << 80 | (0x7 << 76) | (rand_a << 64) | (0x2 << 62) | rand_b
     return str(uuid.UUID(int=val))
 
 
@@ -98,9 +89,7 @@ def clamp_limit(value: int, *, default: int = 100, max_limit: int = 1000) -> int
     return min(limit, max_limit)
 
 
-async def require_registered_agent(
-    urn: str, *, active_only: bool = False
-) -> tuple[str, str]:
+async def require_registered_agent(urn: str, *, active_only: bool = False) -> tuple[str, str]:
     if not urn or not urn.strip():
         raise HTTPException(422, "agent urn is required")
     async with (
@@ -116,7 +105,5 @@ async def require_registered_agent(
     runtime = (row[0] or "unknown").lower()
     status = (row[1] or "unknown").lower()
     if active_only and status not in ACTIVE_AGENT_STATUSES:
-        raise HTTPException(
-            403, f"agent {urn} is not active; current status={status!r}"
-        )
+        raise HTTPException(403, f"agent {urn} is not active; current status={status!r}")
     return runtime, status
