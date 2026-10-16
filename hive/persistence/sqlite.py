@@ -400,8 +400,25 @@ class SqliteHiveRepository(HiveMindRepository):
                 if not committed:
                     await db.execute("ROLLBACK")
 
-    async def patch_job_status(self, **fields: Any) -> None:
-        raise NotImplementedError("PATCH /v1/jobs still uses the compatibility transaction handle in Phase 1")
+    async def patch_job_status(self, **fields: Any) -> int:
+        """Backend-neutral UPDATE of one job row.
+
+        fields: job_id (required) + sets (dict of column -> value; None renders
+        SQL NULL). Returns rowcount. Callers own the business logic; the facade
+        owns the dialect. `sets` keys are column names (never caller input) and
+        every VALUE is bound.
+        """
+        job_id = fields["job_id"]
+        sets: dict[str, Any] = dict(fields.get("sets") or {})
+        if not sets:
+            return 0
+        assign = ", ".join(f"{col}=?" for col in sets)
+        args = list(sets.values())
+        args.append(job_id)
+        async with self.connection() as db:
+            cur = await db.execute(f"UPDATE jobs SET {assign} WHERE id=?", args)
+            await db.commit()
+            return cur.rowcount
 
     async def get_job(self, *, job_id: str) -> tuple[Any, ...] | None:
         async with self.connection() as db:
