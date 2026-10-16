@@ -141,6 +141,20 @@ async def require_orchestrator_submitter(submitter_urn: str) -> str:
 
 
 ACTIVE_JOB_STATUSES = ("queued", "offered", "claimed", "running", "needs-review")
+VALID_JOB_STATUSES = {
+    "queued",
+    "offered",
+    "claimed",
+    "running",
+    "done",
+    "failed",
+    "failed_completion",
+    "cancelled",
+    "dead-letter",
+    "needs-review",
+    "released",
+}
+TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 
 
 async def require_mutation_actor(

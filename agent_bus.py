@@ -40,6 +40,8 @@ from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
     EVENT_QUEUE,
     HOST_DENYLIST,
+    TERMINAL_JOB_STATUSES,
+    VALID_JOB_STATUSES,
     _cascade_delete_jobs,
     clamp_limit,
     connect_db,
@@ -61,6 +63,8 @@ from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export f
 from hive.bus.routers.admin import router as _admin_router
 from hive.bus.routers.agents import heartbeat, list_agents, register
 from hive.bus.routers.agents import router as _agents_router
+from hive.bus.routers.jobs import get_job, list_jobs  # noqa: F401 (re-export for tests)
+from hive.bus.routers.jobs import router as _jobs_router
 from hive.bus.routers.messages import list_messages, publish_message
 from hive.bus.routers.messages import router as _messages_router
 from hive.bus.routers.repos import router as _repos_router
@@ -842,24 +846,11 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 #   C = RESERVE — Anthropic Opus/Sonnet, OpenAI GPT-5.5/Pro, Gemini Pro, Together DeepSeek-Pro
 #                 (Together DeepSeek-V4-Pro = anti-pattern — use DeepSeek direct instead)
 # PROVIDER_COST_TIER / COST_TIERS now live in hive.core.models (imported above).
-VALID_JOB_STATUSES = {
-    "queued",
-    "offered",
-    "claimed",
-    "running",
-    "done",
-    "failed",
-    "failed_completion",
-    "cancelled",
-    "dead-letter",
-    "needs-review",
-    "released",
-}
+# VALID_JOB_STATUSES / TERMINAL_JOB_STATUSES moved to hive.bus.deps (imported above).
 # `released` was terminal here but is NOT in the jobs.status CHECK constraint and
 # is produced by no transition, so PATCH status=released passed validation then
 # died in the DB as a raw IntegrityError (500, not 4xx). An unreachable
 # terminal state is worse than no such state.
-TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
@@ -1723,6 +1714,7 @@ app.include_router(_repos_router)
 app.include_router(_messages_router)
 app.include_router(_agents_router)
 app.include_router(_admin_router)
+app.include_router(_jobs_router)
 app.include_router(_schedules_router)
 
 
@@ -3816,144 +3808,7 @@ async def claim_job(job_id: str, by: str):
     }
 
 
-@app.get("/v1/jobs")
-async def list_jobs(
-    status: str | None = None,
-    agent_urn: str | None = None,
-    parent_job_id: str | None = None,
-    since: float | None = None,
-    limit: int = 100,
-    include_result: bool = True,
-):
-    limit = clamp_limit(limit, default=100, max_limit=1000)
-    if status:
-        # Normalize separator variants (dead_letter -> dead-letter,
-        # failed-completion -> failed_completion) and reject unknown values
-        # with 400 instead of silently returning an empty list. A wrong
-        # separator previously made 82 dead-letter rows API-invisible
-        # (2026-06-06): the canonical spelling is hyphenated dead-letter
-        # while callers naturally write dead_letter.
-        normalized = status.strip().lower().replace("_", "-")
-        status = {"failed-completion": "failed_completion"}.get(normalized, normalized)
-        if status not in VALID_JOB_STATUSES:
-            raise HTTPException(
-                400,
-                f"unknown status {status!r}; valid: {sorted(VALID_JOB_STATUSES)}",
-            )
-    sql = (
-        "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-        "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-        "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE 1=1"
-    )
-    args: list = []
-    cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
-    cnt_args: list = []
-    if status:
-        sql += " AND status=?"
-        cnt_sql += " AND status=?"
-        args.append(status)
-        cnt_args.append(status)
-    if agent_urn:
-        sql += " AND (submitter_urn=? OR claimed_by=?)"
-        cnt_sql += " AND (submitter_urn=? OR claimed_by=?)"
-        args.extend([agent_urn, agent_urn])
-        cnt_args.extend([agent_urn, agent_urn])
-    if parent_job_id:
-        sql += " AND parent_job_id=?"
-        cnt_sql += " AND parent_job_id=?"
-        args.append(parent_job_id)
-        cnt_args.append(parent_job_id)
-    if since:
-        sql += " AND started_at >= ?"
-        cnt_sql += " AND started_at >= ?"
-        args.append(since)
-        cnt_args.append(since)
-    # For terminal statuses, sort by ended_at DESC so 'recent' actually means recently-finished.
-    if status in TERMINAL_JOB_STATUSES:
-        sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
-    else:
-        # Recency-first: without a status filter, "recent" must mean recently
-        # touched, not highest-priority. Priority-first ordering pushed recent
-        # low-priority jobs outside the LIMIT window -> API-invisible (a build
-        # job was lost this way 2026-06-13). Keep priority as the tiebreak.
-        sql += " ORDER BY COALESCE(ended_at, started_at) DESC, priority DESC LIMIT ?"
-    args.append(limit)
-    rows = []
-    total = 0
-    async with connect_db() as db:
-        async with db.execute(cnt_sql, cnt_args) as cur:
-            row = await cur.fetchone()
-            total = row[0] if row else 0
-        async with db.execute(sql, args) as cur:
-            async for r in cur:
-                job = {
-                    "id": r[0],
-                    "submitter_urn": r[1],
-                    "parent_job_id": r[2],
-                    "kind": r[3],
-                    "description": r[4],
-                    "priority": r[5],
-                    "status": r[6],
-                    "claimed_by": r[7],
-                    "started_at": r[8],
-                    "ended_at": r[9],
-                    "result": json.loads(r[10]) if r[10] else None,
-                    "estimated_cost_usd": r[11],
-                    "required_capabilities": json.loads(r[12]) if r[12] else None,
-                    "eligible_kinds": json.loads(r[13]) if r[13] else None,
-                    "eligible_hosts": json.loads(r[14]) if r[14] else None,
-                    "site": r[15],
-                    "repo": r[16],
-                    "head_branch": r[17],
-                    "pr_number": r[18],
-                    "max_retries": r[19],
-                    "retry_count": r[20],
-                }
-                # Opt-in projection: result can be large; listings that only
-                # need metadata can drop it. Default True (unchanged behavior).
-                if not include_result:
-                    job.pop("result", None)
-                rows.append(job)
-    return {"count": len(rows), "total": total, "jobs": rows}
-
-
-@app.get("/v1/jobs/{job_id}")
-async def get_job(job_id: str):
-    """Fetch a single job by id (previously 405 -> callers had to scan the list
-    or query the DB directly to find one job, e.g. a just-submitted build)."""
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
-            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count FROM jobs WHERE id=?",
-            (job_id,),
-        ) as cur:
-            r = await cur.fetchone()
-    if not r:
-        raise HTTPException(404, f"job not found: {job_id}")
-    return {
-        "id": r[0],
-        "submitter_urn": r[1],
-        "parent_job_id": r[2],
-        "kind": r[3],
-        "description": r[4],
-        "priority": r[5],
-        "status": r[6],
-        "claimed_by": r[7],
-        "started_at": r[8],
-        "ended_at": r[9],
-        "result": json.loads(r[10]) if r[10] else None,
-        "estimated_cost_usd": r[11],
-        "required_capabilities": json.loads(r[12]) if r[12] else None,
-        "eligible_kinds": json.loads(r[13]) if r[13] else None,
-        "eligible_hosts": json.loads(r[14]) if r[14] else None,
-        "site": r[15],
-        "repo": r[16],
-        "head_branch": r[17],
-        "pr_number": r[18],
-        "max_retries": r[19],
-        "retry_count": r[20],
-    }
+# /v1/jobs (list) + /v1/jobs/{id} (get) moved to hive.bus.routers.jobs (Phase 1c).
 
 
 # /v1/messages routes moved to hive.bus.routers.messages (Phase 1c).

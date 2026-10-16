@@ -30,6 +30,7 @@ from starlette.responses import Response
 import agent_bus
 from hive import scheduler as sched
 from hive.bus.routers import admin as hive_admin_router
+from hive.bus.routers import jobs as hive_jobs_router
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
 from hive.persistence.oracle import (
     _ORACLE_JOB_ADDITIONS,
@@ -418,7 +419,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
 
-            with mock.patch.object(agent_bus, "connect_db", repo.connection):
+            with mock.patch.object(hive_jobs_router, "connect_db", repo.connection):
                 historical = await agent_bus.list_jobs(status="done")
                 compact = await agent_bus.list_jobs(status="done", include_result=False)
 
