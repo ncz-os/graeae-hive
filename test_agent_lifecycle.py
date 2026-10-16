@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-import time
 import unittest
 
 os.environ.setdefault("HIVE_BACKEND", "sqlite")
@@ -163,6 +162,17 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.json().get("status"), "needs-review")
         r = await c.get(f"/v1/jobs/{jid}")
         self.assertEqual(r.json()["status"], "needs-review")
+
+    async def test_unknown_agent_heartbeat_is_409(self):
+        # 409 (not 404) so hive_worker.py's main loop re-registers and self-heals
+        ghost = "urn:agent:zeroclaw:ghost:00000000-0000-0000-0000-000000000000"
+        r = await self.client.post("/v1/agents/heartbeat", json={"urn": ghost})
+        self.assertEqual(r.status_code, 409, r.text)
+
+    async def test_unknown_agent_claim_is_409(self):
+        ghost = "urn:agent:zeroclaw:ghost:00000000-0000-0000-0000-000000000000"
+        r = await self.client.post(f"/v1/jobs/next?agent_urn={ghost}")
+        self.assertEqual(r.status_code, 409, r.text)
 
 
 if __name__ == "__main__":

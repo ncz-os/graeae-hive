@@ -460,7 +460,9 @@ async def dequeue_next_job(agent_urn: str):
         async with hive_repo().connection() as tx:
             agent_row = await hive_repo().agent_claim_context(tx, agent_urn)
             if not agent_row:
-                raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
+                # 409 (not 404): matches what hive_worker.py's claim loop already
+                # handles by re-registering, so an unregistered worker self-heals.
+                raise HTTPException(409, f"claim failed: agent not registered: {agent_urn}")
             (
                 agent_kind,
                 caps_json,
@@ -1141,7 +1143,7 @@ async def claim_job(job_id: str, by: str):
     async with hive_repo().connection() as tx:
         agent_row = await hive_repo().agent_claim_context(tx, by)
         if not agent_row:
-            raise HTTPException(404, f"claim failed: agent not registered: {by}")
+            raise HTTPException(409, f"claim failed: agent not registered: {by}")
         (
             agent_kind,
             caps_json,
