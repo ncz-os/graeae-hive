@@ -25,11 +25,11 @@ from fastapi import Header, HTTPException
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
 
-# ---- config (mirrors agent_bus.py) --------------------------------------
-_DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
-_HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
-_ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
-_SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
+# ---- repository ---------------------------------------------------------
+# The bus does NOT choose a backend or carry a DSN. `get_hive_repository()`
+# resolves HIVE_BACKEND / AGENT_BUS_DB / ORACLE_DSN / DB2_DSN from the
+# environment in hive.persistence.factory — the single place backend+dialect
+# knowledge lives. The bus layer only ever touches the HiveMindRepository ABC.
 
 ACTIVE_AGENT_STATUSES = {"online", "idle"}
 VALID_AGENT_STATUSES = {"online", "idle", "stale", "offline", "error"}
@@ -57,14 +57,13 @@ _HIVE_REPO = None
 def hive_repo():
     global _HIVE_REPO
     if _HIVE_REPO is None:
-        _HIVE_REPO = get_hive_repository(
-            _HIVE_BACKEND,
-            db_path=_DB_PATH,
-            busy_timeout_ms=_SQLITE_BUSY_TIMEOUT_MS,
-            dsn=_ORACLE_DSN,
-            db2_dsn=os.environ.get("DB2_DSN") or os.environ.get("HIVE_DB2_DSN", ""),
-        )
+        _HIVE_REPO = get_hive_repository()
     return _HIVE_REPO
+
+
+def repo() -> object:
+    """The shared HiveMindRepository ABC instance (storage facade)."""
+    return hive_repo()
 
 
 @asynccontextmanager
