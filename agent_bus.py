@@ -3675,9 +3675,15 @@ async def update_job(job_id: str, req: JobUpdate):
                     except Exception:
                         _prev = None
                 if isinstance(_prev, dict):
+                    # Copy rather than mutate req.result in place (no side
+                    # effect on the caller's request object), then reassign.
+                    _merged = dict(req.result)
                     for _rk in ("hive_reviews", "deepseek_reviews"):
-                        if _prev.get(_rk) and not req.result.get(_rk):
-                            req.result[_rk] = _prev[_rk]
+                        if _prev.get(_rk) and not _merged.get(_rk):
+                            _merged[_rk] = _prev[_rk]
+                    if _merged != req.result:
+                        req.result = _merged
+                        patch_payload["result"] = req.result
 
             if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
                 await db.execute("ROLLBACK")
