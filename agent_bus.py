@@ -20,11 +20,6 @@ import time
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
-try:
-    import aiosqlite
-except ModuleNotFoundError:
-    pass
-
 from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -113,7 +108,6 @@ TEST_JOB_DESC_PATTERNS = (
 )
 SSE_PING_INTERVAL = 15.0
 # EVENT_QUEUE now lives in hive.bus.deps (imported above).
-SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "100"))
 
 
@@ -720,25 +714,6 @@ CREATE INDEX IF NOT EXISTS idx_sched_next ON scheduled_jobs(next_fire_at, enable
 # (single source of truth, shared with mcp_bridge.py). Imported above.
 
 
-# HOST AFFINITY — automatic eligible_hosts injection based on job kind prefix.
-# When a job kind matches a prefix, the server adds eligible_hosts if not already set.
-# This ensures e.g. cixmini-os: jobs only run on cixmini hardware without callers needing to specify.
-KIND_HOST_AFFINITY: dict[str, list[str]] = {
-    # Argonaut DBPR work requires the florida-licenses workspace. Route to
-    # a verified zeroclaw host with the Argonaut workspace map installed.
-    "argonaut:": [
-        "ULTRA",
-        "HYDRA",
-    ],  # TYPHON offline 2026-06-01; retargeted to live zeroclaw hosts w/ florida-licenses workspace
-    # Hardware-bound: needs physical CIX Sky1 NPU — zeroclaw cannot substitute with SSH
-    "cixmini-os:": ["cixmini"],
-    "ncz-os:": ["cixmini"],
-    # Pi-specific tasks (explicit opt-in; general jobs use any worker)
-    "pi:": ["bigpi", "clawpi", "zeropi"],
-    "arm64-test:": ["bigpi", "clawpi", "zeropi", "cixmini"],
-    # Note: investorclaw/investorclaude are NOT here — any zeroclaw can execute
-    # those by SSHing to the appropriate host. Host affinity would over-restrict.
-}
 
 # (Removed 2026-10-15): the bus-side host-quarantine constant/probe. The only
 # host it ever guarded was the NVIDIA-LAN Spark (spark-0c53, out-claiming

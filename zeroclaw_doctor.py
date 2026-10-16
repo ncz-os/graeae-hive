@@ -72,7 +72,6 @@ ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "900"))
 MAX_SSH_PER_HOUR = int(os.environ.get("MAX_SSH_PER_HOUR", "3"))
 MIN_HOST_COOLDOWN = int(os.environ.get("MIN_HOST_COOLDOWN", "1800"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
-SUBMITTER_RUNTIME = "doctor"
 # Loop-detection: per-job-id (re)fail counter. If the same job_id keeps
 # coming back to the doctor (because we released it and some broken worker
 # re-failed it), we escalate instead of releasing it again.
@@ -490,52 +489,6 @@ def _gateway_failure_allows_fallback(reason: str) -> bool:
     return any(marker in text for marker in outage_markers)
 
 
-CODEX_BIN = os.environ.get("CODEX_BIN", "/usr/local/bin/codex")
-CODEX_TIMEOUT = int(os.environ.get("CODEX_TIMEOUT", "120"))
-
-
-def _invoke_codex_cli(prompt: str) -> tuple[bool, str]:
-    """Run the codex CLI tool (ChatGPT subscription auth, no API key).
-    User directive 2026-05-26: 'don't use 5.5 api, use the codex tool which
-    is authed'. Codex auth lives in ~/.codex/auth.json — already on PYTHIA."""
-    full = DOCTOR_SYSTEM + "\n\n" + prompt
-    output_path = f"/tmp/zeroclaw-doctor-codex-{uuid.uuid4().hex}.txt"
-    cmd = [
-        CODEX_BIN,
-        "exec",
-        "--skip-git-repo-check",
-        "--output-last-message",
-        output_path,
-        "-",
-    ]
-    log.info("invoking codex-cli prompt_chars=%d", len(full))
-    try:
-        r = subprocess.run(cmd, input=full, capture_output=True, text=True,
-                           timeout=CODEX_TIMEOUT)
-        if r.returncode != 0:
-            log.warning("codex-cli rc=%d stderr=%s", r.returncode, r.stderr[-300:])
-            return False, r.stderr[-1000:] or r.stdout[-1000:]
-        try:
-            with open(output_path) as f:
-                text = f.read().strip()
-            if text:
-                return True, text
-        except OSError as e:
-            log.warning("codex output file unreadable: %s", e)
-        out = r.stdout.strip()
-        m = re.search(r"\ncodex\n(.*?)(?:\ntokens used|\Z)", out, re.DOTALL)
-        if m:
-            return True, m.group(1).strip()
-        return True, out
-    except subprocess.TimeoutExpired:
-        return False, f"codex-cli timeout after {CODEX_TIMEOUT}s"
-    except FileNotFoundError:
-        return False, f"codex binary not found at {CODEX_BIN}"
-    finally:
-        try:
-            os.unlink(output_path)
-        except OSError:
-            pass
 
 
 def _openweight_api_key() -> str:

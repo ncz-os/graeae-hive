@@ -35,13 +35,6 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _env_csv(name: str) -> frozenset[str]:
     raw = os.environ.get(name, "")
     return frozenset(part.strip() for part in raw.split(",") if part.strip())

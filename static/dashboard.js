@@ -38,7 +38,6 @@ async function api(method,path,body,retry=true){
   if(!r.ok)throw new Error(j.detail||JSON.stringify(j));
   return j;
 }
-function timeStr(ts){if(!ts)return '-';return new Date(ts*1000).toLocaleTimeString();}
 function relTime(ts){if(!ts)return '';const d=(Date.now()/1000-ts);if(d<60)return Math.round(d)+'s ago';if(d<3600)return Math.round(d/60)+'m ago';return Math.round(d/3600)+'h ago';}
 function pbar(p){return `<span class="pbar"><span class="pbar-fill" style="width:${Math.min(100,p)}%"></span></span>`;}
 function badgeCls(s){return 'badge badge-'+(s||'queued');}
@@ -365,43 +364,6 @@ async function refreshRunning(){
   }
 }
 
-async function refreshRealWork(){
-  try {
-    const d = await api('GET', '/v1/jobs?status=done&limit=200');
-    const NOW = Date.now()/1000;
-    const jobs = (d.jobs || []);
-    const recent_h = jobs.filter(j => (NOW - (j.ended_at||0)) < 3600);
-    const recent_d = jobs.filter(j => (NOW - (j.ended_at||0)) < 86400);
-    const with_commits_h = recent_h.filter(j => (j.result||{}).commits && (j.result||{}).commits.length);
-    const with_commits_d = recent_d.filter(j => (j.result||{}).commits && (j.result||{}).commits.length);
-    const hosts_h = new Set();
-    let total_commits = 0;
-    for (const j of with_commits_h) {
-      const cb = (j.claimed_by||'').split(':');
-      if (cb.length >= 4) hosts_h.add(cb[3]);
-      total_commits += (j.result.commits || []).length;
-    }
-    document.getElementById('realwork-cnt').textContent = '(' + total_commits + ' commits last 1h)';
-    const statsEl = document.getElementById('realwork-stats');
-    statsEl.innerHTML = ''
-      + '<div><b style="color:#7ee787">' + total_commits + '</b> commits last 1h</div>'
-      + '<div><b style="color:#7ee787">' + with_commits_h.length + '</b> jobs with commits last 1h</div>'
-      + '<div><b style="color:#7ee787">' + hosts_h.size + '</b> hosts producing</div>'
-      + '<div><b>' + with_commits_d.length + '</b> jobs with commits last 24h</div>'
-      + '<div class="dim">' + recent_h.length + ' total done last 1h ' + (recent_h.length ? '(' + Math.round(100*with_commits_h.length/recent_h.length) + '% commit rate)' : '') + '</div>';
-    const recentEl = document.getElementById('realwork-recent');
-    with_commits_h.sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
-    recentEl.innerHTML = with_commits_h.slice(0,8).map(j => {
-      const r = j.result || {};
-      const cb = (j.claimed_by||'').split(':');
-      const host = cb.length>=4 ? cb[3] : '?';
-      const c0 = (r.commits||[])[0]; const sha = (c0 ? (c0.sha||c0) : '-').slice(0,10);
-      const t = new Date((j.ended_at||0)*1000).toLocaleTimeString();
-      return '<div>' + t + ' <span style="color:#7ee787">' + sha + '</span> ' + esc(host) + ' ' + esc(j.kind||'').slice(0,55) + '</div>';
-    }).join('');
-    if (!with_commits_h.length) recentEl.innerHTML = '<div class="dim">no commits in last hour</div>';
-  } catch(e) { console.warn('realwork err', e); }
-}
 
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');

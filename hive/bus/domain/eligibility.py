@@ -155,19 +155,6 @@ def heavy_repo_required_for_kind(kind: str) -> bool:
     return any(kind.startswith(prefix) for prefix in HEAVY_REPO_KIND_PREFIXES)
 
 
-def job_agent_preference_score(job: dict[str, Any], agent: dict[str, Any]) -> int:
-    score = 0
-    agent_provider = _norm_str(agent.get("provider"))
-    agent_model = _norm_str(agent.get("model"))
-    provs = [_norm_str(p) for p in (job.get("preferred_providers") or []) if _norm_str(p)]
-    models = [_norm_str(m) for m in (job.get("preferred_models") or []) if _norm_str(m)]
-    if agent_provider in provs:
-        score += 1000 - provs.index(agent_provider)
-    if agent_model in models:
-        score += 1000 - models.index(agent_model)
-    return score
-
-
 def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool, str]:
     agent_host = _norm_str(agent.get("host"))
     agent_caps = _norm_str_set(agent.get("capabilities"))
