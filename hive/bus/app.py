@@ -26,6 +26,7 @@ from hive.bus.deps import (
 )
 
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
+from hive.bus.domain.reaper import select_orphan_claims
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
 from hive.bus.routers.admin import router as _admin_router
 from hive.bus.routers.agents import router as _agents_router
@@ -313,22 +314,14 @@ async def reaper_task(app: FastAPI):
                 )
                 # Apply kind-specific override: keep job if its kind has a longer TTL
                 # AND its latest progress timestamp is within that window.
-                orphans = []
-                for jid, jkind, claimer, c_at, u_at, lease_exp in candidates:
-                    if lease_exp is not None and lease_exp <= now_ts:
-                        orphans.append((jid, claimer))
-                        continue
-                    # HARD CAP (un-refreshable): wall-clock since FIRST claim.
-                    # Defeats the retry-loop evasion where lease + last_update
-                    # stay fresh but the job never progresses.
-                    hard_ttl = CLAIM_HARD_MAX_AGE_BY_KIND.get(jkind, CLAIM_HARD_MAX_AGE)
-                    if c_at is not None and (now_ts - c_at) >= hard_ttl:
-                        orphans.append((jid, claimer))
-                        continue
-                    kind_ttl = CLAIM_STALE_AFTER_BY_KIND.get(jkind, CLAIM_STALE_AFTER)
-                    latest = u_at if u_at is not None else (c_at or 0)
-                    if (now_ts - latest) >= kind_ttl:
-                        orphans.append((jid, claimer))
+                orphans = select_orphan_claims(
+                    candidates,
+                    now=now_ts,
+                    stale_after=CLAIM_STALE_AFTER,
+                    hard_max_age=CLAIM_HARD_MAX_AGE,
+                    stale_by_kind=CLAIM_STALE_AFTER_BY_KIND,
+                    hard_by_kind=CLAIM_HARD_MAX_AGE_BY_KIND,
+                )
                 if orphans:
                     for job_id, claimer in orphans:
                         await repo.requeue_orphan_job(db, job_id)
