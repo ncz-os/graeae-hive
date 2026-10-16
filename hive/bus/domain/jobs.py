@@ -15,6 +15,14 @@ import time
 
 from hive.core.models import rate_for
 
+
+def is_dedup_violation(exc: BaseException) -> bool:
+    """Unique-violation from the active-only dedup index ONLY (never another PK/unique)."""
+    m = str(exc)
+    return "HIVE_JOBS_ACTIVE_DEDUP_UQ" in m.upper() or (
+        "unique constraint failed" in m.lower() and "dedup_hash" in m.lower()
+    )
+
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.

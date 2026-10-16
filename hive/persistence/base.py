@@ -14,7 +14,7 @@ Backends own their dialect; callers touch only this ABC.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from typing import Any, Protocol, runtime_checkable
 
@@ -127,6 +127,12 @@ class HiveMindRepository(ABC):
 
     @abstractmethod
     async def find_active_dedup_job(self, tx: Transaction, *, dedup_hash: str) -> Row | None: ...
+
+    @abstractmethod
+    async def jobs_exist(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]: ...
+
+    @abstractmethod
+    async def agent_kind_runtimes(self, tx: Transaction) -> list[Row]: ...
 
     # ---- messages ----
     @abstractmethod

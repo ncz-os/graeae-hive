@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -245,39 +245,56 @@ class SqliteHiveRepository(HiveMindRepository):
         return stale
 
     async def submit_job(self, tx: Transaction, **fields: Any) -> None:
+        """Insert one job row.
+
+        Defaults to a fresh ``queued`` row; callers may pass
+        ``status``/``result_json``/``ended_at``/``claimed_provider``/``claimed_model``/
+        ``claimed_cost_tier``/``estimated_cost_usd``/``result_mnemos_id`` (the
+        cache-hit path inserts an already-``done`` row). No commit here — the
+        caller owns the transaction (EPIMONE shape).
+        """
         db = tx
-        try:
-            await db.execute(
-                "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-                "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, "
-                "preferred_models, mnemos_refs, depends_on, max_retries, dedup_hash, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
-                (
-                    fields["id"],
-                    fields["submitter_urn"],
-                    fields.get("parent_job_id"),
-                    fields["kind"],
-                    fields.get("description"),
-                    fields.get("priority", 0),
-                    fields.get("deadline"),
-                    fields.get("required_capabilities_json"),
-                    fields.get("eligible_kinds_json"),
-                    fields.get("eligible_hosts_json"),
-                    fields.get("project"),
-                    fields.get("max_cost_tier"),
-                    fields.get("preferred_providers_json"),
-                    fields.get("preferred_models_json"),
-                    fields.get("mnemos_refs_json"),
-                    fields.get("depends_on_json"),
-                    int(fields.get("max_retries", 2)),
-                    fields.get("dedup_hash"),
-                    fields["started_at"],
-                ),
-            )
-            await db.commit()
-        except Exception:
-            await db.rollback()
-            raise
+        await db.execute(
+            "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
+            "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, "
+            "preferred_models, mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, pr_number, "
+            "status, started_at, ended_at, result, claimed_provider, claimed_model, claimed_cost_tier, "
+            "estimated_cost_usd, result_mnemos_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fields["id"],
+                fields["submitter_urn"],
+                fields.get("parent_job_id"),
+                fields["kind"],
+                fields.get("description"),
+                fields.get("priority", 0),
+                fields.get("deadline"),
+                fields.get("required_capabilities_json"),
+                fields.get("eligible_kinds_json"),
+                fields.get("eligible_hosts_json"),
+                fields.get("project"),
+                fields.get("max_cost_tier"),
+                fields.get("preferred_providers_json"),
+                fields.get("preferred_models_json"),
+                fields.get("mnemos_refs_json"),
+                fields.get("depends_on_json"),
+                int(fields.get("max_retries", 2)),
+                fields.get("dedup_hash"),
+                fields.get("site"),
+                fields.get("repo"),
+                fields.get("head_branch"),
+                fields.get("pr_number"),
+                fields.get("status", "queued"),
+                fields["started_at"],
+                fields.get("ended_at"),
+                fields.get("result_json"),
+                fields.get("claimed_provider"),
+                fields.get("claimed_model"),
+                fields.get("claimed_cost_tier"),
+                fields.get("estimated_cost_usd"),
+                fields.get("result_mnemos_id"),
+            ),
+        )
 
     async def claim_next_job(
         self,
@@ -563,6 +580,23 @@ class SqliteHiveRepository(HiveMindRepository):
             ) as cur,
         ):
             return await cur.fetchone()
+
+    async def jobs_exist(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]:
+        """Of ``ids``, which job ids exist? (one query, bound placeholders)."""
+        if not ids:
+            return set()
+        db = tx
+        placeholders = ",".join("?" * len(ids))
+        async with db.execute(
+            f"SELECT id FROM jobs WHERE id IN ({placeholders})", tuple(ids)
+        ) as cur:
+            return {row[0] async for row in cur}
+
+    async def agent_kind_runtimes(self, tx: Transaction) -> list[tuple[str, str]]:
+        """(kind, runtime) for every registered agent (kind-alias checking)."""
+        db = tx
+        async with db.execute("SELECT kind, runtime FROM agents") as cur:
+            return [(r[0], r[1]) async for r in cur]
 
     async def post_message(self, tx: Transaction, **fields: Any) -> None:
         db = tx
