@@ -419,7 +419,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
 
-            with mock.patch.object(hive_jobs_router, "connect_db", repo.connection):
+            with mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo):
                 historical = await agent_bus.list_jobs(status="done")
                 compact = await agent_bus.list_jobs(status="done", include_result=False)
 

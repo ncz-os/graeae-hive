@@ -30,14 +30,10 @@ class SqliteHiveRepository(HiveMindRepository):
             os.makedirs(db_dir, exist_ok=True)
         async with self.connection() as db:
             if schema:
-                await db.executescript(
-                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
-                )
+                await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
                 await db.executescript(schema)
             await self._ensure_column(db, "jobs", "dedup_hash", "dedup_hash TEXT")
-            await self._ensure_column(
-                db, "jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0"
-            )
+            await self._ensure_column(db, "jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0")
             await db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedup_uq ON jobs (dedup_hash) "
                 "WHERE dedup_hash IS NOT NULL AND status IN ('queued', 'offered', 'claimed', 'running')"
@@ -62,9 +58,7 @@ class SqliteHiveRepository(HiveMindRepository):
         finally:
             await db.close()
 
-    async def _ensure_column(
-        self, db: Any, table: str, col: str, ddl_fragment: str
-    ) -> None:
+    async def _ensure_column(self, db: Any, table: str, col: str, ddl_fragment: str) -> None:
         try:
             cursor = await db.execute(f"PRAGMA table_info({table})")
             cols = {row[1] for row in await cursor.fetchall()}
@@ -117,9 +111,7 @@ class SqliteHiveRepository(HiveMindRepository):
             )
             await db.commit()
 
-    async def heartbeat_agent(
-        self, *, urn: str, ts: float, status: str, metadata_json: str | None = None
-    ) -> int:
+    async def heartbeat_agent(self, *, urn: str, ts: float, status: str, metadata_json: str | None = None) -> int:
         async with self.connection() as db:
             if metadata_json is not None:
                 cur = await db.execute(
@@ -136,9 +128,7 @@ class SqliteHiveRepository(HiveMindRepository):
 
     async def require_agent(self, *, urn: str) -> tuple[Any, ...] | None:
         async with self.connection() as db:
-            async with db.execute(
-                "SELECT runtime, status FROM agents WHERE urn=?", (urn,)
-            ) as cur:
+            async with db.execute("SELECT runtime, status FROM agents WHERE urn=?", (urn,)) as cur:
                 return await cur.fetchone()
 
     async def list_agents(self, **filters: Any) -> list[dict[str, Any]]:
@@ -263,12 +253,7 @@ class SqliteHiveRepository(HiveMindRepository):
             if a_tier not in cost_tiers:
                 a_tier = "C"
             a_auth = (a_auth or "unknown").lower()
-            sub_throttled = (
-                a_auth == "subscription"
-                and a_cap
-                and a_used
-                and a_used >= throttle_headroom * a_cap
-            )
+            sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= throttle_headroom * a_cap
 
             await db.execute("BEGIN IMMEDIATE")
             committed = False
@@ -300,9 +285,7 @@ class SqliteHiveRepository(HiveMindRepository):
                             j_mnemos_refs,
                             j_deps_json,
                         ) = r
-                        if urn_host in NARROW_HOSTS and not (j_kind or "").startswith(
-                            NARROW_ALLOWLIST
-                        ):
+                        if urn_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
                             continue
                         if j_deps_json:
                             deps = json_list(j_deps_json)
@@ -317,26 +300,17 @@ class SqliteHiveRepository(HiveMindRepository):
                                     continue
                         if _j_kinds_json:
                             kinds = set(json_list(_j_kinds_json))
-                            if (
-                                kinds
-                                and "*" not in kinds
-                                and not kinds.intersection(eligible_aliases)
-                            ):
+                            if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
                                 continue
                         if _j_hosts_json:
                             hosts = set(json_list(_j_hosts_json))
                             host_lc = {h.lower() for h in hosts}
-                            agent_host = (
-                                urn_parts[3] if len(urn_parts) > 3 else ""
-                            ).lower()
+                            agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
                             if hosts and "*" not in hosts and agent_host not in host_lc:
                                 continue
                         if j_caps_json:
                             labels = json_list(j_caps_json)
-                            if (
-                                labels
-                                and not match_capabilities(labels, agent_caps).eligible
-                            ):
+                            if labels and not match_capabilities(labels, agent_caps).eligible:
                                 continue
                         job_max_tier = (j_max_tier or "B").upper()
                         if job_max_tier not in cost_tiers:
@@ -385,9 +359,7 @@ class SqliteHiveRepository(HiveMindRepository):
                             "parent_job_id": j_par,
                             "claimed_at": now,
                             "queued_at": j_started,
-                            "mnemos_refs": json.loads(j_mnemos_refs)
-                            if j_mnemos_refs
-                            else [],
+                            "mnemos_refs": json.loads(j_mnemos_refs) if j_mnemos_refs else [],
                             "claimed_resources": {
                                 "runtime": a_runtime,
                                 "model": a_model,
@@ -403,9 +375,7 @@ class SqliteHiveRepository(HiveMindRepository):
                     await db.execute("ROLLBACK")
 
     async def patch_job_status(self, **fields: Any) -> None:
-        raise NotImplementedError(
-            "PATCH /v1/jobs still uses the compatibility transaction handle in Phase 1"
-        )
+        raise NotImplementedError("PATCH /v1/jobs still uses the compatibility transaction handle in Phase 1")
 
     async def get_job(self, *, job_id: str) -> tuple[Any, ...] | None:
         async with self.connection() as db:
@@ -413,9 +383,87 @@ class SqliteHiveRepository(HiveMindRepository):
                 return await cur.fetchone()
 
     async def list_jobs(self, **filters: Any) -> tuple[int, list[dict[str, Any]]]:
-        raise NotImplementedError(
-            "list_jobs endpoint still uses the compatibility transaction handle in Phase 1"
+        """Backend-neutral job listing (GET /v1/jobs).
+
+        Filters: status, agent_urn, parent_job_id, since, limit, include_result.
+        Returns (total_count, rows). Sorting: terminal statuses by ended/started
+        DESC; otherwise recency-first with priority as tiebreak.
+        """
+        status = filters.get("status")
+        agent_urn = filters.get("agent_urn")
+        parent_job_id = filters.get("parent_job_id")
+        since = filters.get("since")
+        limit = int(filters.get("limit") or 100)
+        include_result = bool(filters.get("include_result", True))
+        col_sql = (
+            "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
+            "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
+            "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, "
+            "pr_number, max_retries, retry_count FROM jobs WHERE 1=1"
         )
+        cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
+        args: list[Any] = []
+        cnt_args: list[Any] = []
+        if status:
+            col_sql += " AND status=?"
+            cnt_sql += " AND status=?"
+            args.append(status)
+            cnt_args.append(status)
+        if agent_urn:
+            col_sql += " AND (submitter_urn=? OR claimed_by=?)"
+            cnt_sql += " AND (submitter_urn=? OR claimed_by=?)"
+            args.extend([agent_urn, agent_urn])
+            cnt_args.extend([agent_urn, agent_urn])
+        if parent_job_id:
+            col_sql += " AND parent_job_id=?"
+            cnt_sql += " AND parent_job_id=?"
+            args.append(parent_job_id)
+            cnt_args.append(parent_job_id)
+        if since:
+            col_sql += " AND started_at >= ?"
+            cnt_sql += " AND started_at >= ?"
+            args.append(since)
+            cnt_args.append(since)
+        terminal = {"done", "failed", "cancelled", "dead-letter"}
+        if status in terminal:
+            col_sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
+        else:
+            col_sql += " ORDER BY COALESCE(ended_at, started_at) DESC, priority DESC LIMIT ?"
+        args.append(limit)
+        rows: list[dict[str, Any]] = []
+        async with self.connection() as db:
+            async with db.execute(cnt_sql, cnt_args) as cur:
+                r = await cur.fetchone()
+                total = r[0] if r else 0
+            async with db.execute(col_sql, args) as cur:
+                async for r in cur:
+                    job = {
+                        "id": r[0],
+                        "submitter_urn": r[1],
+                        "parent_job_id": r[2],
+                        "kind": r[3],
+                        "description": r[4],
+                        "priority": r[5],
+                        "status": r[6],
+                        "claimed_by": r[7],
+                        "started_at": r[8],
+                        "ended_at": r[9],
+                        "result": json.loads(r[10]) if r[10] else None,
+                        "estimated_cost_usd": r[11],
+                        "required_capabilities": json.loads(r[12]) if r[12] else None,
+                        "eligible_kinds": json.loads(r[13]) if r[13] else None,
+                        "eligible_hosts": json.loads(r[14]) if r[14] else None,
+                        "site": r[15],
+                        "repo": r[16],
+                        "head_branch": r[17],
+                        "pr_number": r[18],
+                        "max_retries": r[19],
+                        "retry_count": r[20],
+                    }
+                    if not include_result:
+                        job.pop("result", None)
+                    rows.append(job)
+        return total, rows
 
     async def find_active_dedup_job(self, *, dedup_hash: str) -> tuple[Any, ...] | None:
         async with (
@@ -446,13 +494,41 @@ class SqliteHiveRepository(HiveMindRepository):
             await db.commit()
 
     async def list_messages(self, **filters: Any) -> list[dict[str, Any]]:
-        raise NotImplementedError(
-            "list_messages endpoint still uses the compatibility transaction handle in Phase 1"
-        )
+        """Backend-neutral message listing (GET /v1/messages)."""
+        to_urn = filters.get("to_urn")
+        topic = filters.get("topic")
+        since = filters.get("since")
+        limit = int(filters.get("limit") or 100)
+        sql = "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts FROM messages WHERE 1=1"
+        args: list[Any] = []
+        if to_urn:
+            sql += " AND (to_urn=? OR to_urn IS NULL)"
+            args.append(to_urn)
+        if topic:
+            sql += " AND topic LIKE ?"
+            args.append(topic.replace("*", "%"))
+        if since:
+            sql += " AND ts >= ?"
+            args.append(since)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        args.append(limit)
+        rows: list[dict[str, Any]] = []
+        async with self.connection() as db, db.execute(sql, args) as cur:
+            async for r in cur:
+                rows.append(
+                    {
+                        "id": r[0],
+                        "from": r[1],
+                        "to": r[2],
+                        "in_reply_to": r[3],
+                        "topic": r[4],
+                        "payload": json.loads(r[5]),
+                        "ts": r[6],
+                    }
+                )
+        return rows
 
-    async def tail_events(
-        self, *, since_id: int | None = None, limit: int = 100
-    ) -> list[dict[str, Any]]:
+    async def tail_events(self, *, since_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
         sql = "SELECT id, ts, kind, payload, agent_urn FROM events"
         args: list[Any] = []
         if since_id is not None:
@@ -475,9 +551,7 @@ class SqliteHiveRepository(HiveMindRepository):
                     )
         return rows
 
-    async def cache_lookup(
-        self, *, cache_key: str, cutoff: float
-    ) -> dict[str, Any] | None:
+    async def cache_lookup(self, *, cache_key: str, cutoff: float) -> dict[str, Any] | None:
         async with self.connection() as db:
             async with db.execute(
                 "SELECT result_json, source_job_id, result_mnemos_id, hit_count, cost_saved_usd, model, provider, cached_at "
@@ -518,9 +592,7 @@ class SqliteHiveRepository(HiveMindRepository):
             )
             await db.commit()
 
-    async def cache_record_hit(
-        self, *, cache_key: str, cost_saved_usd: float, ts: float
-    ) -> None:
+    async def cache_record_hit(self, *, cache_key: str, cost_saved_usd: float, ts: float) -> None:
         async with self.connection() as db:
             await db.execute(
                 "UPDATE hive_cache SET hit_count=hit_count+1, cost_saved_usd=COALESCE(cost_saved_usd,0)+?, "

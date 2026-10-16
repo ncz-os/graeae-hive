@@ -15,6 +15,7 @@ from hive.bus.deps import (
     clamp_limit,
     connect_db,
     emit_event,
+    hive_repo,
     require_registered_agent,
     uuidv7,
 )
@@ -64,31 +65,6 @@ async def list_messages(
     limit: int = 100,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
-    sql = "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts FROM messages WHERE 1=1"
-    args: list = []
-    if to_urn:
-        sql += " AND (to_urn=? OR to_urn IS NULL)"
-        args.append(to_urn)
-    if topic:
-        sql += " AND topic LIKE ?"
-        args.append(topic.replace("*", "%"))
-    if since:
-        sql += " AND ts >= ?"
-        args.append(since)
-    sql += " ORDER BY ts DESC LIMIT ?"
-    args.append(limit)
-    rows = []
-    async with connect_db() as db, db.execute(sql, args) as cur:
-        async for r in cur:
-            rows.append(
-                {
-                    "id": r[0],
-                    "from": r[1],
-                    "to": r[2],
-                    "in_reply_to": r[3],
-                    "topic": r[4],
-                    "payload": json.loads(r[5]),
-                    "ts": r[6],
-                }
-            )
+    # Storage via the HiveMindRepository ABC (no raw SQL in the router).
+    rows = await hive_repo().list_messages(to_urn=to_urn, topic=topic, since=since, limit=limit)
     return {"count": len(rows), "messages": rows}
