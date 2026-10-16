@@ -15,7 +15,6 @@ import json
 import os
 import time
 from contextlib import asynccontextmanager, suppress
-from typing import Any
 
 from fastapi import FastAPI
 
@@ -473,29 +472,9 @@ async def reaper_task(app: FastAPI):
                 now_ts = time.time()
                 default_cutoff = now_ts - CLAIM_STALE_AFTER
                 hard_cutoff = now_ts - CLAIM_HARD_MAX_AGE
-                async with db.execute(
-                    "SELECT j.id, j.kind, j.claimed_by, j.claimed_at, j.last_update_at, "
-                    "j.claim_lease_expires_at "
-                    "FROM jobs j "
-                    "LEFT JOIN agents a ON a.urn = j.claimed_by "
-                    "WHERE j.status IN ('claimed','running') "
-                    # j.claimed_at IS NULL = corrupt/phantom claim (an atomic claim always
-                    # writes claimed_at): without this the all-NULL-timestamp staleness
-                    # predicates below are UNKNOWN, so a phantom running job is never a
-                    # candidate and is un-reapable. Surfacing it lets the python filter
-                    # (latest=0) requeue it.
-                    "AND ( a.status = 'offline' OR a.urn IS NULL OR "
-                    "      j.claimed_at IS NULL OR "
-                    "      j.claim_lease_expires_at <= ? OR "
-                    "      j.claimed_at < ? OR "
-                    "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
-                    (
-                        now_ts,
-                        hard_cutoff,
-                        default_cutoff,
-                    ),
-                ) as cur:
-                    candidates = [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
+                candidates = await repo.select_orphan_claim_candidates(
+                    db, now=now_ts, hard_cutoff=hard_cutoff, default_cutoff=default_cutoff
+                )
                 # Apply kind-specific override: keep job if its kind has a longer TTL
                 # AND its latest progress timestamp is within that window.
                 orphans = []
@@ -516,14 +495,7 @@ async def reaper_task(app: FastAPI):
                         orphans.append((jid, claimer))
                 if orphans:
                     for job_id, claimer in orphans:
-                        await db.execute(
-                            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
-                            "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
-                            "ended_at=NULL, result=NULL "
-                            "WHERE id=? AND status IN ('claimed','running')",
-                            (job_id,),
-                        )
+                        await repo.requeue_orphan_job(db, job_id)
                         await emit_event(
                             db,
                             "job.unclaimed",
@@ -536,22 +508,15 @@ async def reaper_task(app: FastAPI):
                     await db.commit()
                 # 3. Scheduler — fire due interval-based jobs
                 now_ts = time.time()
-                async with db.execute(
-                    "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count "
-                    "FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
-                    (now_ts,),
-                ) as cur:
-                    due = [tuple(r) async for r in cur]
+                due = await repo.select_due_schedules(db, now=now_ts)
                 for sched_id, sname, sub_urn, interval, tpl_json, fcount in due:
                     try:
                         tpl = json.loads(tpl_json)
                         tpl["submitter_urn"] = sub_urn
                         # synth a JobCreate + go through the cache+role machinery
                         await create_job(JobCreate(**tpl))  # type: ignore
-                        await db.execute(
-                            "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
-                            "fire_count=fire_count+1 WHERE id=?",
-                            (now_ts, now_ts + interval, sched_id),
+                        await repo.mark_schedule_fired(
+                            db, sched_id=sched_id, now=now_ts, next_at=now_ts + interval
                         )
                         await emit_event(
                             db,
@@ -569,22 +534,15 @@ async def reaper_task(app: FastAPI):
                     await db.commit()
                 # 4. Auto-cancel stale jobs (queued > 7 days untouched)
                 stale_job_cutoff = time.time() - 7 * 24 * 3600
-                async with db.execute(
-                    "SELECT id FROM jobs WHERE status='queued' AND started_at < ?",
-                    (stale_job_cutoff,),
-                ) as cur:
-                    stale_ids = [r[0] async for r in cur]
+                stale_ids = await repo.select_stale_queued_job_ids(db, cutoff=stale_job_cutoff)
                 if stale_ids:
-                    await db.executemany(
-                        "UPDATE jobs SET status='cancelled', ended_at=? WHERE id=?",
-                        [(time.time(), j) for j in stale_ids],
-                    )
+                    await repo.cancel_jobs(db, stale_ids, ended_at=time.time())
                     for j in stale_ids:
                         await emit_event(db, "job.cancelled", {"id": j, "reason": "stale_>7d"})
                     await db.commit()
                 # 5. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
-                await db.execute("DELETE FROM events WHERE ts < ?", (retain_cutoff,))
+                await repo.purge_events_before(db, cutoff=retain_cutoff)
                 await db.commit()
                 # 6. JOB RETENTION SWEEP (housekeeping — keeps the dashboard clean).
                 # Auto-delete OLD TERMINAL jobs (+ cascade job_audit_log). Two tiers:
@@ -601,27 +559,17 @@ async def reaper_task(app: FastAPI):
                 sweep_ids: list[str] = []
                 # (a) test/e2e junk — terminal + matches any test pattern + > test window
                 test_cutoff = now_ts - RETAIN_TEST_JOBS_DAYS * 86400
-                status_ph = ",".join("?" for _ in SWEEPABLE_STATUSES)
-                like_ph = " OR ".join("LOWER(description) LIKE ?" for _ in TEST_JOB_DESC_PATTERNS)
-                test_params: list[Any] = list(SWEEPABLE_STATUSES)
-                test_params += [f"%{p.lower()}%" for p in TEST_JOB_DESC_PATTERNS]
-                test_params.append(test_cutoff)
-                async with db.execute(
-                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) "
-                    f"AND description IS NOT NULL AND ({like_ph}) "
-                    f"AND COALESCE(ended_at, started_at) < ?",
-                    tuple(test_params),
-                ) as cur:
-                    sweep_ids += [r[0] async for r in cur]
+                sweep_ids += await repo.select_sweepable_test_job_ids(
+                    db,
+                    statuses=list(SWEEPABLE_STATUSES),
+                    patterns=TEST_JOB_DESC_PATTERNS,
+                    cutoff=test_cutoff,
+                )
                 # (b) any terminal job older than the done-retention window
                 done_cutoff = now_ts - RETAIN_DONE_JOBS_DAYS * 86400
-                done_params: list[Any] = list(SWEEPABLE_STATUSES)
-                done_params.append(done_cutoff)
-                async with db.execute(
-                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) AND COALESCE(ended_at, started_at) < ?",
-                    tuple(done_params),
-                ) as cur:
-                    sweep_ids += [r[0] async for r in cur]
+                sweep_ids += await repo.select_sweepable_terminal_job_ids(
+                    db, statuses=list(SWEEPABLE_STATUSES), cutoff=done_cutoff
+                )
                 sweep_ids = list(dict.fromkeys(sweep_ids))  # de-dupe, keep order
                 if sweep_ids:
                     # allow_active defaults False: the cascade re-checks status at

@@ -1262,3 +1262,110 @@ class SqliteHiveRepository(HiveMindRepository):
             (cutoff,),
         )
         return max(0, getattr(cur, "rowcount", 0) or 0)  # some drivers report -1
+
+    # ---- reaper: job lifecycle maintenance ----
+    async def select_orphan_claim_candidates(
+        self, tx: Transaction, *, now: float, hard_cutoff: float, default_cutoff: float
+    ) -> list[tuple]:
+        """Jobs claimed by dead/stale workers (kind-specific TTL applied in Python).
+
+        Staleness is measured against COALESCE(last_update_at, claimed_at) so a
+        worker still PATCHing progress is never reclaimed. j.claimed_at IS NULL
+        surfaces the corrupt/phantom claim whose all-NULL timestamps would
+        otherwise make the staleness predicates UNKNOWN."""
+        db = tx
+        async with db.execute(
+            "SELECT j.id, j.kind, j.claimed_by, j.claimed_at, j.last_update_at, "
+            "j.claim_lease_expires_at "
+            "FROM jobs j "
+            "LEFT JOIN agents a ON a.urn = j.claimed_by "
+            "WHERE j.status IN ('claimed','running') "
+            "AND ( a.status = 'offline' OR a.urn IS NULL OR "
+            "      j.claimed_at IS NULL OR "
+            "      j.claim_lease_expires_at <= ? OR "
+            "      j.claimed_at < ? OR "
+            "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
+            (now, hard_cutoff, default_cutoff),
+        ) as cur:
+            return [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
+
+    async def requeue_orphan_job(self, tx: Transaction, job_id: str) -> None:
+        db = tx
+        await db.execute(
+            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
+            "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
+            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
+            "ended_at=NULL, result=NULL "
+            "WHERE id=? AND status IN ('claimed','running')",
+            (job_id,),
+        )
+
+    async def select_due_schedules(self, tx: Transaction, *, now: float) -> list[tuple]:
+        db = tx
+        async with db.execute(
+            "SELECT id, name, created_by_urn, interval_seconds, job_template, fire_count "
+            "FROM scheduled_jobs WHERE enabled=1 AND next_fire_at <= ?",
+            (now,),
+        ) as cur:
+            return [tuple(r) async for r in cur]
+
+    async def mark_schedule_fired(
+        self, tx: Transaction, *, sched_id: str, now: float, next_at: float
+    ) -> None:
+        db = tx
+        await db.execute(
+            "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
+            "fire_count=fire_count+1 WHERE id=?",
+            (now, next_at, sched_id),
+        )
+
+    async def select_stale_queued_job_ids(self, tx: Transaction, *, cutoff: float) -> list[str]:
+        db = tx
+        async with db.execute(
+            "SELECT id FROM jobs WHERE status='queued' AND started_at < ?",
+            (cutoff,),
+        ) as cur:
+            return [r[0] async for r in cur]
+
+    async def cancel_jobs(self, tx: Transaction, ids: list[str], *, ended_at: float) -> None:
+        db = tx
+        await db.executemany(
+            "UPDATE jobs SET status='cancelled', ended_at=? WHERE id=?",
+            [(ended_at, j) for j in ids],
+        )
+
+    async def purge_events_before(self, tx: Transaction, *, cutoff: float) -> None:
+        db = tx
+        await db.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+
+    async def select_sweepable_test_job_ids(
+        self, tx: Transaction, *, statuses: list[str], patterns: tuple[str, ...], cutoff: float
+    ) -> list[str]:
+        """Terminal jobs matching a test/e2e description pattern older than cutoff."""
+        db = tx
+        status_ph = ",".join("?" for _ in statuses)
+        like_ph = " OR ".join("LOWER(description) LIKE ?" for _ in patterns)
+        params: list = list(statuses)
+        params += [f"%{p.lower()}%" for p in patterns]
+        params.append(cutoff)
+        async with db.execute(
+            f"SELECT id FROM jobs WHERE status IN ({status_ph}) "
+            f"AND description IS NOT NULL AND ({like_ph}) "
+            f"AND COALESCE(ended_at, started_at) < ?",
+            tuple(params),
+        ) as cur:
+            return [r[0] async for r in cur]
+
+    async def select_sweepable_terminal_job_ids(
+        self, tx: Transaction, *, statuses: list[str], cutoff: float
+    ) -> list[str]:
+        """Any terminal job older than the retention window (age = COALESCE(ended_at, started_at))."""
+        db = tx
+        status_ph = ",".join("?" for _ in statuses)
+        params: list = list(statuses)
+        params.append(cutoff)
+        async with db.execute(
+            f"SELECT id FROM jobs WHERE status IN ({status_ph}) AND COALESCE(ended_at, started_at) < ?",
+            tuple(params),
+        ) as cur:
+            return [r[0] async for r in cur]

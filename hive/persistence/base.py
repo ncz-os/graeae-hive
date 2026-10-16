@@ -260,3 +260,39 @@ class HiveMindRepository(ABC):
 
     @abstractmethod
     async def purge_offline_agents(self, tx: Transaction, *, cutoff: float) -> int: ...
+
+    # ---- reaper: job lifecycle maintenance ----
+    @abstractmethod
+    async def select_orphan_claim_candidates(
+        self, tx: Transaction, *, now: float, hard_cutoff: float, default_cutoff: float
+    ) -> list[tuple]: ...
+
+    @abstractmethod
+    async def requeue_orphan_job(self, tx: Transaction, job_id: str) -> None: ...
+
+    @abstractmethod
+    async def select_due_schedules(self, tx: Transaction, *, now: float) -> list[tuple]: ...
+
+    @abstractmethod
+    async def mark_schedule_fired(
+        self, tx: Transaction, *, sched_id: str, now: float, next_at: float
+    ) -> None: ...
+
+    @abstractmethod
+    async def select_stale_queued_job_ids(self, tx: Transaction, *, cutoff: float) -> list[str]: ...
+
+    @abstractmethod
+    async def cancel_jobs(self, tx: Transaction, ids: list[str], *, ended_at: float) -> None: ...
+
+    @abstractmethod
+    async def purge_events_before(self, tx: Transaction, *, cutoff: float) -> None: ...
+
+    @abstractmethod
+    async def select_sweepable_test_job_ids(
+        self, tx: Transaction, *, statuses: list[str], patterns: tuple[str, ...], cutoff: float
+    ) -> list[str]: ...
+
+    @abstractmethod
+    async def select_sweepable_terminal_job_ids(
+        self, tx: Transaction, *, statuses: list[str], cutoff: float
+    ) -> list[str]: ...
