@@ -1,6 +1,6 @@
 # Arm orchestrator hosts (HYDRA / ACHILLES)
 
-**Status:** ACHILLES live (2026-10-15); HYDRA pending the same build.
+**Status:** ACHILLES + HYDRA both live and serving (2026-10-15).
 **Owner:** opencode · **Refs:** `docs/decision-rocm-libxml2-fix-20261015.md`, `docs/decision-master-agent-20261015.md`
 
 ## Role
@@ -17,9 +17,15 @@ The 780M shares system RAM (GTT), so the orchestrator must yield to builds. A
 `~/llama-scripts/arm-orchestrator-manage.sh`, which:
 
 - **unloads** the model (kills `llama-server`) when the host is busy —
-  `cc1plus`/`rustc`/`bitbake|ninja|cargo build|go build` running, load > 0.6×cores,
+  `cc1plus`/`rustc`/`bitbake|ninja|cargo build|go build` running, load > 1.0×cores,
   or `MemAvailable < 8 GB`;
-- **loads** it when the host is idle and the model isn't already running.
+- **loads** it when the host is idle and the port isn't already listening.
+
+"Already up?" is decided by the **listening port** (`ss -ltn "( sport = :$PORT )"`),
+not `pgrep -f`. The first version used `pgrep -f "llama-server.*--port $PORT"`, which
+self-matched its own argv, so the manager thought nothing was up and **respawned the
+model every 60s** (flapping: health up/down). Fixed 2026-10-15; the running managers
++ units live at `deploy/arm-orchestrator/`.
 
 So the model appears when there's headroom and disappears the moment a build
 starts. Idempotent; safe to run on every tick.
@@ -52,11 +58,17 @@ retry, or fall through to the other arm, or to CERBERUS.
 
 | Host | ROCm build | Timer | Verified |
 |---|---|---|---|
-| **ACHILLES** `.11` | ✅ latest `59d5fad` | ✅ `arm-orchestrator.timer` active | ✅ JSON decision, model loaded on idle |
-| **HYDRA** `.78` | ⏳ needs the same rebuild + shim | ⏳ | — |
+| **ACHILLES** `.11` | ✅ `59d5fad` | ✅ active | ✅ JSON decision, single load, no flap |
+| **HYDRA** `.78` | ✅ `2851b3b` | ✅ active | ✅ JSON decision, single load, no flap |
 
-Replicate on HYDRA via `docs/decision-rocm-libxml2-fix-20261015.md`, then copy
-`arm-orchestrator-manage.sh` + the `.service`/`.timer`.
+Deploy/replicate: `deploy/arm-orchestrator/` (script + `.service` + `.timer`); build
+steps in `docs/decision-rocm-libxml2-fix-20261015.md`.
+
+**HYDRA "won't serve" (2026-10-15) was three things, all resolved:** (1) the timer had
+been stopped; (2) a transient `GPU Hang` (llama.cpp `HW Exception by GPU node-1`) from
+a stale bge-m3 KFD queue that couldn't be evicted — cleared once bge-m3 restarted
+cleanly; (3) the `pgrep` self-match flapping above. HYDRA's APU reports a 512 MB VRAM
+carve-out with a 16 GB GTT; the model runs out of GTT, which is normal.
 
 ## Caveat
 

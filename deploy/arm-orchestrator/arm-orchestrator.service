@@ -1,0 +1,8 @@
+[Unit]
+Description=Arm orchestrator model lifecycle (load when idle, unload when building)
+After=network.target
+
+[Service]
+Type=oneshot
+User=jasonperlow
+ExecStart=/home/jasonperlow/llama-scripts/arm-orchestrator-manage.sh
