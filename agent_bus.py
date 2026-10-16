@@ -30,11 +30,8 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-import retry_policy
 from hive.bus.deps import (
-    ACTIVE_AGENT_STATUSES,
     EVENT_QUEUE,
-    HOST_DENYLIST,
     _cascade_delete_jobs,
     clamp_limit,
     connect_db,
@@ -44,24 +41,18 @@ from hive.bus.deps import (
 )
 
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
-from hive.bus.domain.eligibility import (
-    THROTTLE_HEADROOM,
-    agent_kind_aliases,
-    job_agent_eligible,
-)
-from hive.bus.domain.jobs import (  # noqa: E402
-    CLAIM_LEASE_SECONDS,
-    json_list,
-)
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
 from hive.bus.routers.admin import router as _admin_router
 from hive.bus.routers.agents import heartbeat, list_agents, register
 from hive.bus.routers.agents import router as _agents_router
 from hive.bus.routers.jobs import (  # noqa: F401 (re-export)
+    auto_retry_job,
+    claim_job,
     create_job,
     get_job,
     list_jobs,
     update_job,  # noqa: F401 (re-export)
+    zcgate_release,
 )
 from hive.bus.routers.jobs import router as _jobs_router
 from hive.bus.routers.messages import list_messages, publish_message
@@ -1463,52 +1454,7 @@ async def dashboard():
 # PATCH /v1/jobs/{id} (update_job) moved to hive.bus.routers.jobs (Phase 1c).
 
 
-@app.post("/v1/jobs/{job_id}/auto-retry")
-async def auto_retry_job(job_id: str):
-    """Recheck stored retry policy under a row lock before consuming a retry."""
-    async with connect_db() as db:
-        try:
-            if HIVE_BACKEND == "sqlite":
-                await db.execute("BEGIN IMMEDIATE")
-            lock_clause = {
-                "sqlite": "",
-                "oracle": " FOR UPDATE",
-                "db2": " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS",
-            }[HIVE_BACKEND]
-            async with db.execute(
-                "SELECT status, kind, max_retries, retry_count, result FROM jobs WHERE id=?" + lock_clause,
-                (job_id,),
-            ) as cur:
-                row = await cur.fetchone()
-            if row is None:
-                raise HTTPException(404, "job not found")
-            status, kind, max_retries, retry_count, raw_result = row
-            try:
-                result = json.loads(raw_result) if raw_result else None
-            except (ValueError, TypeError):
-                result = None
-            job = {
-                "status": status,
-                "kind": kind,
-                "max_retries": max_retries,
-                "retry_count": retry_count,
-                "result": result,
-            }
-            if not retry_policy.auto_retry_allowed(job):
-                raise HTTPException(409, "job is not eligible for automatic retry")
-            await db.execute(
-                "UPDATE jobs SET status='queued', retry_count=retry_count+1, "
-                "claimed_by=NULL, claimed_at=NULL, claimed_runtime=NULL, "
-                "claimed_model=NULL, claimed_provider=NULL, claimed_cost_tier=NULL, "
-                "claim_lease_expires_at=NULL, ended_at=NULL, retry_backoff_until=NULL "
-                "WHERE id=?",
-                (job_id,),
-            )
-            await db.commit()
-        except BaseException:
-            await db.rollback()
-            raise
-    return {"ok": True, "id": job_id, "retry_count": retry_count + 1}
+# /v1/jobs/{job_id}/auto-retry moved to hive.bus.routers.jobs (Phase 1c).
 
 
 # /v1/admin/jobs/* + DELETE /v1/jobs/{id} + /v1/jobs/purge moved to hive.bus.routers.admin (Phase 1c).
@@ -2072,195 +2018,7 @@ async def knemon_spend(since_hours: int = 168):
 # /v1/jobs/metrics moved to hive.bus.routers.jobs (Phase 1c).
 
 
-@app.post("/v1/jobs/{job_id}/claim")
-async def claim_job(job_id: str, by: str):
-    # HOST_DENYLIST was enforced on /v1/jobs/next but NOT here, so a denylisted
-    # host could take work by calling this by-id endpoint and skipping the
-    # dequeue path entirely.
-    _hp = by.split(":")
-    _host = (_hp[3] if len(_hp) > 3 else "").lower()
-    if _host in HOST_DENYLIST:
-        raise HTTPException(403, f"host {_host} is in HIVE_HOST_DENYLIST")
-    """Targeted single-job claim with the same eligibility checks as
-    /v1/jobs/next (dequeue_next_job).
-
-    Previously this endpoint just ran UPDATE WHERE status IN
-    ('queued','offered') with no validation — any caller could claim
-    any job by passing an arbitrary `by` URN, bypassing agent
-    registration, capability matching, eligible_kinds, cost-tier ceiling,
-    throttling, preferred provider/model, and DAG dependency gating, and
-    skipping the claimed_runtime/claimed_model/claimed_provider/
-    claimed_cost_tier population that cost accounting + worker_kind_stats
-    depend on. This rewrite reuses the dequeue eligibility chain for
-    one specific job_id so manual claims are subject to the same
-    contract as auto-claims.
-    """
-    now = time.time()
-    async with connect_db() as db:
-        # 1. agent must exist + be online/idle
-        async with db.execute(
-            "SELECT kind, capabilities, runtime, model, provider, cost_tier, "
-            "auth_method, plan_cap_usd, plan_period_used_usd, status "
-            "FROM agents WHERE urn=?",
-            (by,),
-        ) as cur:
-            agent_row = await cur.fetchone()
-        if not agent_row:
-            raise HTTPException(404, f"claim failed: agent not registered: {by}")
-        (
-            agent_kind,
-            caps_json,
-            a_runtime,
-            a_model,
-            a_provider,
-            a_tier,
-            a_auth,
-            a_cap,
-            a_used,
-            agent_status,
-        ) = agent_row
-        if agent_status not in ACTIVE_AGENT_STATUSES:
-            raise HTTPException(
-                409,
-                f"claim failed: agent status is {agent_status!r}, not online/idle: {by}",
-            )
-        agent_caps = set(json.loads(caps_json)) if caps_json else set()
-        eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
-        a_tier = (a_tier or "C").upper()
-        if a_tier not in COST_TIERS:
-            a_tier = "C"
-        a_auth = (a_auth or "unknown").lower()
-        sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
-
-        # 2. job must exist + be claimable + agent must satisfy its filters
-        async with db.execute(
-            "SELECT status, kind, required_capabilities, eligible_kinds, "
-            "eligible_hosts, max_cost_tier, preferred_providers, preferred_models, "
-            "depends_on, retry_backoff_until, started_at "
-            "FROM jobs WHERE id=?",
-            (job_id,),
-        ) as cur:
-            job_row = await cur.fetchone()
-        if not job_row:
-            raise HTTPException(404, f"job not found: {job_id}")
-        (
-            j_status,
-            j_kind,
-            j_caps_json,
-            j_kinds_json,
-            j_hosts_json,
-            j_max_tier,
-            j_pref_providers,
-            j_pref_models,
-            j_deps_json,
-            j_retry_backoff_until,
-            j_started_at,
-        ) = job_row
-
-        urn_parts = by.split(":")
-        agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
-
-        if j_status not in ("queued", "offered"):
-            raise HTTPException(409, f"job already in status={j_status!r}; cannot claim")
-
-        # retry-backoff gate (same as dequeue)
-        if j_retry_backoff_until is not None and j_retry_backoff_until > now:
-            raise HTTPException(
-                409,
-                f"job is in retry backoff until {j_retry_backoff_until} (now={now})",
-            )
-
-        # DAG gate: all depends_on must be status='done'
-        if j_deps_json:
-            deps = json_list(j_deps_json)
-            if deps:
-                ph = ",".join("?" * len(deps))
-                async with db.execute(
-                    f"SELECT id FROM jobs WHERE id IN ({ph}) AND status='done'",
-                    tuple(deps),
-                ) as dc:
-                    done_ids = {row[0] async for row in dc}
-                if len(done_ids) < len(deps):
-                    raise HTTPException(
-                        409,
-                        f"job has unsatisfied DAG dependencies ({len(done_ids)}/{len(deps)} done)",
-                    )
-
-        agent = {
-            "urn": by,
-            "host": agent_host,
-            "kind": agent_kind,
-            "runtime": a_runtime,
-            "model": a_model,
-            "provider": a_provider,
-            "cost_tier": a_tier,
-            "capabilities": agent_caps,
-            "eligible_aliases": eligible_aliases,
-            "subscription_throttled": sub_throttled,
-        }
-        job = {
-            "id": job_id,
-            "kind": j_kind,
-            "required_capabilities": json_list(j_caps_json),
-            "eligible_kinds": json_list(j_kinds_json),
-            "eligible_hosts": json_list(j_hosts_json),
-            "max_cost_tier": j_max_tier,
-            "preferred_providers": json_list(j_pref_providers),
-            "preferred_models": json_list(j_pref_models),
-            "queued_at": j_started_at,
-        }
-        eligible, reason = job_agent_eligible(job, agent)
-        if not eligible:
-            status = (
-                422
-                if reason.startswith("job max_cost_tier")
-                else (429 if reason.startswith("subscription agent throttled") else 403)
-            )
-            raise HTTPException(status, reason)
-
-        # 3. atomic claim with race guard + populate claimed_resources
-        cur = await db.execute(
-            "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
-            "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
-            "claim_lease_expires_at=?, last_update_at=?, "
-            "ended_at=NULL, result=NULL "
-            "WHERE id=? AND status IN ('queued','offered')",
-            (
-                by,
-                now,
-                a_runtime,
-                a_model,
-                a_provider,
-                a_tier,
-                now + CLAIM_LEASE_SECONDS,
-                now,
-                job_id,
-            ),
-        )
-        await db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(409, "job already claimed or not available (race)")
-        await emit_event(
-            db,
-            "job.claimed",
-            {
-                "id": job_id,
-                "claimed_by": by,
-                "claimed_runtime": a_runtime,
-                "claimed_model": a_model,
-                "claimed_provider": a_provider,
-                "claimed_cost_tier": a_tier,
-                "manual_claim": True,
-            },
-        )
-    return {
-        "claimed": True,
-        "ts": now,
-        "claimed_runtime": a_runtime,
-        "claimed_model": a_model,
-        "claimed_provider": a_provider,
-        "claimed_cost_tier": a_tier,
-    }
+# /v1/jobs/{job_id}/claim moved to hive.bus.routers.jobs (Phase 1c).
 
 
 # /v1/jobs (list) + /v1/jobs/{id} (get) moved to hive.bus.routers.jobs (Phase 1c).
@@ -2392,52 +2150,7 @@ async def mcp_rpc(body: dict):
 # /v1/jobs/{id}/preview moved to hive.bus.routers.jobs (Phase 1c).
 
 
-@app.post("/v1/jobs/{job_id}/release")
-async def zcgate_release(job_id: str):
-    """Human-gated 'Release & Push': enqueue a release:<repo> job that a worker
-    claims and runs `zc-gate release` on (push branch + open upstream PR)."""
-    async with (
-        connect_db() as db,
-        db.execute("SELECT result, status FROM jobs WHERE id=?", (job_id,)) as cur,
-    ):
-        r = await cur.fetchone()
-    if not r:
-        raise HTTPException(404, f"job not found: {job_id}")
-    result = json.loads(r[0]) if r[0] else {}
-    preview = result.get("preview")
-    if not preview:
-        raise HTTPException(404, f"no preview bundle on job {job_id}")
-    if (preview.get("verdict") or "").lower() == "blocked":
-        raise HTTPException(409, "bundle verdict is blocked; not releasable")
-    if result.get("release_job_id"):
-        return {"ok": True, "already": True, "release_job_id": result["release_job_id"]}
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT urn FROM agents WHERE runtime IN ('mnemos','human','claude-code','claude') "
-            "AND status != 'offline' ORDER BY last_heartbeat DESC LIMIT 1"
-        ) as cur:
-            o = await cur.fetchone()
-    if not o:
-        raise HTTPException(503, "no active orchestrator to submit the release job")
-    submitter = o[0]
-    repo = preview.get("repo") or "zeroclaw-labs/zeroclaw"
-    rel = await create_job(
-        JobCreate(
-            submitter_urn=submitter,
-            kind="release:zeroclaw",
-            description=job_id,
-            eligible_kinds=["zeroclaw"],
-            eligible_hosts=["zcgate-release-sink"],
-            priority=5,
-        )
-    )
-    rel_id = rel.get("id") if isinstance(rel, dict) else None
-    result["release_job_id"] = rel_id
-    result["release_requested_at"] = time.time()
-    async with connect_db() as db:
-        await db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result), job_id))
-        await db.commit()
-    return {"ok": True, "release_job_id": rel_id, "repo": repo, "submitter": submitter}
+# /v1/jobs/{job_id}/release moved to hive.bus.routers.jobs (Phase 1c).
 
 
 # ===== end zerocode-gate patch =====

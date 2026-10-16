@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, Response
 
 import queue_logic
+import retry_policy
 
 try:
     import aiosqlite
@@ -20,7 +21,6 @@ except ModuleNotFoundError:
     from hive.persistence import _sqlite_async as aiosqlite
 
 from hive import scheduler as sched
-from hive.persistence.sqlite import SqlExpr
 from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
     CLAIM_SCAN_WINDOW,
@@ -53,7 +53,6 @@ from hive.bus.domain.jobs import (
     _safe_nonneg_int,
     _safe_str,
     cache_key_for,
-    cache_store,
     estimate_cost,
     field_was_set,
     hallucination_check,
@@ -66,6 +65,7 @@ from hive.bus.domain.jobs import (
 from hive.bus.domain.workspace import resolve_workspace_shadow
 from hive.bus.schemas import JobCreate, JobUpdate
 from hive.core.models import COST_TIERS
+from hive.persistence.sqlite import SqlExpr
 
 router = APIRouter()
 
@@ -1069,3 +1069,225 @@ async def update_job(job_id: str, req: JobUpdate):
             content={"ok": False, "status": "needs-review", "reason": "completion_evidence_missing"},
         )
     return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate, "dead_lettered": dead_lettered}
+
+
+@router.post("/v1/jobs/{job_id}/auto-retry")
+async def auto_retry_job(job_id: str):
+    """Recheck stored retry policy under a row lock before consuming a retry."""
+    async with hive_repo().connection() as tx:
+        row = await hive_repo().job_retry_context(tx, job_id)
+        if row is None:
+            raise HTTPException(404, "job not found")
+        status, kind, max_retries, retry_count, raw_result = row
+        try:
+            result = json.loads(raw_result) if raw_result else None
+        except (ValueError, TypeError):
+            result = None
+        job = {
+            "status": status,
+            "kind": kind,
+            "max_retries": max_retries,
+            "retry_count": retry_count,
+            "result": result,
+        }
+        if not retry_policy.auto_retry_allowed(job):
+            raise HTTPException(409, "job is not eligible for automatic retry")
+        await hive_repo().patch_job_status(
+            tx,
+            job_id,
+            sets={
+                "status": "queued",
+                "retry_count": SqlExpr("retry_count+1"),
+                "claimed_by": None,
+                "claimed_at": None,
+                "claimed_runtime": None,
+                "claimed_model": None,
+                "claimed_provider": None,
+                "claimed_cost_tier": None,
+                "claim_lease_expires_at": None,
+                "ended_at": None,
+                "retry_backoff_until": None,
+            },
+        )
+        await tx.commit()
+    return {"ok": True, "id": job_id, "retry_count": retry_count + 1}
+
+
+@router.post("/v1/jobs/{job_id}/claim")
+async def claim_job(job_id: str, by: str):
+    """Targeted single-job claim with the same eligibility checks as /v1/jobs/next."""
+    # HOST_DENYLIST was enforced on /v1/jobs/next but NOT here historically, so a
+    # denylisted host could take work by skipping the dequeue path entirely.
+    _hp = by.split(":")
+    _host = (_hp[3] if len(_hp) > 3 else "").lower()
+    if _host in HOST_DENYLIST:
+        raise HTTPException(403, f"host {_host} is in HIVE_HOST_DENYLIST")
+    now = time.time()
+    async with hive_repo().connection() as tx:
+        agent_row = await hive_repo().agent_claim_context(tx, by)
+        if not agent_row:
+            raise HTTPException(404, f"claim failed: agent not registered: {by}")
+        (
+            agent_kind,
+            caps_json,
+            a_runtime,
+            a_model,
+            a_provider,
+            a_tier,
+            a_auth,
+            a_cap,
+            a_used,
+            agent_status,
+            _agent_load,
+        ) = agent_row
+        if agent_status not in ACTIVE_AGENT_STATUSES:
+            raise HTTPException(
+                409, f"claim failed: agent status is {agent_status!r}, not online/idle: {by}"
+            )
+        agent_caps = set(json.loads(caps_json)) if caps_json else set()
+        eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
+        a_tier = (a_tier or "C").upper()
+        if a_tier not in COST_TIERS:
+            a_tier = "C"
+        a_auth = (a_auth or "unknown").lower()
+        sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
+
+        job_row = await hive_repo().job_claim_context(tx, job_id)
+        if not job_row:
+            raise HTTPException(404, f"job not found: {job_id}")
+        (
+            j_status,
+            j_kind,
+            j_caps_json,
+            j_kinds_json,
+            j_hosts_json,
+            j_max_tier,
+            j_pref_providers,
+            j_pref_models,
+            j_deps_json,
+            j_retry_backoff_until,
+            j_started_at,
+        ) = job_row
+
+        urn_parts = by.split(":")
+        agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
+
+        if j_status not in ("queued", "offered"):
+            raise HTTPException(409, f"job already in status={j_status!r}; cannot claim")
+        if j_retry_backoff_until is not None and j_retry_backoff_until > now:
+            raise HTTPException(409, f"job is in retry backoff until {j_retry_backoff_until} (now={now})")
+
+        if j_deps_json:
+            deps = json_list(j_deps_json)
+            if deps:
+                done_ids = await hive_repo().completed_job_ids(tx, ids=list(deps))
+                if len(done_ids) < len(deps):
+                    raise HTTPException(
+                        409, f"job has unsatisfied DAG dependencies ({len(done_ids)}/{len(deps)} done)"
+                    )
+
+        agent = {
+            "urn": by,
+            "host": agent_host,
+            "kind": agent_kind,
+            "runtime": a_runtime,
+            "model": a_model,
+            "provider": a_provider,
+            "cost_tier": a_tier,
+            "capabilities": agent_caps,
+            "eligible_aliases": eligible_aliases,
+            "subscription_throttled": sub_throttled,
+        }
+        job = {
+            "id": job_id,
+            "kind": j_kind,
+            "required_capabilities": json_list(j_caps_json),
+            "eligible_kinds": json_list(j_kinds_json),
+            "eligible_hosts": json_list(j_hosts_json),
+            "max_cost_tier": j_max_tier,
+            "preferred_providers": json_list(j_pref_providers),
+            "preferred_models": json_list(j_pref_models),
+            "queued_at": j_started_at,
+        }
+        eligible, reason = job_agent_eligible(job, agent)
+        if not eligible:
+            status = (
+                422 if reason.startswith("job max_cost_tier") else (429 if reason.startswith("subscription agent throttled") else 403)
+            )
+            raise HTTPException(status, reason)
+
+        rc = await hive_repo().claim_job(
+            tx,
+            job_id=job_id,
+            agent_urn=by,
+            now=now,
+            lease_expires_at=now + CLAIM_LEASE_SECONDS,
+            runtime=a_runtime,
+            model=a_model,
+            provider=a_provider,
+            cost_tier=a_tier,
+        )
+        await tx.commit()
+        if rc == 0:
+            raise HTTPException(409, "job already claimed or not available (race)")
+        await emit_event(
+            tx,
+            "job.claimed",
+            {
+                "id": job_id,
+                "claimed_by": by,
+                "claimed_runtime": a_runtime,
+                "claimed_model": a_model,
+                "claimed_provider": a_provider,
+                "claimed_cost_tier": a_tier,
+                "manual_claim": True,
+            },
+        )
+    return {
+        "claimed": True,
+        "ts": now,
+        "claimed_runtime": a_runtime,
+        "claimed_model": a_model,
+        "claimed_provider": a_provider,
+        "claimed_cost_tier": a_tier,
+    }
+
+
+@router.post("/v1/jobs/{job_id}/release")
+async def zcgate_release(job_id: str):
+    """Human-gated 'Release & Push': enqueue a release:<repo> job that a worker
+    claims and runs `zc-gate release` on (push branch + open upstream PR)."""
+    async with hive_repo().connection() as tx:
+        r = await hive_repo().job_release_context(tx, job_id)
+        if not r:
+            raise HTTPException(404, f"job not found: {job_id}")
+    result = json.loads(r[0]) if r[0] else {}
+    preview = result.get("preview")
+    if not preview:
+        raise HTTPException(404, f"no preview bundle on job {job_id}")
+    if (preview.get("verdict") or "").lower() == "blocked":
+        raise HTTPException(409, "bundle verdict is blocked; not releasable")
+    if result.get("release_job_id"):
+        return {"ok": True, "already": True, "release_job_id": result["release_job_id"]}
+    async with hive_repo().connection() as tx:
+        submitter = await hive_repo().active_orchestrator_urn(tx)
+    if not submitter:
+        raise HTTPException(503, "no active orchestrator to submit the release job")
+    repo = preview.get("repo") or "zeroclaw-labs/zeroclaw"
+    rel = await create_job(
+        JobCreate(
+            submitter_urn=submitter,
+            kind="release:zeroclaw",
+            description=job_id,
+            eligible_kinds=["zeroclaw"],
+            eligible_hosts=["zcgate-release-sink"],
+            priority=5,
+        )
+    )
+    rel_id = rel.get("id") if isinstance(rel, dict) else None
+    result["release_job_id"] = rel_id
+    result["release_requested_at"] = time.time()
+    async with hive_repo().connection() as tx:
+        await hive_repo().patch_job_status(tx, job_id, sets={"result": json.dumps(result)})
+        await tx.commit()
+    return {"ok": True, "release_job_id": rel_id, "repo": repo, "submitter": submitter}

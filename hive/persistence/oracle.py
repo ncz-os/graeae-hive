@@ -448,6 +448,9 @@ class OracleConnection:
 class OracleHiveRepository(SqliteHiveRepository):
     """Oracle backend using the repository-owned SQL compatibility adapter."""
 
+    #: Oracle row-lock for the auto-retry read.
+    _retry_lock_clause = " FOR UPDATE"
+
     connection_class: Any = OracleConnection
 
     def __init__(self, dsn: str) -> None:

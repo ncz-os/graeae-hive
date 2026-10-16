@@ -34,6 +34,11 @@ NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 
 
 class SqliteHiveRepository(HiveMindRepository):
+    #: Backend lock clause for the auto-retry row read. SQLite serialises via the
+    #: connection; Oracle/Db2 override this to add FOR UPDATE. Kept as a class
+    #: attr so the dialect lives in the backend, never in the router.
+    _retry_lock_clause = ""
+
     def __init__(self, db_path: str, *, busy_timeout_ms: int = 5000) -> None:
         self.db_path = db_path
         self.busy_timeout_ms = busy_timeout_ms
@@ -797,6 +802,46 @@ class SqliteHiveRepository(HiveMindRepository):
                 fields.get("patch_json"),
             ),
         )
+
+    async def job_claim_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
+        """The by-id claim pre-read (status/kind/caps/kinds/hosts/tier/prefs/deps)."""
+        db = tx
+        async with db.execute(
+            "SELECT status, kind, required_capabilities, eligible_kinds, "
+            "eligible_hosts, max_cost_tier, preferred_providers, preferred_models, "
+            "depends_on, retry_backoff_until, started_at "
+            "FROM jobs WHERE id=?",
+            (job_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def job_retry_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
+        """The auto-retry pre-read, row-locked per this backend's dialect."""
+        db = tx
+        async with db.execute(
+            "SELECT status, kind, max_retries, retry_count, result FROM jobs WHERE id=?"
+            + self._retry_lock_clause,
+            (job_id,),
+        ) as cur:
+            return await cur.fetchone()
+
+    async def job_release_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
+        """The zcgate release pre-read (result/status)."""
+        db = tx
+        async with db.execute(
+            "SELECT result, status FROM jobs WHERE id=?", (job_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+    async def active_orchestrator_urn(self, tx: Transaction) -> str | None:
+        """Latest non-offline orchestrator URN (the release-job submitter)."""
+        db = tx
+        async with db.execute(
+            "SELECT urn FROM agents WHERE runtime IN ('mnemos','human','claude-code','claude') "
+            "AND status != 'offline' ORDER BY last_heartbeat DESC LIMIT 1"
+        ) as cur:
+            r = await cur.fetchone()
+        return r[0] if r else None
 
     async def post_message(self, tx: Transaction, **fields: Any) -> None:
         db = tx

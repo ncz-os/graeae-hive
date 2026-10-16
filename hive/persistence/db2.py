@@ -667,6 +667,9 @@ class _Db2Pool:
 
 
 class Db2HiveRepository(SqliteHiveRepository):
+    #: Db2 row-lock for the auto-retry read.
+    _retry_lock_clause = " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS"
+
     def __init__(
         self,
         dsn: str,
