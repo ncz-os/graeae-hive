@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import json
 import os
 import secrets
@@ -19,7 +20,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import HTTPException
+from fastapi import Header, HTTPException
 
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
@@ -137,3 +138,57 @@ async def require_orchestrator_submitter(submitter_urn: str) -> str:
             ),
         )
     return runtime
+
+
+ACTIVE_JOB_STATUSES = ("queued", "offered", "claimed", "running", "needs-review")
+
+
+async def require_mutation_actor(
+    x_hive_actor: str | None = Header(default=None, alias="X-Hive-Actor"),
+    x_hive_token: str | None = Header(default=None, alias="X-Hive-Token"),
+) -> str:
+    """Gate mutating endpoints that previously had NO guard at all.
+
+    Two layers: (1) if HIVE_SHARED_SECRET is set, a matching X-Hive-Token is
+    required; (2) X-Hive-Actor must name a REGISTERED, ACTIVE agent. (Moved
+    verbatim from agent_bus.py, Phase 1c.)
+    """
+    secret = os.environ.get("HIVE_SHARED_SECRET")
+    if secret:
+        if not x_hive_token or not hmac.compare_digest(str(x_hive_token), str(secret)):
+            raise HTTPException(401, "missing or incorrect X-Hive-Token")
+    if not x_hive_actor or not str(x_hive_actor).strip():
+        raise HTTPException(401, "X-Hive-Actor header is required for mutating calls")
+    await require_registered_agent(str(x_hive_actor).strip(), active_only=True)
+    return str(x_hive_actor).strip()
+
+
+async def _cascade_delete_jobs(db, job_ids: list[str], *, allow_active: bool = False) -> list[str]:
+    """Delete the given jobs and their job_audit_log rows. ATOMIC active-job guard.
+
+    (Moved verbatim from agent_bus.py, Phase 1c — see the original for the full
+    codex-review #3 rationale on the compare-and-delete predicate.)
+    """
+    if not job_ids:
+        return []
+    rows = [(jid,) for jid in job_ids]
+    if allow_active:
+        await db.executemany("DELETE FROM jobs WHERE id=?", rows)
+    else:
+        active_ph = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
+        await db.executemany(
+            f"DELETE FROM jobs WHERE id=? AND status NOT IN ({active_ph})",
+            [(jid, *ACTIVE_JOB_STATUSES) for jid in job_ids],
+        )
+    survivors: set[str] = set()
+    for jid in job_ids:
+        async with db.execute("SELECT 1 FROM jobs WHERE id=?", (jid,)) as cur:
+            if await cur.fetchone() is not None:
+                survivors.add(jid)
+    deleted = [jid for jid in job_ids if jid not in survivors]
+    if deleted:
+        await db.executemany(
+            "DELETE FROM job_audit_log WHERE job_id=?",
+            [(jid,) for jid in deleted],
+        )
+    return deleted

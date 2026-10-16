@@ -29,6 +29,7 @@ from starlette.responses import Response
 
 import agent_bus
 from hive import scheduler as sched
+from hive.bus.routers import admin as hive_admin_router
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
 from hive.persistence.oracle import (
     _ORACLE_JOB_ADDITIONS,
@@ -57,6 +58,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_mcp2_import_registers_typed_handlers(self):
         bridge = load_script("mcp_bridge_under_test", str(HERE / "mcp_bridge.py"))
         from mcp.types import PaginatedRequestParams
+
         self.assertEqual(bridge.MCP_VERSION.split(".", 1)[0], "2")
         handlers = getattr(bridge.server, "_request_handlers", {})
         self.assertTrue({"tools/list", "tools/call", "resources/list", "prompts/list"}.issubset(handlers))
@@ -76,9 +78,14 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
             await bridge.handle_call_tool("mnemos_memory_search", {"query": "q"})
             await bridge.handle_call_tool("mnemos_memory_create", {"content": "c", "category": "test"})
             await bridge.handle_call_tool("mnemos_memory_get", {"id": "mem_1"})
-        self.assertEqual([path for _method, path, _kwargs in seen], [
-            "/v1/memories/search", "/v1/memories", "/v1/memories/mem_1",
-        ])
+        self.assertEqual(
+            [path for _method, path, _kwargs in seen],
+            [
+                "/v1/memories/search",
+                "/v1/memories",
+                "/v1/memories/mem_1",
+            ],
+        )
         await bridge.client.aclose()
 
     async def test_orchestrator_registration_uses_admin_token(self):
@@ -87,8 +94,12 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         class Reply:
             status_code = 200
-            def raise_for_status(self): return None
-            def json(self): return {"urn": "urn:agent:human:test:1"}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"urn": "urn:agent:human:test:1"}
 
         async def request(method, url, **kwargs):
             seen.append((method, url, kwargs))
@@ -97,15 +108,15 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bridge.client, "request", request):
             for runtime in sorted(agent_bus.ORCHESTRATOR_RUNTIMES):
                 await bridge._hive(
-                    "POST", "/v1/agents/register",
+                    "POST",
+                    "/v1/agents/register",
                     json={"kind": runtime, "runtime": runtime},
                     admin_authorized=True,
                 )
         self.assertEqual(len(seen), len(agent_bus.ORCHESTRATOR_RUNTIMES))
-        self.assertTrue(all(
-            kwargs["headers"]["Authorization"] == "Bearer test-admin-token"
-            for _method, _url, kwargs in seen
-        ))
+        self.assertTrue(
+            all(kwargs["headers"]["Authorization"] == "Bearer test-admin-token" for _method, _url, kwargs in seen)
+        )
         await bridge.client.aclose()
 
     async def test_bridge_requires_inbound_bearer_and_has_admin_scope(self):
@@ -114,12 +125,25 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         async def request(token=None):
             headers = [] if token is None else [(b"authorization", f"Bearer {token}".encode())]
-            scope = {"type": "http", "method": "POST", "path": "/messages/",
-                     "raw_path": b"/messages/", "query_string": b"", "headers": headers,
-                     "scheme": "http", "server": ("test", 80), "client": ("test", 1)}
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/messages/",
+                "raw_path": b"/messages/",
+                "query_string": b"",
+                "headers": headers,
+                "scheme": "http",
+                "server": ("test", 80),
+                "client": ("test", 1),
+            }
             sent = []
-            async def receive(): return {"type": "http.request", "body": b"", "more_body": False}
-            async def send(message): sent.append(message)
+
+            async def receive():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                sent.append(message)
+
             await bridge.app(scope, receive, send)
             return next(message["status"] for message in sent if message["type"] == "http.response.start")
 
@@ -142,18 +166,35 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         from mcp.server.auth.provider import AccessToken
         from mcp.types import CallToolRequestParams
 
-        request = Request({"type": "http", "method": "POST", "path": "/messages/",
-                           "raw_path": b"/messages/", "query_string": b"", "headers": [],
-                           "scheme": "http", "server": ("test", 80)})
-        request.scope["user"] = AuthenticatedUser(AccessToken(
-            token="test-mcp-token", client_id="client", scopes=["bridge:use"],
-        ))
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/messages/",
+                "raw_path": b"/messages/",
+                "query_string": b"",
+                "headers": [],
+                "scheme": "http",
+                "server": ("test", 80),
+            }
+        )
+        request.scope["user"] = AuthenticatedUser(
+            AccessToken(
+                token="test-mcp-token",
+                client_id="client",
+                scopes=["bridge:use"],
+            )
+        )
         context = types.SimpleNamespace(request=request)
         handler = bridge.server._request_handlers["tools/call"].handler
         with mock.patch.object(bridge, "_mnemos", side_effect=OSError("down")):
-            result = await handler(context, CallToolRequestParams(
-                name="mnemos_memory_search", arguments={"query": "q"},
-            ))
+            result = await handler(
+                context,
+                CallToolRequestParams(
+                    name="mnemos_memory_search",
+                    arguments={"query": "q"},
+                ),
+            )
         self.assertTrue(result.is_error)
         self.assertTrue(result.model_dump(by_alias=True)["isError"])
         await bridge.client.aclose()
@@ -179,7 +220,8 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_ordinary_bridge_scope_cannot_borrow_admin_bus_token(self):
         bridge = load_script("mcp_bridge_tool_auth_under_test", str(HERE / "mcp_bridge.py"))
         outcome = await bridge.handle_call_tool(
-            "hive_agent_register", {"kind": "human", "host": "test"},
+            "hive_agent_register",
+            {"kind": "human", "host": "test"},
         )
         self.assertTrue(outcome.is_error)
         self.assertIn("administrator MCP bridge credential required", outcome.content[0].text)
@@ -191,8 +233,12 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         class Reply:
             status_code = 200
-            def raise_for_status(self): return None
-            def json(self): return {"urn": "urn:agent:codex:test:1"}
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {"urn": "urn:agent:codex:test:1"}
 
         async def request(_method, _url, **kwargs):
             seen.append(kwargs)
@@ -201,14 +247,12 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(bridge.client, "request", request):
             for runtime in sorted(agent_bus.WORKER_ONLY_RUNTIMES):
                 await bridge._hive(
-                    "POST", "/v1/agents/register",
+                    "POST",
+                    "/v1/agents/register",
                     json={"kind": runtime, "runtime": runtime},
                 )
         self.assertEqual(len(seen), len(agent_bus.WORKER_ONLY_RUNTIMES))
-        self.assertTrue(all(
-            kwargs["headers"]["Authorization"] == "Bearer test-bus-token"
-            for kwargs in seen
-        ))
+        self.assertTrue(all(kwargs["headers"]["Authorization"] == "Bearer test-bus-token" for kwargs in seen))
         await bridge.client.aclose()
 
 
@@ -224,11 +268,21 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
             headers.append((b"authorization", f"Bearer {token}".encode()))
         if cookie is not None:
             headers.append((b"cookie", cookie.encode()))
-        request = Request({"type": "http", "method": method, "path": path,
-                           "raw_path": path.encode(), "query_string": b"",
-                           "headers": headers, "scheme": "http", "server": ("test", 80)})
+        request = Request(
+            {
+                "type": "http",
+                "method": method,
+                "path": path,
+                "raw_path": path.encode(),
+                "query_string": b"",
+                "headers": headers,
+                "scheme": "http",
+                "server": ("test", 80),
+            }
+        )
 
         if call_next is None:
+
             async def call_next(_request):
                 return Response(status_code=204)
 
@@ -264,28 +318,51 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
             return await agent_bus.create_browser_session(request)
 
         response = await self._request(
-            "/v1/auth/session", "test-admin-token", "POST", call_next=issue,
+            "/v1/auth/session",
+            "test-admin-token",
+            "POST",
+            call_next=issue,
         )
         cookie = response.headers["set-cookie"].split(";", 1)[0]
         self.assertIn("HttpOnly", response.headers["set-cookie"])
         self.assertIn("SameSite=strict", response.headers["set-cookie"])
         self.assertEqual((await self._request("/v1/events", cookie=cookie)).status_code, 204)
         self.assertEqual((await self._request("/v1/schedules", method="POST", cookie=cookie)).status_code, 204)
-        https_request = Request({"type": "http", "method": "POST", "path": "/v1/auth/session",
-                                 "raw_path": b"/v1/auth/session", "query_string": b"",
-                                 "headers": [(b"authorization", b"Bearer test-admin-token")],
-                                 "scheme": "https", "server": ("test", 443)})
+        https_request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/auth/session",
+                "raw_path": b"/v1/auth/session",
+                "query_string": b"",
+                "headers": [(b"authorization", b"Bearer test-admin-token")],
+                "scheme": "https",
+                "server": ("test", 443),
+            }
+        )
         https_request.state.auth_role = "admin"
         https_response = await agent_bus.create_browser_session(https_request)
         self.assertIn("Secure", https_response.headers["set-cookie"])
 
     async def test_browser_session_cookie_cannot_renew_itself(self):
-        request = Request({"type": "http", "method": "POST", "path": "/v1/auth/session",
-                           "raw_path": b"/v1/auth/session", "query_string": b"", "headers": [],
-                           "scheme": "http", "server": ("test", 80)})
-        request._cookies = {"hive_session": agent_bus._session_cookie(
-            "admin", int(time.time()) + 120,
-        )}
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/auth/session",
+                "raw_path": b"/v1/auth/session",
+                "query_string": b"",
+                "headers": [],
+                "scheme": "http",
+                "server": ("test", 80),
+            }
+        )
+        request._cookies = {
+            "hive_session": agent_bus._session_cookie(
+                "admin",
+                int(time.time()) + 120,
+            )
+        }
         request.state.auth_role = "admin"
         with self.assertRaises(agent_bus.HTTPException) as raised:
             await agent_bus.create_browser_session(request)
@@ -302,13 +379,23 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
             agent_bus.HIVE_BUS_TOKEN, agent_bus.HIVE_BUS_ADMIN_TOKEN = old_worker, old_admin
 
     async def test_worker_role_cannot_register_synthetic_orchestrator(self):
-        request = Request({"type": "http", "method": "POST", "path": "/v1/agents/register",
-                           "raw_path": b"/v1/agents/register", "query_string": b"", "headers": [],
-                           "scheme": "http", "server": ("test", 80)})
+        request = Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/agents/register",
+                "raw_path": b"/v1/agents/register",
+                "query_string": b"",
+                "headers": [],
+                "scheme": "http",
+                "server": ("test", 80),
+            }
+        )
         request.state.auth_role = "worker"
         with self.assertRaises(agent_bus.HTTPException) as raised:
             await agent_bus.register(
-                agent_bus.AgentRegister(host="attacker", runtime="human", kind="human"), request,
+                agent_bus.AgentRegister(host="attacker", runtime="human", kind="human"),
+                request,
             )
         self.assertEqual(raised.exception.status_code, 403)
 
@@ -319,7 +406,9 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             repo = SqliteHiveRepository(str(Path(td) / "jobs.db"))
             await repo.init(agent_bus.SCHEMA)
             await repo.submit_job(
-                id="job-result", submitter_urn="urn:submitter", kind="test",
+                id="job-result",
+                submitter_urn="urn:submitter",
+                kind="test",
                 started_at=1.0,
             )
             async with repo.connection() as db:
@@ -345,8 +434,18 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 await db.execute(
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, started_at, "
                     "last_heartbeat, status, runtime, cost_tier) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("urn:agent:zeroclaw:host:session", "zeroclaw", "host", "session", "[]",
-                     now, now, "online", "zeroclaw", "B"),
+                    (
+                        "urn:agent:zeroclaw:host:session",
+                        "zeroclaw",
+                        "host",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                    ),
                 )
                 for job_id, status in (("dep-done", "done"), ("dep-pending", "queued")):
                     await db.execute(
@@ -381,8 +480,10 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                     db.execute = traced_execute
                     yield db
 
-            with mock.patch.object(agent_bus, "connect_db", traced_connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", traced_connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 claimed = await agent_bus.dequeue_next_job("urn:agent:zeroclaw:host:session")
 
             self.assertEqual(claimed["id"], "ready")
@@ -418,8 +519,10 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         old_backend = agent_bus.HIVE_BACKEND
         agent_bus.HIVE_BACKEND = "db2"
         try:
-            with mock.patch.object(agent_bus, "hive_repo", return_value=fake), \
-                    mock.patch.object(agent_bus, "reaper_task", idle_reaper):
+            with (
+                mock.patch.object(agent_bus, "hive_repo", return_value=fake),
+                mock.patch.object(agent_bus, "reaper_task", idle_reaper),
+            ):
                 async with agent_bus.lifespan(agent_bus.app):
                     self.assertIsNone(fake.initialized)
             self.assertTrue(fake.closed)
@@ -428,9 +531,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_oracle_populated_core_schema_is_converged_and_verified(self):
         repo = OracleHiveRepository("oracle://user:pass@db/TEST")
-        columns = {
-            name: ("CLOB", None) for name in _ORACLE_REQUIRED_JOB_COLUMNS - set(_ORACLE_JOB_ADDITIONS)
-        }
+        columns = {name: ("CLOB", None) for name in _ORACLE_REQUIRED_JOB_COLUMNS - set(_ORACLE_JOB_ADDITIONS)}
         columns["STATUS"] = ("VARCHAR2", 16)
         indexes = set()
         checks = [("CK_HIVE_JOBS_STATUS", "status IN ('queued','done')")]
@@ -453,10 +554,17 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 for name in _ORACLE_JOB_ADDITIONS:
                     if name in upper:
                         data_type = (
-                            "NUMBER" if name in {
-                                "RETRY_COUNT", "MAX_RETRIES", "RETRY_BACKOFF_UNTIL",
-                                "LAST_UPDATE_AT", "CLAIM_LEASE_EXPIRES_AT", "DECLINE_COUNT",
-                            } else "CLOB"
+                            "NUMBER"
+                            if name
+                            in {
+                                "RETRY_COUNT",
+                                "MAX_RETRIES",
+                                "RETRY_BACKOFF_UNTIL",
+                                "LAST_UPDATE_AT",
+                                "CLAIM_LEASE_EXPIRES_AT",
+                                "DECLINE_COUNT",
+                            }
+                            else "CLOB"
                         )
                         length = None
                         if name in {"REQUIRED_AUTONOMY", "PROJECT", "DEDUP_HASH"}:
@@ -503,9 +611,11 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         repo = OracleHiveRepository("oracle://user:pass@db/TEST")
         raw = mock.AsyncMock()
         fake_driver = types.SimpleNamespace(connect_async=mock.AsyncMock(return_value=raw))
-        with mock.patch.dict("sys.modules", {"oracledb": fake_driver}), \
-                mock.patch.object(repo, "_apply_migrations", mock.AsyncMock()) as migrate, \
-                mock.patch.object(repo, "_verify_schema", mock.AsyncMock()) as verify:
+        with (
+            mock.patch.dict("sys.modules", {"oracledb": fake_driver}),
+            mock.patch.object(repo, "_apply_migrations", mock.AsyncMock()) as migrate,
+            mock.patch.object(repo, "_verify_schema", mock.AsyncMock()) as verify,
+        ):
             await repo.init()
         migrate.assert_awaited_once_with(raw)
         verify.assert_awaited_once_with(raw)
@@ -524,12 +634,18 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_health_returns_503_when_reaper_worker_has_stopped(self):
         class Cursor:
-            async def __aenter__(self): return self
-            async def __aexit__(self, *_args): return None
-            async def fetchone(self): return (0,)
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def fetchone(self):
+                return (0,)
 
         class Db:
-            def execute(self, _sql): return Cursor()
+            def execute(self, _sql):
+                return Cursor()
 
         @asynccontextmanager
         async def working_connection():
@@ -553,21 +669,53 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 self.rows = rows or []
 
             def __await__(self):
-                async def done(): return self
+                async def done():
+                    return self
+
                 return done().__await__()
 
-            async def __aenter__(self): return self
-            async def __aexit__(self, *_args): return None
-            async def fetchall(self): return list(self.rows)
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def fetchall(self):
+                return list(self.rows)
 
         class FakeDb:
             def __init__(self):
                 self.columns = {
-                    "HIVE_AGENTS": {"URN", "KIND", "HOST", "SESSION_ID", "PID", "CAPABILITIES",
-                               "VERSION", "STARTED_AT", "LAST_HEARTBEAT", "STATUS", "METADATA"},
-                    "HIVE_JOBS": {"ID", "SUBMITTER_URN", "PARENT_JOB_ID", "KIND", "DESCRIPTION",
-                             "PRIORITY", "DEADLINE", "REQUIRED_CAPABILITIES", "ELIGIBLE_KINDS",
-                             "STATUS", "CLAIMED_BY", "CLAIMED_AT", "STARTED_AT", "ENDED_AT", "RESULT"},
+                    "HIVE_AGENTS": {
+                        "URN",
+                        "KIND",
+                        "HOST",
+                        "SESSION_ID",
+                        "PID",
+                        "CAPABILITIES",
+                        "VERSION",
+                        "STARTED_AT",
+                        "LAST_HEARTBEAT",
+                        "STATUS",
+                        "METADATA",
+                    },
+                    "HIVE_JOBS": {
+                        "ID",
+                        "SUBMITTER_URN",
+                        "PARENT_JOB_ID",
+                        "KIND",
+                        "DESCRIPTION",
+                        "PRIORITY",
+                        "DEADLINE",
+                        "REQUIRED_CAPABILITIES",
+                        "ELIGIBLE_KINDS",
+                        "STATUS",
+                        "CLAIMED_BY",
+                        "CLAIMED_AT",
+                        "STARTED_AT",
+                        "ENDED_AT",
+                        "RESULT",
+                    },
                 }
                 self.indexes = {"HIVE_JOBS": set()}
                 # Simulate an installation whose old parallel tables already
@@ -653,10 +801,17 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         seen = []
 
         class Cursor:
-            def __init__(self, row=None): self.row = row
-            async def __aenter__(self): return self
-            async def __aexit__(self, *_args): return None
-            async def fetchone(self): return self.row
+            def __init__(self, row=None):
+                self.row = row
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def fetchone(self):
+                return self.row
 
         class Db:
             def execute(self, sql, params=None):
@@ -664,24 +819,34 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 cursor = Cursor(("failed",) if sql.startswith("SELECT status") else None)
                 if sql.startswith("SELECT status"):
                     return cursor
-                async def executed(): return cursor
+
+                async def executed():
+                    return cursor
+
                 return executed()
-            async def commit(self): return None
+
+            async def commit(self):
+                return None
 
         @asynccontextmanager
         async def connection():
             yield Db()
 
-        with mock.patch.object(agent_bus, "connect_db", connection):
+        with mock.patch.object(hive_admin_router, "connect_db", connection):
             result = await agent_bus.admin_requeue_jobs(
                 agent_bus.RequeueRequest(job_ids=["job-1"]),
             )
         self.assertEqual(result["ok"], ["job-1"])
         update = next(sql for sql, _params in seen if sql.lstrip().startswith("UPDATE jobs"))
         for fragment in (
-            "ended_at=NULL", "result=NULL", "claimed_runtime=NULL",
-            "claimed_host_caps=NULL", "claim_lease_expires_at=NULL",
-            "tokens_in=NULL", "tokens_out=NULL", "estimated_cost_usd=NULL",
+            "ended_at=NULL",
+            "result=NULL",
+            "claimed_runtime=NULL",
+            "claimed_host_caps=NULL",
+            "claim_lease_expires_at=NULL",
+            "tokens_in=NULL",
+            "tokens_out=NULL",
+            "estimated_cost_usd=NULL",
             "result_mnemos_id=NULL",
         ):
             self.assertIn(fragment, update)
@@ -704,11 +869,24 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                     "claimed_by, ended_at, result, claimed_runtime, tokens_in, "
                     "estimated_cost_usd, result_mnemos_id, claim_lease_expires_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("job-real", "urn:submitter", "fix:test", "failed", 1.0,
-                     "urn:worker", 2.0, "{}", "zeroclaw", 10, 1.25, "mem-1", 3.0),
+                    (
+                        "job-real",
+                        "urn:submitter",
+                        "fix:test",
+                        "failed",
+                        1.0,
+                        "urn:worker",
+                        2.0,
+                        "{}",
+                        "zeroclaw",
+                        10,
+                        1.25,
+                        "mem-1",
+                        3.0,
+                    ),
                 )
                 await db.commit()
-            with mock.patch.object(agent_bus, "connect_db", repo.connection):
+            with mock.patch.object(hive_admin_router, "connect_db", repo.connection):
                 result = await agent_bus.admin_requeue_jobs(
                     agent_bus.RequeueRequest(job_ids=["job-real"]),
                 )
@@ -754,10 +932,19 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    urn, kind, host, "session",
+                    urn,
+                    kind,
+                    host,
+                    "session",
                     json.dumps(capabilities),
                     json.dumps(current_load) if current_load else None,
-                    now, now, "online", kind, "B", "default", "default",
+                    now,
+                    now,
+                    "online",
+                    kind,
+                    "B",
+                    "default",
+                    "default",
                 ),
             )
             for jid, jkind, jprio, jcaps, jhosts in jobs:
@@ -782,13 +969,16 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             await self._seed_worker_and_jobs(
                 repo,
                 urn="urn:agent:zeroclaw:typhon:s1",
-                kind="zeroclaw", host="typhon",
+                kind="zeroclaw",
+                host="typhon",
                 capabilities=[],
                 current_load={"utilization": 0.0, "deficit": 0.0},
                 jobs=jobs,
             )
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 claimed = await agent_bus.dequeue_next_job(
                     "urn:agent:zeroclaw:typhon:s1",
                 )
@@ -803,16 +993,18 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             await self._seed_worker_and_jobs(
                 repo,
                 urn="urn:agent:zeroclaw:hydra:s1",
-                kind="zeroclaw", host="hydra",
+                kind="zeroclaw",
+                host="hydra",
                 capabilities=["role:build", "linux-compile"],
                 current_load={"utilization": 0.0, "deficit": 0.0},
                 jobs=[
-                    ("job-build", "build:compile", 5,
-                     json.dumps(["hard:linux-compile"]), None),
+                    ("job-build", "build:compile", 5, json.dumps(["hard:linux-compile"]), None),
                 ],
             )
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 claimed = await agent_bus.dequeue_next_job(
                     "urn:agent:zeroclaw:hydra:s1",
                 )
@@ -832,9 +1024,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                         "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                         "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (holder, "zeroclaw", f"w{i}", "session", "[]",
-                         now, now, "online", "zeroclaw", "B",
-                         "minimax-m3", "minimax"),
+                        (
+                            holder,
+                            "zeroclaw",
+                            f"w{i}",
+                            "session",
+                            "[]",
+                            now,
+                            now,
+                            "online",
+                            "zeroclaw",
+                            "B",
+                            "minimax-m3",
+                            "minimax",
+                        ),
                     )
                 # Their active MiniMax jobs.
                 for i, holder in enumerate(active_holders):
@@ -851,9 +1054,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("urn:agent:zeroclaw:w6:s1", "zeroclaw", "w6", "session", "[]",
-                     now, now, "online", "zeroclaw", "B",
-                     "minimax-m3", "minimax"),
+                    (
+                        "urn:agent:zeroclaw:w6:s1",
+                        "zeroclaw",
+                        "w6",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "minimax-m3",
+                        "minimax",
+                    ),
                 )
                 await db.execute(
                     "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
@@ -863,8 +1077,11 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
 
             from fastapi.responses import Response
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 response = await agent_bus.dequeue_next_job(
                     "urn:agent:zeroclaw:w6:s1",
                 )
@@ -897,9 +1114,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (urn, "zeroclaw", "typhon", "session", "[]",
-                     now, now, "online", "zeroclaw", "B",
-                     "grok-4.3", "xai"),
+                    (
+                        urn,
+                        "zeroclaw",
+                        "typhon",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "grok-4.3",
+                        "xai",
+                    ),
                 )
                 # Existing active MiniMax lease held by this same worker
                 # (would normally mean "you're on MiniMax" — but here the
@@ -922,8 +1150,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     ("job-local", now),
                 )
                 await db.commit()
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 claimed = await agent_bus.dequeue_next_job(urn)
             self.assertEqual(claimed["id"], "job-local")
 
@@ -950,10 +1180,21 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "current_load, started_at, last_heartbeat, status, runtime, "
                     "cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("urn:agent:zeroclaw:hydra:s-build", "zeroclaw", "hydra",
-                     "session", '["role:build", "linux-compile"]',
-                     json.dumps({"utilization": 0.0, "deficit": 0.0}),
-                     now, now, "online", "zeroclaw", "B", "default", "default"),
+                    (
+                        "urn:agent:zeroclaw:hydra:s-build",
+                        "zeroclaw",
+                        "hydra",
+                        "session",
+                        '["role:build", "linux-compile"]',
+                        json.dumps({"utilization": 0.0, "deficit": 0.0}),
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "default",
+                        "default",
+                    ),
                 )
                 # General worker busy.
                 await db.execute(
@@ -961,10 +1202,21 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "current_load, started_at, last_heartbeat, status, runtime, "
                     "cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("urn:agent:zeroclaw:typhon:s-gen", "zeroclaw", "typhon",
-                     "session", "[]",
-                     json.dumps({"utilization": 0.0, "deficit": 0.0}),
-                     now, now, "online", "zeroclaw", "B", "default", "default"),
+                    (
+                        "urn:agent:zeroclaw:typhon:s-gen",
+                        "zeroclaw",
+                        "typhon",
+                        "session",
+                        "[]",
+                        json.dumps({"utilization": 0.0, "deficit": 0.0}),
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "default",
+                        "default",
+                    ),
                 )
                 # Build job + ordinary job.
                 await db.execute(
@@ -982,18 +1234,23 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
             # General worker polls first — it gets the non-build job because
             # role-aware scoring de-prioritises build: jobs for non-builders.
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 general_claim = await agent_bus.dequeue_next_job(
                     "urn:agent:zeroclaw:typhon:s-gen",
                 )
             self.assertEqual(general_claim["id"], "job-ord-only")
             # Build job remains unclaimed (will be picked up by the build
             # worker when it polls).
-            async with repo.connection() as db, db.execute(
-                "SELECT status, claimed_by FROM jobs WHERE id=?",
-                ("job-build-only",),
-            ) as cur:
+            async with (
+                repo.connection() as db,
+                db.execute(
+                    "SELECT status, claimed_by FROM jobs WHERE id=?",
+                    ("job-build-only",),
+                ) as cur,
+            ):
                 row = await cur.fetchone()
             self.assertEqual(row, ("queued", None))
 
@@ -1013,13 +1270,27 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "current_load, started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (urn_starved, "zeroclaw", "forge", "session", "[]",
-                     json.dumps({
-                         "utilization": 0.0,
-                         "last_served_at": now - 7200,  # 2h ago
-                         "deficit": 12.0,
-                     }),
-                     now, now, "online", "zeroclaw", "B", "default", "default"),
+                    (
+                        urn_starved,
+                        "zeroclaw",
+                        "forge",
+                        "session",
+                        "[]",
+                        json.dumps(
+                            {
+                                "utilization": 0.0,
+                                "last_served_at": now - 7200,  # 2h ago
+                                "deficit": 12.0,
+                            }
+                        ),
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "default",
+                        "default",
+                    ),
                 )
                 # Two equal-priority jobs. The starved worker's pick is
                 # lexicographic — same as a fresh worker — but the score
@@ -1037,8 +1308,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     ("job-bb", now),
                 )
                 await db.commit()
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 claimed = await agent_bus.dequeue_next_job(urn_starved)
             self.assertIn(claimed["id"], ("job-aa", "job-bb"))
 
@@ -1063,9 +1336,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                         "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                         "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (holder, "zeroclaw", f"w{i}", "session", "[]",
-                         now, now, "online", "zeroclaw", "B",
-                         "minimax-m3", "minimax"),
+                        (
+                            holder,
+                            "zeroclaw",
+                            f"w{i}",
+                            "session",
+                            "[]",
+                            now,
+                            now,
+                            "online",
+                            "zeroclaw",
+                            "B",
+                            "minimax-m3",
+                            "minimax",
+                        ),
                     )
                     await db.execute(
                         "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
@@ -1080,9 +1364,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (urn, "zeroclaw", "typhon", "session", "[]",
-                     now, now, "online", "zeroclaw", "B",
-                     "grok-4.3", "xai"),
+                    (
+                        urn,
+                        "zeroclaw",
+                        "typhon",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "grok-4.3",
+                        "xai",
+                    ),
                 )
                 # Local job + EIH job queued (both general pool, not MiniMax).
                 for jid in ("job-local-1", "job-eih-1"):
@@ -1093,8 +1388,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                         (jid, now),
                     )
                 await db.commit()
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 claimed = await agent_bus.dequeue_next_job(urn)
             # Pool saturated (5/5 MiniMax leases) but a general worker on
             # the grok-4.3/xai route is unaffected — it claims the highest-
@@ -1118,9 +1415,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                         "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                         "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (holder, "zeroclaw", f"w{i}", "session", "[]",
-                         now, now, "online", "zeroclaw", "B",
-                         "minimax-m3", "minimax"),
+                        (
+                            holder,
+                            "zeroclaw",
+                            f"w{i}",
+                            "session",
+                            "[]",
+                            now,
+                            now,
+                            "online",
+                            "zeroclaw",
+                            "B",
+                            "minimax-m3",
+                            "minimax",
+                        ),
                     )
                     await db.execute(
                         "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
@@ -1135,9 +1443,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (urn, "zeroclaw", "typhon", "session", "[]",
-                     now, now, "online", "zeroclaw", "B",
-                     "minimax-m3", "minimax"),
+                    (
+                        urn,
+                        "zeroclaw",
+                        "typhon",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "minimax-m3",
+                        "minimax",
+                    ),
                 )
                 await db.execute(
                     "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
@@ -1148,19 +1467,23 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
             # Capture emitted events.
             from fastapi.responses import Response
+
             captured_events = []
 
             async def fake_emit(db, kind, payload):
                 captured_events.append((kind, payload))
 
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", fake_emit):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", fake_emit),
+            ):
                 response = await agent_bus.dequeue_next_job(urn)
             self.assertIsInstance(response, Response)
             self.assertEqual(response.status_code, 204)
             denied = [e for e in captured_events if e[0] == "minimax.pool.denied"]
             self.assertEqual(
-                len(denied), 1,
+                len(denied),
+                1,
                 f"exactly one minimax.pool.denied event must be emitted; got {captured_events!r}",
             )
             _kind, payload = denied[0]
@@ -1189,9 +1512,21 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                         "current_load, started_at, last_heartbeat, status, runtime, "
                         "cost_tier, model, provider) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (urn, "zeroclaw", "typhon", "session", "[]",
-                         json.dumps({"utilization": 0.0, "deficit": 0.0}),
-                         now, now, "online", "zeroclaw", "B", "default", "default"),
+                        (
+                            urn,
+                            "zeroclaw",
+                            "typhon",
+                            "session",
+                            "[]",
+                            json.dumps({"utilization": 0.0, "deficit": 0.0}),
+                            now,
+                            now,
+                            "online",
+                            "zeroclaw",
+                            "B",
+                            "default",
+                            "default",
+                        ),
                     )
                 await db.execute(
                     "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
@@ -1200,9 +1535,12 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
             from fastapi.responses import Response
+
             results: list = []
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 # Sequential polls — under BEGIN IMMEDIATE the second claim
                 # observes status='claimed' and returns 204.
                 a = await agent_bus.dequeue_next_job(urn_a)
@@ -1216,13 +1554,15 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(no_claim), 1, "the second poller sees 204 (no_jobs_available)")
             self.assertEqual(no_claim[0].status_code, 204)
             # And the claimed_by column in the DB is exactly one of the two urns.
-            async with repo.connection() as db, db.execute(
-                "SELECT claimed_by FROM jobs WHERE id=?",
-                ("job-only-one",),
-            ) as cur:
+            async with (
+                repo.connection() as db,
+                db.execute(
+                    "SELECT claimed_by FROM jobs WHERE id=?",
+                    ("job-only-one",),
+                ) as cur,
+            ):
                 row = await cur.fetchone()
-            self.assertIn(row[0], (urn_a, urn_b),
-                          f"claimed_by must be one of the two pollers; got {row[0]!r}")
+            self.assertIn(row[0], (urn_a, urn_b), f"claimed_by must be one of the two pollers; got {row[0]!r}")
 
     async def test_dequeue_minimax_offered_state_counts_against_global_cap(self):
         """Per the rollout directive (2026-10-01): "a hard global maximum
@@ -1233,6 +1573,7 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
         active) + a 6th polling MiniMax-M3 worker → the 6th is denied
         with ``X-Hive-Claim-Result: minimax_pool_saturated``."""
         from fastapi.responses import Response as _Response
+
         with tempfile.TemporaryDirectory() as td:
             repo = SqliteHiveRepository(str(Path(td) / "minimax-offered.db"))
             await repo.init(agent_bus.SCHEMA)
@@ -1244,9 +1585,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                         "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                         "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (holder, "zeroclaw", f"w{i}", "session", "[]",
-                         now, now, "online", "zeroclaw", "B",
-                         "minimax-m3", "minimax"),
+                        (
+                            holder,
+                            "zeroclaw",
+                            f"w{i}",
+                            "session",
+                            "[]",
+                            now,
+                            now,
+                            "online",
+                            "zeroclaw",
+                            "B",
+                            "minimax-m3",
+                            "minimax",
+                        ),
                     )
                 # Five OFFERED (not claimed, not running) MiniMax jobs —
                 # assigned to workers but not yet actively claimed. These
@@ -1266,9 +1618,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (urn_6, "zeroclaw", "w6", "session", "[]",
-                     now, now, "online", "zeroclaw", "B",
-                     "minimax-m3", "minimax"),
+                    (
+                        urn_6,
+                        "zeroclaw",
+                        "w6",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "minimax-m3",
+                        "minimax",
+                    ),
                 )
                 await db.execute(
                     "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
@@ -1277,8 +1640,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
 
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 response = await agent_bus.dequeue_next_job(urn_6)
             self.assertIsInstance(response, _Response)
             self.assertEqual(response.status_code, 204)
@@ -1288,8 +1653,7 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 "5 offered MiniMax jobs must count as ASSIGNED and saturate the global pool",
             )
             detail = response.headers.get("X-Hive-Claim-Detail", "").lower()
-            self.assertIn("global cap", detail,
-                          f"denial detail must reference the global cap; got {detail!r}")
+            self.assertIn("global cap", detail, f"denial detail must reference the global cap; got {detail!r}")
 
     async def test_dequeue_minimax_offered_state_counts_against_per_worker_cap(self):
         """A worker that already holds an OFFERED (not yet actively
@@ -1298,6 +1662,7 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
         leases. The denial reason is the per-worker cap, not the global
         cap (the global pool has plenty of headroom here)."""
         from fastapi.responses import Response as _Response
+
         with tempfile.TemporaryDirectory() as td:
             repo = SqliteHiveRepository(str(Path(td) / "minimax-offered-perw.db"))
             await repo.init(agent_bus.SCHEMA)
@@ -1309,9 +1674,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (urn, "zeroclaw", "typhon", "session", "[]",
-                     now, now, "online", "zeroclaw", "B",
-                     "minimax-m3", "minimax"),
+                    (
+                        urn,
+                        "zeroclaw",
+                        "typhon",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "minimax-m3",
+                        "minimax",
+                    ),
                 )
                 await db.execute(
                     "INSERT INTO jobs (id, submitter_urn, kind, priority, status, "
@@ -1328,8 +1704,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     ("job-mx-second-attempt", now),
                 )
                 await db.commit()
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 response = await agent_bus.dequeue_next_job(urn)
             self.assertIsInstance(response, _Response)
             self.assertEqual(response.status_code, 204)
@@ -1341,8 +1719,7 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                 "an offered MiniMax lease must count against the per-worker cap",
             )
             detail = response.headers.get("X-Hive-Claim-Detail", "").lower()
-            self.assertIn("per-worker cap", detail,
-                          f"denial detail must reference the per-worker cap; got {detail!r}")
+            self.assertIn("per-worker cap", detail, f"denial detail must reference the per-worker cap; got {detail!r}")
 
     async def test_dequeue_minimax_stale_offered_lease_does_not_count(self):
         """A MiniMax lease whose ``claim_lease_expires_at`` is in the past
@@ -1351,6 +1728,7 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
         crashed worker doesn't permanently reduce capacity. A new MiniMax
         worker can claim even when an expired offered lease exists."""
         from fastapi.responses import Response as _Response
+
         with tempfile.TemporaryDirectory() as td:
             repo = SqliteHiveRepository(str(Path(td) / "minimax-stale-offered.db"))
             await repo.init(agent_bus.SCHEMA)
@@ -1361,9 +1739,20 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     "INSERT INTO agents (urn, kind, host, session_id, capabilities, "
                     "started_at, last_heartbeat, status, runtime, cost_tier, model, provider) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (urn, "zeroclaw", "typhon", "session", "[]",
-                     now, now, "online", "zeroclaw", "B",
-                     "minimax-m3", "minimax"),
+                    (
+                        urn,
+                        "zeroclaw",
+                        "typhon",
+                        "session",
+                        "[]",
+                        now,
+                        now,
+                        "online",
+                        "zeroclaw",
+                        "B",
+                        "minimax-m3",
+                        "minimax",
+                    ),
                 )
                 # Stale offered MiniMax job — lease expired 1 hour ago.
                 await db.execute(
@@ -1381,8 +1770,10 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
                     ("job-mx-fresh", now),
                 )
                 await db.commit()
-            with mock.patch.object(agent_bus, "connect_db", repo.connection), \
-                    mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()):
+            with (
+                mock.patch.object(agent_bus, "connect_db", repo.connection),
+                mock.patch.object(agent_bus, "emit_event", mock.AsyncMock()),
+            ):
                 claimed = await agent_bus.dequeue_next_job(urn)
             # Stale offered lease does NOT count — worker claims the fresh
             # MiniMax job. The claim must succeed (return a dict, not a
@@ -1414,18 +1805,26 @@ class ServiceTests(unittest.TestCase):
 
         with mock.patch.object(auto_restore, "_http", fake_http):
             self.assertEqual(auto_restore.restore_job("job-1"), (True, ""))
-        self.assertEqual(seen, {"method": "POST", "path": "/v1/admin/jobs/requeue",
-                                "body": {"job_ids": ["job-1"], "reason": "auto-restore"}})
+        self.assertEqual(
+            seen,
+            {
+                "method": "POST",
+                "path": "/v1/admin/jobs/requeue",
+                "body": {"job_ids": ["job-1"], "reason": "auto-restore"},
+            },
+        )
 
     @unittest.skip(
         "auto-restore creds-gated fail-fast targets the forge's bus-auth design; "
         "the fleet is local-LAN only and does not require auth (operator 2026-10-15)."
     )
     def test_auto_restore_missing_credentials_is_fatal_before_poll(self):
-        with mock.patch.object(auto_restore, "HIVE_BUS_TOKEN", ""), \
-                mock.patch.object(auto_restore, "HIVE_BUS_ADMIN_TOKEN", ""), \
-                mock.patch.object(auto_restore, "fetch_failed_jobs") as fetch, \
-                mock.patch.object(auto_restore, "log"):
+        with (
+            mock.patch.object(auto_restore, "HIVE_BUS_TOKEN", ""),
+            mock.patch.object(auto_restore, "HIVE_BUS_ADMIN_TOKEN", ""),
+            mock.patch.object(auto_restore, "fetch_failed_jobs") as fetch,
+            mock.patch.object(auto_restore, "log"),
+        ):
             self.assertEqual(auto_restore.main(), 2)
         fetch.assert_not_called()
 
@@ -1434,11 +1833,13 @@ class ServiceTests(unittest.TestCase):
         "the fleet is local-LAN only and does not require auth (operator 2026-10-15)."
     )
     def test_auto_restore_queue_read_failure_is_fatal(self):
-        with mock.patch.object(auto_restore, "HIVE_BUS_TOKEN", "worker"), \
-                mock.patch.object(auto_restore, "HIVE_BUS_ADMIN_TOKEN", "admin"), \
-                mock.patch.object(auto_restore, "load_state", return_value={}), \
-                mock.patch.object(auto_restore, "fetch_failed_jobs", side_effect=RuntimeError("HTTP 503")), \
-                mock.patch.object(auto_restore, "log"):
+        with (
+            mock.patch.object(auto_restore, "HIVE_BUS_TOKEN", "worker"),
+            mock.patch.object(auto_restore, "HIVE_BUS_ADMIN_TOKEN", "admin"),
+            mock.patch.object(auto_restore, "load_state", return_value={}),
+            mock.patch.object(auto_restore, "fetch_failed_jobs", side_effect=RuntimeError("HTTP 503")),
+            mock.patch.object(auto_restore, "log"),
+        ):
             self.assertEqual(auto_restore.main(), 1)
 
     def test_auto_restore_unit_loads_required_root_managed_environment(self):
@@ -1473,8 +1874,12 @@ class ServiceTests(unittest.TestCase):
 
         class Reply(io.BytesIO):
             status = 200
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
 
         def urlopen(request, timeout=0):
             seen["authorization"] = request.get_header("Authorization")
@@ -1482,7 +1887,8 @@ class ServiceTests(unittest.TestCase):
 
         with mock.patch.object(doctor.urllib.request, "urlopen", urlopen):
             code, _ = doctor._http(
-                "POST", "/v1/agents/register",
+                "POST",
+                "/v1/agents/register",
                 {"kind": "doctor", "runtime": "doctor"},
             )
         self.assertEqual(code, 200)
@@ -1492,24 +1898,33 @@ class ServiceTests(unittest.TestCase):
         seen = {}
 
         class Reply(io.BytesIO):
-            def __enter__(self): return self
-            def __exit__(self, *_args): return None
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
 
         def urlopen(request, timeout=0):
             seen["authorization"] = request.get_header("Authorization")
             return Reply(b'{"jobs":[]}')
 
-        with mock.patch.dict(os.environ, {"HIVE_BUS_TOKEN": "audit-token"}), \
-                mock.patch("urllib.request.urlopen", urlopen), \
-                mock.patch("builtins.open", mock.mock_open()):
+        with (
+            mock.patch.dict(os.environ, {"HIVE_BUS_TOKEN": "audit-token"}),
+            mock.patch("urllib.request.urlopen", urlopen),
+            mock.patch("builtins.open", mock.mock_open()),
+        ):
             runpy.run_path("bs_audit.py", run_name="bs_audit_under_test")
         self.assertEqual(seen["authorization"], "Bearer audit-token")
 
     def test_worker_authorized_valid_oauth_probe_closes_breaker(self):
         async def run():
-            body = json.dumps({
-                "success": True, "model": "hive_codex", "reporter": "worker-1",
-            }).encode()
+            body = json.dumps(
+                {
+                    "success": True,
+                    "model": "hive_codex",
+                    "reporter": "worker-1",
+                }
+            ).encode()
             sent = False
 
             async def receive():
@@ -1519,14 +1934,24 @@ class ServiceTests(unittest.TestCase):
                 sent = True
                 return {"type": "http.request", "body": body, "more_body": False}
 
-            request = Request({
-                "type": "http", "method": "POST", "path": "/v1/knemon/cap",
-                "raw_path": b"/v1/knemon/cap", "query_string": b"", "headers": [],
-                "scheme": "http", "server": ("test", 80),
-            }, receive)
+            request = Request(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/knemon/cap",
+                    "raw_path": b"/v1/knemon/cap",
+                    "query_string": b"",
+                    "headers": [],
+                    "scheme": "http",
+                    "server": ("test", 80),
+                },
+                receive,
+            )
             request.state.auth_role = "worker"
-            with mock.patch.object(agent_bus, "clear_oauth_cap", return_value=None), \
-                    mock.patch.object(agent_bus, "oauth_cap_state", return_value={"capped": False}):
+            with (
+                mock.patch.object(agent_bus, "clear_oauth_cap", return_value=None),
+                mock.patch.object(agent_bus, "oauth_cap_state", return_value={"capped": False}),
+            ):
                 return await agent_bus.knemon_cap_set(request)
 
         result = asyncio.run(run())
@@ -1537,18 +1962,24 @@ class WorkerTests(unittest.TestCase):
     def test_completion_outbox_flush_is_bounded(self):
         entries = {
             f"job-{index}": {
-                "jid": f"job-{index}", "urn": "urn-1", "status": "done", "result": {},
+                "jid": f"job-{index}",
+                "urn": "urn-1",
+                "status": "done",
+                "result": {},
             }
             for index in range(5)
         }
         flushed = []
-        with mock.patch.object(worker, "COMPLETION_OUTBOX_BATCH_SIZE", 2), \
-                mock.patch.object(worker, "_COMPLETION_OUTBOX_CURSOR", 0), \
-                mock.patch.object(worker, "_read_completion_outbox", return_value=entries), \
-                mock.patch.object(
-                    worker, "persist_terminal_job",
-                    side_effect=lambda jid, *_args, **_kwargs: flushed.append(jid),
-                ):
+        with (
+            mock.patch.object(worker, "COMPLETION_OUTBOX_BATCH_SIZE", 2),
+            mock.patch.object(worker, "_COMPLETION_OUTBOX_CURSOR", 0),
+            mock.patch.object(worker, "_read_completion_outbox", return_value=entries),
+            mock.patch.object(
+                worker,
+                "persist_terminal_job",
+                side_effect=lambda jid, *_args, **_kwargs: flushed.append(jid),
+            ),
+        ):
             worker.flush_completion_outbox()
             worker.flush_completion_outbox()
         self.assertEqual(flushed, ["job-0", "job-1", "job-2", "job-3"])
@@ -1556,21 +1987,27 @@ class WorkerTests(unittest.TestCase):
     def test_failed_terminal_write_is_retained_and_later_flushed(self):
         with tempfile.TemporaryDirectory() as td:
             outbox = Path(td) / "outbox.json"
-            with mock.patch.object(worker, "COMPLETION_OUTBOX", outbox), \
-                    mock.patch.object(worker, "patch_job", return_value=False), \
-                    mock.patch.object(worker, "_completion_is_acknowledged", return_value=False), \
-                    mock.patch.object(worker.time, "sleep", return_value=None):
+            with (
+                mock.patch.object(worker, "COMPLETION_OUTBOX", outbox),
+                mock.patch.object(worker, "patch_job", return_value=False),
+                mock.patch.object(worker, "_completion_is_acknowledged", return_value=False),
+                mock.patch.object(worker.time, "sleep", return_value=None),
+            ):
                 self.assertFalse(worker.persist_terminal_job("job-1", "urn-1", "done", {"ok": True}))
             self.assertIn("job-1", json.loads(outbox.read_text()))
-            with mock.patch.object(worker, "COMPLETION_OUTBOX", outbox), \
-                    mock.patch.object(worker, "patch_job", return_value=True):
+            with (
+                mock.patch.object(worker, "COMPLETION_OUTBOX", outbox),
+                mock.patch.object(worker, "patch_job", return_value=True),
+            ):
                 worker.flush_completion_outbox()
             self.assertNotIn("job-1", json.loads(outbox.read_text()))
 
     def test_lease_thread_renews_until_stopped(self):
         calls = []
-        with mock.patch.object(worker, "LEASE_RENEW_INTERVAL", 0.01), \
-                mock.patch.object(worker, "patch_job", side_effect=lambda *args: calls.append(args) or True):
+        with (
+            mock.patch.object(worker, "LEASE_RENEW_INTERVAL", 0.01),
+            mock.patch.object(worker, "patch_job", side_effect=lambda *args: calls.append(args) or True),
+        ):
             worker._start_lease_renewal("job-lease", "urn-1")
             time.sleep(0.04)
             worker._stop_lease_renewal("job-lease")
@@ -1583,15 +2020,16 @@ class WorkerTests(unittest.TestCase):
             calls.append((method, path, body))
             return 200, {"ok": True}
 
-        job = {"id": "job-route", "kind": "unmapped-kind",
-               "eligible_kinds": ["zeroclaw", "zoder"]}
-        with mock.patch.object(worker, "patch_job", return_value=True), \
-                mock.patch.object(worker, "_start_lease_renewal"), \
-                mock.patch.object(worker, "_stop_lease_renewal"), \
-                mock.patch.object(worker, "_is_code_kind", return_value=False), \
-                mock.patch.object(worker, "_resolve_workspace", return_value=(None, "no_workspace_for_kind")), \
-                mock.patch.object(worker, "route_chain", return_value=[]), \
-                mock.patch.object(worker, "http", side_effect=fake_http):
+        job = {"id": "job-route", "kind": "unmapped-kind", "eligible_kinds": ["zeroclaw", "zoder"]}
+        with (
+            mock.patch.object(worker, "patch_job", return_value=True),
+            mock.patch.object(worker, "_start_lease_renewal"),
+            mock.patch.object(worker, "_stop_lease_renewal"),
+            mock.patch.object(worker, "_is_code_kind", return_value=False),
+            mock.patch.object(worker, "_resolve_workspace", return_value=(None, "no_workspace_for_kind")),
+            mock.patch.object(worker, "route_chain", return_value=[]),
+            mock.patch.object(worker, "http", side_effect=fake_http),
+        ):
             worker.process_job("urn-worker", job)
         routing = [call for call in calls if call[1] == "/v1/jobs/job-route"]
         self.assertEqual(len(routing), 1)
@@ -1600,19 +2038,38 @@ class WorkerTests(unittest.TestCase):
 
     def test_completion_outbox_is_instance_scoped_and_locked(self):
         source = (HERE / "tests" / "fixtures" / "zeroclaw_wss_worker_v2.py").read_text()
-        self.assertIn('hive_completion_outbox.{INSTANCE}.json', source)
+        self.assertIn("hive_completion_outbox.{INSTANCE}.json", source)
         self.assertIn("fcntl.LOCK_EX", source)
 
     def test_failed_completion_acknowledges_exact_server_retry_transition(self):
-        with mock.patch.object(worker, "http", return_value=(200, {
-            "status": "queued", "claimed_by": None, "retry_count": 4,
-        })):
-            self.assertTrue(worker._completion_is_acknowledged(
-                "job-1", "urn-1", "failed", claimed_retry_count=3,
-            ))
-            self.assertFalse(worker._completion_is_acknowledged(
-                "job-1", "urn-1", "failed", claimed_retry_count=2,
-            ))
+        with mock.patch.object(
+            worker,
+            "http",
+            return_value=(
+                200,
+                {
+                    "status": "queued",
+                    "claimed_by": None,
+                    "retry_count": 4,
+                },
+            ),
+        ):
+            self.assertTrue(
+                worker._completion_is_acknowledged(
+                    "job-1",
+                    "urn-1",
+                    "failed",
+                    claimed_retry_count=3,
+                )
+            )
+            self.assertFalse(
+                worker._completion_is_acknowledged(
+                    "job-1",
+                    "urn-1",
+                    "failed",
+                    claimed_retry_count=2,
+                )
+            )
 
     def test_worker_refuses_to_start_without_mnemos_token(self):
         with mock.patch.object(worker, "MNEMOS_TOKEN", ""):
