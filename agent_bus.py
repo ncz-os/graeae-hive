@@ -46,6 +46,17 @@ from hive.bus.domain.eligibility import (
     job_agent_eligible,
 )
 from hive.bus.routers.repos import router as _repos_router
+from hive.bus.routers.messages import router as _messages_router
+from hive.bus.deps import (
+    ACTIVE_AGENT_STATUSES,
+    EVENT_QUEUE,
+    clamp_limit,
+    connect_db,
+    emit_event,
+    hive_repo,
+    require_registered_agent,
+    uuidv7,
+)
 from hive.bus.schemas import (
     AgentHeartbeat,
     AgentRegister,
@@ -116,7 +127,7 @@ TEST_JOB_DESC_PATTERNS = (
     "hive deploy e2e",
 )
 SSE_PING_INTERVAL = 15.0
-EVENT_QUEUE: dict[str, asyncio.Queue] = {}  # subscriber_id -> queue
+# EVENT_QUEUE now lives in hive.bus.deps (imported above).
 SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "100"))
 
@@ -552,46 +563,12 @@ class OracleConnection:
             await result
 
 
-def hive_repo():
-    global _HIVE_REPO
-    if _HIVE_REPO is None:
-        _HIVE_REPO = get_hive_repository(
-            HIVE_BACKEND,
-            db_path=DB_PATH,
-            busy_timeout_ms=SQLITE_BUSY_TIMEOUT_MS,
-            dsn=ORACLE_DSN,
-            db2_dsn=os.environ.get("DB2_DSN") or os.environ.get("HIVE_DB2_DSN", ""),
-        )
-    return _HIVE_REPO
-
-
-@asynccontextmanager
-async def connect_db():
-    async with hive_repo().connection() as db:
-        yield db
-
-
 def _is_dedup_violation(exc: BaseException) -> bool:
     """Unique-violation from the active-only dedup index ONLY (never another PK/unique)."""
     m = str(exc)
     return "HIVE_JOBS_ACTIVE_DEDUP_UQ" in m.upper() or (
         "unique constraint failed" in m.lower() and "dedup_hash" in m.lower()
     )
-
-
-def uuidv7() -> str:
-    """Time-ordered UUID for monotonic index inserts."""
-    ts_ms = int(time.time() * 1000)
-    rand_a = secrets.randbits(12)
-    rand_b = secrets.randbits(62)
-    val = (
-        (ts_ms & ((1 << 48) - 1)) << 80
-        | (0x7 << 76)
-        | (rand_a << 64)
-        | (0x2 << 62)
-        | rand_b
-    )
-    return str(uuid.UUID(int=val))
 
 
 def make_urn(kind: str, host: str, session_id: str) -> str:
@@ -650,22 +627,6 @@ def _safe_str(v, default: str = "unknown") -> str:
         return s or default
     except Exception:  # noqa: BLE001
         return default
-
-
-async def emit_event(db, kind: str, payload: dict) -> None:
-    ts = time.time()
-    payload_json = json.dumps(payload, separators=(",", ":"))
-    await db.execute(
-        "INSERT INTO events (ts, kind, payload, agent_urn) VALUES (?, ?, ?, ?)",
-        (ts, kind, payload_json, payload.get("urn") or payload.get("agent_urn")),
-    )
-    await db.commit()
-    # broadcast to live SSE subscribers
-    for q in list(EVENT_QUEUE.values()):
-        try:
-            q.put_nowait({"kind": kind, "ts": ts, "payload": payload})
-        except asyncio.QueueFull:
-            pass
 
 
 # ---------- schema ----------
@@ -849,7 +810,7 @@ DEFAULT_PLAN_CAPS = {
     "unknown": 50.0,  # conservative
 }
 VALID_AGENT_STATUSES = {"online", "idle", "stale", "offline", "error"}
-ACTIVE_AGENT_STATUSES = {"online", "idle"}
+# (emit_event moved to hive.bus.deps, imported above)
 
 # ROLE SPLIT (user directive 2026-05-23): opencode + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
@@ -996,61 +957,11 @@ def json_list(raw: str | None) -> list[Any]:
     return [x for x in val if isinstance(x, str)] if isinstance(val, list) else []
 
 
-def clamp_limit(value: int, *, default: int = 100, max_limit: int = 1000) -> int:
-    try:
-        limit = int(value)
-    except (TypeError, ValueError):
-        return default
-    if limit < 1:
-        return default
-    return min(limit, max_limit)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def field_was_set(model: BaseModel, name: str) -> bool:
     fields_set = getattr(model, "model_fields_set", None)
     if fields_set is None:
         fields_set = getattr(model, "__fields_set__", set())
     return name in fields_set
-
-
-async def require_registered_agent(
-    urn: str, *, active_only: bool = False
-) -> tuple[str, str]:
-    if not urn or not urn.strip():
-        raise HTTPException(422, "agent urn is required")
-    async with (
-        connect_db() as db,
-        db.execute(
-            "SELECT runtime, status FROM agents WHERE urn=?",
-            (urn,),
-        ) as cur,
-    ):
-        row = await cur.fetchone()
-    if not row:
-        raise HTTPException(403, f"agent is not registered: {urn}")
-    runtime = (row[0] or "unknown").lower()
-    status = (row[1] or "unknown").lower()
-    if active_only and status not in ACTIVE_AGENT_STATUSES:
-        raise HTTPException(
-            403, f"agent {urn} is not active; current status={status!r}"
-        )
-    return runtime, status
 
 
 async def require_mutation_actor(
@@ -1941,6 +1852,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 app.include_router(_repos_router)
+app.include_router(_messages_router)
 
 
 # ---------- endpoints ----------
@@ -5262,76 +5174,7 @@ async def get_job(job_id: str):
     }
 
 
-@app.post("/v1/messages")
-async def publish_message(req: MessagePublish):
-    msg_id = uuidv7()
-    now = time.time()
-    await require_registered_agent(req.from_urn, active_only=True)
-    async with connect_db() as db:
-        await db.execute(
-            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                msg_id,
-                req.from_urn,
-                req.to_urn,
-                req.in_reply_to,
-                req.topic,
-                json.dumps(req.payload),
-                now,
-            ),
-        )
-        await db.commit()
-        await emit_event(
-            db,
-            "message",
-            {
-                "id": msg_id,
-                "from": req.from_urn,
-                "to": req.to_urn,
-                "topic": req.topic,
-                "payload": req.payload,
-            },
-        )
-    return {"id": msg_id, "ts": now}
-
-
-@app.get("/v1/messages")
-async def list_messages(
-    to_urn: str | None = None,
-    topic: str | None = None,
-    since: float | None = None,
-    limit: int = 100,
-):
-    limit = clamp_limit(limit, default=100, max_limit=1000)
-    sql = "SELECT id, from_urn, to_urn, in_reply_to, topic, payload, ts FROM messages WHERE 1=1"
-    args: list = []
-    if to_urn:
-        sql += " AND (to_urn=? OR to_urn IS NULL)"
-        args.append(to_urn)
-    if topic:
-        sql += " AND topic LIKE ?"
-        args.append(topic.replace("*", "%"))
-    if since:
-        sql += " AND ts >= ?"
-        args.append(since)
-    sql += " ORDER BY ts DESC LIMIT ?"
-    args.append(limit)
-    rows = []
-    async with connect_db() as db, db.execute(sql, args) as cur:
-        async for r in cur:
-            rows.append(
-                {
-                    "id": r[0],
-                    "from": r[1],
-                    "to": r[2],
-                    "in_reply_to": r[3],
-                    "topic": r[4],
-                    "payload": json.loads(r[5]),
-                    "ts": r[6],
-                }
-            )
-    return {"count": len(rows), "messages": rows}
+# /v1/messages routes moved to hive.bus.routers.messages (Phase 1c).
 
 
 @app.get("/v1/events")
