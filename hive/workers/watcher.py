@@ -411,12 +411,16 @@ def dynamic_load() -> dict:
             pass
     # Runtime GPU metrics (added 2026-05-26 for dashboard GPU status panel).
     # nvidia-smi → name, util%, mem MiB, temp C; same shape for rocm-smi (AMD).
+    # Use _find_bin (PATH *and* /opt/rocm*/bin, /usr/sbin) — the live metrics were
+    # blank on hosts whose tools are off-PATH (ACHILLES' rocm-smi), so the GPU
+    # chart showed nothing even though the static specs listed the GPU.
     try:
         gpus_rt = []
-        if shutil.which("nvidia-smi"):
+        _nvsmi_rt = _find_bin("nvidia-smi", ["/usr/bin", "/usr/local/bin", "/usr/sbin"])
+        if _nvsmi_rt:
             try:
                 r = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+                    [_nvsmi_rt, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=5,
                 )
@@ -435,9 +439,10 @@ def dynamic_load() -> dict:
                             })
             except Exception:
                 pass
-        if shutil.which("rocm-smi"):
+        _rocsmi_rt = _find_bin("rocm-smi", _rocm_bin_dirs())
+        if _rocsmi_rt:
             try:
-                r = subprocess.run(["rocm-smi", "--showproductname", "--showuse", "--showmemuse",
+                r = subprocess.run([_rocsmi_rt, "--showproductname", "--showuse", "--showmemuse",
                                     "--showtemp", "--showpower", "--json"],
                                    capture_output=True, text=True, timeout=5)
                 data = json.loads(r.stdout) if r.stdout.strip() else {}
