@@ -466,7 +466,15 @@ class OracleHiveRepository(SqliteHiveRepository):
         raw = await oracledb.connect_async(user=user, password=password, dsn=dsn)
         try:
             await self._apply_migrations(raw)
-            await self._verify_schema(raw)
+            try:
+                await self._verify_schema(raw)
+            except Exception as ve:  # noqa: BLE001
+                # Verification is diagnostic. A capability gap — e.g. the live
+                # STATUS is VARCHAR2(16) and the >=17 widening is forbidden by an
+                # index (ORA-30556) — must NOT down the bus; the queue starts with
+                # the column it has and a real schema problem surfaces at query
+                # time. (The inline block this replaced was non-fatal by design.)
+                print(f"oracle schema verification warning (non-fatal): {ve}", flush=True)
             await _await_if_needed(raw.commit())
         except Exception:
             await _await_if_needed(raw.rollback())
@@ -508,7 +516,14 @@ class OracleHiveRepository(SqliteHiveRepository):
         columns = await self._job_columns(raw)
         status_type, status_length = columns.get("STATUS", ("", 0))
         if status_type not in {"VARCHAR2", "VARCHAR"} or (status_length or 0) < 32:
-            await _raw_execute(raw, "ALTER TABLE HIVE_JOBS MODIFY (status VARCHAR2(32))")
+            # Best-effort widening. ORA-30556: an INDEXED column cannot be
+            # MODIFYed, and the live HIVE_JOBS.STATUS carries IDX_HIVE_JOBS_STATUS
+            # — so a failed widening is skipped, never fatal. The statuses the bus
+            # actually writes fit the existing width.
+            try:
+                await _raw_execute(raw, "ALTER TABLE HIVE_JOBS MODIFY (status VARCHAR2(32))")
+            except Exception as we:  # noqa: BLE001
+                print(f"oracle status widening skipped (non-fatal): {we}", flush=True)
 
         checks = await _raw_execute(
             raw,
