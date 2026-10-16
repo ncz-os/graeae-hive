@@ -37,7 +37,7 @@ async def create_schedule(req: ScheduleCreate):
         await db.execute(
             "INSERT INTO scheduled_jobs (id, name, created_by_urn, interval_seconds, "
             "job_template, enabled, last_fired_at, next_fire_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 sid,
                 req.name,
@@ -45,8 +45,9 @@ async def create_schedule(req: ScheduleCreate):
                 int(req.interval_seconds),
                 json.dumps(req.job_template),
                 1 if req.enabled else 0,
-                now + req.interval_seconds,
-                now,
+                None,  # last_fired_at: never fired yet
+                now + req.interval_seconds,  # next_fire_at
+                now,  # created_at
             ),
         )
         await db.commit()

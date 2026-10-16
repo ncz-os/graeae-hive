@@ -4870,7 +4870,7 @@ async def stream_events(request: Request, since_id: int | None = None):
                     yield {
                         "data": json.dumps(evt),
                     }
-                except TimeoutError:
+                except asyncio.TimeoutError:  # noqa: UP041 (keep explicit for the SSE ping path)
                     if time.time() - last_ping >= SSE_PING_INTERVAL:
                         yield {"event": "ping", "data": str(int(time.time()))}
                         last_ping = time.time()
