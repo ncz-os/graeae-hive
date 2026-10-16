@@ -74,7 +74,6 @@ from hive.bus.schemas import (
 # Re-exported for back-compat: mcp_bridge consumers + tests read these off agent_bus.
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES  # noqa: F401
 
-DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
