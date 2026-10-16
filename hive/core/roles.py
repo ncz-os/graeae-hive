@@ -16,6 +16,8 @@ ORCHESTRATOR_RUNTIMES: frozenset[str] = frozenset(
         "claude-cli",
         "claude",
         "codex-orchestrator",
+        "opencode",  # agentic CLI — submits its own orchestration jobs AND claims
+        "opencode-cli",
         "human",
         "mnemos",
         "doctor",  # PYTHIA triage authority — submits codex sub-jobs + auto-triage
@@ -25,10 +27,10 @@ ORCHESTRATOR_RUNTIMES: frozenset[str] = frozenset(
 )
 
 # Runtimes that may ONLY claim/execute jobs (workers), never submit.
+# NOTE: opencode/opencode-cli are deliberately NOT here — opencode is a valid
+# orchestrator (operator 2026-10-16): it both submits and claims.
 WORKER_ONLY_RUNTIMES: frozenset[str] = frozenset(
     {
-        "opencode",
-        "opencode-cli",
         "codex",
         "codex-cli",
         "hermes",
