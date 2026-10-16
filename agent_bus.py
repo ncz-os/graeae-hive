@@ -11,7 +11,6 @@ Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central 
 from __future__ import annotations
 
 import asyncio
-import hashlib as _hashlib
 import json
 import os
 import re
@@ -35,7 +34,6 @@ from sse_starlette.sse import EventSourceResponse
 import queue_logic
 import retry_policy
 from hive import scheduler as sched
-from hive.bus import capacity as _capacity
 from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
     EVENT_QUEUE,
@@ -51,6 +49,9 @@ from hive.bus.deps import (
     require_orchestrator_submitter,
     uuidv7,
 )
+
+# Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
+from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
     THROTTLE_HEADROOM,
     _norm_str,
@@ -60,7 +61,6 @@ from hive.bus.domain.eligibility import (
     job_agent_eligible,
 )
 from hive.bus.domain.jobs import (
-    CACHE_TTL_SECONDS,
     CLAIM_LEASE_SECONDS,
     DECLINE_REASON_PREFIXES,
     MAX_DECLINE_REQUEUES,
@@ -96,22 +96,10 @@ from hive.bus.schemas import (
     ReclassifyRequest,  # noqa: F401 (re-export for tests)
     RequeueRequest,  # noqa: F401 (re-export for tests)
 )
-from hive.core.models import COST_TIERS, knemon_candidates, rate_for
+from hive.core.models import COST_TIERS, knemon_candidates
 
 # Re-exported for back-compat: mcp_bridge consumers + tests read these off agent_bus.
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES  # noqa: F401
-
-# Capacity ledger (Phase 5): per-service admission. MiniMax is the first service
-# with a declared capacity; its GLOBAL slot count flows through the ledger while
-# the per-worker cap stays in hive.scheduler. Add services here as they get one.
-_capacity_ledger = _capacity.CapacityLedger()
-_capacity_ledger.register(
-    _capacity.ServiceCapacity(
-        service=sched.MINIMAX_PROVIDER,
-        slots=sched.MINIMAX_GLOBAL_MAX,
-        is_subscription=True,
-    )
-)
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
