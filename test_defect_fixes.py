@@ -32,6 +32,7 @@ from hive import scheduler as sched
 from hive.bus.routers import admin as hive_admin_router
 from hive.bus.routers import jobs as hive_jobs_router
 from hive.bus.routers import knemon as hive_knemon_router
+from hive.bus.routers import system as hive_system_router
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
 from hive.persistence.oracle import (
     _ORACLE_JOB_ADDITIONS,
@@ -623,8 +624,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             raise OSError("database unavailable")
             yield
 
-        with mock.patch.object(agent_bus, "connect_db", broken_connection):
-            response = await agent_bus.health()
+        with mock.patch.object(hive_system_router, "connect_db", broken_connection):
+            response = await hive_system_router.health(mock.Mock(app=agent_bus.app))
         self.assertEqual(response.status_code, 503)
         self.assertEqual(json.loads(response.body)["status"], "unhealthy")
 
@@ -652,8 +653,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         old = getattr(agent_bus.app.state, "reaper_task", None)
         agent_bus.app.state.reaper_task = stopped
         try:
-            with mock.patch.object(agent_bus, "connect_db", working_connection):
-                response = await agent_bus.health()
+            with mock.patch.object(hive_system_router, "connect_db", working_connection):
+                response = await hive_system_router.health(mock.Mock(app=agent_bus.app))
         finally:
             agent_bus.app.state.reaper_task = old
         self.assertEqual(response.status_code, 503)

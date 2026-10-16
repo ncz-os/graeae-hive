@@ -20,7 +20,6 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
 
 from hive.bus.deps import (
     _cascade_delete_jobs,
@@ -32,10 +31,11 @@ from hive.bus.deps import (
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
 from hive.bus.routers.admin import router as _admin_router
-from hive.bus.routers.agents import heartbeat, list_agents, register
 from hive.bus.routers.agents import router as _agents_router
 from hive.bus.routers.events import router as _events_router
 from hive.bus.routers.knemon import router as _knemon_router
+from hive.bus.routers.mcp import router as _mcp_router
+from hive.bus.routers.system import router as _system_router
 from hive.bus.routers.jobs import (  # noqa: F401 (re-export)
     auto_retry_job,
     claim_job,
@@ -46,17 +46,28 @@ from hive.bus.routers.jobs import (  # noqa: F401 (re-export)
     zcgate_release,
 )
 from hive.bus.routers.jobs import router as _jobs_router
-from hive.bus.routers.messages import list_messages, publish_message
 from hive.bus.routers.messages import router as _messages_router
 from hive.bus.routers.repos import router as _repos_router
 from hive.bus.routers.schedules import router as _schedules_router
 from hive.bus.routers.stats import router as _stats_router
+
+# Compat re-exports — symbols moved into routers during Phase 1c, kept on the
+# agent_bus facade for tests + external callers that still import from here.
+from hive.bus.routers.agents import heartbeat, list_agents, register  # noqa: F401 (re-export)
+from hive.bus.routers.knemon import (  # noqa: F401 (re-export)
+    KNEMON_BYPASS_FILE,
+    KNEMON_CAP_FILE,
+    OAUTH_CAP_RESET_SEC,
+    clear_oauth_cap,
+    knemon_bypass_active,
+    oauth_cap_state,
+)
+from hive.bus.routers.mcp import mcp_rpc  # noqa: F401 (re-export)
+from hive.bus.routers.messages import list_messages, publish_message  # noqa: F401 (re-export)
+from hive.bus.routers.system import dashboard, health  # noqa: F401 (re-export)
 from hive.bus.schemas import (
-    AgentHeartbeat,
-    AgentRegister,
     JobCreate,
     JobPurgeRequest,  # noqa: F401 (re-export for tests)
-    MessagePublish,
     PurgeRequest,  # noqa: F401 (re-export for tests)
     ReclassifyRequest,  # noqa: F401 (re-export for tests)
     RequeueRequest,  # noqa: F401 (re-export for tests)
@@ -1356,6 +1367,8 @@ app.include_router(_repos_router)
 app.include_router(_stats_router)
 app.include_router(_events_router)
 app.include_router(_knemon_router)
+app.include_router(_system_router)
+app.include_router(_mcp_router)
 app.include_router(_messages_router)
 app.include_router(_agents_router)
 app.include_router(_admin_router)
@@ -1366,51 +1379,7 @@ app.include_router(_schedules_router)
 # ---------- endpoints ----------
 
 
-@app.get("/health")
-async def health():
-    """Liveness — 200 only if the DB probe succeeds AND the reaper is running.
-
-    Returning 200 unconditionally (as the argonas line did) hides a downed DB or
-    a stopped reaper from any external monitor. 503 carries the reason."""
-    base = {"ts": time.time(), "service": "graeae-hive-mind", "version": "0.1.0"}
-    try:
-        async with connect_db() as db:
-            async with db.execute("SELECT 1") as cur:
-                await cur.fetchone()
-    except Exception as e:  # noqa: BLE001
-        return JSONResponse(
-            {**base, "status": "unhealthy", "detail": f"database probe failed: {e}"},
-            status_code=503,
-        )
-    reaper = getattr(app.state, "reaper_task", None)
-    # 200 only if the reaper is running: a missing task (e.g. lifespan never
-    # completed) or a finished one is unhealthy.
-    if reaper is None or reaper.done():
-        return JSONResponse(
-            {**base, "status": "unhealthy", "detail": "reaper task is not running"},
-            status_code=503,
-        )
-    return {**base, "status": "healthy"}
-
-
-@app.get("/")
-async def dashboard():
-    """Minimal HTML+JS dashboard. Auto-refreshes /v1/agents + /v1/jobs + /v1/stats/* + SSE."""
-    from fastapi.responses import HTMLResponse
-
-    p = "/srv/agent-bus/dashboard.html"
-    try:
-        with open(p) as f:
-            return HTMLResponse(
-                f.read(),
-                headers={
-                    "Cache-Control": "no-store, no-cache, must-revalidate",
-                    "Pragma": "no-cache",
-                },
-            )
-    except FileNotFoundError:
-        return HTMLResponse(f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404)
-
+# /health + / (dashboard) moved to hive.bus.routers.system (Phase 1c).
 
 # /v1/agents + /v1/hosts routes moved to hive.bus.routers.agents (Phase 1c).
 
@@ -1457,45 +1426,7 @@ async def dashboard():
 # /v1/events + /v1/events/log moved to hive.bus.routers.events (Phase 1c).
 
 
-# ---------- minimal MCP shim ----------
-# Maps a few common MCP-style JSON-RPC calls to the REST endpoints.
-# Phase 2: replace with full mcp-server-sdk.
-
-
-@app.post("/mcp")
-async def mcp_rpc(body: dict):
-    method = body.get("method", "")
-    params = body.get("params", {})
-    handlers = {
-        "agent.register": register,
-        "agent.heartbeat": heartbeat,
-        "agent.list": list_agents,
-        "job.create": create_job,
-        "job.list": list_jobs,
-        "message.publish": publish_message,
-        "message.list": list_messages,
-    }
-    if method not in handlers:
-        return JSONResponse({"error": f"unknown method: {method}"}, status_code=404)
-    # crude param coercion - production MCP would use proper validation
-    try:
-        if method == "agent.register":
-            return await register(AgentRegister(**params))
-        if method == "agent.heartbeat":
-            return await heartbeat(AgentHeartbeat(**params))
-        if method == "agent.list":
-            return await list_agents(**params)
-        if method == "job.create":
-            return await create_job(JobCreate(**params))
-        if method == "job.list":
-            return await list_jobs(**params)
-        if method == "message.publish":
-            return await publish_message(MessagePublish(**params))
-        if method == "message.list":
-            return await list_messages(**params)
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
+# POST /mcp shim moved to hive.bus.routers.mcp (Phase 1c).
 
 # ===== zerocode-gate: pre-submission gate preview + release (patch) =====
 # /v1/jobs/{id}/preview moved to hive.bus.routers.jobs (Phase 1c).
