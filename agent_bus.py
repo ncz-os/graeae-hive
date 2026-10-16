@@ -3375,24 +3375,7 @@ async def knemon_spend(since_hours: int = 168):
     }
 
 
-@app.get("/v1/jobs/metrics")
-async def job_metrics():
-    counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}
-    async with (
-        connect_db() as db,
-        db.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status") as cur,
-    ):
-        async for status, count in cur:
-            counts["total"] += count
-            if status in {"queued", "offered"}:
-                counts["pending"] += count
-            elif status in {"claimed", "running"}:
-                counts["running"] += count
-            elif status == "done":
-                counts["completed"] += count
-            elif status == "failed":
-                counts["failed"] += count
-    return counts
+# /v1/jobs/metrics moved to hive.bus.routers.jobs (Phase 1c).
 
 
 @app.post("/v1/jobs/{job_id}/claim")
@@ -3712,31 +3695,7 @@ async def mcp_rpc(body: dict):
 
 
 # ===== zerocode-gate: pre-submission gate preview + release (patch) =====
-@app.get("/v1/jobs/{job_id}/preview")
-async def zcgate_get_preview(job_id: str):
-    """Return the zerocode-gate PreviewBundle stored on a needs-review job."""
-    async with (
-        connect_db() as db,
-        db.execute(
-            "SELECT result, status, repo, head_branch, pr_number FROM jobs WHERE id=?",
-            (job_id,),
-        ) as cur,
-    ):
-        r = await cur.fetchone()
-    if not r:
-        raise HTTPException(404, f"job not found: {job_id}")
-    result = json.loads(r[0]) if r[0] else {}
-    preview = result.get("preview")
-    if not preview:
-        raise HTTPException(404, f"no preview bundle on job {job_id}")
-    return {
-        "job_id": job_id,
-        "status": r[1],
-        "repo": r[2],
-        "head_branch": r[3],
-        "pr_number": r[4],
-        "preview": preview,
-    }
+# /v1/jobs/{id}/preview moved to hive.bus.routers.jobs (Phase 1c).
 
 
 @app.post("/v1/jobs/{job_id}/release")
