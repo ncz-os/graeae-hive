@@ -410,58 +410,26 @@ async def reaper_task(app: FastAPI):
                 now_ts = time.time()
                 stale_cutoff = now_ts - HEARTBEAT_STALE_AFTER
                 offline_cutoff = now_ts - HEARTBEAT_OFFLINE_AFTER
-                async with db.execute(
-                    "SELECT urn FROM agents "
-                    "WHERE status IN ('online','idle','error') "
-                    "AND last_heartbeat < ? AND last_heartbeat >= ?",
-                    (stale_cutoff, offline_cutoff),
-                ) as cur:
-                    stale = [row[0] async for row in cur]
+                repo = hive_repo()
+                stale = await repo.select_stale_agent_urns(
+                    db, stale_cutoff=stale_cutoff, offline_cutoff=offline_cutoff
+                )
                 if stale:
-                    await db.executemany(
-                        "UPDATE agents SET status='stale' WHERE urn=? AND status != 'offline'",
-                        [(u,) for u in stale],
-                    )
+                    await repo.mark_agents_stale(db, stale)
                     await db.commit()
                     for urn in stale:
                         await emit_event(db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"})
 
-                async with db.execute(
-                    "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
-                    (offline_cutoff,),
-                ) as cur:
-                    dead = [row[0] async for row in cur]
+                dead = await repo.select_dead_agent_urns(db, offline_cutoff=offline_cutoff)
                 if dead:
                     for urn in dead:
                         # A MISSED HEARTBEAT IS NOT PROOF OF AN ABANDONED JOB.
-                        # This used to requeue offered/claimed/RUNNING work and null
-                        # its result. A worker on a flaky link (not a dead one) lost
-                        # two heartbeats, its running job reset to 'queued', and when
-                        # it reported back the result was already gone -- PATCH 'done'
-                        # is not legal out of 'queued', so it took a 409 and the work
-                        # was silently discarded. Reclaiming in-flight work is step
-                        # 2's job, and step 2 measures staleness against
-                        # COALESCE(last_update_at, claimed_at) so a worker still
-                        # PATCHing progress is never reclaimed. Here we release only
-                        # work that has not STARTED, which cannot lose a result
-                        # because none exists yet.
-                        async with db.execute(
-                            "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed')",
-                            (urn,),
-                        ) as cur:
-                            assigned_jobs = [row[0] async for row in cur]
-                        await db.execute(
-                            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
-                            "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
-                            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
-                            "ended_at=NULL, result=NULL "
-                            "WHERE claimed_by=? AND status IN ('offered','claimed')",
-                            (urn,),
-                        )
-                        await db.execute(
-                            "UPDATE agents SET status='offline' WHERE urn=?",
-                            (urn,),
-                        )
+                        # release_unstarted_jobs_for_agent releases only work that
+                        # has not STARTED (offered/claimed) — no result can be lost.
+                        # In-flight reclaim is step 2's job (staleness measured
+                        # against COALESCE(last_update_at, claimed_at)).
+                        assigned_jobs = await repo.release_unstarted_jobs_for_agent(db, urn)
+                        await repo.mark_agent_offline(db, urn)
                         for job_id in assigned_jobs:
                             await emit_event(
                                 db,
@@ -491,17 +459,7 @@ async def reaper_task(app: FastAPI):
                 # NOT EXISTS guard is the authoritative protection for actively-claimed
                 # URNs, not ordering.
                 purge_cutoff = now_ts - AGENT_PURGE_AFTER
-                pcur = await db.execute(
-                    "DELETE FROM agents WHERE status='offline' AND last_heartbeat < ? "
-                    # non-correlated NOT IN (was a correlated `agents.urn` subquery): the
-                    # sqlite->Oracle table-name rewrite only translates FROM/JOIN/ON positions,
-                    # so a table-qualified `agents.urn` survived untranslated and ORA-00904'd,
-                    # crashing the whole reaper every 30s. IS NOT NULL guards NOT-IN null-poison.
-                    "AND (urn IS NULL OR urn NOT IN (SELECT claimed_by FROM jobs "
-                    "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running')))",
-                    (purge_cutoff,),
-                )
-                purged = max(0, getattr(pcur, "rowcount", 0) or 0)  # some drivers report -1
+                purged = await repo.purge_offline_agents(db, cutoff=purge_cutoff)
                 if purged:
                     await db.commit()
                     print(

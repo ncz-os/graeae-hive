@@ -1187,3 +1187,78 @@ class SqliteHiveRepository(HiveMindRepository):
                     }
                 )
         return rows
+
+    # ---- reaper: agent lifecycle maintenance ----
+    async def select_stale_agent_urns(
+        self, tx: Transaction, *, stale_cutoff: float, offline_cutoff: float
+    ) -> list[str]:
+        db = tx
+        async with db.execute(
+            "SELECT urn FROM agents "
+            "WHERE status IN ('online','idle','error') "
+            "AND last_heartbeat < ? AND last_heartbeat >= ?",
+            (stale_cutoff, offline_cutoff),
+        ) as cur:
+            return [row[0] async for row in cur]
+
+    async def mark_agents_stale(self, tx: Transaction, urns: list[str]) -> None:
+        db = tx
+        await db.executemany(
+            "UPDATE agents SET status='stale' WHERE urn=? AND status != 'offline'",
+            [(u,) for u in urns],
+        )
+
+    async def select_dead_agent_urns(self, tx: Transaction, *, offline_cutoff: float) -> list[str]:
+        db = tx
+        async with db.execute(
+            "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
+            (offline_cutoff,),
+        ) as cur:
+            return [row[0] async for row in cur]
+
+    async def release_unstarted_jobs_for_agent(self, tx: Transaction, urn: str) -> list[str]:
+        """Release only NOT-YET-STARTED work (offered/claimed) for a dead agent.
+
+        A missed heartbeat is not proof of an abandoned job: reclaiming running
+        work here would discard a live worker's result (PATCH 'done' is illegal
+        out of 'queued'). In-flight reclaim is the orphan-claim path's job.
+        Returns the released job ids (for event emission)."""
+        db = tx
+        async with db.execute(
+            "SELECT id FROM jobs WHERE claimed_by=? AND status IN ('offered','claimed')",
+            (urn,),
+        ) as cur:
+            ids = [row[0] async for row in cur]
+        await db.execute(
+            "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
+            "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
+            "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
+            "ended_at=NULL, result=NULL "
+            "WHERE claimed_by=? AND status IN ('offered','claimed')",
+            (urn,),
+        )
+        return ids
+
+    async def mark_agent_offline(self, tx: Transaction, urn: str) -> None:
+        db = tx
+        await db.execute("UPDATE agents SET status='offline' WHERE urn=?", (urn,))
+
+    async def purge_offline_agents(self, tx: Transaction, *, cutoff: float) -> int:
+        """Set-based hard-delete of agents offline beyond the purge window.
+
+        Re-checks every safety condition AT DELETE TIME (status, heartbeat age,
+        no in-flight claim) so an agent that heartbeats or claims work between a
+        select and delete cannot be removed. Returns rows deleted."""
+        db = tx
+        cur = await db.execute(
+            "DELETE FROM agents WHERE status='offline' AND last_heartbeat < ? "
+            # non-correlated NOT IN (was a correlated `agents.urn` subquery): the
+            # sqlite->Oracle table-name rewrite only translates FROM/JOIN/ON
+            # positions, so a table-qualified `agents.urn` survived untranslated
+            # and ORA-00904'd, crashing the reaper every 30s. IS NOT NULL guards
+            # NOT-IN null-poison.
+            "AND (urn IS NULL OR urn NOT IN (SELECT claimed_by FROM jobs "
+            "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running')))",
+            (cutoff,),
+        )
+        return max(0, getattr(cur, "rowcount", 0) or 0)  # some drivers report -1

@@ -239,3 +239,24 @@ class HiveMindRepository(ABC):
 
     @abstractmethod
     async def list_schedules(self, tx: Transaction) -> list[dict[str, Any]]: ...
+
+    # ---- reaper: agent lifecycle maintenance ----
+    @abstractmethod
+    async def select_stale_agent_urns(
+        self, tx: Transaction, *, stale_cutoff: float, offline_cutoff: float
+    ) -> list[str]: ...
+
+    @abstractmethod
+    async def mark_agents_stale(self, tx: Transaction, urns: list[str]) -> None: ...
+
+    @abstractmethod
+    async def select_dead_agent_urns(self, tx: Transaction, *, offline_cutoff: float) -> list[str]: ...
+
+    @abstractmethod
+    async def release_unstarted_jobs_for_agent(self, tx: Transaction, urn: str) -> list[str]: ...
+
+    @abstractmethod
+    async def mark_agent_offline(self, tx: Transaction, urn: str) -> None: ...
+
+    @abstractmethod
+    async def purge_offline_agents(self, tx: Transaction, *, cutoff: float) -> int: ...
