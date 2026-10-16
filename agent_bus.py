@@ -810,7 +810,7 @@ DEFAULT_PLAN_CAPS = {
     "unknown": 50.0,  # conservative
 }
 VALID_AGENT_STATUSES = {"online", "idle", "stale", "offline", "error"}
-# (emit_event moved to hive.bus.deps, imported above)
+# ACTIVE_AGENT_STATUSES moved to hive.bus.deps (imported above).
 
 # ROLE SPLIT (user directive 2026-05-23): opencode + codex + hermes +
 # claw-family + ic-engine + unknown = WORKERS (claim-only). Cannot submit jobs.
