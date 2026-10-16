@@ -99,7 +99,24 @@ MAX_DECLINE_REQUEUES = 3
 DECLINE_REASON_PREFIXES: tuple[str, ...] = (
     "no_workspace_for_kind",
     "no_workspace_for_repo",
+    # Worker-side JOB-LEVEL unschedulable reasons (hive_worker.py release_job):
+    # no worker can ever run these jobs, so without counting them the reclaim loop
+    # requeues forever (observed live 2026-10-16: a job with worker_error
+    # no_repo_mapping climbed to retry_count=5 with no dead-letter). Count them so
+    # the thrash guard terminates the loop.
+    "no_repo_mapping",
+    "malformed_job_id",
+    "invalid_head_branch",
 )  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
+
+
+def is_unresolvable_release(reason: str) -> bool:
+    """True if ``reason`` is a job-level unschedulable release that should count
+    toward the dead-letter threshold (exact match or ``reason:<detail>`` form)."""
+    r = reason or ""
+    return r in DECLINE_REASON_PREFIXES or any(r.startswith(p + ":") for p in DECLINE_REASON_PREFIXES)
+
+
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
     "offered": {"queued", "claimed", "cancelled"},

@@ -46,7 +46,6 @@ from hive.bus.domain.eligibility import (
 from hive.bus.domain.jobs import (
     CACHE_TTL_SECONDS,
     CLAIM_LEASE_SECONDS,
-    DECLINE_REASON_PREFIXES,
     MAX_DECLINE_REQUEUES,
     STATUS_TRANSITIONS,
     SUBSCRIPTION_PROVIDERS,
@@ -58,6 +57,7 @@ from hive.bus.domain.jobs import (
     field_was_set,
     hallucination_check,
     is_dedup_violation,
+    is_unresolvable_release,
     json_list,
     normalize_result_payload,
     stable_worker_id,
@@ -730,7 +730,7 @@ async def update_job(job_id: str, req: JobUpdate):
     dead_lettered = False
     if req.status == "queued" and isinstance(req.result, dict):
         _werr = str(req.result.get("worker_error") or "")
-        if _werr in DECLINE_REASON_PREFIXES or any(_werr.startswith(p + ":") for p in DECLINE_REASON_PREFIXES):
+        if is_unresolvable_release(_werr):
             decline_reason = _werr
 
     # Storage via the HiveMindRepository ABC on ONE transaction (EPIMONE shape).
