@@ -28,6 +28,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 import agent_bus
+import hive.bus.app as hive_bus_app
 from hive import scheduler as sched
 from hive.bus.routers import admin as hive_admin_router
 from hive.bus.routers import jobs as hive_jobs_router
@@ -513,18 +514,18 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         async def idle_reaper(_app):
             await asyncio.Event().wait()
 
-        old_backend = agent_bus.HIVE_BACKEND
-        agent_bus.HIVE_BACKEND = "db2"
+        old_backend = hive_bus_app.HIVE_BACKEND
+        hive_bus_app.HIVE_BACKEND = "db2"
         try:
             with (
-                mock.patch.object(agent_bus, "hive_repo", return_value=fake),
-                mock.patch.object(agent_bus, "reaper_task", idle_reaper),
+                mock.patch.object(hive_bus_app, "hive_repo", return_value=fake),
+                mock.patch.object(hive_bus_app, "reaper_task", idle_reaper),
             ):
-                async with agent_bus.lifespan(agent_bus.app):
+                async with hive_bus_app.lifespan(hive_bus_app.app):
                     self.assertIsNone(fake.initialized)
             self.assertTrue(fake.closed)
         finally:
-            agent_bus.HIVE_BACKEND = old_backend
+            hive_bus_app.HIVE_BACKEND = old_backend
 
     async def test_oracle_populated_core_schema_is_converged_and_verified(self):
         repo = OracleHiveRepository("oracle://user:pass@db/TEST")
