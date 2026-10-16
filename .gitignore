@@ -16,3 +16,7 @@ agents.db*
 *.sqlite*
 *.log
 *.wal
+
+# runtime artifacts (capacity shadow ledger) - not source
+admission_shadow.jsonl
+*.jsonl
