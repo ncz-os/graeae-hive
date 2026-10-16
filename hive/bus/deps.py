@@ -21,6 +21,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import HTTPException
 
+from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
 from hive.persistence.factory import get_hive_repository
 
 # ---- config (mirrors agent_bus.py) --------------------------------------
@@ -107,3 +108,17 @@ async def require_registered_agent(urn: str, *, active_only: bool = False) -> tu
     if active_only and status not in ACTIVE_AGENT_STATUSES:
         raise HTTPException(403, f"agent {urn} is not active; current status={status!r}")
     return runtime, status
+
+
+async def require_orchestrator_submitter(submitter_urn: str) -> str:
+    runtime, _status = await require_registered_agent(submitter_urn, active_only=True)
+    if runtime in WORKER_ONLY_RUNTIMES or runtime not in ORCHESTRATOR_RUNTIMES:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"role-violation: runtime={runtime!r} is not an orchestrator. "
+                f"Workers CLAIM jobs via POST /v1/jobs/next; only registered active "
+                f"orchestrators may SUBMIT jobs. Orchestrators: {sorted(ORCHESTRATOR_RUNTIMES)}."
+            ),
+        )
+    return runtime

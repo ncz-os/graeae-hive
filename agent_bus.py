@@ -36,6 +36,17 @@ import queue_logic
 import retry_policy
 from hive import scheduler as sched
 from hive.bus import capacity as _capacity
+from hive.bus.deps import (
+    ACTIVE_AGENT_STATUSES,
+    EVENT_QUEUE,
+    clamp_limit,
+    connect_db,
+    emit_event,
+    hive_repo,
+    require_orchestrator_submitter,
+    require_registered_agent,
+    uuidv7,
+)
 from hive.bus.domain.eligibility import (
     RUNTIME_KIND_MAP,
     THROTTLE_HEADROOM,
@@ -45,18 +56,10 @@ from hive.bus.domain.eligibility import (
     heavy_repo_required_for_kind,
     job_agent_eligible,
 )
-from hive.bus.routers.repos import router as _repos_router
+from hive.bus.routers.messages import list_messages, publish_message
 from hive.bus.routers.messages import router as _messages_router
-from hive.bus.deps import (
-    ACTIVE_AGENT_STATUSES,
-    EVENT_QUEUE,
-    clamp_limit,
-    connect_db,
-    emit_event,
-    hive_repo,
-    require_registered_agent,
-    uuidv7,
-)
+from hive.bus.routers.repos import router as _repos_router
+from hive.bus.routers.schedules import router as _schedules_router
 from hive.bus.schemas import (
     AgentHeartbeat,
     AgentRegister,
@@ -67,11 +70,10 @@ from hive.bus.schemas import (
     PurgeRequest,
     ReclassifyRequest,
     RequeueRequest,
-    ScheduleCreate,
 )
 from hive.core.models import COST_TIERS, cost_tier_for, knemon_candidates, rate_for
-from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES
-from hive.persistence.factory import get_hive_repository
+# Re-exported for back-compat: mcp_bridge consumers + tests read these off agent_bus.
+from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES  # noqa: F401
 
 # Capacity ledger (Phase 5): per-service admission. MiniMax is the first service
 # with a declared capacity; its GLOBAL slot count flows through the ledger while
@@ -87,9 +89,7 @@ _capacity_ledger.register(
 
 DB_PATH = os.environ.get("AGENT_BUS_DB", "/srv/agent-bus/agents.db")
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
-ORACLE_DSN = os.environ.get(
-    "ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1"
-)
+ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1:1521/ORCLPDB1")
 HEARTBEAT_REAP_INTERVAL = 30.0
 HEARTBEAT_STALE_AFTER = 90.0
 HEARTBEAT_OFFLINE_AFTER = 300.0
@@ -159,9 +159,7 @@ def _parse_oracle_url(url: str) -> tuple[str, str, str]:
 
 
 if HIVE_BACKEND not in {"sqlite", "oracle", "db2"}:
-    raise RuntimeError(
-        f"HIVE_BACKEND must be sqlite, oracle, or db2, got {HIVE_BACKEND!r}"
-    )
+    raise RuntimeError(f"HIVE_BACKEND must be sqlite, oracle, or db2, got {HIVE_BACKEND!r}")
 
 if HIVE_BACKEND == "oracle":
     try:
@@ -174,12 +172,8 @@ if HIVE_BACKEND == "oracle":
         )
         raise
     try:
-        _oracle_user, _oracle_password, _oracle_connect_dsn = _parse_oracle_url(
-            ORACLE_DSN
-        )
-        _probe = oracledb.connect(
-            user=_oracle_user, password=_oracle_password, dsn=_oracle_connect_dsn
-        )
+        _oracle_user, _oracle_password, _oracle_connect_dsn = _parse_oracle_url(ORACLE_DSN)
+        _probe = oracledb.connect(user=_oracle_user, password=_oracle_password, dsn=_oracle_connect_dsn)
         _probe.close()
     except Exception as exc:
         print(
@@ -352,12 +346,8 @@ class BackendCursor:
         self._cursor = cursor
         self._rows = rows
         self._index = 0
-        self.rowcount = (
-            rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
-        )
-        self.lastrowid = (
-            getattr(cursor, "lastrowid", None) if cursor is not None else None
-        )
+        self.rowcount = rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
+        self.lastrowid = getattr(cursor, "lastrowid", None) if cursor is not None else None
 
     async def __aenter__(self):
         return self
@@ -435,7 +425,7 @@ class BackendCursor:
             elif isinstance(v, _dt.datetime):
                 # Oracle TSTZ -> epoch float (SQLite stores as REAL epoch)
                 if v.tzinfo is None:
-                    v = v.replace(tzinfo=_dt.timezone.utc)
+                    v = v.replace(tzinfo=_dt.UTC)
                 out.append(v.timestamp())
             elif isinstance(v, (bytes, bytearray)) and len(v) == 16:
                 # RAW(16) -> uuid hex with dashes (matches SQLite TEXT id format)
@@ -508,19 +498,14 @@ class OracleConnection:
 
     async def _execute(self, sql: str, params: Any = None):
         if re.match(r"^\s*PRAGMA\s+table_info\((\w+)\)", sql, flags=re.IGNORECASE):
-            table = re.match(
-                r"^\s*PRAGMA\s+table_info\((\w+)\)", sql, flags=re.IGNORECASE
-            ).group(1)
+            table = re.match(r"^\s*PRAGMA\s+table_info\((\w+)\)", sql, flags=re.IGNORECASE).group(1)
             mapped = _TABLE_MAP.get(table.lower(), table)
             cur = self._conn.cursor()
             await cur.execute(
                 "SELECT column_name FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id",
                 (mapped.upper(),),
             )
-            rows = [
-                (i, row[0].lower(), None, None, None, None)
-                for i, row in enumerate(await cur.fetchall())
-            ]
+            rows = [(i, row[0].lower(), None, None, None, None) for i, row in enumerate(await cur.fetchall())]
             await BackendCursor(cur).close()
             return BackendCursor(rows=rows)
         translated, translated_params = _translate_sql(sql, params)
@@ -857,7 +842,6 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 # submitted jobs and older queued rows that were created before the mapping.
 
 
-
 # COST-TIER MAP (per ~/.claude/rules/llm-usage-policy-2026-05-22.md):
 #   A = FREE   — local + NGC NIM (try first, token-miser)
 #   B = CHEAP  — Groq Dev tier, xAI, DeepSeek direct, Together cheap, Gemini-Flash, OpenAI-mini
@@ -932,11 +916,7 @@ CLAIM_SCAN_WINDOW = int(os.environ.get("CLAIM_SCAN_WINDOW", "10000"))
 # claim immediately. User directive 2026-05-26: pegasus (.79) is flooding
 # the failed queue with 241/243 recent fails — denylist it until config-fix.
 # Format: lowercase short hostname. Updated via env or admin endpoint.
-HOST_DENYLIST: set[str] = {
-    h.strip().lower()
-    for h in os.environ.get("HIVE_HOST_DENYLIST", "").split(",")
-    if h.strip()
-}
+HOST_DENYLIST: set[str] = {h.strip().lower() for h in os.environ.get("HIVE_HOST_DENYLIST", "").split(",") if h.strip()}
 
 # Phase 2 provider-as-capability gate. When ON, an executor job (build / agent
 # coding kind) can only be claimed by a host advertising >=1 live llm-* cap, so a
@@ -996,20 +976,6 @@ async def require_mutation_actor(
     return str(x_hive_actor).strip()
 
 
-async def require_orchestrator_submitter(submitter_urn: str) -> str:
-    runtime, _status = await require_registered_agent(submitter_urn, active_only=True)
-    if runtime in WORKER_ONLY_RUNTIMES or runtime not in ORCHESTRATOR_RUNTIMES:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                f"role-violation: runtime={runtime!r} is not an orchestrator. "
-                f"Workers CLAIM jobs via POST /v1/jobs/next; only registered active "
-                f"orchestrators may SUBMIT jobs. Orchestrators: {sorted(ORCHESTRATOR_RUNTIMES)}."
-            ),
-        )
-    return runtime
-
-
 def valid_completion_proof(proof: dict) -> bool:
     """Fail closed on missing Git evidence, including successful subprocesses.
 
@@ -1028,10 +994,7 @@ def valid_completion_proof(proof: dict) -> bool:
         and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
         and isinstance(commits, list)
         and sha in commits
-        and all(
-            isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c)
-            for c in commits
-        )
+        and all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c) for c in commits)
         and isinstance(files, list)
         and files
         and all(isinstance(f, str) and f for f in files)
@@ -1046,9 +1009,7 @@ def normalize_result_payload(status: str, result: dict | None) -> dict | None:
     commits = normalized.get("commits")
     files_changed = normalized.get("files_changed")
     normalized["commits"] = commits if isinstance(commits, list) else []
-    normalized["files_changed"] = (
-        files_changed if isinstance(files_changed, list) else []
-    )
+    normalized["files_changed"] = files_changed if isinstance(files_changed, list) else []
     return normalized
 
 
@@ -1073,9 +1034,7 @@ def estimate_cost(provider: str, model: str, tokens_in: int, tokens_out: int) ->
     if (provider or "").lower() in SUBSCRIPTION_PROVIDERS:
         return 0.0
     in_rate, out_rate = rate_for(provider, model)
-    return round(
-        (tokens_in / 1_000_000) * in_rate + (tokens_out / 1_000_000) * out_rate, 6
-    )
+    return round((tokens_in / 1_000_000) * in_rate + (tokens_out / 1_000_000) * out_rate, 6)
 
 
 def hallucination_check(result: dict) -> str | None:
@@ -1094,10 +1053,7 @@ def hallucination_check(result: dict) -> str | None:
         return None
     if "rate limit exceeded" in stdout.lower():
         return "rate_limit_in_output"
-    if (
-        "authentication error" in stdout.lower()
-        or "authentication failed" in stdout.lower()
-    ):
+    if "authentication error" in stdout.lower() or "authentication failed" in stdout.lower():
         return "auth_error_in_output"
     if "context length" in stdout.lower() and "exceed" in stdout.lower():
         return "context_overflow_in_output"
@@ -1118,9 +1074,7 @@ def hallucination_check(result: dict) -> str | None:
 # 30-70% on repetitive work + avoids NGC 429 storms from duplicate dispatches.
 import hashlib as _hashlib
 
-CACHE_TTL_SECONDS = (
-    24 * 3600
-)  # 24h default; idempotent work like compiles/lints often valid much longer
+CACHE_TTL_SECONDS = 24 * 3600  # 24h default; idempotent work like compiles/lints often valid much longer
 
 
 def cache_key_for(
@@ -1149,9 +1103,7 @@ async def cache_lookup(db, cache_key: str) -> dict | None:
     # Defensive: never SERVE a poisoned needs-review entry as a done answer,
     # even if one slipped into the table before the store-side guard landed
     # (orphan propagation, 2026-06-07).
-    if isinstance(_res, dict) and (
-        _res.get("needs_review") or _res.get("status") == "needs-review"
-    ):
+    if isinstance(_res, dict) and (_res.get("needs_review") or _res.get("status") == "needs-review"):
         return None
     return {
         "result": _res,
@@ -1235,23 +1187,9 @@ async def cache_record_hit(db, cache_key: str, cost_saved: float):
     )
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 # ---------- lifecycle ----------
 
-CLAIM_STALE_AFTER = (
-    1800.0  # claim → still 'claimed'/'running' without update >30min ⇒ orphan
-)
+CLAIM_STALE_AFTER = 1800.0  # claim → still 'claimed'/'running' without update >30min ⇒ orphan
 # REVIEW #2 fix: kind-specific overrides. Orchestration jobs that fan out
 # + collect can legitimately run 60+ minutes without a PATCH while
 # sub-jobs execute. Reaper also measures against last_update_at (any PATCH
@@ -1299,9 +1237,7 @@ async def reaper_task(app: FastAPI):
                     )
                     await db.commit()
                     for urn in stale:
-                        await emit_event(
-                            db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"}
-                        )
+                        await emit_event(db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"})
 
                 async with db.execute(
                     "SELECT urn FROM agents WHERE status != 'offline' AND last_heartbeat < ?",
@@ -1378,9 +1314,7 @@ async def reaper_task(app: FastAPI):
                     "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running')))",
                     (purge_cutoff,),
                 )
-                purged = max(
-                    0, getattr(pcur, "rowcount", 0) or 0
-                )  # some drivers report -1
+                purged = max(0, getattr(pcur, "rowcount", 0) or 0)  # some drivers report -1
                 if purged:
                     await db.commit()
                     print(
@@ -1416,9 +1350,7 @@ async def reaper_task(app: FastAPI):
                         default_cutoff,
                     ),
                 ) as cur:
-                    candidates = [
-                        (r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur
-                    ]
+                    candidates = [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
                 # Apply kind-specific override: keep job if its kind has a longer TTL
                 # AND its latest progress timestamp is within that window.
                 orphans = []
@@ -1503,9 +1435,7 @@ async def reaper_task(app: FastAPI):
                         [(time.time(), j) for j in stale_ids],
                     )
                     for j in stale_ids:
-                        await emit_event(
-                            db, "job.cancelled", {"id": j, "reason": "stale_>7d"}
-                        )
+                        await emit_event(db, "job.cancelled", {"id": j, "reason": "stale_>7d"})
                     await db.commit()
                 # 5. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
@@ -1527,9 +1457,7 @@ async def reaper_task(app: FastAPI):
                 # (a) test/e2e junk — terminal + matches any test pattern + > test window
                 test_cutoff = now_ts - RETAIN_TEST_JOBS_DAYS * 86400
                 status_ph = ",".join("?" for _ in SWEEPABLE_STATUSES)
-                like_ph = " OR ".join(
-                    "LOWER(description) LIKE ?" for _ in TEST_JOB_DESC_PATTERNS
-                )
+                like_ph = " OR ".join("LOWER(description) LIKE ?" for _ in TEST_JOB_DESC_PATTERNS)
                 test_params: list[Any] = list(SWEEPABLE_STATUSES)
                 test_params += [f"%{p.lower()}%" for p in TEST_JOB_DESC_PATTERNS]
                 test_params.append(test_cutoff)
@@ -1545,8 +1473,7 @@ async def reaper_task(app: FastAPI):
                 done_params: list[Any] = list(SWEEPABLE_STATUSES)
                 done_params.append(done_cutoff)
                 async with db.execute(
-                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) "
-                    f"AND COALESCE(ended_at, started_at) < ?",
+                    f"SELECT id FROM jobs WHERE status IN ({status_ph}) AND COALESCE(ended_at, started_at) < ?",
                     tuple(done_params),
                 ) as cur:
                     sweep_ids += [r[0] async for r in cur]
@@ -1600,9 +1527,7 @@ async def lifespan(app: FastAPI):
                 await conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl_fragment}")
 
         async def _ensure_agents_status_allows_stale(conn) -> None:
-            async with conn.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'"
-            ) as cur:
+            async with conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'") as cur:
                 row = await cur.fetchone()
             table_sql = row[0] if row else ""
             if "stale" in table_sql:
@@ -1631,9 +1556,7 @@ async def lifespan(app: FastAPI):
                 "subscription_pools",
             )
             col_list = ", ".join(cols)
-            await conn.execute(
-                "ALTER TABLE agents RENAME TO agents__pre_stale_migration"
-            )
+            await conn.execute("ALTER TABLE agents RENAME TO agents__pre_stale_migration")
             await conn.execute(
                 "CREATE TABLE agents ("
                 "urn TEXT PRIMARY KEY, "
@@ -1658,9 +1581,7 @@ async def lifespan(app: FastAPI):
                 "plan_period_used_usd REAL DEFAULT 0, "
                 "subscription_pools TEXT)"
             )
-            await conn.execute(
-                f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration"
-            )
+            await conn.execute(f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration")
             await conn.execute("DROP TABLE agents__pre_stale_migration")
 
         async def _ensure_jobs_status_allows_dead_letter(conn) -> None:
@@ -1670,9 +1591,7 @@ async def lifespan(app: FastAPI):
             # (possibly drifted) columns + data. No-op when the constraint is
             # already permissive or absent (fresh DBs are created from SCHEMA,
             # which already lists dead-letter).
-            async with conn.execute(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'"
-            ) as cur:
+            async with conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'") as cur:
                 row = await cur.fetchone()
             table_sql = row[0] if row else ""
             if not table_sql:
@@ -1681,12 +1600,8 @@ async def lifespan(app: FastAPI):
                 return  # no status CHECK, or already permissive — nothing to do
             async with conn.execute("PRAGMA table_info(jobs)") as cur:
                 old_cols = [r[1] for r in await cur.fetchall()]
-            await conn.execute(
-                "ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration"
-            )
-            await conn.executescript(
-                SCHEMA
-            )  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
+            await conn.execute("ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration")
+            await conn.executescript(SCHEMA)  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
             # Copy only columns common to old + recreated table — guards against
             # drift columns the recreated SCHEMA lacks (the live_columns ALTERs
             # below re-add any expected-but-missing ones afterwards).
@@ -1694,9 +1609,7 @@ async def lifespan(app: FastAPI):
                 new_cols = {r[1] for r in await cur.fetchall()}
             common = [c for c in old_cols if c in new_cols]
             col_list = ", ".join(common)
-            await conn.execute(
-                f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration"
-            )
+            await conn.execute(f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration")
             await conn.execute("DROP TABLE jobs__pre_deadletter_migration")
 
         live_columns = (
@@ -1772,9 +1685,7 @@ async def lifespan(app: FastAPI):
                 )
                 has_col = (rcur.fetchone())[0]
                 if not has_col:
-                    rcur.execute(
-                        "ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)"
-                    )
+                    rcur.execute("ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)")
                 for _c, _d in (
                     ("SITE", "VARCHAR2(64)"),
                     ("REPO", "VARCHAR2(512)"),
@@ -1782,8 +1693,7 @@ async def lifespan(app: FastAPI):
                     ("PR_NUMBER", "NUMBER"),
                 ):
                     rcur.execute(
-                        "SELECT COUNT(*) FROM user_tab_columns "
-                        "WHERE table_name = 'HIVE_JOBS' AND column_name = :1",
+                        "SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'HIVE_JOBS' AND column_name = :1",
                         [_c],
                     )
                     if not (rcur.fetchone())[0]:
@@ -1795,9 +1705,7 @@ async def lifespan(app: FastAPI):
                 crow = rcur.fetchone()
                 cond = str(crow[0]) if crow and crow[0] is not None else ""
                 if crow is not None and "dead-letter" not in cond:
-                    rcur.execute(
-                        "ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS"
-                    )
+                    rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
                     rcur.execute(
                         "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
                         "CHECK (status IN ('queued','offered','claimed','running',"
@@ -1811,9 +1719,7 @@ async def lifespan(app: FastAPI):
                 # fails, every subsequent decline PATCH would error (invalid
                 # identifier / CHECK violation), so refuse to start rather than
                 # serve a half-migrated bus.
-                print(
-                    f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True
-                )
+                print(f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True)
                 # non-fatal: runtime dead-letter UPDATE falls back to requeue if CHECK not relaxed
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
@@ -1853,6 +1759,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 app.include_router(_repos_router)
 app.include_router(_messages_router)
+app.include_router(_schedules_router)
 
 
 # ---------- endpoints ----------
@@ -1901,9 +1808,7 @@ async def dashboard():
                 },
             )
     except FileNotFoundError:
-        return HTMLResponse(
-            f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404
-        )
+        return HTMLResponse(f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404)
 
 
 @app.post("/v1/agents/register")
@@ -1963,11 +1868,7 @@ async def register(req: AgentRegister):
             422,
             f"auth_method must be one of {sorted(AUTH_METHODS)}, got {auth_method!r}",
         )
-    plan_cap_usd = (
-        req.plan_cap_usd
-        if req.plan_cap_usd is not None
-        else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
-    )
+    plan_cap_usd = req.plan_cap_usd if req.plan_cap_usd is not None else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
     provider = (req.provider or "unknown").lower()
     model = (req.model or "unknown").lower()
     # EIH ban (operator 2026-06-18): the hive must never advertise EIH / gpt-5.5
@@ -2013,11 +1914,7 @@ async def register(req: AgentRegister):
     # is never blocked or serialized), which is the correct safety posture for the
     # most critical fleet component.
     instance = req.instance
-    effective_metadata = (
-        dict(req.metadata)
-        if isinstance(req.metadata, dict)
-        else ({} if instance else None)
-    )
+    effective_metadata = dict(req.metadata) if isinstance(req.metadata, dict) else ({} if instance else None)
     if instance:
         effective_metadata["_instance"] = instance
     async with connect_db() as db:
@@ -2131,8 +2028,7 @@ async def register(req: AgentRegister):
                 # not a logger) so the data-quality regression stays observable in
                 # the service journal.
                 print(
-                    f"register dedup skipped for host={req.host} kind={kind} "
-                    f"instance={instance!r}: {_dedup_exc!r}",
+                    f"register dedup skipped for host={req.host} kind={kind} instance={instance!r}: {_dedup_exc!r}",
                     flush=True,
                 )
         await db.commit()
@@ -2391,8 +2287,7 @@ async def agent_throttle(urn_path: str):
     async with (
         connect_db() as db,
         db.execute(
-            "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd "
-            "FROM agents WHERE urn=?",
+            "SELECT urn, kind, runtime, auth_method, plan_cap_usd, plan_period_used_usd FROM agents WHERE urn=?",
             (urn_path,),
         ) as cur,
     ):
@@ -2419,9 +2314,7 @@ async def agent_throttle(urn_path: str):
 async def reset_plan_period(urn_path: str):
     """Operator zeros the MTD usage — call monthly on billing rollover."""
     async with connect_db() as db:
-        cur = await db.execute(
-            "UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,)
-        )
+        cur = await db.execute("UPDATE agents SET plan_period_used_usd = 0 WHERE urn=?", (urn_path,))
         await db.commit()
     if cur.rowcount == 0:
         raise HTTPException(404, f"agent not found: {urn_path}")
@@ -2527,9 +2420,7 @@ async def create_job(req: JobCreate):
     now = time.time()
     max_cost_tier = (req.max_cost_tier or "B").upper()
     if max_cost_tier not in COST_TIERS:
-        raise HTTPException(
-            422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}"
-        )
+        raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
     # 2026-05-26: codex-only eligibility auto-rewrite, ORIGINALLY for all of
     # codex/review/hermes-cli — codex was a CLI zeroclaw shells out to, with
     # no standalone claimer. RESCINDED for codex 2026-09-14 (operator): a real
@@ -2548,15 +2439,9 @@ async def create_job(req: JobCreate):
             # Mixed (e.g. ["zeroclaw", "codex"]) → keep only the claimer kinds
             req = req.model_copy(update={"eligible_kinds": kept})
     if req.mnemos_refs:
-        bad = [
-            r
-            for r in req.mnemos_refs
-            if not (isinstance(r, str) and r.startswith("mem_"))
-        ]
+        bad = [r for r in req.mnemos_refs if not (isinstance(r, str) and r.startswith("mem_"))]
         if bad:
-            raise HTTPException(
-                422, f"mnemos_refs must be mem_XXX ids — bad entries: {bad}"
-            )
+            raise HTTPException(422, f"mnemos_refs must be mem_XXX ids — bad entries: {bad}")
     # DAG: validate depends_on targets exist + no self-cycle
     if req.depends_on:
         if job_id in req.depends_on:
@@ -2570,9 +2455,7 @@ async def create_job(req: JobCreate):
                 found = {row[0] async for row in cur}
             missing = [d for d in req.depends_on if d not in found]
             if missing:
-                raise HTTPException(
-                    422, f"depends_on references unknown job ids: {missing}"
-                )
+                raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
     # AFFINITY INJECTION REMOVED (operator 2026-06-03): jobs are not pinned to
     # hosts/kinds/capabilities — all workers eligible for everything.
     # NARROW HEAVY-REPO CARVE-OUT (operator 2026-06-04, GRAEAE consult): the only
@@ -2612,9 +2495,7 @@ async def create_job(req: JobCreate):
     # Mode-1 jam = jobs (kind="code", no project/repo) whose workspace can't resolve -> worker
     # declines -> dead-letter. Observe would-be 422s now; enforce after vocabulary stabilizes (~1wk).
     try:
-        _ws, _wsrc = resolve_workspace_shadow(
-            req.kind, req.description, req.target_workspace, req.project
-        )
+        _ws, _wsrc = resolve_workspace_shadow(req.kind, req.description, req.target_workspace, req.project)
         if _wsrc == "UNRESOLVABLE":
             print(
                 f"ADMISSION_SHADOW would-422 no_resolvable_workspace kind={req.kind!r} "
@@ -2650,9 +2531,7 @@ async def create_job(req: JobCreate):
     except Exception:
         pass
     # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
-    ck = cache_key_for(
-        req.kind, req.description, max_cost_tier, req.required_capabilities
-    )
+    ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
     async with connect_db() as db:
         cached = await cache_lookup(db, ck)
         # Repository jobs must execute against their actual checkout. A cached
@@ -2675,16 +2554,12 @@ async def create_job(req: JobCreate):
                     req.description,
                     req.priority,
                     req.deadline,
-                    json.dumps(req.required_capabilities)
-                    if req.required_capabilities
-                    else None,
+                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
                     json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
                     json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
                     req.project,
                     max_cost_tier,
-                    json.dumps(req.preferred_providers)
-                    if req.preferred_providers
-                    else None,
+                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
                     json.dumps(req.preferred_models) if req.preferred_models else None,
                     json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
                     now,
@@ -2766,16 +2641,12 @@ async def create_job(req: JobCreate):
                     req.description,
                     req.priority,
                     req.deadline,
-                    json.dumps(req.required_capabilities)
-                    if req.required_capabilities
-                    else None,
+                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
                     json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
                     json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
                     req.project,
                     max_cost_tier,
-                    json.dumps(req.preferred_providers)
-                    if req.preferred_providers
-                    else None,
+                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
                     json.dumps(req.preferred_models) if req.preferred_models else None,
                     json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
                     json.dumps(req.depends_on) if req.depends_on else None,
@@ -2858,9 +2729,7 @@ async def dequeue_next_job(agent_urn: str):
                 agent_row = await cur.fetchone()
             if not agent_row:
                 await db.execute("ROLLBACK")
-                raise HTTPException(
-                    404, f"claim failed: agent not registered: {agent_urn}"
-                )
+                raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
             (
                 agent_kind,
                 caps_json,
@@ -2896,10 +2765,7 @@ async def dequeue_next_job(agent_urn: str):
                 "capabilities": agent_caps,
                 "eligible_aliases": agent_kind_aliases(agent_kind, a_runtime),
                 "subscription_throttled": (
-                    a_auth == "subscription"
-                    and a_cap
-                    and a_used
-                    and a_used >= THROTTLE_HEADROOM * a_cap
+                    a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
                 ),
             }
 
@@ -2971,9 +2837,7 @@ async def dequeue_next_job(agent_urn: str):
                 urn=agent_urn,
                 host=agent_host,
                 capabilities=agent_caps,
-                current_load=(
-                    json.loads(agent_current_load) if agent_current_load else None
-                ),
+                current_load=(json.loads(agent_current_load) if agent_current_load else None),
             )
             _job_dicts = [
                 {
@@ -2985,9 +2849,7 @@ async def dequeue_next_job(agent_urn: str):
                 }
                 for r in candidates
             ]
-            _ordered = sched.order_candidates_for_worker(
-                candidates=_job_dicts, worker=worker_profile, now=now
-            )
+            _ordered = sched.order_candidates_for_worker(candidates=_job_dicts, worker=worker_profile, now=now)
             _by_id = {r[0]: r for r in candidates}
             candidates = [_by_id[d["id"]] for d in _ordered]
 
@@ -3131,9 +2993,7 @@ async def dequeue_next_job(agent_urn: str):
     except HTTPException:
         raise
     except aiosqlite.Error as e:
-        raise HTTPException(
-            500, f"claim failed: database error while claiming next job: {e}"
-        ) from e
+        raise HTTPException(500, f"claim failed: database error while claiming next job: {e}") from e
 
     # HTTP 204 = No Content. By spec the response body must be EMPTY.
     # JSONResponse(content=None) writes 'null' (4 bytes) which violates the
@@ -3182,11 +3042,7 @@ async def update_job(job_id: str, req: JobUpdate):
 
     claimed_by_was_set = original_claimed_by_was_set
     result_mnemos_was_set = original_result_mnemos_was_set
-    patch_payload = (
-        req.model_dump(exclude_unset=True)
-        if hasattr(req, "model_dump")
-        else req.dict(exclude_unset=True)
-    )
+    patch_payload = req.model_dump(exclude_unset=True) if hasattr(req, "model_dump") else req.dict(exclude_unset=True)
     cost_estimate = None
 
     # Skip releases are not failures. DECLINE_REASON_PREFIXES is intentionally
@@ -3198,9 +3054,7 @@ async def update_job(job_id: str, req: JobUpdate):
         # Match exact reasons or the documented separator form
         # (host_declines_kind:<host>) — avoid matching an unrelated reason that
         # merely shares a prefix.
-        if _werr in DECLINE_REASON_PREFIXES or any(
-            _werr.startswith(p + ":") for p in DECLINE_REASON_PREFIXES
-        ):
+        if _werr in DECLINE_REASON_PREFIXES or any(_werr.startswith(p + ":") for p in DECLINE_REASON_PREFIXES):
             decline_reason = _werr
 
     async with connect_db() as db:
@@ -3268,9 +3122,7 @@ async def update_job(job_id: str, req: JobUpdate):
             }:
                 if not old_claimed_by:
                     await db.execute("ROLLBACK")
-                    raise HTTPException(
-                        409, "cannot release a job with no current claimant"
-                    )
+                    raise HTTPException(409, "cannot release a job with no current claimant")
                 if not claimed_by_was_set or req.claimed_by != old_claimed_by:
                     await db.execute("ROLLBACK")
                     raise HTTPException(
@@ -3307,9 +3159,7 @@ async def update_job(job_id: str, req: JobUpdate):
                         "job update requires claimed_by to match the current claimant",
                     )
 
-            effective_claimed_by = (
-                None if release_to_queue else (req.claimed_by or old_claimed_by)
-            )
+            effective_claimed_by = None if release_to_queue else (req.claimed_by or old_claimed_by)
             if req.status in {"claimed", "running"} and not effective_claimed_by:
                 await db.execute("ROLLBACK")
                 raise HTTPException(
@@ -3378,9 +3228,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 # backoff escalates to the 300s cap (~6 bounces); a capable host grabs it during
                 # a backoff window while the incapable host stops hammering it.
                 _rc = int(retry_count or 0) + 1
-                _bo = min(5.0 * (2 ** min(_rc, 6)), 300.0) * (
-                    1.0 + _rnd.uniform(-0.2, 0.2)
-                )
+                _bo = min(5.0 * (2 ** min(_rc, 6)), 300.0) * (1.0 + _rnd.uniform(-0.2, 0.2))
                 fields.append("retry_count=retry_count+1")
                 fields.append("retry_backoff_until=?")
                 args.append(now + _bo)
@@ -3396,9 +3244,7 @@ async def update_job(job_id: str, req: JobUpdate):
             if req.tokens_in is not None or req.tokens_out is not None:
                 t_in = int(req.tokens_in or 0)
                 t_out = int(req.tokens_out or 0)
-                cost_estimate = estimate_cost(
-                    prov or "unknown", mod or "unknown", t_in, t_out
-                )
+                cost_estimate = estimate_cost(prov or "unknown", mod or "unknown", t_in, t_out)
                 fields.extend(["tokens_in=?", "tokens_out=?", "estimated_cost_usd=?"])
                 args.extend([t_in, t_out, cost_estimate])
 
@@ -3496,10 +3342,7 @@ async def update_job(job_id: str, req: JobUpdate):
             # Gate on a REAL non-terminal -> terminal transition: done->done /
             # failed->failed are allowed (idempotent re-PATCH), so without this guard a
             # duplicate terminal PATCH would double-count stats AND the usage_ledger cost.
-            if (
-                req.status in TERMINAL_JOB_STATUSES
-                and old_status not in TERMINAL_JOB_STATUSES
-            ):
+            if req.status in TERMINAL_JOB_STATUSES and old_status not in TERMINAL_JOB_STATUSES:
                 async with db.execute(
                     "SELECT kind, description, max_cost_tier, required_capabilities, "
                     "claimed_model, claimed_provider, claimed_by, result, started_at "
@@ -3530,16 +3373,8 @@ async def update_job(job_id: str, req: JobUpdate):
                         _rd = req.result or {}
                     if not isinstance(_rd, dict):
                         _rd = {}
-                    rt_in = _safe_nonneg_int(
-                        req.tokens_in
-                        if req.tokens_in is not None
-                        else _rd.get("tokens_in")
-                    )
-                    rt_out = _safe_nonneg_int(
-                        req.tokens_out
-                        if req.tokens_out is not None
-                        else _rd.get("tokens_out")
-                    )
+                    rt_in = _safe_nonneg_int(req.tokens_in if req.tokens_in is not None else _rd.get("tokens_in"))
+                    rt_out = _safe_nonneg_int(req.tokens_out if req.tokens_out is not None else _rd.get("tokens_out"))
                     rt_reason = _safe_nonneg_int(_rd.get("tokens_reasoning"))
                     # Some workers report only a combined total — attribute to output.
                     if rt_in == 0 and rt_out == 0 and _rd.get("tokens_total"):
@@ -3548,9 +3383,7 @@ async def update_job(job_id: str, req: JobUpdate):
                     eff_prov = _safe_str(_rd.get("gateway_provider") or prov_j)
                     # Cost estimation must never break the hot completion path.
                     try:
-                        job_cost = (
-                            estimate_cost(eff_prov, eff_model, rt_in, rt_out) or 0
-                        )
+                        job_cost = estimate_cost(eff_prov, eff_model, rt_in, rt_out) or 0
                         job_cost = max(job_cost, 0)
                     except Exception as _ce:  # noqa: BLE001
                         print(f"cost estimate skipped for {job_id}: {_ce}", flush=True)
@@ -3562,11 +3395,7 @@ async def update_job(job_id: str, req: JobUpdate):
                         # per-restart session segment) so a worker's history
                         # aggregates across restarts instead of fragmenting.
                         worker_key = stable_worker_id(claimed_by_j)
-                        duration = (
-                            (time.time() - (started_j or time.time()))
-                            if started_j
-                            else 0
-                        )
+                        duration = (time.time() - (started_j or time.time())) if started_j else 0
                         col = {
                             "done": "success_count",
                             "failed": "fail_count",
@@ -3625,10 +3454,7 @@ async def update_job(job_id: str, req: JobUpdate):
                                     (mtier or "A").upper(),
                                     claimed_by_j,
                                     1,
-                                    1
-                                    if (eff_prov or "").lower()
-                                    in SUBSCRIPTION_PROVIDERS
-                                    else 0,
+                                    1 if (eff_prov or "").lower() in SUBSCRIPTION_PROVIDERS else 0,
                                     str(_rd.get("via") or "worker"),
                                 ),
                             )
@@ -3653,10 +3479,7 @@ async def update_job(job_id: str, req: JobUpdate):
                         # orphaned FRI jobs, 2026-06-07). Only cache real
                         # completed work: not needs_review, and either it carries
                         # commits or it is a non-workspace job (no repo to commit).
-                        _nr = (
-                            bool((rdict or {}).get("needs_review"))
-                            or (rdict or {}).get("status") == "needs-review"
-                        )
+                        _nr = bool((rdict or {}).get("needs_review")) or (rdict or {}).get("status") == "needs-review"
                         if (ec == 0 or ec is None) and not _nr:
                             await cache_store(
                                 db,
@@ -3677,9 +3500,7 @@ async def update_job(job_id: str, req: JobUpdate):
                     now,
                     req.claimed_by or old_claimed_by,
                     old_status,
-                    "dead-letter"
-                    if dead_lettered
-                    else ("queued" if retried else req.status),
+                    "dead-letter" if dead_lettered else ("queued" if retried else req.status),
                     old_claimed_by,
                     None if release_to_queue else effective_claimed_by,
                     json.dumps(patch_payload, default=str),
@@ -3760,8 +3581,7 @@ async def auto_retry_job(job_id: str):
                 "db2": " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS",
             }[HIVE_BACKEND]
             async with db.execute(
-                "SELECT status, kind, max_retries, retry_count, result "
-                "FROM jobs WHERE id=?" + lock_clause,
+                "SELECT status, kind, max_retries, retry_count, result FROM jobs WHERE id=?" + lock_clause,
                 (job_id,),
             ) as cur:
                 row = await cur.fetchone()
@@ -3796,17 +3616,13 @@ async def auto_retry_job(job_id: str):
     return {"ok": True, "id": job_id, "retry_count": retry_count + 1}
 
 
-
-
 @app.post("/v1/admin/jobs/requeue", dependencies=[Depends(require_mutation_actor)])
 async def admin_requeue_jobs(req: RequeueRequest):
     """Force-requeue terminal (failed/cancelled) or any non-done jobs back to queued."""
     results = {"ok": [], "not_found": [], "skipped_done": []}
     async with connect_db() as db:
         for job_id in req.job_ids:
-            async with db.execute(
-                "SELECT status FROM jobs WHERE id=?", (job_id,)
-            ) as cur:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -3831,8 +3647,6 @@ async def admin_requeue_jobs(req: RequeueRequest):
     return results
 
 
-
-
 @app.post("/v1/admin/jobs/purge", dependencies=[Depends(require_mutation_actor)])
 async def admin_purge_jobs(req: PurgeRequest):
     """Permanently remove terminal dead-letter jobs (doctor 'remove' action).
@@ -3843,9 +3657,7 @@ async def admin_purge_jobs(req: PurgeRequest):
     results: dict = {"ok": [], "not_found": [], "skipped_not_dead_letter": []}
     async with connect_db() as db:
         for job_id in req.job_ids:
-            async with db.execute(
-                "SELECT status FROM jobs WHERE id=?", (job_id,)
-            ) as cur:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -3853,16 +3665,12 @@ async def admin_purge_jobs(req: PurgeRequest):
             if row[0] != "dead-letter":
                 results["skipped_not_dead_letter"].append(job_id)
                 continue
-            await db.execute(
-                "DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,)
-            )
+            await db.execute("DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,))
             await db.commit()
             results["ok"].append(job_id)
     async with connect_db() as event_db:
         for job_id in results["ok"]:
-            await emit_event(
-                event_db, "job.purged", {"id": job_id, "reason": req.reason}
-            )
+            await emit_event(event_db, "job.purged", {"id": job_id, "reason": req.reason})
     return results
 
 
@@ -3875,9 +3683,7 @@ async def admin_purge_jobs(req: PurgeRequest):
 # ---------------------------------------------------------------------------
 
 
-async def _cascade_delete_jobs(
-    db, job_ids: list[str], *, allow_active: bool = False
-) -> list[str]:
+async def _cascade_delete_jobs(db, job_ids: list[str], *, allow_active: bool = False) -> list[str]:
     """Delete the given jobs and their job_audit_log rows. ATOMIC active-job guard
     (codex review #3): the job row is deleted with a compare-and-delete predicate
     that re-checks status AT DELETE TIME, so a job that was queued/offered at SELECT
@@ -3954,8 +3760,6 @@ async def delete_job(job_id: str, force: bool = False):
     return {"deleted": 1, "id": job_id, "prior_status": status}
 
 
-
-
 @app.post("/v1/jobs/purge", dependencies=[Depends(require_mutation_actor)])
 async def purge_jobs(req: JobPurgeRequest):
     """Bulk housekeeping purge. JSON-body filters are AND-combined; at least one
@@ -4025,11 +3829,7 @@ async def purge_jobs(req: JobPurgeRequest):
     if req.kind_prefix:
         # Escape LIKE metacharacters so a literal '%'/'_' in the prefix cannot turn
         # into a match-all wildcard (codex review #2). 'kind%' anchors the prefix.
-        kp = (
-            req.kind_prefix.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        kp = req.kind_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         wheres.append("kind LIKE ? ESCAPE '\\'")
         params.append(kp + "%")
     if statuses:
@@ -4038,11 +3838,7 @@ async def purge_jobs(req: JobPurgeRequest):
     if req.description_contains:
         wheres.append("description LIKE ?")
         # escape LIKE metacharacters in caller input so % / _ are literal
-        esc = (
-            req.description_contains.replace("\\", "\\\\")
-            .replace("%", "\\%")
-            .replace("_", "\\_")
-        )
+        esc = req.description_contains.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         params.append("%" + esc + "%")
         # NB: ESCAPE clause appended below for the description predicate only
         wheres[-1] = "description LIKE ? ESCAPE '\\'"
@@ -4070,15 +3866,11 @@ async def purge_jobs(req: JobPurgeRequest):
             # allow_active mirrors include_active: when not including active jobs the
             # cascade re-checks status at delete time, so a job that got claimed
             # between SELECT and DELETE is skipped (atomic guard, codex review #3).
-            deleted = await _cascade_delete_jobs(
-                db, matched, allow_active=req.include_active
-            )
+            deleted = await _cascade_delete_jobs(db, matched, allow_active=req.include_active)
             await db.commit()
     if deleted:
         async with connect_db() as event_db:
-            await emit_event(
-                event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason}
-            )
+            await emit_event(event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason})
     return {"deleted": len(deleted), "matched_ids": deleted}
 
 
@@ -4088,23 +3880,17 @@ async def purge_jobs(req: JobPurgeRequest):
 RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
 
 
-
-
 @app.post("/v1/admin/jobs/reclassify", dependencies=[Depends(require_mutation_actor)])
 async def admin_reclassify_jobs(req: ReclassifyRequest):
     """Admin override to move terminal (esp. dead-letter) jobs to a safe target
     status, bypassing ALLOWED_TRANSITIONS. The doctor uses status='needs-review'
     to surface ambiguous dead-letter jobs for a human."""
     if req.status not in RECLASSIFY_ALLOWED_TARGETS:
-        raise HTTPException(
-            422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}"
-        )
+        raise HTTPException(422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}")
     results: dict = {"ok": [], "not_found": [], "skipped_done": []}
     async with connect_db() as db:
         for job_id in req.job_ids:
-            async with db.execute(
-                "SELECT status FROM jobs WHERE id=?", (job_id,)
-            ) as cur:
+            async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
                 row = await cur.fetchone()
             if not row:
                 results["not_found"].append(job_id)
@@ -4136,114 +3922,11 @@ async def admin_reclassify_jobs(req: ReclassifyRequest):
     return results
 
 
-@app.post("/v1/schedules")
-async def create_schedule(req: ScheduleCreate):
-    """Create a recurring scheduled job. Re-fires every `interval_seconds`.
-    job_template is the JobCreate body that will be submitted each tick.
-    Submitter_urn auto-injected from caller — they take responsibility for the cron loop.
-    """
-    sid = uuidv7()
-    now = time.time()
-    # Validate the template parses as a JobCreate
-    try:
-        tpl_copy = dict(req.job_template)
-        if not tpl_copy.get("submitter_urn"):
-            raise ValueError(
-                "job_template.submitter_urn is required and must be a registered orchestrator"
-            )
-        JobCreate(**tpl_copy)
-    except Exception as e:
-        raise HTTPException(422, f"job_template invalid: {e}")
-    await require_orchestrator_submitter(tpl_copy["submitter_urn"])
-    async with connect_db() as db:
-        await db.execute(
-            "INSERT INTO scheduled_jobs (id, name, created_by_urn, interval_seconds, "
-            "job_template, enabled, last_fired_at, next_fire_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)",
-            (
-                sid,
-                req.name,
-                tpl_copy.get("submitter_urn"),
-                int(req.interval_seconds),
-                json.dumps(req.job_template),
-                1 if req.enabled else 0,
-                now + req.interval_seconds,
-                now,
-            ),
-        )
-        await db.commit()
-    return {"id": sid, "name": req.name, "next_fire_at": now + req.interval_seconds}
-
-
-@app.get("/v1/schedules")
-async def list_schedules():
-    rows = []
-    async with (
-        connect_db() as db,
-        db.execute(
-            "SELECT id, name, created_by_urn, interval_seconds, enabled, "
-            "last_fired_at, next_fire_at, fire_count, created_at FROM scheduled_jobs"
-        ) as cur,
-    ):
-        async for r in cur:
-            rows.append(
-                {
-                    "id": r[0],
-                    "name": r[1],
-                    "created_by": r[2],
-                    "interval_seconds": r[3],
-                    "enabled": bool(r[4]),
-                    "last_fired_at": r[5],
-                    "next_fire_at": r[6],
-                    "fire_count": r[7],
-                    "created_at": r[8],
-                }
-            )
-    return {"count": len(rows), "schedules": rows}
-
-
-@app.patch("/v1/schedules/{sid}")
-async def patch_schedule(
-    sid: str, enabled: bool | None = None, interval_seconds: int | None = None
-):
-    sets, args = [], []
-    if enabled is not None:
-        sets.append("enabled=?")
-        args.append(1 if enabled else 0)
-    if interval_seconds is not None:
-        if interval_seconds < 60 or interval_seconds > 86400 * 30:
-            raise HTTPException(422, "interval_seconds must be 60..2592000")
-        sets.append("interval_seconds=?")
-        args.append(int(interval_seconds))
-        sets.append("next_fire_at=?")
-        args.append(time.time() + int(interval_seconds))
-    if not sets:
-        raise HTTPException(422, "no fields to update")
-    args.append(sid)
-    async with connect_db() as db:
-        cur = await db.execute(
-            f"UPDATE scheduled_jobs SET {', '.join(sets)} WHERE id=?", args
-        )
-        await db.commit()
-    if cur.rowcount == 0:
-        raise HTTPException(404, "schedule not found")
-    return {"ok": True}
-
-
-@app.delete("/v1/schedules/{sid}")
-async def delete_schedule(sid: str):
-    async with connect_db() as db:
-        cur = await db.execute("DELETE FROM scheduled_jobs WHERE id=?", (sid,))
-        await db.commit()
-    if cur.rowcount == 0:
-        raise HTTPException(404, "schedule not found")
-    return {"ok": True}
+# /v1/schedules routes moved to hive.bus.routers.schedules (Phase 1c).
 
 
 @app.get("/v1/stats/workers")
-async def worker_stats(
-    kind: str | None = None, top_n: int = 30, include_system: bool = False
-):
+async def worker_stats(kind: str | None = None, top_n: int = 30, include_system: bool = False):
     """Per-worker per-kind capability scores. Submitters use this to pick best worker for a kind.
 
     #8 FIX (review 2026-05-23): exclude `system` kind agents by default (they're host monitors,
@@ -4292,9 +3975,7 @@ async def cache_stats(top_n: int = 20):
     """Result-cache hit-rate + cost savings."""
     top_n = clamp_limit(top_n, default=20, max_limit=500)
     async with connect_db() as db:
-        async with db.execute(
-            "SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache"
-        ) as cur:
+        async with db.execute("SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache") as cur:
             r = await cur.fetchone()
         totals = {
             "cached_jobs": r[0] or 0,
@@ -4302,9 +3983,7 @@ async def cache_stats(top_n: int = 20):
             "total_cost_saved_usd": r[2] or 0,
         }
         # job-side stats
-        async with db.execute(
-            "SELECT COUNT(*) FROM jobs WHERE result LIKE '%\"cache_hit\": true%'"
-        ) as cur:
+        async with db.execute("SELECT COUNT(*) FROM jobs WHERE result LIKE '%\"cache_hit\": true%'") as cur:
             r2 = await cur.fetchone()
         totals["jobs_short_circuited"] = r2[0] or 0
         # top cached entries
@@ -4437,8 +4116,6 @@ async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
 # like its local TIER_CHAINS values.
 
 
-
-
 # ── HIVE-LEVEL KNEMON BYPASS FLAG (operator 2026-06-03) ──────────────────
 # Presence of this file = bypass ON for the WHOLE hive. Durable across bus
 # restarts; observable (ls/cat); togglable via the /v1/knemon/bypass endpoints
@@ -4534,11 +4211,7 @@ async def knemon_providers():
     """Provider denylist for the worker llm-* capability probe (Phase 2). A
     family listed here is treated as globally dead; workers drop its llm-* cap.
     Set HIVE_PROVIDER_DENYLIST=comma,list (e.g. nvidia,eih)."""
-    denied = [
-        p.strip().lower()
-        for p in os.environ.get("HIVE_PROVIDER_DENYLIST", "").split(",")
-        if p.strip()
-    ]
+    denied = [p.strip().lower() for p in os.environ.get("HIVE_PROVIDER_DENYLIST", "").split(",") if p.strip()]
     return {"denied": denied}
 
 
@@ -4569,13 +4242,8 @@ async def knemon_route(req: Request):
     #   light/narrow (triage/docs/investigation) -> hive_gpt_mini (gpt-5.4-mini)
     #   everything else (coding default) -> hive_gpt (gpt-5.4)
     kl = kind.lower()
-    review_kind = any(
-        kl.startswith(p)
-        for p in ("review:", "codex", "doctor:codex-fix", "adversarial")
-    )
-    arch_kind = any(t in kl for t in ("architecture", "design")) or kl.startswith(
-        "heavy:"
-    )
+    review_kind = any(kl.startswith(p) for p in ("review:", "codex", "doctor:codex-fix", "adversarial"))
+    arch_kind = any(t in kl for t in ("architecture", "design")) or kl.startswith("heavy:")
     # DEEPSEEK POLICY (operator 2026-06-07) SUPERSEDED 2026-09-07: deepseek
     # direct is now FORBIDDEN fleet-wide, full stop — not just gated to
     # review/architecture. Both aliases are already struck from
@@ -4629,9 +4297,7 @@ async def knemon_route(req: Request):
         if cap.get("capped"):
             # Half-open breaker: most jobs use metered fallback, but a small share leads
             # OAuth so routed traffic can prove recovery before the 5h stale-report TTL.
-            if CODEX_SUB_LEAD and secrets.randbelow(10000) < int(
-                OAUTH_CAP_PROBE_RATE * 10000
-            ):
+            if CODEX_SUB_LEAD and secrets.randbelow(10000) < int(OAUTH_CAP_PROBE_RATE * 10000):
                 oauth_cap_probe = True
                 chain = list(CODEX_SUB_LEAD) + METERED_FALLBACK
             else:
@@ -4659,9 +4325,7 @@ async def knemon_route(req: Request):
         "knemon_bypass": bypass,
         "oauth_cap": cap,
         "oauth_cap_probe": oauth_cap_probe,
-        "oauth_cap_probe_rate": OAUTH_CAP_PROBE_RATE
-        if cap.get("capped") and CODEX_SUB_LEAD
-        else 0.0,
+        "oauth_cap_probe_rate": OAUTH_CAP_PROBE_RATE if cap.get("capped") and CODEX_SUB_LEAD else 0.0,
         "sub_lead": CODEX_SUB_LEAD,
         # codex/gpt sub agent first ($0 unlimited), metered open-weights as fallback
         "chain": chain,
@@ -4753,9 +4417,7 @@ async def knemon_cap_set(req: Request):
         "hit_at": now,
         "capped_until": now + reset,
         "model": str(body.get("model") or ""),
-        "reporter": str(
-            body.get("reporter") or body.get("worker") or body.get("host") or ""
-        ),
+        "reporter": str(body.get("reporter") or body.get("worker") or body.get("host") or ""),
     }
     try:
         tmp = KNEMON_CAP_FILE + ".tmp"
@@ -4893,12 +4555,7 @@ async def claim_job(job_id: str, by: str):
         if a_tier not in COST_TIERS:
             a_tier = "C"
         a_auth = (a_auth or "unknown").lower()
-        sub_throttled = (
-            a_auth == "subscription"
-            and a_cap
-            and a_used
-            and a_used >= THROTTLE_HEADROOM * a_cap
-        )
+        sub_throttled = a_auth == "subscription" and a_cap and a_used and a_used >= THROTTLE_HEADROOM * a_cap
 
         # 2. job must exist + be claimable + agent must satisfy its filters
         async with db.execute(
@@ -4929,9 +4586,7 @@ async def claim_job(job_id: str, by: str):
         agent_host = (urn_parts[3] if len(urn_parts) > 3 else "").lower()
 
         if j_status not in ("queued", "offered"):
-            raise HTTPException(
-                409, f"job already in status={j_status!r}; cannot claim"
-            )
+            raise HTTPException(409, f"job already in status={j_status!r}; cannot claim")
 
         # retry-backoff gate (same as dequeue)
         if j_retry_backoff_until is not None and j_retry_backoff_until > now:
@@ -4953,8 +4608,7 @@ async def claim_job(job_id: str, by: str):
                 if len(done_ids) < len(deps):
                     raise HTTPException(
                         409,
-                        f"job has unsatisfied DAG dependencies "
-                        f"({len(done_ids)}/{len(deps)} done)",
+                        f"job has unsatisfied DAG dependencies ({len(done_ids)}/{len(deps)} done)",
                     )
 
         agent = {
@@ -5181,9 +4835,7 @@ async def get_job(job_id: str):
 async def stream_events(request: Request, since_id: int | None = None):
     """SSE stream of events. Optional since_id for catch-up."""
     if len(EVENT_QUEUE) >= MAX_EVENT_SUBSCRIBERS:
-        raise HTTPException(
-            503, f"too many event subscribers; max={MAX_EVENT_SUBSCRIBERS}"
-        )
+        raise HTTPException(503, f"too many event subscribers; max={MAX_EVENT_SUBSCRIBERS}")
     sub_id = str(uuid.uuid4())
     queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
     EVENT_QUEUE[sub_id] = queue
@@ -5218,7 +4870,7 @@ async def stream_events(request: Request, since_id: int | None = None):
                     yield {
                         "data": json.dumps(evt),
                     }
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     if time.time() - last_ping >= SSE_PING_INTERVAL:
                         yield {"event": "ping", "data": str(int(time.time()))}
                         last_ping = time.time()
@@ -5369,9 +5021,7 @@ async def zcgate_release(job_id: str):
     result["release_job_id"] = rel_id
     result["release_requested_at"] = time.time()
     async with connect_db() as db:
-        await db.execute(
-            "UPDATE jobs SET result=? WHERE id=?", (json.dumps(result), job_id)
-        )
+        await db.execute("UPDATE jobs SET result=? WHERE id=?", (json.dumps(result), job_id))
         await db.commit()
     return {"ok": True, "release_job_id": rel_id, "repo": repo, "submitter": submitter}
 
