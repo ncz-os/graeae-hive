@@ -117,7 +117,14 @@ class HiveMindRepository(ABC):
     ) -> dict[str, Any] | None: ...
 
     @abstractmethod
-    async def patch_job_status(self, tx: Transaction, job_id: str, *, sets: Mapping[str, Any]) -> int: ...
+    async def patch_job_status(
+        self,
+        tx: Transaction,
+        job_id: str,
+        *,
+        sets: Mapping[str, Any],
+        expected_status: str | None = None,
+    ) -> int: ...
 
     @abstractmethod
     async def get_job(self, tx: Transaction, *, job_id: str) -> Row | None: ...
@@ -139,14 +146,10 @@ class HiveMindRepository(ABC):
     async def agent_claim_context(self, tx: Transaction, urn: str) -> Row | None: ...
 
     @abstractmethod
-    async def pool_occupancy(
-        self, tx: Transaction, *, provider: str, model: str, now: float
-    ) -> list[Row]: ...
+    async def pool_occupancy(self, tx: Transaction, *, provider: str, model: str, now: float) -> list[Row]: ...
 
     @abstractmethod
-    async def queued_candidates(
-        self, tx: Transaction, *, agent_urn: str, now: float, limit: int
-    ) -> list[Row]: ...
+    async def queued_candidates(self, tx: Transaction, *, agent_urn: str, now: float, limit: int) -> list[Row]: ...
 
     @abstractmethod
     async def completed_job_ids(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]: ...
@@ -174,6 +177,12 @@ class HiveMindRepository(ABC):
 
     @abstractmethod
     async def agent_spend_add(self, tx: Transaction, *, urn: str, delta: float) -> None: ...
+
+    @abstractmethod
+    async def usage_ledger_insert(self, tx: Transaction, **fields: Any) -> None: ...
+
+    @abstractmethod
+    async def insert_job_audit(self, tx: Transaction, **fields: Any) -> None: ...
 
     # ---- messages ----
     @abstractmethod

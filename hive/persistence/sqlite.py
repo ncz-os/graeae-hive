@@ -6,6 +6,7 @@ import json
 import os
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 try:
@@ -14,6 +15,19 @@ except ModuleNotFoundError:
     from . import _sqlite_async as aiosqlite
 
 from .base import HiveMindRepository, Transaction
+
+
+@dataclass(frozen=True)
+class SqlExpr:
+    """A raw SQL expression value for patch_job_status ``sets`` (code-side only).
+
+    Lets a caller express ``col = col + 1`` / ``col = NULL`` / ``col = SYSTIMESTAMP``
+    without string-building SQL in the router. The expression text is never
+    caller input.
+    """
+
+    sql: str
+
 
 NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
 NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
@@ -208,9 +222,7 @@ class SqliteHiveRepository(HiveMindRepository):
         never fail a register (the caller catches it).
         """
         db = tx
-        async with db.execute(
-            "SELECT urn, metadata FROM agents WHERE host=? AND kind=?", (host, kind)
-        ) as dup_cur:
+        async with db.execute("SELECT urn, metadata FROM agents WHERE host=? AND kind=?", (host, kind)) as dup_cur:
             dup_rows = await dup_cur.fetchall()
         stale: list[str] = []
         for d_row in dup_rows or []:
@@ -465,20 +477,43 @@ class SqliteHiveRepository(HiveMindRepository):
             if not committed:
                 await db.execute("ROLLBACK")
 
-    async def patch_job_status(self, tx: Transaction, job_id: str, *, sets: Mapping[str, Any]) -> int:
+    async def patch_job_status(
+        self,
+        tx: Transaction,
+        job_id: str,
+        *,
+        sets: Mapping[str, Any],
+        expected_status: str | None = None,
+    ) -> int:
         """Backend-neutral UPDATE of one job row, on the caller's transaction.
 
         Follows the EPIMONE/MNEMOS convention: the method takes the `tx` handle
         the caller opened (`async with repo.connection() as tx:`) so multi-step
         writes stay atomic. Column names come from code (never caller input);
-        every VALUE is bound; None renders SQL NULL. Returns rowcount.
+        every VALUE is bound; None renders SQL NULL. When ``expected_status`` is
+        given the UPDATE is a compare-and-set on ``status=?`` (rowcount 0 = lost
+        the race / status changed). Returns rowcount.
+
+        ``sets`` may carry a raw SQL-expression value via the sentinel
+        ``SqlExpr`` (e.g. ``retry_count=retry_count+1``) — used by the PATCH
+        release/retry paths; the expression text is always code-side.
         """
         if not sets:
             return 0
-        assign = ", ".join(f"{col}=?" for col in sets)
-        args = list(sets.values())
+        assign_parts = []
+        args: list[Any] = []
+        for col, val in sets.items():
+            if isinstance(val, SqlExpr):
+                assign_parts.append(f"{col}={val.sql}")
+            else:
+                assign_parts.append(f"{col}=?")
+                args.append(val)
         args.append(job_id)
-        cur = await tx.execute(f"UPDATE jobs SET {assign} WHERE id=?", args)
+        where = "id=?"
+        if expected_status is not None:
+            where += " AND status=?"
+            args.append(expected_status)
+        cur = await tx.execute(f"UPDATE jobs SET {', '.join(assign_parts)} WHERE {where}", args)
         return cur.rowcount
 
     async def get_job(self, tx: Transaction, *, job_id: str) -> tuple[Any, ...] | None:
@@ -587,9 +622,7 @@ class SqliteHiveRepository(HiveMindRepository):
             return set()
         db = tx
         placeholders = ",".join("?" * len(ids))
-        async with db.execute(
-            f"SELECT id FROM jobs WHERE id IN ({placeholders})", tuple(ids)
-        ) as cur:
+        async with db.execute(f"SELECT id FROM jobs WHERE id IN ({placeholders})", tuple(ids)) as cur:
             return {row[0] async for row in cur}
 
     async def agent_kind_runtimes(self, tx: Transaction) -> list[tuple[str, str]]:
@@ -609,9 +642,7 @@ class SqliteHiveRepository(HiveMindRepository):
         ) as cur:
             return await cur.fetchone()
 
-    async def pool_occupancy(
-        self, tx: Transaction, *, provider: str, model: str, now: float
-    ) -> list[tuple[Any, ...]]:
+    async def pool_occupancy(self, tx: Transaction, *, provider: str, model: str, now: float) -> list[tuple[Any, ...]]:
         """Active (claimed_by, id) leases for a (provider, model) pool."""
         db = tx
         async with db.execute(
@@ -719,6 +750,52 @@ class SqliteHiveRepository(HiveMindRepository):
         await db.execute(
             "UPDATE agents SET plan_period_used_usd = COALESCE(plan_period_used_usd,0) + ? WHERE urn=?",
             (delta, urn),
+        )
+
+    async def usage_ledger_insert(self, tx: Transaction, **fields: Any) -> None:
+        """Append one per-job cost-ledger row (ts uses SYSTIMESTAMP)."""
+        db = tx
+        await db.execute(
+            "INSERT INTO usage_ledger (provider, model, task_kind, tokens_in, "
+            "tokens_out, tokens_reasoning, est_cost_usd, latency_ms, outcome, "
+            "caller_subsystem, tier, ts, session_id, request_count, "
+            "subscription_amortized, path_kind) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSTIMESTAMP, ?, ?, ?, ?)",
+            (
+                fields.get("provider"),
+                fields.get("model"),
+                fields.get("task_kind"),
+                fields.get("tokens_in", 0),
+                fields.get("tokens_out", 0),
+                fields.get("tokens_reasoning", 0),
+                fields.get("est_cost_usd", 0),
+                fields.get("latency_ms", 0),
+                fields.get("outcome", "err"),
+                fields.get("caller_subsystem", "hive"),
+                (fields.get("tier") or "A").upper(),
+                fields.get("session_id"),
+                fields.get("request_count", 1),
+                fields.get("subscription_amortized", 0),
+                fields.get("path_kind", "worker"),
+            ),
+        )
+
+    async def insert_job_audit(self, tx: Transaction, **fields: Any) -> None:
+        """Append one job_audit_log row (the PATCH audit trail)."""
+        db = tx
+        await db.execute(
+            "INSERT INTO job_audit_log (job_id, ts, actor_urn, old_status, new_status, "
+            "old_claimed_by, new_claimed_by, patch) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fields["job_id"],
+                fields["ts"],
+                fields.get("actor_urn"),
+                fields.get("old_status"),
+                fields.get("new_status"),
+                fields.get("old_claimed_by"),
+                fields.get("new_claimed_by"),
+                fields.get("patch_json"),
+            ),
         )
 
     async def post_message(self, tx: Transaction, **fields: Any) -> None:
