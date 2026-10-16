@@ -136,123 +136,45 @@ async def register(req: AgentRegister):
     effective_metadata = dict(req.metadata) if isinstance(req.metadata, dict) else ({} if instance else None)
     if instance:
         effective_metadata["_instance"] = instance
-    async with connect_db() as db:
-        # INSERT the fresh row FIRST, then dedup-delete the stale prior rows for the
-        # same (host, kind, instance) EXCLUDING this new URN, all inside the single
-        # transaction that commits below. Insert-before-delete (vs delete-then-insert)
-        # means there is never a window where NO row exists for this instance — a
-        # dashboard/scheduler/heartbeat always sees at least the new row. The whole
-        # thing commits atomically, so an observer sees either {old} or {new}, never
-        # {empty} and never {old,new} post-commit.
-        await db.execute(
-            "INSERT INTO agents (urn, kind, runtime, model, provider, cost_tier, autonomy_level, "
-            "auth_method, plan_cap_usd, plan_period_used_usd, subscription_pools, "
-            "host, session_id, pid, capabilities, version, started_at, last_heartbeat, status, metadata) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'online', ?)",
-            (
-                urn,
-                kind,
-                runtime,
-                model,
-                provider,
-                tier,
-                autonomy,
-                auth_method,
-                plan_cap_usd,
-                json.dumps(req.subscription_pools or []),
-                req.host,
-                session_id,
-                req.pid,
-                json.dumps(req.capabilities) if req.capabilities else None,
-                req.version,
-                now,
-                now,
-                json.dumps(effective_metadata) if effective_metadata else None,
-            ),
+    # Storage via the HiveMindRepository ABC on one transaction (EPIMONE shape):
+    # insert-then-dedup is atomic, so an observer sees {old} or {new}, never
+    # {empty} and never {old,new} post-commit.
+    async with hive_repo().connection() as tx:
+        await hive_repo().register_agent(
+            tx,
+            urn=urn,
+            kind=kind,
+            runtime=runtime,
+            model=model,
+            provider=provider,
+            cost_tier=tier,
+            autonomy_level=autonomy,
+            auth_method=auth_method,
+            plan_cap_usd=plan_cap_usd,
+            subscription_pools_json=json.dumps(req.subscription_pools or []),
+            host=req.host,
+            session_id=session_id,
+            pid=req.pid,
+            capabilities_json=json.dumps(req.capabilities) if req.capabilities else None,
+            version=req.version,
+            started_at=now,
+            last_heartbeat=now,
+            metadata_json=json.dumps(effective_metadata) if effective_metadata else None,
         )
-        # Dedup the prior rows for this stable instance. We select-then-filter in
-        # Python (matching the heartbeat metadata-merge idiom at heartbeat()) rather
-        # than push a JSON predicate into SQL, so the path is identical on SQLite and
-        # Oracle (metadata is a CLOB the backend normalizes to a str). The new URN is
-        # excluded so we never delete the row we just inserted.
         if instance:
             try:
-                async with db.execute(
-                    "SELECT urn, metadata FROM agents WHERE host=? AND kind=?",
-                    (req.host, kind),
-                ) as dup_cur:
-                    dup_rows = await dup_cur.fetchall()
-                stale_urns = []
-                for d_row in dup_rows or []:
-                    # Defensive row access: BackendCursor._normalize_row returns a
-                    # 2-tuple of (urn, metadata-as-str) for BOTH sqlite and Oracle
-                    # (Oracle CLOB / auto-decoded JSON dict are normalized to str
-                    # before we see them), but never assume — index defensively so
-                    # a driver quirk degrades to "skip dedup", never crashes.
-                    try:
-                        d_urn = d_row[0]
-                        d_meta = d_row[1] if len(d_row) > 1 else None
-                    except (IndexError, TypeError):
-                        continue
-                    if d_urn == urn:
-                        continue  # never delete the row we just inserted
-                    # Oracle 23ai can auto-decode a JSON CLOB to dict; BackendCursor
-                    # re-serializes to str, but accept a dict directly too so a
-                    # driver that hands back a mapping never silently skips a valid
-                    # dedup row via the except branch.
-                    if isinstance(d_meta, dict):
-                        m = d_meta
-                    else:
-                        if isinstance(d_meta, (bytes, bytearray)):
-                            # CLOB-as-bytes path (some drivers): decode before parse
-                            # so a valid dedup row isn't silently skipped.
-                            try:
-                                d_meta = d_meta.decode("utf-8", errors="replace")
-                            except Exception:
-                                d_meta = None
-                        try:
-                            m = json.loads(d_meta) if d_meta else {}
-                        except Exception:
-                            m = {}
-                    if isinstance(m, dict) and m.get("_instance") == instance:
-                        stale_urns.append(d_urn)
-                for s_urn in stale_urns:
-                    # SAFETY GUARD: never delete a row that currently holds an
-                    # in-flight job claim, so a stale duplicate cannot orphan a
-                    # running job. This is the EXACT proven pattern the agent-purge
-                    # reaper uses (non-correlated `? NOT IN (SELECT claimed_by FROM
-                    # jobs WHERE claimed_by IS NOT NULL AND status IN (...))` with
-                    # UNQUALIFIED columns): the sqlite->Oracle rewriter only
-                    # translates table names in FROM/JOIN/ON positions, so a
-                    # table-qualified `jobs.claimed_by` survives untranslated and
-                    # the predicate misbehaves (an earlier `NOT EXISTS(... jobs.col
-                    # ...)` draft matched 0 rows on Oracle and silently no-op'd the
-                    # delete — verified live 2026-06-15). The active-claim status set
-                    # ('offered','claimed','running') is the same one the reaper and
-                    # claim-recovery use as the authoritative in-flight predicate;
-                    # `claimed_by IS NOT NULL` guards NOT-IN null-poison. A genuinely-
-                    # restarting worker holds no claim under its old URN, so its prior
-                    # row is removed.
-                    await db.execute(
-                        "DELETE FROM agents WHERE urn=? "
-                        "AND ? NOT IN (SELECT claimed_by FROM jobs "
-                        "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running'))",
-                        (s_urn, s_urn),
-                    )
+                await hive_repo().dedup_agent_instance(
+                    tx, host=req.host, kind=kind, instance=instance, keep_urn=urn
+                )
             except Exception as _dedup_exc:
-                # Dedup is best-effort: a failure here must NEVER fail a register.
-                # The new row is already inserted; worst case a stale duplicate row
-                # lingers (the agent-purge reaper still collects it), preserving bus
-                # availability. Printed (house style — this module logs via print,
-                # not a logger) so the data-quality regression stays observable in
-                # the service journal.
+                # Dedup is best-effort: a failure never fails a register. The new
+                # row is already inserted; worst case a stale duplicate lingers.
                 print(
                     f"register dedup skipped for host={req.host} kind={kind} instance={instance!r}: {_dedup_exc!r}",
                     flush=True,
                 )
-        await db.commit()
         await emit_event(
-            db,
+            tx,
             "agent.online",
             {
                 "urn": urn,
@@ -266,6 +188,7 @@ async def register(req: AgentRegister):
                 "subscription_pools": req.subscription_pools or [],
             },
         )
+        await tx.commit()
     return {
         "urn": urn,
         "session_id": session_id,

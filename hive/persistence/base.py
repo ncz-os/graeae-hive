@@ -90,6 +90,11 @@ class HiveMindRepository(ABC):
     @abstractmethod
     async def list_agents(self, tx: Transaction, **filters: Any) -> list[dict[str, Any]]: ...
 
+    @abstractmethod
+    async def dedup_agent_instance(
+        self, tx: Transaction, *, host: str, kind: str, instance: str, keep_urn: str
+    ) -> list[str]: ...
+
     # ---- jobs ----
     @abstractmethod
     async def submit_job(self, tx: Transaction, **fields: Any) -> None: ...

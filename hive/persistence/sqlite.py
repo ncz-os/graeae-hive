@@ -196,6 +196,54 @@ class SqliteHiveRepository(HiveMindRepository):
                 )
         return rows
 
+    async def dedup_agent_instance(
+        self, tx: Transaction, *, host: str, kind: str, instance: str, keep_urn: str
+    ) -> list[str]:
+        """Best-effort removal of stale prior agent rows for a stable instance.
+
+        Select-then-filter in Python (metadata is a CLOB normalized to str on
+        Oracle) so the path is identical on every backend. NEVER deletes a row
+        that currently holds an in-flight job claim (so a stale duplicate can't
+        orphan a running job). Returns the URNs deleted. A failure here must
+        never fail a register (the caller catches it).
+        """
+        db = tx
+        async with db.execute(
+            "SELECT urn, metadata FROM agents WHERE host=? AND kind=?", (host, kind)
+        ) as dup_cur:
+            dup_rows = await dup_cur.fetchall()
+        stale: list[str] = []
+        for d_row in dup_rows or []:
+            try:
+                d_urn = d_row[0]
+                d_meta = d_row[1] if len(d_row) > 1 else None
+            except (IndexError, TypeError):
+                continue
+            if d_urn == keep_urn:
+                continue
+            if isinstance(d_meta, dict):
+                m = d_meta
+            else:
+                if isinstance(d_meta, (bytes, bytearray)):
+                    try:
+                        d_meta = d_meta.decode("utf-8", errors="replace")
+                    except Exception:
+                        d_meta = None
+                try:
+                    m = json.loads(d_meta) if d_meta else {}
+                except Exception:
+                    m = {}
+            if isinstance(m, dict) and m.get("_instance") == instance:
+                stale.append(d_urn)
+        for s_urn in stale:
+            await db.execute(
+                "DELETE FROM agents WHERE urn=? "
+                "AND ? NOT IN (SELECT claimed_by FROM jobs "
+                "WHERE claimed_by IS NOT NULL AND status IN ('offered','claimed','running'))",
+                (s_urn, s_urn),
+            )
+        return stale
+
     async def submit_job(self, tx: Transaction, **fields: Any) -> None:
         db = tx
         try:
