@@ -747,7 +747,26 @@ async def update_job(job_id: str, req: JobUpdate):
             decline_count,
             job_kind,
             job_repo,
+            existing_result,
         ) = current
+
+        # Preserve reviewer-owned keys across a worker's result write. The hive
+        # auto-reviewer appends hive_reviews to result, but a worker's later
+        # result PATCH REPLACED the whole result column and silently dropped the
+        # review (34 jobs lost their review this way; found 2026-10-16). Carry
+        # the reviewer keys over when the incoming result does not supply them,
+        # so a review is never clobbered.
+        if isinstance(req.result, dict):
+            _prev = existing_result
+            if isinstance(_prev, str):
+                try:
+                    _prev = json.loads(_prev)
+                except Exception:
+                    _prev = None
+            if isinstance(_prev, dict):
+                for _rk in ("hive_reviews", "deepseek_reviews"):
+                    if _prev.get(_rk) and not req.result.get(_rk):
+                        req.result[_rk] = _prev[_rk]
 
         if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
             raise HTTPException(409, f"invalid status transition {old_status!r} -> {req.status!r}")

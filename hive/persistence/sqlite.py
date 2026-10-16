@@ -1076,11 +1076,11 @@ class SqliteHiveRepository(HiveMindRepository):
         return cur.rowcount
 
     async def job_update_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
-        """The PATCH pre-read: status/claim/retry/decline/kind/repo for one job."""
+        """The PATCH pre-read: status/claim/retry/decline/kind/repo/result for one job."""
         db = tx
         async with db.execute(
             "SELECT status, claimed_by, claimed_provider, claimed_model, retry_count, "
-            "max_retries, COALESCE(decline_count, 0), kind, repo FROM jobs WHERE id=?",
+            "max_retries, COALESCE(decline_count, 0), kind, repo, result FROM jobs WHERE id=?",
             (job_id,),
         ) as cur:
             return await cur.fetchone()
