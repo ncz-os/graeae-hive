@@ -28,7 +28,6 @@ import os
 import secrets
 
 logger = logging.getLogger("mcp_bridge")
-import sys
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any

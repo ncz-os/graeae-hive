@@ -305,7 +305,7 @@ class SqliteHiveRepository(HiveMindRepository):
                 async with conn.execute("PRAGMA table_info(jobs)") as cur:
                     old_cols = [r[1] for r in await cur.fetchall()]
                 await conn.execute("ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration")
-                await conn.executescript(SCHEMA)  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
+                await conn.executescript(DDL)  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
                 # Copy only columns common to old + recreated table — guards against
                 # drift columns the recreated SCHEMA lacks (the live_columns ALTERs
                 # below re-add any expected-but-missing ones afterwards).
