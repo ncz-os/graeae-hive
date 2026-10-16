@@ -59,6 +59,7 @@ from hive.bus.domain.jobs import (
     is_dedup_violation,
     is_unresolvable_release,
     json_list,
+    kind_requires_commit,
     normalize_result_payload,
     stable_worker_id,
     valid_completion_proof,
@@ -811,13 +812,7 @@ async def update_job(job_id: str, req: JobUpdate):
         if req.status in {"claimed", "running"} and not effective_claimed_by:
             raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
 
-        commit_required = (
-            bool(job_repo)
-            or str(job_kind) in ("riskyeats", "code")
-            or str(job_kind).startswith(
-                ("riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:", "ic-engine", "investorclaw", "ncz-os")
-            )
-        )
+        commit_required = kind_requires_commit(job_kind, job_repo)
         if req.status == "done" and commit_required:
             proof = req.result or {}
             if not valid_completion_proof(proof):
