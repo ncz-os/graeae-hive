@@ -15,19 +15,10 @@ const _panelSig={};
 function unchanged(key,data){const s=JSON.stringify(data);if(_panelSig[key]===s)return true;_panelSig[key]=s;return false;}
 function td(html,cls=''){const t=document.createElement('td');t.className=cls;if(html instanceof Node)t.appendChild(html);else t.innerHTML=html;return t;}
 async function establishSession(){
-  if(_sessionPromise)return _sessionPromise;
-  _sessionPromise=(async()=>{
-    const token=window.prompt('Enter the Hive administrator token to open this dashboard session:');
-    if(!token)throw new Error('authentication cancelled');
-    const r=await fetch(BUS+'/v1/auth/session',{
-      method:'POST',credentials:'same-origin',
-      headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'},
-    });
-    const j=await r.json().catch(()=>({}));
-    if(!r.ok)throw new Error(j.detail||'authentication failed');
-    return j;
-  })();
-  try{return await _sessionPromise;}finally{_sessionPromise=null;}
+  // LAN-trusted bus (operator 2026-10-15): the fleet is local-LAN only and the
+  // bus requires NO auth, so there is no administrator token to enter and no
+  // /v1/auth/session route. This is a no-op kept so api() callers don't change.
+  return {};
 }
 async function api(method,path,body,retry=true){
   const opts={method,credentials:'same-origin',headers:{'Content-Type':'application/json'}};
