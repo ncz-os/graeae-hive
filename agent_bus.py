@@ -31,7 +31,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-import queue_logic
 import retry_policy
 from hive import scheduler as sched
 from hive.bus.deps import (
@@ -46,18 +45,13 @@ from hive.bus.deps import (
     emit_event,
     hive_repo,
     require_mutation_actor,
-    require_orchestrator_submitter,
-    uuidv7,
 )
 
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
 from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
     THROTTLE_HEADROOM,
-    _norm_str,
-    _norm_str_set,
     agent_kind_aliases,
-    heavy_repo_required_for_kind,
     job_agent_eligible,
 )
 from hive.bus.domain.jobs import (
@@ -67,23 +61,17 @@ from hive.bus.domain.jobs import (
     STATUS_TRANSITIONS,
     SUBSCRIPTION_PROVIDERS,
     cache_key_for,
-    cache_lookup,
-    cache_record_hit,
     cache_store,
     estimate_cost,
     hallucination_check,
     normalize_result_payload,
     valid_completion_proof,
 )
-from hive.bus.domain.jobs import (
-    is_dedup_violation as _is_dedup_violation,
-)
-from hive.bus.domain.workspace import resolve_workspace_shadow
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
 from hive.bus.routers.admin import router as _admin_router
 from hive.bus.routers.agents import heartbeat, list_agents, register
 from hive.bus.routers.agents import router as _agents_router
-from hive.bus.routers.jobs import get_job, list_jobs  # noqa: F401 (re-export for tests)
+from hive.bus.routers.jobs import create_job, get_job, list_jobs  # noqa: F401 (re-export)
 from hive.bus.routers.jobs import router as _jobs_router
 from hive.bus.routers.messages import list_messages, publish_message
 from hive.bus.routers.messages import router as _messages_router
@@ -1536,288 +1524,7 @@ async def dashboard():
 # to hive.bus.domain.{workspace,jobs} (imported above).
 
 
-@app.post("/v1/jobs")
-async def create_job(req: JobCreate):
-    """Submit work to the triage queue. No agent assignment — workers self-claim via /v1/jobs/next.
-
-    ROLE ENFORCEMENT (user directive 2026-05-23):
-    Worker runtimes (opencode/codex/hermes/claw-family/ic-engine) are CLAIMERS, not submitters.
-    Posting jobs requires submitter to be registered with an orchestrator runtime (claude-code/human/mnemos).
-    Workers attempting to POST jobs get 403 — they should call /v1/jobs/next instead.
-    """
-    job_id = uuidv7()
-    now = time.time()
-    max_cost_tier = (req.max_cost_tier or "B").upper()
-    if max_cost_tier not in COST_TIERS:
-        raise HTTPException(422, f"max_cost_tier must be one of {COST_TIERS}, got {max_cost_tier!r}")
-    # 2026-05-26: codex-only eligibility auto-rewrite, ORIGINALLY for all of
-    # codex/review/hermes-cli — codex was a CLI zeroclaw shells out to, with
-    # no standalone claimer. RESCINDED for codex 2026-09-14 (operator): a real
-    # kind=codex claimer daemon now exists and self-registers, so
-    # eligible_kinds=['codex'] is claimable again. review/hermes-cli still
-    # have no claimer and stay rewritten to ['zeroclaw'].
-    NON_CLAIMER_KINDS = {"review", "hermes-cli"}
-    if req.eligible_kinds:
-        ek = list(req.eligible_kinds)
-        # Filter out non-claimer kinds
-        kept = [k for k in ek if _norm_str(k) not in NON_CLAIMER_KINDS]
-        if not kept:
-            # All entries were non-claimer → rewrite to zeroclaw
-            req = req.model_copy(update={"eligible_kinds": ["zeroclaw"]})
-        elif kept != ek:
-            # Mixed (e.g. ["zeroclaw", "codex"]) → keep only the claimer kinds
-            req = req.model_copy(update={"eligible_kinds": kept})
-    if req.mnemos_refs:
-        bad = [r for r in req.mnemos_refs if not (isinstance(r, str) and r.startswith("mem_"))]
-        if bad:
-            raise HTTPException(422, f"mnemos_refs must be mem_XXX ids — bad entries: {bad}")
-    # DAG: validate depends_on targets exist + no self-cycle
-    if req.depends_on:
-        if job_id in req.depends_on:
-            raise HTTPException(422, "depends_on cannot include self")
-        async with connect_db() as _vd:
-            placeholders = ",".join("?" * len(req.depends_on))
-            async with _vd.execute(
-                f"SELECT id FROM jobs WHERE id IN ({placeholders})",
-                tuple(req.depends_on),
-            ) as cur:
-                found = {row[0] async for row in cur}
-            missing = [d for d in req.depends_on if d not in found]
-            if missing:
-                raise HTTPException(422, f"depends_on references unknown job ids: {missing}")
-    # AFFINITY INJECTION REMOVED (operator 2026-06-03): jobs are not pinned to
-    # hosts/kinds/capabilities — all workers eligible for everything.
-    # NARROW HEAVY-REPO CARVE-OUT (operator 2026-06-04, GRAEAE consult): the only
-    # documented exception to the line above. Large-repo classes (zeroclaw — big
-    # Rust tree) strain a lightweight worker's in-job clone -> timeout -> retry
-    # thrash -> dead-letter. Tagging them 'heavy-repo' means ONLY build hosts that
-    # advertise that capability claim them (true skip-at-poll, NOT decline-after-
-    # claim per directive 15). Everything else stays all-eligible.
-    if heavy_repo_required_for_kind(req.kind):
-        _caps = list(req.required_capabilities or [])
-        if "heavy-repo" not in _norm_str_set(_caps):
-            _caps.append("heavy-repo")
-            req = req.model_copy(update={"required_capabilities": _caps})
-    # ROLE ENFORCEMENT: check submitter runtime BEFORE the cache lookup so
-    # worker-only runtimes get a 403 consistently for both cache hits and
-    # cache misses. Unregistered submitter_urn values are rejected too; the
-    # endpoint contract says jobs are submitted by registered orchestrators.
-    await require_orchestrator_submitter(req.submitter_urn)
-
-    if req.eligible_kinds and "*" not in req.eligible_kinds:
-        async with (
-            connect_db() as _edb,
-            _edb.execute("SELECT kind, runtime FROM agents") as _cur,
-        ):
-            registered_aliases: set[str] = set()
-            async for _kind, _runtime in _cur:
-                registered_aliases.update(agent_kind_aliases(_kind, _runtime))
-        requested = _norm_str_set(req.eligible_kinds)
-        if requested and not requested.intersection(registered_aliases):
-            raise HTTPException(
-                422,
-                f"eligible_kinds has no registered worker: requested={sorted(requested)!r}; "
-                f"registered_agent_kinds={sorted(registered_aliases)!r}",
-            )
-
-    # GRAEAE permanent logjam-fix: SUBMIT-TIME WORKSPACE ADMISSION (SHADOW / log-only, 2026-06-04).
-    # Mode-1 jam = jobs (kind="code", no project/repo) whose workspace can't resolve -> worker
-    # declines -> dead-letter. Observe would-be 422s now; enforce after vocabulary stabilizes (~1wk).
-    try:
-        _ws, _wsrc = resolve_workspace_shadow(req.kind, req.description, req.target_workspace, req.project)
-        if _wsrc == "UNRESOLVABLE":
-            print(
-                f"ADMISSION_SHADOW would-422 no_resolvable_workspace kind={req.kind!r} "
-                f"project={req.project!r} submitter={req.submitter_urn}",
-                flush=True,
-            )
-        elif _wsrc == "prefix-fallback":
-            print(
-                f"ADMISSION_SHADOW deprecated_prefix_resolve kind={req.kind!r} -> ws={_ws} "
-                f"(migrate submitter to target_workspace)",
-                flush=True,
-            )
-        if _wsrc in ("UNRESOLVABLE", "prefix-fallback"):
-            try:
-                import json as _sj
-
-                with open("/srv/agent-bus/admission_shadow.jsonl", "a") as _sf:
-                    _sf.write(
-                        _sj.dumps(
-                            {
-                                "ts": now,
-                                "verdict": _wsrc,
-                                "kind": req.kind,
-                                "project": req.project,
-                                "submitter": req.submitter_urn,
-                                "resolved_ws": _ws,
-                            }
-                        )
-                        + "\n"
-                    )
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # RESULT-CACHE CHECK: identical (kind, description, max_cost_tier, required_caps) within TTL → return cached result, mark new job done immediately
-    ck = cache_key_for(req.kind, req.description, max_cost_tier, req.required_capabilities)
-    async with connect_db() as db:
-        cached = await cache_lookup(db, ck)
-        # Repository jobs must execute against their actual checkout. A cached
-        # narrative is not evidence of delivery, even if it contains old SHAs.
-        if req.repo:
-            cached = None
-        if cached:
-            # short-circuit: store job as done with cached result + cost=0
-            await db.execute(
-                "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-                "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, status, started_at, ended_at, result, claimed_provider, claimed_model, "
-                "claimed_cost_tier, estimated_cost_usd, result_mnemos_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, 'A', 0, ?)",
-                (
-                    job_id,
-                    req.submitter_urn,
-                    req.parent_job_id,
-                    req.kind,
-                    req.description,
-                    req.priority,
-                    req.deadline,
-                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
-                    json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
-                    json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
-                    req.project,
-                    max_cost_tier,
-                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
-                    json.dumps(req.preferred_models) if req.preferred_models else None,
-                    json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
-                    now,
-                    now,
-                    json.dumps(
-                        {
-                            **(cached["result"] or {}),
-                            "cache_hit": True,
-                            "source_job_id": cached["source_job_id"],
-                        }
-                    ),
-                    cached["provider"],
-                    cached["model"],
-                    cached.get("result_mnemos_id"),
-                ),
-            )
-            # record cache hit with estimated cost-saving (use prior job's cost or fallback)
-            saved = 0.01  # conservative fallback if no token data
-            await cache_record_hit(db, ck, saved)
-            await db.commit()
-            await emit_event(
-                db,
-                "job.cached",
-                {
-                    "id": job_id,
-                    "source_job_id": cached["source_job_id"],
-                    "kind": req.kind,
-                    "cost_saved_usd": saved,
-                },
-            )
-            return {
-                "id": job_id,
-                "created_at": now,
-                "status": "done",
-                "cache_hit": True,
-                "source_job_id": cached["source_job_id"],
-                "result": cached["result"],
-                "result_mnemos_id": cached.get("result_mnemos_id"),
-            }
-        # role check moved to the top of create_job() so cache hits and
-        # cache misses share the same enforcement (was bypassable for
-        # worker-runtimes when cache had a relevant entry; see comment
-        # near the role-enforcement block above).
-        dedup_scope_version = json.dumps(
-            {
-                "tier": max_cost_tier,
-                "caps": sorted(req.required_capabilities or []),
-                "eligible_hosts": sorted(req.eligible_hosts or []),
-                "eligible_kinds": sorted(req.eligible_kinds or []),
-                "preferred_providers": req.preferred_providers or [],
-                "preferred_models": req.preferred_models or [],
-                "depends_on": sorted(req.depends_on or []),
-                "project": req.project,
-                "parent_job_id": req.parent_job_id,
-                "mnemos_refs": sorted(req.mnemos_refs or []),
-                "deadline": req.deadline,
-            },
-            sort_keys=True,
-            default=str,
-        )
-        dedup_hash = queue_logic.dedup_key(
-            tenant="_default",
-            kind=req.kind,
-            description=req.description,
-            version=dedup_scope_version,
-            idempotency_key=req.idempotency_key,
-        )
-        try:
-            await db.execute(
-                "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
-                "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, preferred_models, "
-                "mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, pr_number, status, started_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
-                (
-                    job_id,
-                    req.submitter_urn,
-                    req.parent_job_id,
-                    req.kind,
-                    req.description,
-                    req.priority,
-                    req.deadline,
-                    json.dumps(req.required_capabilities) if req.required_capabilities else None,
-                    json.dumps(req.eligible_kinds) if req.eligible_kinds else None,
-                    json.dumps(req.eligible_hosts) if req.eligible_hosts else None,
-                    req.project,
-                    max_cost_tier,
-                    json.dumps(req.preferred_providers) if req.preferred_providers else None,
-                    json.dumps(req.preferred_models) if req.preferred_models else None,
-                    json.dumps(req.mnemos_refs) if req.mnemos_refs else None,
-                    json.dumps(req.depends_on) if req.depends_on else None,
-                    int(req.max_retries),
-                    dedup_hash,
-                    req.site,
-                    req.repo,
-                    req.head_branch,
-                    (int(req.pr_number) if req.pr_number is not None else None),
-                    now,
-                ),
-            )
-            await db.commit()
-        except Exception as _dexc:
-            if not _is_dedup_violation(_dexc):
-                raise
-            async with db.execute(
-                "SELECT id, started_at FROM jobs WHERE dedup_hash = ? "
-                "AND status IN ('queued', 'offered', 'claimed', 'running') "
-                "ORDER BY started_at ASC LIMIT 1",
-                (dedup_hash,),
-            ) as _cur:
-                _row = await _cur.fetchone()
-            if _row:
-                return {"id": _row[0], "created_at": _row[1], "coalesced": True}
-            raise
-        await emit_event(
-            db,
-            "job.queued",
-            {
-                "id": job_id,
-                "submitter": req.submitter_urn,
-                "kind": req.kind,
-                "description": req.description,
-                "priority": req.priority,
-                "required_capabilities": req.required_capabilities,
-                "eligible_kinds": req.eligible_kinds,
-                "max_cost_tier": max_cost_tier,
-                "mnemos_refs": req.mnemos_refs,
-            },
-        )
-    return {"id": job_id, "created_at": now, "mnemos_refs": req.mnemos_refs}
+# POST /v1/jobs (create_job) moved to hive.bus.routers.jobs (Phase 1c).
 
 
 @app.post("/v1/jobs/next")
