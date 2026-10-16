@@ -50,6 +50,7 @@ from hive.bus.domain.jobs import (
     MAX_DECLINE_REQUEUES,
     STATUS_TRANSITIONS,
     SUBSCRIPTION_PROVIDERS,
+    _cache_json,
     _safe_nonneg_int,
     _safe_str,
     cache_key_for,
@@ -1031,11 +1032,11 @@ async def update_job(job_id: str, req: JobUpdate):
                             tx,
                             cache_key=ck,
                             source_job_id=job_id,
-                            result=rdict,
+                            result_json=_cache_json(rdict),
                             result_mnemos_id=req.result_mnemos_id,
                             model=mdl_j or "unknown",
                             provider=prov_j or "unknown",
-                            cost_for_save=cost_estimate or 0,
+                            cached_at=time.time(),
                         )
 
         await hive_repo().insert_job_audit(
