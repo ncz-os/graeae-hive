@@ -10,7 +10,7 @@ import time
 
 from fastapi import APIRouter, HTTPException
 
-from hive.bus.deps import connect_db, require_orchestrator_submitter, uuidv7
+from hive.bus.deps import connect_db, hive_repo, require_orchestrator_submitter, uuidv7
 from hive.bus.schemas import JobCreate, ScheduleCreate
 
 router = APIRouter()
@@ -33,51 +33,42 @@ async def create_schedule(req: ScheduleCreate):
     except Exception as e:
         raise HTTPException(422, f"job_template invalid: {e}") from e
     await require_orchestrator_submitter(tpl_copy["submitter_urn"])
-    async with connect_db() as db:
-        await db.execute(
-            "INSERT INTO scheduled_jobs (id, name, created_by_urn, interval_seconds, "
-            "job_template, enabled, last_fired_at, next_fire_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                sid,
-                req.name,
-                tpl_copy.get("submitter_urn"),
-                int(req.interval_seconds),
-                json.dumps(req.job_template),
-                1 if req.enabled else 0,
-                None,  # last_fired_at: never fired yet
-                now + req.interval_seconds,  # next_fire_at
-                now,  # created_at
-            ),
+    # Storage via the HiveMindRepository ABC on a transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        await hive_repo().create_schedule(
+            tx,
+            id=sid,
+            name=req.name,
+            created_by_urn=tpl_copy.get("submitter_urn"),
+            interval_seconds=int(req.interval_seconds),
+            job_template_json=json.dumps(req.job_template),
+            enabled=1 if req.enabled else 0,
+            next_fire_at=now + req.interval_seconds,
+            created_at=now,
         )
-        await db.commit()
+        await tx.commit()
     return {"id": sid, "name": req.name, "next_fire_at": now + req.interval_seconds}
 
 
 @router.get("/v1/schedules")
 async def list_schedules():
-    rows = []
-    async with (
-        connect_db() as db,
-        db.execute(
-            "SELECT id, name, created_by_urn, interval_seconds, enabled, "
-            "last_fired_at, next_fire_at, fire_count, created_at FROM scheduled_jobs"
-        ) as cur,
-    ):
-        async for r in cur:
-            rows.append(
-                {
-                    "id": r[0],
-                    "name": r[1],
-                    "created_by": r[2],
-                    "interval_seconds": r[3],
-                    "enabled": bool(r[4]),
-                    "last_fired_at": r[5],
-                    "next_fire_at": r[6],
-                    "fire_count": r[7],
-                    "created_at": r[8],
-                }
-            )
+    # Storage via the HiveMindRepository ABC on a transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        raw = await hive_repo().list_schedules(tx)
+    rows = [
+        {
+            "id": r["id"],
+            "name": r["name"],
+            "created_by": r["created_by_urn"],
+            "interval_seconds": r["interval_seconds"],
+            "enabled": r["enabled"],
+            "last_fired_at": r["last_fired_at"],
+            "next_fire_at": r["next_fire_at"],
+            "fire_count": r["fire_count"],
+            "created_at": r["created_at"],
+        }
+        for r in raw
+    ]
     return {"count": len(rows), "schedules": rows}
 
 

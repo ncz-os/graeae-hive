@@ -13,7 +13,6 @@ from fastapi import APIRouter
 
 from hive.bus.deps import (
     clamp_limit,
-    connect_db,
     emit_event,
     hive_repo,
     require_registered_agent,
@@ -29,22 +28,20 @@ async def publish_message(req: MessagePublish):
     msg_id = uuidv7()
     now = time.time()
     await require_registered_agent(req.from_urn, active_only=True)
-    async with connect_db() as db:
-        await db.execute(
-            "INSERT INTO messages (id, from_urn, to_urn, in_reply_to, topic, payload, ts) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                msg_id,
-                req.from_urn,
-                req.to_urn,
-                req.in_reply_to,
-                req.topic,
-                json.dumps(req.payload),
-                now,
-            ),
+    # Storage via the HiveMindRepository ABC on a transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        await hive_repo().post_message(
+            tx,
+            id=msg_id,
+            from_urn=req.from_urn,
+            to_urn=req.to_urn,
+            in_reply_to=req.in_reply_to,
+            topic=req.topic,
+            payload_json=json.dumps(req.payload),
+            ts=now,
         )
-        await db.commit()
         await emit_event(
-            db,
+            tx,
             "message",
             {
                 "id": msg_id,
@@ -54,6 +51,7 @@ async def publish_message(req: MessagePublish):
                 "payload": req.payload,
             },
         )
+        await tx.commit()
     return {"id": msg_id, "ts": now}
 
 
