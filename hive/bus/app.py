@@ -589,11 +589,13 @@ async def reaper_task(app: FastAPI):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if HIVE_BACKEND == "db2":
-        # Db2 owns its DDL via the repository (init/close). Do NOT run the
-        # sqlite schema-convergence path below, which needs a raw connection
-        # handle the Db2 repo does not expose.
-        repo = hive_repo()
+    repo = hive_repo()
+    if HIVE_BACKEND in ("db2", "oracle"):
+        # Db2 + Oracle own their DDL/migration via the repository (init/close).
+        # Do NOT run the sqlite schema-convergence path below, which needs a raw
+        # sqlite connection handle these backends do not expose. Oracle's
+        # migration (columns, status CHECK, indexes, dedup) lives in
+        # OracleHiveRepository.init/_apply_migrations.
         await repo.init()
         task = asyncio.create_task(reaper_task(app))
         app.state.reaper_task = task
@@ -752,68 +754,16 @@ async def lifespan(app: FastAPI):
         # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
         # rebuild recreates the table from SCHEMA (sans drift columns), then the
         # loop re-adds any missing columns (incl. decline_count) to the new table.
-        # SQLite only — the mocked sqlite_master on the Oracle adapter makes this
-        # unsafe there; Oracle gets its own migration below.
-        if HIVE_BACKEND == "sqlite":
-            await _ensure_jobs_status_allows_dead_letter(db)
+        # (SQLite-only path — Oracle/Db2 converge via their repository init().)
+        await _ensure_jobs_status_allows_dead_letter(db)
         for table, col, ddl_fragment in live_columns:
             await _ensure_column(db, table, col, ddl_fragment)
         await _ensure_agents_status_allows_stale(db)
 
-        # Thrash fix (2026-06-02) — Oracle backend equivalents. The live hive
-        # runs HIVE_BACKEND=oracle; the SQLite executescript/ALTER paths above
-        # are no-ops there, so add decline_count + relax CK_HIVE_JOBS_STATUS to
-        # include 'dead-letter' (and 'failed_completion') directly via the Oracle
-        # connection. Both steps are idempotent and guarded by existence checks.
-        # DDL on the Oracle adapter is intentionally a no-op (translate returns
-        # None for ALTER/CREATE/DROP), so run these on the RAW oracledb connection
-        # (db._conn) to actually apply them. Idempotent + existence-guarded.
-        if HIVE_BACKEND == "oracle" and getattr(db, "_conn", None) is not None:
-            try:
-                raw = db._conn
-                rcur = raw.cursor()
-                rcur.execute(
-                    "SELECT COUNT(*) FROM user_tab_columns "
-                    "WHERE table_name = 'HIVE_JOBS' AND column_name = 'DECLINE_COUNT'"
-                )
-                has_col = (rcur.fetchone())[0]
-                if not has_col:
-                    rcur.execute("ALTER TABLE HIVE_JOBS ADD (decline_count NUMBER DEFAULT 0 NOT NULL)")
-                for _c, _d in (
-                    ("SITE", "VARCHAR2(64)"),
-                    ("REPO", "VARCHAR2(512)"),
-                    ("HEAD_BRANCH", "VARCHAR2(512)"),
-                    ("PR_NUMBER", "NUMBER"),
-                ):
-                    rcur.execute(
-                        "SELECT COUNT(*) FROM user_tab_columns WHERE table_name = 'HIVE_JOBS' AND column_name = :1",
-                        [_c],
-                    )
-                    if not (rcur.fetchone())[0]:
-                        rcur.execute(f"ALTER TABLE HIVE_JOBS ADD ({_c} {_d})")
-                rcur.execute(
-                    "SELECT search_condition_vc FROM user_constraints "
-                    "WHERE table_name = 'HIVE_JOBS' AND constraint_name = 'CK_HIVE_JOBS_STATUS'"
-                )
-                crow = rcur.fetchone()
-                cond = str(crow[0]) if crow and crow[0] is not None else ""
-                if crow is not None and "dead-letter" not in cond:
-                    rcur.execute("ALTER TABLE HIVE_JOBS DROP CONSTRAINT CK_HIVE_JOBS_STATUS")
-                    rcur.execute(
-                        "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS "
-                        "CHECK (status IN ('queued','offered','claimed','running',"
-                        "'done','failed','failed_completion','cancelled','dead-letter'))"
-                    )
-                rcur.close()
-                db._conn.commit()
-            except Exception as e:
-                # FATAL: the runtime decline/dead-letter path REQUIRES both the
-                # decline_count column and the relaxed status CHECK. If this DDL
-                # fails, every subsequent decline PATCH would error (invalid
-                # identifier / CHECK violation), so refuse to start rather than
-                # serve a half-migrated bus.
-                print(f"oracle dead-letter migration skipped (non-fatal): {e}", flush=True)
-                # non-fatal: runtime dead-letter UPDATE falls back to requeue if CHECK not relaxed
+        # (Oracle decline_count / CK_HIVE_JOBS_STATUS DDL removed: it was a
+        # superseded duplicate of OracleHiveRepository.init/_apply_migrations,
+        # which Oracle now runs via repo.init() above.)
+
         # Idempotent index re-creates (in case live DB pre-dates an index).
         live_indexes = (
             "CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status)",
