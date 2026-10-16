@@ -63,7 +63,7 @@ from mcp.types import (
 )
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://127.0.0.1:5005")
@@ -502,6 +502,10 @@ async def handle_sse(request):
             experimental_capabilities={},
         )
         await server.run(read_stream, write_stream, options)
+    # The endpoint MUST return a Response once the SSE stream closes: returning
+    # None made Starlette call `await None(...)` (routing.py->await response(...))
+    # and raise TypeError on every stream end — ~5000 log errors/day + churn.
+    return Response()
 
 
 app = Starlette(
