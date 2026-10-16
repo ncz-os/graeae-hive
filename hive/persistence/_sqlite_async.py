@@ -108,7 +108,5 @@ class Connection:
 async def connect(database: str, **kwargs: Any) -> Connection:
     timeout = kwargs.pop("timeout", 5.0)
     check_same_thread = kwargs.pop("check_same_thread", False)
-    conn = sqlite3.connect(
-        database, timeout=timeout, check_same_thread=check_same_thread
-    )
+    conn = sqlite3.connect(database, timeout=timeout, check_same_thread=check_same_thread)
     return Connection(conn)

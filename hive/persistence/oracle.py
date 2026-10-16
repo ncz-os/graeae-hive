@@ -287,12 +287,8 @@ class BackendCursor:
         self._cursor = cursor
         self._rows = rows
         self._index = 0
-        self.rowcount = (
-            rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
-        )
-        self.lastrowid = (
-            getattr(cursor, "lastrowid", None) if cursor is not None else None
-        )
+        self.rowcount = rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
+        self.lastrowid = getattr(cursor, "lastrowid", None) if cursor is not None else None
 
     async def __aenter__(self):
         return self
@@ -316,9 +312,7 @@ class BackendCursor:
 
         def default(value):
             if isinstance(value, _Decimal):
-                return (
-                    float(value) if value != value.to_integral_value() else int(value)
-                )
+                return float(value) if value != value.to_integral_value() else int(value)
             if isinstance(value, (bytes, bytearray)):
                 if len(value) == 16:
                     return str(_uuid.UUID(bytes=bytes(value)))
@@ -337,9 +331,7 @@ class BackendCursor:
                     result = await result
                 out.append(result)
             elif isinstance(value, _Decimal):
-                out.append(
-                    int(value) if value == value.to_integral_value() else float(value)
-                )
+                out.append(int(value) if value == value.to_integral_value() else float(value))
             elif isinstance(value, _dt.datetime):
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=_dt.UTC)
@@ -413,10 +405,7 @@ class OracleConnection:
                 "SELECT column_name FROM user_tab_columns WHERE table_name = :1 ORDER BY column_id",
                 (mapped.upper(),),
             )
-            rows = [
-                (i, row[0].lower(), None, None, None, None)
-                for i, row in enumerate(await cur.fetchall())
-            ]
+            rows = [(i, row[0].lower(), None, None, None, None) for i, row in enumerate(await cur.fetchall())]
             await BackendCursor(cur).close()
             return BackendCursor(rows=rows)
         translated, translated_params = _translate_sql(sql, params)
@@ -431,9 +420,7 @@ class OracleConnection:
         if translated is None:
             return BackendCursor(rows=[])
         cur = self._conn.cursor()
-        await cur.executemany(
-            _rewrite_limit(translated), [tuple(p) for p in seq_of_params]
-        )
+        await cur.executemany(_rewrite_limit(translated), [tuple(p) for p in seq_of_params])
         return BackendCursor(cur)
 
     async def executescript(self, script: str):
@@ -471,9 +458,7 @@ class OracleHiveRepository(SqliteHiveRepository):
         try:
             import oracledb
         except Exception as exc:
-            raise RuntimeError(
-                f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}"
-            ) from exc
+            raise RuntimeError(f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}") from exc
         user, password, dsn = _parse_oracle_url(self.dsn)
         raw = await oracledb.connect_async(user=user, password=password, dsn=dsn)
         try:
@@ -490,8 +475,7 @@ class OracleHiveRepository(SqliteHiveRepository):
     async def _job_columns(raw: Any) -> dict[str, tuple[str, int | None]]:
         rows = await _raw_execute(
             raw,
-            "SELECT column_name, data_type, data_length FROM user_tab_columns "
-            "WHERE table_name = 'HIVE_JOBS'",
+            "SELECT column_name, data_type, data_length FROM user_tab_columns WHERE table_name = 'HIVE_JOBS'",
         )
         return {
             str(name).strip().upper(): (
@@ -521,9 +505,7 @@ class OracleHiveRepository(SqliteHiveRepository):
         columns = await self._job_columns(raw)
         status_type, status_length = columns.get("STATUS", ("", 0))
         if status_type not in {"VARCHAR2", "VARCHAR"} or (status_length or 0) < 32:
-            await _raw_execute(
-                raw, "ALTER TABLE HIVE_JOBS MODIFY (status VARCHAR2(32))"
-            )
+            await _raw_execute(raw, "ALTER TABLE HIVE_JOBS MODIFY (status VARCHAR2(32))")
 
         checks = await _raw_execute(
             raw,
@@ -533,9 +515,7 @@ class OracleHiveRepository(SqliteHiveRepository):
         status_checks = [
             (str(name).strip().upper(), str(condition or ""))
             for name, condition in checks
-            if re.search(
-                r"\bSTATUS\b\s+IN\s*\(", str(condition or ""), flags=re.IGNORECASE
-            )
+            if re.search(r"\bSTATUS\b\s+IN\s*\(", str(condition or ""), flags=re.IGNORECASE)
         ]
         if not any(
             all(value.upper() in condition.upper() for value in _ORACLE_JOB_STATUSES)
@@ -546,8 +526,7 @@ class OracleHiveRepository(SqliteHiveRepository):
             values = ",".join(f"'{value}'" for value in _ORACLE_JOB_STATUSES)
             await _raw_execute(
                 raw,
-                "ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS_RUNTIME "
-                f"CHECK (status IN ({values}))",
+                f"ALTER TABLE HIVE_JOBS ADD CONSTRAINT CK_HIVE_JOBS_STATUS_RUNTIME CHECK (status IN ({values}))",
             )
 
         indexes = await self._indexes(raw)
@@ -596,9 +575,7 @@ class OracleHiveRepository(SqliteHiveRepository):
         columns = await self._job_columns(raw)
         missing = _ORACLE_REQUIRED_JOB_COLUMNS - set(columns)
         if missing:
-            raise RuntimeError(
-                f"Oracle schema verification failed: HIVE_JOBS missing {sorted(missing)}"
-            )
+            raise RuntimeError(f"Oracle schema verification failed: HIVE_JOBS missing {sorted(missing)}")
         status_type, status_length = columns["STATUS"]
         if status_type not in {"VARCHAR2", "VARCHAR"} or (status_length or 0) < 17:
             raise RuntimeError(
@@ -610,31 +587,21 @@ class OracleHiveRepository(SqliteHiveRepository):
                 f"Oracle schema verification failed: HIVE_JOBS.DEDUP_HASH is {dedup_type}({dedup_length}), expected VARCHAR2(>=64)"
             )
         if columns["CLAIM_LEASE_EXPIRES_AT"][0] != "NUMBER":
-            raise RuntimeError(
-                "Oracle schema verification failed: HIVE_JOBS.CLAIM_LEASE_EXPIRES_AT must be NUMBER"
-            )
+            raise RuntimeError("Oracle schema verification failed: HIVE_JOBS.CLAIM_LEASE_EXPIRES_AT must be NUMBER")
         if columns["ELIGIBLE_HOSTS"][0] not in {"CLOB", "JSON"}:
-            raise RuntimeError(
-                "Oracle schema verification failed: HIVE_JOBS.ELIGIBLE_HOSTS must be CLOB or JSON"
-            )
+            raise RuntimeError("Oracle schema verification failed: HIVE_JOBS.ELIGIBLE_HOSTS must be CLOB or JSON")
         indexes = await self._indexes(raw)
         if "IDX_HIVE_JOBS_CLAIM_LEASE" not in indexes:
-            raise RuntimeError(
-                "Oracle schema verification failed: claim lease index is missing"
-            )
+            raise RuntimeError("Oracle schema verification failed: claim lease index is missing")
         if not ({"JOBS_ACTIVE_DEDUP_UQ", "HIVE_JOBS_ACTIVE_DEDUP_UQ"} & indexes):
-            raise RuntimeError(
-                "Oracle schema verification failed: active dedup index is missing"
-            )
+            raise RuntimeError("Oracle schema verification failed: active dedup index is missing")
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Any]:
         try:
             import oracledb
         except Exception as exc:
-            raise RuntimeError(
-                f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}"
-            ) from exc
+            raise RuntimeError(f"HIVE_BACKEND=oracle requires python-oracledb importable: {exc}") from exc
         user, password, dsn = _parse_oracle_url(self.dsn)
         raw = await oracledb.connect_async(user=user, password=password, dsn=dsn)
         db = self.connection_class(raw)

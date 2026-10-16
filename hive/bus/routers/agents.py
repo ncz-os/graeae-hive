@@ -291,14 +291,18 @@ async def heartbeat(req: AgentHeartbeat):
             422,
             f"agent status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}",
         )
-    # Storage via the HiveMindRepository ABC: the metadata merge happens inside
-    # the storage layer (one connection), so no raw SELECT here.
-    rowcount = await hive_repo().heartbeat_agent(
-        urn=req.urn,
-        ts=now,
-        status=status,
-        metadata_patch=req.metadata if req.metadata is not None else None,
-    )
+    # Storage via the HiveMindRepository ABC: metadata merge happens in the
+    # storage layer; the caller owns the transaction + its commit (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        rowcount = await hive_repo().heartbeat_agent(
+            tx,
+            urn=req.urn,
+            ts=now,
+            status=status,
+            metadata_patch=req.metadata if req.metadata is not None else None,
+        )
+        if rowcount:
+            await tx.commit()
     if rowcount == 0:
         raise HTTPException(404, f"agent not found: {req.urn}")
     return {"ack": True, "ts": now}
@@ -319,16 +323,18 @@ async def list_agents(
             422,
             f"status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}",
         )
-    # Storage via the HiveMindRepository ABC (no raw SQL in the router).
-    rows = await hive_repo().list_agents(
-        status=status,
-        kind=kind,
-        host=host,
-        runtime=runtime,
-        pid=pid,
-        cost_tier=cost_tier,
-        include_offline=include_offline,
-    )
+    # Storage via the HiveMindRepository ABC on a transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        rows = await hive_repo().list_agents(
+            tx,
+            status=status,
+            kind=kind,
+            host=host,
+            runtime=runtime,
+            pid=pid,
+            cost_tier=cost_tier,
+            include_offline=include_offline,
+        )
     for r in rows:
         # build display name: kind@host[pid] cwd:cwd_basename — distinguishes multiple sessions on same host
         meta = r.get("metadata") or {}

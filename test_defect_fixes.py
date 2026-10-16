@@ -406,12 +406,15 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             repo = SqliteHiveRepository(str(Path(td) / "jobs.db"))
             await repo.init(agent_bus.SCHEMA)
-            await repo.submit_job(
-                id="job-result",
-                submitter_urn="urn:submitter",
-                kind="test",
-                started_at=1.0,
-            )
+            async with repo.connection() as tx:
+                await repo.submit_job(
+                    tx,
+                    id="job-result",
+                    submitter_urn="urn:submitter",
+                    kind="test",
+                    started_at=1.0,
+                )
+                await tx.commit()
             async with repo.connection() as db:
                 await db.execute(
                     "UPDATE jobs SET status='done', ended_at=?, result=? WHERE id=?",

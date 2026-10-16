@@ -320,9 +320,7 @@ def _split_script(script: str) -> list[str]:
 
 def _is_already_exists(exc: BaseException) -> bool:
     text = str(exc).upper()
-    return (
-        "SQLSTATE=42710" in text or "SQLSTATE 42710" in text or "ALREADY EXISTS" in text
-    )
+    return "SQLSTATE=42710" in text or "SQLSTATE 42710" in text or "ALREADY EXISTS" in text
 
 
 def _adapt_sql(sql: str, params: Any = None) -> tuple[str | None, tuple[Any, ...]]:
@@ -417,9 +415,7 @@ class _Db2Cursor:
         self._cursor = cursor
         self._rows = rows
         self._index = 0
-        self.rowcount = (
-            rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
-        )
+        self.rowcount = rowcount if cursor is None else getattr(cursor, "rowcount", rowcount)
         self.lastrowid = None
 
     async def __aenter__(self):
@@ -454,16 +450,12 @@ class _Db2Cursor:
         out = []
         for value in row:
             if isinstance(value, (dict, list)):
-                out.append(
-                    _json.dumps(value, separators=(",", ":"), default=cls._json_default)
-                )
+                out.append(_json.dumps(value, separators=(",", ":"), default=cls._json_default))
             elif hasattr(value, "read") and callable(value.read):
                 result = await asyncio.to_thread(value.read)
                 out.append(result)
             elif isinstance(value, _Decimal):
-                out.append(
-                    int(value) if value == value.to_integral_value() else float(value)
-                )
+                out.append(int(value) if value == value.to_integral_value() else float(value))
             elif isinstance(value, _dt.datetime):
                 if value.tzinfo is None:
                     value = value.replace(tzinfo=_dt.UTC)
@@ -488,10 +480,7 @@ class _Db2Cursor:
             rows = self._rows[self._index :]
             self._index = len(self._rows)
             return [await self._normalize_row(row) for row in rows]
-        return [
-            await self._normalize_row(row)
-            for row in await asyncio.to_thread(self._cursor.fetchall)
-        ]
+        return [await self._normalize_row(row) for row in await asyncio.to_thread(self._cursor.fetchall)]
 
     async def close(self):
         if self._cursor is not None:
@@ -542,9 +531,7 @@ class _Db2Connection:
 
         return _Db2Cursor(await asyncio.to_thread(_go))
 
-    async def executemany(
-        self, sql: str, seq_of_params: list[tuple[Any, ...]]
-    ) -> _Db2Cursor:
+    async def executemany(self, sql: str, seq_of_params: list[tuple[Any, ...]]) -> _Db2Cursor:
         if not seq_of_params:
             return _Db2Cursor(rows=[])
         adapted, _ = _adapt_sql(sql, seq_of_params[0])
@@ -604,9 +591,7 @@ class _Db2Pool:
             raise RuntimeError(
                 f"HIVE_BACKEND=db2 requires ibm_db/ibm_db_dbi importable before connecting: {exc}"
             ) from exc
-        raw = await asyncio.to_thread(
-            ibm_db_dbi.connect, _dsn_string(self._parts), "", ""
-        )
+        raw = await asyncio.to_thread(ibm_db_dbi.connect, _dsn_string(self._parts), "", "")
         return _Db2Connection(raw)
 
     async def warmup(self) -> None:
@@ -639,9 +624,7 @@ class _Db2Pool:
                     break
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    raise TimeoutError(
-                        f"DB2 pool acquire timeout after {self._acquire_timeout:.1f}s"
-                    )
+                    raise TimeoutError(f"DB2 pool acquire timeout after {self._acquire_timeout:.1f}s")
                 await asyncio.wait_for(self._not_full.wait(), remaining)
         if need_open:
             try:
@@ -695,20 +678,10 @@ class Db2HiveRepository(SqliteHiveRepository):
         super().__init__(":memory:")
         self.dsn = dsn
         self._pool: _Db2Pool | None = None
-        self._min_size = int(
-            min_size
-            if min_size is not None
-            else os.environ.get("HIVE_DB2_POOL_MIN", "0")
-        )
-        self._max_size = int(
-            max_size
-            if max_size is not None
-            else os.environ.get("HIVE_DB2_POOL_MAX", "8")
-        )
+        self._min_size = int(min_size if min_size is not None else os.environ.get("HIVE_DB2_POOL_MIN", "0"))
+        self._max_size = int(max_size if max_size is not None else os.environ.get("HIVE_DB2_POOL_MAX", "8"))
         self._acquire_timeout = float(
-            acquire_timeout
-            if acquire_timeout is not None
-            else os.environ.get("HIVE_DB2_ACQUIRE_TIMEOUT", "30")
+            acquire_timeout if acquire_timeout is not None else os.environ.get("HIVE_DB2_ACQUIRE_TIMEOUT", "30")
         )
 
     async def init(self, schema: str | None = None) -> None:
@@ -727,8 +700,7 @@ class Db2HiveRepository(SqliteHiveRepository):
     @staticmethod
     async def _columns(db: Any, table: str) -> set[str]:
         async with db.execute(
-            "SELECT colname FROM syscat.columns "
-            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            "SELECT colname FROM syscat.columns WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
             (table.upper(),),
         ) as cur:
             return {str(row[0]).strip().upper() for row in await cur.fetchall()}
@@ -736,19 +708,15 @@ class Db2HiveRepository(SqliteHiveRepository):
     @staticmethod
     async def _column_lengths(db: Any, table: str) -> dict[str, int]:
         async with db.execute(
-            "SELECT colname, length FROM syscat.columns "
-            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            "SELECT colname, length FROM syscat.columns WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
             (table.upper(),),
         ) as cur:
-            return {
-                str(row[0]).strip().upper(): int(row[1]) for row in await cur.fetchall()
-            }
+            return {str(row[0]).strip().upper(): int(row[1]) for row in await cur.fetchall()}
 
     @staticmethod
     async def _indexes(db: Any, table: str) -> set[str]:
         async with db.execute(
-            "SELECT indname FROM syscat.indexes "
-            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            "SELECT indname FROM syscat.indexes WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
             (table.upper(),),
         ) as cur:
             return {str(row[0]).strip().upper() for row in await cur.fetchall()}
@@ -756,8 +724,7 @@ class Db2HiveRepository(SqliteHiveRepository):
     @staticmethod
     async def _status_checks(db: Any, table: str) -> dict[str, str]:
         async with db.execute(
-            "SELECT checkname, text FROM syscat.checks "
-            "WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
+            "SELECT checkname, text FROM syscat.checks WHERE tabschema = CURRENT SCHEMA AND tabname = ?",
             (table.upper(),),
         ) as cur:
             return {
@@ -780,17 +747,13 @@ class Db2HiveRepository(SqliteHiveRepository):
             columns = await self._columns(db, table)
             for name, fragment in definitions:
                 if name not in columns:
-                    await db.execute(
-                        f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}"
-                    )
+                    await db.execute(f"ALTER TABLE {table.lower()} ADD COLUMN {fragment}")
                     columns.add(name)
 
         # Core created HIVE_JOBS.STATUS as VARCHAR(16), but failed_completion
         # needs 17 characters. Widen before allowing that value in the check.
         if (await self._column_lengths(db, "HIVE_JOBS")).get("STATUS", 0) < 32:
-            await db.execute(
-                "ALTER TABLE hive_jobs ALTER COLUMN status SET DATA TYPE VARCHAR(32)"
-            )
+            await db.execute("ALTER TABLE hive_jobs ALTER COLUMN status SET DATA TYPE VARCHAR(32)")
 
         # Core's original checks predate the stale/failed_completion/
         # dead-letter/needs-review states used by the current service.
@@ -808,17 +771,11 @@ class Db2HiveRepository(SqliteHiveRepository):
         ):
             checks = await self._status_checks(db, table)
             required_values = {value.strip("'") for value in values.split(",")}
-            if not any(
-                all(value.upper() in text for value in required_values)
-                for text in checks.values()
-            ):
+            if not any(all(value.upper() in text for value in required_values) for text in checks.values()):
                 for old_constraint in checks:
-                    await db.execute(
-                        f"ALTER TABLE {table.lower()} DROP CHECK {old_constraint}"
-                    )
+                    await db.execute(f"ALTER TABLE {table.lower()} DROP CHECK {old_constraint}")
                 await db.execute(
-                    f"ALTER TABLE {table.lower()} ADD CONSTRAINT {constraint} "
-                    f"CHECK (status IN ({values}))"
+                    f"ALTER TABLE {table.lower()} ADD CONSTRAINT {constraint} CHECK (status IN ({values}))"
                 )
 
         if 1 not in applied:
@@ -861,10 +818,7 @@ class Db2HiveRepository(SqliteHiveRepository):
             )
         indexes = await self._indexes(db, "HIVE_JOBS")
         if "JOBS_ACTIVE_DEDUP_UQ" not in indexes:
-            await db.execute(
-                "CREATE UNIQUE INDEX jobs_active_dedup_uq "
-                "ON jobs(dedup_active_hash) EXCLUDE NULL KEYS"
-            )
+            await db.execute("CREATE UNIQUE INDEX jobs_active_dedup_uq ON jobs(dedup_active_hash) EXCLUDE NULL KEYS")
         if 2 not in applied:
             await db.execute(
                 "INSERT INTO hive_schema_migrations (version, applied_at) VALUES (?, ?)",
@@ -876,13 +830,9 @@ class Db2HiveRepository(SqliteHiveRepository):
             expected = base | {name for name, _fragment in _DB2_ADDITIVE_COLUMNS[table]}
             missing = expected - await self._columns(db, table)
             if missing:
-                raise RuntimeError(
-                    f"Db2 schema verification failed: {table} missing {sorted(missing)}"
-                )
+                raise RuntimeError(f"Db2 schema verification failed: {table} missing {sorted(missing)}")
         if "JOBS_ACTIVE_DEDUP_UQ" not in await self._indexes(db, "HIVE_JOBS"):
-            raise RuntimeError(
-                "Db2 schema verification failed: jobs_active_dedup_uq is missing"
-            )
+            raise RuntimeError("Db2 schema verification failed: jobs_active_dedup_uq is missing")
         status_length = (await self._column_lengths(db, "HIVE_JOBS")).get("STATUS", 0)
         if status_length < 17:
             raise RuntimeError(

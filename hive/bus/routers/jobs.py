@@ -50,15 +50,17 @@ async def list_jobs(
                 400,
                 f"unknown status {status!r}; valid: {sorted(VALID_JOB_STATUSES)}",
             )
-    # Storage via the HiveMindRepository ABC (no raw SQL in the router).
-    total, rows = await hive_repo().list_jobs(
-        status=status,
-        agent_urn=agent_urn,
-        parent_job_id=parent_job_id,
-        since=since,
-        limit=limit,
-        include_result=include_result,
-    )
+    # Storage via the HiveMindRepository ABC on a transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        total, rows = await hive_repo().list_jobs(
+            tx,
+            status=status,
+            agent_urn=agent_urn,
+            parent_job_id=parent_job_id,
+            since=since,
+            limit=limit,
+            include_result=include_result,
+        )
     return {"count": len(rows), "total": total, "jobs": rows}
 
 

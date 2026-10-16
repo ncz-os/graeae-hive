@@ -65,6 +65,7 @@ async def list_messages(
     limit: int = 100,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
-    # Storage via the HiveMindRepository ABC (no raw SQL in the router).
-    rows = await hive_repo().list_messages(to_urn=to_urn, topic=topic, since=since, limit=limit)
+    # Storage via the HiveMindRepository ABC on a transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        rows = await hive_repo().list_messages(tx, to_urn=to_urn, topic=topic, since=since, limit=limit)
     return {"count": len(rows), "messages": rows}
