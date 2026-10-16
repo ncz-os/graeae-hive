@@ -57,7 +57,7 @@ with mock.patch("pathlib.Path.mkdir"):
 
 class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
     async def test_mcp2_import_registers_typed_handlers(self):
-        bridge = load_script("mcp_bridge_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         from mcp.types import PaginatedRequestParams
 
         self.assertEqual(bridge.MCP_VERSION.split(".", 1)[0], "2")
@@ -68,7 +68,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_all_mnemos_memory_tools_use_versioned_routes(self):
-        bridge = load_script("mcp_bridge_routes_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_routes_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         seen = []
 
         async def fake_mnemos(method, path, **kwargs):
@@ -90,7 +90,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_orchestrator_registration_uses_admin_token(self):
-        bridge = load_script("mcp_bridge_admin_auth_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_admin_auth_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         seen = []
 
         class Reply:
@@ -121,7 +121,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_bridge_requires_inbound_bearer_and_has_admin_scope(self):
-        bridge = load_script("mcp_bridge_inbound_auth_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_inbound_auth_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         self.assertTrue(bridge.app.user_middleware)
 
         async def request(token=None):
@@ -154,7 +154,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_bridge_rejects_reused_downstream_credential(self):
-        bridge = load_script("mcp_bridge_distinct_auth_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_distinct_auth_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         bridge.MCP_BRIDGE_TOKEN = bridge.HIVE_BUS_TOKEN
         with self.assertRaisesRegex(RuntimeError, "must be distinct"):
             async with bridge.lifespan(bridge.app):
@@ -162,7 +162,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_tool_failures_set_mcp_is_error(self):
-        bridge = load_script("mcp_bridge_error_result_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_error_result_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         from mcp.server.auth.middleware.auth_context import AuthenticatedUser
         from mcp.server.auth.provider import AccessToken
         from mcp.types import CallToolRequestParams
@@ -201,7 +201,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_memory_tags_are_nested_in_metadata(self):
-        bridge = load_script("mcp_bridge_tags_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_tags_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         seen = {}
 
         async def fake_mnemos(_method, _path, **kwargs):
@@ -219,7 +219,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_ordinary_bridge_scope_cannot_borrow_admin_bus_token(self):
-        bridge = load_script("mcp_bridge_tool_auth_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_tool_auth_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         outcome = await bridge.handle_call_tool(
             "hive_agent_register",
             {"kind": "human", "host": "test"},
@@ -229,7 +229,7 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
         await bridge.client.aclose()
 
     async def test_worker_registration_still_uses_worker_token(self):
-        bridge = load_script("mcp_bridge_worker_auth_under_test", str(HERE / "mcp_bridge.py"))
+        bridge = load_script("mcp_bridge_worker_auth_under_test", str(HERE / "hive" / "mcp" / "bridge.py"))
         seen = []
 
         class Reply:
