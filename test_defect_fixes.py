@@ -1861,7 +1861,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("ON HIVE_JOBS", oracle)
 
     def test_doctor_selects_admin_credential_for_registration(self):
-        doctor = load_script("zeroclaw_doctor_auth_under_test", str(HERE / "zeroclaw_doctor.py"))
+        doctor = load_script("zeroclaw_doctor_auth_under_test", str(HERE / "hive" / "workers" / "doctor.py"))
         seen = {}
 
         class Reply(io.BytesIO):

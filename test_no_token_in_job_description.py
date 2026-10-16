@@ -22,8 +22,9 @@ SENTINEL = "fleet-token-SENTINEL-do-not-leak-9f3a2b"
 def doctor(monkeypatch):
     """Import the module with a known token in the environment."""
     monkeypatch.setenv("FLEET_LAN_TOKEN", SENTINEL)
-    import zeroclaw_doctor
-    return importlib.reload(zeroclaw_doctor)
+    from hive.workers import doctor as _doctor
+
+    return importlib.reload(_doctor)
 
 
 def test_token_value_never_appears_in_the_job_description(doctor):
@@ -47,7 +48,8 @@ def test_the_remediation_still_resolves_the_token_at_run_time(doctor):
 def test_no_token_when_the_variable_is_unset(monkeypatch):
     """An unset token must not silently produce a description containing ''."""
     monkeypatch.delenv("FLEET_LAN_TOKEN", raising=False)
-    import zeroclaw_doctor
-    d = importlib.reload(zeroclaw_doctor)
+    from hive.workers import doctor as _doctor
+
+    d = importlib.reload(_doctor)
     task = d._build_token_fix_codex_task("TESTHOST")
     assert "FLEET_LAN_TOKEN" in task
