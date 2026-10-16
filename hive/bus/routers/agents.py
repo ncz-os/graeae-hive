@@ -20,6 +20,7 @@ from hive.bus.deps import (
     VALID_AGENT_STATUSES,
     connect_db,
     emit_event,
+    hive_repo,
     make_urn,
 )
 from hive.bus.domain.eligibility import RUNTIME_KIND_MAP, THROTTLE_HEADROOM
@@ -331,70 +332,32 @@ async def list_agents(
     cost_tier: str | None = None,
     include_offline: bool = False,
 ):
-    sql = (
-        "SELECT urn, kind, host, status, last_heartbeat, capabilities, version, metadata, "
-        "pid, runtime, model, provider, cost_tier, autonomy_level "
-        "FROM agents WHERE 1=1"
+    if status and status not in VALID_AGENT_STATUSES:
+        raise HTTPException(
+            422,
+            f"status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}",
+        )
+    # Storage via the HiveMindRepository ABC (no raw SQL in the router).
+    rows = await hive_repo().list_agents(
+        status=status,
+        kind=kind,
+        host=host,
+        runtime=runtime,
+        pid=pid,
+        cost_tier=cost_tier,
+        include_offline=include_offline,
     )
-    args: list = []
-    if status:
-        if status not in VALID_AGENT_STATUSES:
-            raise HTTPException(
-                422,
-                f"status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}",
-            )
-        sql += " AND status=?"
-        args.append(status)
-    elif not include_offline:
-        sql += " AND status='online'"
-    if kind:
-        sql += " AND kind=?"
-        args.append(kind)
-    if host:
-        sql += " AND host=?"
-        args.append(host)
-    if runtime:
-        sql += " AND runtime=?"
-        args.append(runtime)
-    if pid is not None:
-        sql += " AND pid=?"
-        args.append(pid)
-    if cost_tier:
-        sql += " AND cost_tier=?"
-        args.append(cost_tier)
-    sql += " ORDER BY last_heartbeat DESC"
-    rows = []
-    async with connect_db() as db:
-        async with db.execute(sql, args) as cur:
-            async for r in cur:
-                meta = json.loads(r[7]) if r[7] else {}
-                # build display name: kind@host[pid] cwd:cwd_basename — distinguishes multiple sessions on same host
-                cwd = (meta or {}).get("cwd") if isinstance(meta, dict) else None
-                cwd_short = cwd.split("/")[-1] if cwd else None
-                display = f"{r[1]}@{r[2]}"
-                if r[8] is not None:
-                    display += f"[pid={r[8]}]"
-                if cwd_short:
-                    display += f" cwd={cwd_short}"
-                rows.append(
-                    {
-                        "urn": r[0],
-                        "kind": r[1],
-                        "host": r[2],
-                        "status": r[3],
-                        "last_heartbeat": r[4],
-                        "capabilities": json.loads(r[5]) if r[5] else None,
-                        "version": r[6],
-                        "metadata": meta,
-                        "pid": r[8],
-                        "runtime": r[9],
-                        "model": r[10],
-                        "provider": r[11],
-                        "cost_tier": r[12],
-                        "autonomy_level": r[13],
-                        "display": display,
-                    }
-                )
+    for r in rows:
+        # build display name: kind@host[pid] cwd:cwd_basename — distinguishes multiple sessions on same host
+        meta = r.get("metadata") or {}
+        cwd = meta.get("cwd") if isinstance(meta, dict) else None
+        cwd_short = cwd.split("/")[-1] if cwd else None
+        display = f"{r.get('kind')}@{r.get('host')}"
+        if r.get("pid") is not None:
+            display += f"[pid={r.get('pid')}]"
+        if cwd_short:
+            display += f" cwd={cwd_short}"
+        r["display"] = display
     return {"count": len(rows), "agents": rows}
 
 
