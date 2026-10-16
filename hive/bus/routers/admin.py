@@ -202,7 +202,7 @@ async def purge_jobs(req: JobPurgeRequest):
         wheres.append("kind LIKE ? ESCAPE '\\'")
         params.append(kp + "%")
     if statuses:
-        wheres.append("status IN (%s)" % ",".join("?" for _ in statuses))
+        wheres.append(f"status IN ({','.join('?' for _ in statuses)})")
         params.extend(statuses)
     if req.description_contains:
         wheres.append("description LIKE ?")
@@ -218,12 +218,12 @@ async def purge_jobs(req: JobPurgeRequest):
         wheres.append("COALESCE(ended_at, started_at) < ?")
         params.append(time.time() - float(req.older_than_seconds))
     if req.ids:
-        wheres.append("id IN (%s)" % ",".join("?" for _ in req.ids))
+        wheres.append(f"id IN ({','.join('?' for _ in req.ids)})")
         params.extend(req.ids)
 
     # Active-job guard: unless explicitly included, never match in-flight work.
     if not req.include_active:
-        wheres.append("status NOT IN (%s)" % ",".join("?" for _ in ACTIVE_JOB_STATUSES))
+        wheres.append(f"status NOT IN ({','.join('?' for _ in ACTIVE_JOB_STATUSES)})")
         params.extend(ACTIVE_JOB_STATUSES)
 
     select_sql = "SELECT id FROM jobs WHERE " + " AND ".join(wheres)
