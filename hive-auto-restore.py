@@ -85,28 +85,24 @@ def _http(
 
 
 def fetch_failed_jobs(limit: int = 1000) -> list[dict]:
-    # Server-side projection + ordering: no `result` payload (can be large) and
-    # the bus already sorts terminal statuses by ended_at DESC — do NOT re-sort
-    # client-side (the server's order is canonical).
-    query = urllib.parse.urlencode(
-        {"status": "failed", "include_result": "false", "limit": str(limit)}
-    )
+    query = urllib.parse.urlencode({"status": "failed", "limit": str(limit)})
     code, resp = _http("GET", f"/v1/jobs?{query}", timeout=15.0)
     if code != 200 or not resp:
         log(f"fetch_failed_jobs http={code} resp={str(resp)[:200]}")
         return []
-    return resp.get("jobs", []) or []
+    jobs = resp.get("jobs", []) or []
+    jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
+    return jobs
 
 
 def restore_job(jid: str) -> tuple[bool, str]:
-    # Requeue via the admin endpoint (server-side, clears stale execution state).
     code, resp = _http(
         "POST",
-        "/v1/admin/jobs/requeue",
-        {"job_ids": [jid], "reason": "auto-restore"},
+        f"/v1/jobs/{urllib.parse.quote(jid, safe='')}/auto-retry",
+        {},
         timeout=15.0,
     )
-    if code == 200 and isinstance(resp, dict) and jid in (resp.get("ok") or []):
+    if code == 200 and isinstance(resp, dict) and resp.get("ok") is True:
         return True, ""
     return False, f"http={code} resp={str(resp)[:200]}"
 
