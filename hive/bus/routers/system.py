@@ -50,12 +50,25 @@ async def dashboard():
     p = "/srv/agent-bus/dashboard.html"
     try:
         with open(p) as f:
-            return HTMLResponse(
-                f.read(),
-                headers={
-                    "Cache-Control": "no-store, no-cache, must-revalidate",
-                    "Pragma": "no-cache",
-                },
-            )
+            html = f.read()
+        # Cache-bust the static bundles by mtime: /static/* is served without
+        # Cache-Control, so a browser can keep an OLD dashboard.js and mask a
+        # deploy (e.g. a removed token prompt kept reappearing). The HTML is
+        # no-store, so stamping ?v=<mtime> on each asset URL forces a fresh fetch.
+        import os as _os
+
+        for asset in ("dashboard.css", "dashboard.js"):
+            try:
+                v = int(_os.path.getmtime(f"/srv/agent-bus/static/{asset}"))
+            except OSError:
+                v = 0
+            html = html.replace(f"/static/{asset}", f"/static/{asset}?v={v}")
+        return HTMLResponse(
+            html,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Pragma": "no-cache",
+            },
+        )
     except FileNotFoundError:
         return HTMLResponse(f"<h1>dashboard.html missing</h1><p>Expected at {p}</p>", status_code=404)
