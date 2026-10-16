@@ -168,9 +168,10 @@ async def require_mutation_actor(
     verbatim from agent_bus.py, Phase 1c.)
     """
     secret = os.environ.get("HIVE_SHARED_SECRET")
-    if secret:
-        if not x_hive_token or not hmac.compare_digest(str(x_hive_token), str(secret)):
-            raise HTTPException(401, "missing or incorrect X-Hive-Token")
+    if secret and (
+        not x_hive_token or not hmac.compare_digest(str(x_hive_token), str(secret))
+    ):
+        raise HTTPException(401, "missing or incorrect X-Hive-Token")
     if not x_hive_actor or not str(x_hive_actor).strip():
         raise HTTPException(401, "X-Hive-Actor header is required for mutating calls")
     await require_registered_agent(str(x_hive_actor).strip(), active_only=True)
