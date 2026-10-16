@@ -1165,14 +1165,33 @@ function renderCapBanner(){
   const rem=Math.max(0,Math.round(((_capState&&_capState.capped_until)||0)-Date.now()/1000));
   if(rem<=0){el.style.display='none';return;}
   const h=Math.floor(rem/3600),m=Math.floor((rem%3600)/60),sc=rem%60;
-  const hit=_capState.hit_at?new Date(_capState.hit_at*1000).toLocaleTimeString():'unknown time';
-  const model=_capState.model?esc(_capState.model):'unknown model';
-  const reporter=_capState.reporter?(' by '+esc(_capState.reporter)):'';
+  // Build the static text ONCE per state change; the 1s tick only updates the
+  // countdown node (was: full innerHTML rebuild every second).
+  const key=(_capState&&_capState.capped_until)+'|'+(_capState&&_capState.model)+'|'+(_capState&&_capState.reporter)+'|'+(_capState&&_capState.hit_at);
+  if(el.dataset.capkey!==key){
+    const hit=_capState.hit_at?new Date(_capState.hit_at*1000).toLocaleTimeString():'unknown time';
+    const model=_capState.model?esc(_capState.model):'unknown model';
+    const reporter=_capState.reporter?(' by '+esc(_capState.reporter)):'';
+    el.innerHTML='\u23f3 <b>OpenAI OAuth cap reported, unverified</b> \u2014 '+model+reporter+' reported usage_limit at <b>'+esc(hit)+'</b>. Most jobs route fallback; ~5% are OAuth probes. Auto-clear in <b id="cap-countdown"></b> unless a success report clears it first.';
+    el.dataset.capkey=key;
+  }
+  const cd=document.getElementById('cap-countdown');
+  if(cd) cd.textContent=h+'h '+String(m).padStart(2,'0')+'m '+String(sc).padStart(2,'0')+'s';
   el.style.display='block';
-  el.innerHTML='\u23f3 <b>OpenAI OAuth cap reported, unverified</b> \u2014 '+model+reporter+' reported usage_limit at <b>'+esc(hit)+'</b>. Most jobs route fallback; ~5% are OAuth probes. Auto-clear in <b>'+h+'h '+String(m).padStart(2,'0')+'m '+String(sc).padStart(2,'0')+'s</b> unless a success report clears it first.';
 }
 setInterval(renderCapBanner,1000);
+
+// ── refresh scheduling ────────────────────────────────────────────────
+// ONE in-flight refreshAll at a time; SSE events and the poll both funnel
+// through scheduleRefresh() which coalesces bursts into a single run.
+let _refreshing=false, _refreshQueued=false, _refreshTimer=null;
+function scheduleRefresh(delay=350){
+  if(_refreshTimer)clearTimeout(_refreshTimer);
+  _refreshTimer=setTimeout(()=>{_refreshTimer=null;refreshAll();},delay);
+}
 async function refreshAll(){
+  if(_refreshing){_refreshQueued=true;return;}
+  _refreshing=true;
   document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 8s`;
   try{
     await Promise.all([
@@ -1181,6 +1200,10 @@ async function refreshAll(){
       refreshHosts(),refreshGPU(),
     ]);
   }catch(e){document.getElementById('meta-time').textContent='error: '+e;}
+  finally{
+    _refreshing=false;
+    if(_refreshQueued){_refreshQueued=false;scheduleRefresh(150);}
+  }
 }
 
 // ── SSE live events ───────────────────────────────────────────────────
@@ -1202,25 +1225,9 @@ function initSSE(){
         if(p.claimed_by)detail+=` by ${p.claimed_by.split(':').slice(2,4).join('@')}`;
         if(p.cost_saved_usd)detail+=` (cache saved $${p.cost_saved_usd.toFixed(4)})`;
         evLine(`<span class="ek">${esc(d.kind)}</span> ${short?esc(short)+'…':''} ${esc(detail)}`);
-        if(['job.done','job.cached'].includes(d.kind)){
-          refreshJobs().catch(()=>{});
-          refreshResults().catch(()=>{});
-          refreshRunning().catch(()=>{});
-        }
-        if(d.kind==='job.failed'){
-          refreshFailed().catch(()=>{});
-          refreshRunning().catch(()=>{});
-          refreshJobs().catch(()=>{});
-        }
-        if(d.kind==='job.queued'){
-          refreshJobs().catch(()=>{});
-        }
-                if(d.kind==='message' && (p.topic||'').startsWith('doctor.')){
-        }
-        if(['job.claimed','job.running','job.started'].includes(d.kind)){
-          refreshRunning().catch(()=>{});
-          refreshJobs().catch(()=>{});
-        }
+        // Coalesce: ANY job-lifecycle event funnels into ONE debounced refresh
+        // (was: up to 3 separate refreshX() fetches per event -> storm).
+        if(String(d.kind||'').startsWith('job.') || d.kind==='message') scheduleRefresh();
       }catch(e){}
     };
     es.onerror=()=>evLine('<span style="color:#f85149">SSE disconnected — retrying</span>');
@@ -1235,7 +1242,8 @@ async function init(){
   }
   await registerAgent();
   await refreshAll();
-  setInterval(refreshAll, 8000);
+  // SSE drives live refreshes; this is a slow safety net for a dropped stream.
+  setInterval(refreshAll, 15000);
   initSSE();
 }
 init();
