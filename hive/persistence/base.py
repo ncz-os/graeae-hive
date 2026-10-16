@@ -196,6 +196,20 @@ class HiveMindRepository(ABC):
     @abstractmethod
     async def active_orchestrator_urn(self, tx: Transaction) -> str | None: ...
 
+    # ---- stats reads ----
+    @abstractmethod
+    async def worker_stats_rows(
+        self, tx: Transaction, *, kind: str | None, include_system: bool, top_n: int
+    ) -> list[dict[str, Any]]: ...
+
+    @abstractmethod
+    async def cache_stats(self, tx: Transaction, *, top_n: int) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def cost_stats_rows(
+        self, tx: Transaction, *, group_by: str, cutoff: float
+    ) -> list[dict[str, Any]]: ...
+
     # ---- messages ----
     @abstractmethod
     async def post_message(self, tx: Transaction, **fields: Any) -> None: ...

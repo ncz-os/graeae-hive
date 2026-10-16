@@ -843,6 +843,137 @@ class SqliteHiveRepository(HiveMindRepository):
             r = await cur.fetchone()
         return r[0] if r else None
 
+    async def worker_stats_rows(
+        self, tx: Transaction, *, kind: str | None, include_system: bool, top_n: int
+    ) -> list[dict[str, Any]]:
+        """Per-worker per-kind capability scores (GET /v1/stats/workers)."""
+        db = tx
+        sql = (
+            "SELECT urn, kind, success_count, fail_count, cancelled_count, "
+            "total_tokens_in, total_tokens_out, ROUND(total_cost_usd,4), "
+            "ROUND(total_duration_sec/NULLIF(success_count+fail_count,0),1) AS avg_dur, "
+            "datetime(last_run,'unixepoch') AS last_run, "
+            "ROUND(100.0 * success_count / NULLIF(success_count+fail_count+cancelled_count,0), 1) AS success_pct "
+            "FROM worker_kind_stats WHERE 1=1"
+        )
+        args: list[Any] = []
+        if kind:
+            sql += " AND kind=?"
+            args.append(kind)
+        if not include_system:
+            sql += " AND urn NOT LIKE 'urn:agent:system:%'"
+        sql += " ORDER BY success_count DESC, success_pct DESC LIMIT ?"
+        args.append(top_n)
+        rows: list[dict[str, Any]] = []
+        async with db.execute(sql, args) as cur:
+            async for r in cur:
+                rows.append(
+                    {
+                        "urn": r[0],
+                        "kind": r[1],
+                        "success_count": r[2],
+                        "fail_count": r[3],
+                        "cancelled_count": r[4],
+                        "total_tokens_in": r[5],
+                        "total_tokens_out": r[6],
+                        "total_cost_usd": r[7],
+                        "avg_duration_sec": r[8],
+                        "last_run": r[9],
+                        "success_pct": r[10],
+                    }
+                )
+        return rows
+
+    async def cache_stats(self, tx: Transaction, *, top_n: int) -> dict[str, Any]:
+        """Result-cache hit-rate + cost savings (GET /v1/stats/cache)."""
+        db = tx
+        async with db.execute(
+            "SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache"
+        ) as cur:
+            r = await cur.fetchone()
+        totals = {
+            "cached_jobs": r[0] or 0,
+            "total_hits": r[1] or 0,
+            "total_cost_saved_usd": r[2] or 0,
+        }
+        async with db.execute("SELECT COUNT(*) FROM jobs WHERE result LIKE '%\"cache_hit\": true%'") as cur:
+            r2 = await cur.fetchone()
+        totals["jobs_short_circuited"] = r2[0] or 0
+        entries = []
+        async with db.execute(
+            "SELECT cache_key, hit_count, cost_saved_usd, model, provider, "
+            "datetime(cached_at,'unixepoch') AS cached_at, source_job_id "
+            "FROM hive_cache ORDER BY hit_count DESC, cost_saved_usd DESC LIMIT ?",
+            (top_n,),
+        ) as cur:
+            async for row in cur:
+                entries.append(
+                    {
+                        "cache_key": row[0][:16],
+                        "hit_count": row[1],
+                        "cost_saved_usd": row[2],
+                        "model": row[3],
+                        "provider": row[4],
+                        "cached_at": row[5],
+                        "source_job_id": row[6],
+                    }
+                )
+        return {"totals": totals, "top_entries": entries}
+
+    async def cost_stats_rows(
+        self, tx: Transaction, *, group_by: str, cutoff: float
+    ) -> list[dict[str, Any]]:
+        """Aggregated cost stats (GET /v1/stats/costs)."""
+        db = tx
+        if group_by == "day":
+            sel = "DATE(ended_at, 'unixepoch')"
+        elif group_by == "provider":
+            sel = (
+                "CASE "
+                "WHEN JSON_VALUE(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_minimax%' THEN 'minimax' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
+                "ELSE COALESCE(claimed_provider,'unknown') END"
+            )
+        elif group_by == "model":
+            sel = "COALESCE(claimed_model,'unknown')"
+        elif group_by == "runtime":
+            sel = "COALESCE(claimed_runtime,'unknown')"
+        elif group_by == "cost_tier":
+            sel = "COALESCE(claimed_cost_tier,'unknown')"
+        elif group_by == "claimed_by":
+            sel = "COALESCE(claimed_by,'unknown')"
+        else:  # kind
+            sel = "kind"
+        sql = (
+            f"SELECT {sel} AS bucket, "
+            "COUNT(*) AS job_count, "
+            "SUM(COALESCE(tokens_in,0)) AS tot_in, "
+            "SUM(COALESCE(tokens_out,0)) AS tot_out, "
+            "ROUND(SUM(COALESCE(estimated_cost_usd,0)),4) AS tot_cost_usd, "
+            "ROUND(AVG(CASE WHEN ended_at IS NOT NULL THEN ended_at-started_at END),2) AS avg_dur_s "
+            "FROM jobs WHERE ended_at IS NOT NULL AND ended_at >= ? "
+            f"GROUP BY bucket ORDER BY tot_cost_usd DESC, job_count DESC"
+        )
+        rows: list[dict[str, Any]] = []
+        async with db.execute(sql, (cutoff,)) as cur:
+            async for r in cur:
+                rows.append(
+                    {
+                        "bucket": r[0],
+                        "job_count": r[1],
+                        "tokens_in": r[2],
+                        "tokens_out": r[3],
+                        "estimated_cost_usd": r[4],
+                        "avg_duration_sec": r[5],
+                    }
+                )
+        return rows
+
     async def post_message(self, tx: Transaction, **fields: Any) -> None:
         db = tx
         await db.execute(

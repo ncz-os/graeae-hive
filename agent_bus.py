@@ -59,6 +59,7 @@ from hive.bus.routers.messages import list_messages, publish_message
 from hive.bus.routers.messages import router as _messages_router
 from hive.bus.routers.repos import router as _repos_router
 from hive.bus.routers.schedules import router as _schedules_router
+from hive.bus.routers.stats import router as _stats_router
 from hive.bus.schemas import (
     AgentHeartbeat,
     AgentRegister,
@@ -1382,6 +1383,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 app.include_router(_repos_router)
+app.include_router(_stats_router)
 app.include_router(_messages_router)
 app.include_router(_agents_router)
 app.include_router(_admin_router)
@@ -1463,171 +1465,7 @@ async def dashboard():
 # /v1/schedules routes moved to hive.bus.routers.schedules (Phase 1c).
 
 
-@app.get("/v1/stats/workers")
-async def worker_stats(kind: str | None = None, top_n: int = 30, include_system: bool = False):
-    """Per-worker per-kind capability scores. Submitters use this to pick best worker for a kind.
-
-    #8 FIX (review 2026-05-23): exclude `system` kind agents by default (they're host monitors,
-    not compute workers — including them was misleading). Pass include_system=true to override.
-    """
-    top_n = clamp_limit(top_n, default=30, max_limit=500)
-    sql = (
-        "SELECT urn, kind, success_count, fail_count, cancelled_count, "
-        "total_tokens_in, total_tokens_out, ROUND(total_cost_usd,4), "
-        "ROUND(total_duration_sec/NULLIF(success_count+fail_count,0),1) AS avg_dur, "
-        "datetime(last_run,'unixepoch') AS last_run, "
-        "ROUND(100.0 * success_count / NULLIF(success_count+fail_count+cancelled_count,0), 1) AS success_pct "
-        "FROM worker_kind_stats WHERE 1=1"
-    )
-    args: list = []
-    if kind:
-        sql += " AND kind=?"
-        args.append(kind)
-    if not include_system:
-        sql += " AND urn NOT LIKE 'urn:agent:system:%'"
-    sql += " ORDER BY success_count DESC, success_pct DESC LIMIT ?"
-    args.append(top_n)
-    rows = []
-    async with connect_db() as db, db.execute(sql, args) as cur:
-        async for r in cur:
-            rows.append(
-                {
-                    "urn": r[0],
-                    "kind": r[1],
-                    "success_count": r[2],
-                    "fail_count": r[3],
-                    "cancelled_count": r[4],
-                    "total_tokens_in": r[5],
-                    "total_tokens_out": r[6],
-                    "total_cost_usd": r[7],
-                    "avg_duration_sec": r[8],
-                    "last_run": r[9],
-                    "success_pct": r[10],
-                }
-            )
-    return {"count": len(rows), "workers": rows}
-
-
-@app.get("/v1/stats/cache")
-async def cache_stats(top_n: int = 20):
-    """Result-cache hit-rate + cost savings."""
-    top_n = clamp_limit(top_n, default=20, max_limit=500)
-    async with connect_db() as db:
-        async with db.execute("SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache") as cur:
-            r = await cur.fetchone()
-        totals = {
-            "cached_jobs": r[0] or 0,
-            "total_hits": r[1] or 0,
-            "total_cost_saved_usd": r[2] or 0,
-        }
-        # job-side stats
-        async with db.execute("SELECT COUNT(*) FROM jobs WHERE result LIKE '%\"cache_hit\": true%'") as cur:
-            r2 = await cur.fetchone()
-        totals["jobs_short_circuited"] = r2[0] or 0
-        # top cached entries
-        async with db.execute(
-            "SELECT cache_key, hit_count, cost_saved_usd, model, provider, "
-            "datetime(cached_at,'unixepoch') AS cached_at, source_job_id "
-            "FROM hive_cache ORDER BY hit_count DESC, cost_saved_usd DESC LIMIT ?",
-            (top_n,),
-        ) as cur:
-            entries = []
-            async for row in cur:
-                entries.append(
-                    {
-                        "cache_key": row[0][:16],
-                        "hit_count": row[1],
-                        "cost_saved_usd": row[2],
-                        "model": row[3],
-                        "provider": row[4],
-                        "cached_at": row[5],
-                        "source_job_id": row[6],
-                    }
-                )
-    return {"totals": totals, "top_entries": entries}
-
-
-@app.get("/v1/stats/costs")
-async def cost_stats(since_hours: int = 168, group_by: str = "provider"):
-    """Aggregated cost stats. group_by: provider | model | runtime | cost_tier | claimed_by | day.
-    since_hours: window in hours (default 168 = 7 days).
-    """
-    if group_by not in {
-        "provider",
-        "model",
-        "runtime",
-        "cost_tier",
-        "claimed_by",
-        "day",
-        "kind",
-    }:
-        raise HTTPException(
-            422,
-            "group_by must be one of: provider, model, runtime, cost_tier, claimed_by, day, kind",
-        )
-    cutoff = time.time() - since_hours * 3600
-    if group_by == "day":
-        sel = "DATE(ended_at, 'unixepoch')"
-    elif group_by == "provider":
-        # Derive REAL provider from result.agent_alias (the alias that did the work),
-        # NOT claimed_provider (which carries the zeroclaw #7066 label-lie = openai/codex).
-        sel = (
-            "CASE "
-            "WHEN JSON_VALUE(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
-            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
-            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
-            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
-            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_minimax%' THEN 'minimax' "
-            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
-            "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
-            "ELSE COALESCE(claimed_provider,'unknown') END"
-        )
-    elif group_by == "model":
-        sel = "COALESCE(claimed_model,'unknown')"
-    elif group_by == "runtime":
-        sel = "COALESCE(claimed_runtime,'unknown')"
-    elif group_by == "cost_tier":
-        sel = "COALESCE(claimed_cost_tier,'unknown')"
-    elif group_by == "claimed_by":
-        sel = "COALESCE(claimed_by,'unknown')"
-    else:  # kind
-        sel = "kind"
-    sql = (
-        f"SELECT {sel} AS bucket, "
-        "COUNT(*) AS job_count, "
-        "SUM(COALESCE(tokens_in,0)) AS tot_in, "
-        "SUM(COALESCE(tokens_out,0)) AS tot_out, "
-        "ROUND(SUM(COALESCE(estimated_cost_usd,0)),4) AS tot_cost_usd, "
-        "ROUND(AVG(CASE WHEN ended_at IS NOT NULL THEN ended_at-started_at END),2) AS avg_dur_s "
-        "FROM jobs WHERE ended_at IS NOT NULL AND ended_at >= ? "
-        f"GROUP BY bucket ORDER BY tot_cost_usd DESC, job_count DESC"
-    )
-    rows = []
-    async with connect_db() as db, db.execute(sql, (cutoff,)) as cur:
-        async for r in cur:
-            rows.append(
-                {
-                    "bucket": r[0],
-                    "job_count": r[1],
-                    "tokens_in": r[2],
-                    "tokens_out": r[3],
-                    "estimated_cost_usd": r[4],
-                    "avg_duration_sec": r[5],
-                }
-            )
-    # totals
-    totals = {
-        "job_count": sum(r["job_count"] for r in rows),
-        "tokens_in": sum(r["tokens_in"] or 0 for r in rows),
-        "tokens_out": sum(r["tokens_out"] or 0 for r in rows),
-        "estimated_cost_usd": round(sum(r["estimated_cost_usd"] or 0 for r in rows), 4),
-    }
-    return {
-        "since_hours": since_hours,
-        "group_by": group_by,
-        "totals": totals,
-        "buckets": rows,
-    }
+# /v1/stats/* routes moved to hive.bus.routers.stats (Phase 1c).
 
 
 # ── KNEMON COST-AWARE ROUTER (2026-06-02) ────────────────────────────────────
