@@ -13,6 +13,7 @@ import os
 import re
 import time
 
+from hive.bus.domain.workspace import ADMISSION_NONCOMMIT_PREFIXES
 from hive.core.models import rate_for
 
 
@@ -131,6 +132,27 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     "dead-letter": {"dead-letter"},  # terminal; idempotent same-status PATCH only
 }
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
+
+
+def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
+    """Whether a ``done`` job must carry commit evidence.
+
+    Read-only kinds (review/analysis/investigation/triage/docs/design/...) never
+    produce a commit, so a review job that sets a ``repo`` (to clone the code
+    under review) must NOT be held to the commit-evidence gate. Regression
+    2026-10-16: ``review:...`` with ``repo`` set went ``needs-review`` with
+    ``completion_evidence_missing`` despite a clean verified run.
+    """
+    k = str(job_kind or "")
+    if any(k.startswith(p) for p in ADMISSION_NONCOMMIT_PREFIXES):
+        return False
+    return (
+        bool(job_repo)
+        or k in ("riskyeats", "code")
+        or k.startswith(
+            ("riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:", "ic-engine", "investorclaw", "ncz-os")
+        )
+    )
 
 
 def valid_completion_proof(proof: dict) -> bool:
