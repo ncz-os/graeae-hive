@@ -16,6 +16,8 @@ ORCHESTRATOR_RUNTIMES: frozenset[str] = frozenset(
         "claude-cli",
         "claude",
         "codex-orchestrator",
+        "codex",  # codex is also a valid orchestrator (operator 2026-10-16)
+        "codex-cli",
         "opencode",  # agentic CLI — submits its own orchestration jobs AND claims
         "opencode-cli",
         "human",
@@ -27,12 +29,10 @@ ORCHESTRATOR_RUNTIMES: frozenset[str] = frozenset(
 )
 
 # Runtimes that may ONLY claim/execute jobs (workers), never submit.
-# NOTE: opencode/opencode-cli are deliberately NOT here — opencode is a valid
-# orchestrator (operator 2026-10-16): it both submits and claims.
+# NOTE: opencode/opencode-cli + codex/codex-cli are deliberately NOT here —
+# they are valid orchestrators (operator 2026-10-16): they both submit and claim.
 WORKER_ONLY_RUNTIMES: frozenset[str] = frozenset(
     {
-        "codex",
-        "codex-cli",
         "hermes",
         "zeroclaw",
         "openclaw",
