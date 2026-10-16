@@ -296,3 +296,15 @@ class HiveMindRepository(ABC):
     async def select_sweepable_terminal_job_ids(
         self, tx: Transaction, *, statuses: list[str], cutoff: float
     ) -> list[str]: ...
+
+    # ---- capacity ledger (Phase 5) ----
+    @abstractmethod
+    async def capacity_state_load(self, tx: Transaction) -> list[Row]: ...
+
+    @abstractmethod
+    async def capacity_state_save(self, tx: Transaction, **fields: Any) -> None: ...
+
+    @abstractmethod
+    async def capacity_fold_usage(
+        self, tx: Transaction, *, dedup_key: str, service: str, tokens: int, cost_usd: float, now: float
+    ) -> bool: ...

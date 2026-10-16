@@ -29,4 +29,18 @@ def get_hive_repository(backend: str | None = None, **settings) -> HiveMindRepos
         return Db2HiveRepository(
             settings.get("db2_dsn") or os.environ.get("DB2_DSN") or os.environ.get("HIVE_DB2_DSN", "")
         )
-    raise RuntimeError(f"HIVE_BACKEND must be sqlite, oracle, or db2, got {selected!r}")
+    if selected == "postgres":
+        from .postgres import PostgresHiveRepository
+
+        return PostgresHiveRepository(
+            settings.get("dsn") or os.environ.get("POSTGRES_DSN") or os.environ.get("HIVE_PG_DSN", "")
+        )
+    if selected in ("mysql", "mariadb"):
+        from .mysql import MySqlHiveRepository
+
+        return MySqlHiveRepository(
+            settings.get("dsn") or os.environ.get("MYSQL_DSN") or os.environ.get("MARIADB_DSN", "")
+        )
+    raise RuntimeError(
+        f"HIVE_BACKEND must be sqlite, oracle, postgres, mysql/mariadb, or db2, got {selected!r}"
+    )

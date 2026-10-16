@@ -505,6 +505,7 @@ class OracleHiveRepository(SqliteHiveRepository):
         return {str(row[0]).strip().upper() for row in rows}
 
     async def _apply_migrations(self, raw: Any) -> None:
+        await self._ensure_capacity_tables(raw)
         columns = await self._job_columns(raw)
         if not columns:
             raise RuntimeError(
@@ -587,6 +588,29 @@ class OracleHiveRepository(SqliteHiveRepository):
                 raw,
                 "CREATE UNIQUE INDEX JOBS_ACTIVE_DEDUP_UQ ON HIVE_JOBS "
                 "(CASE WHEN status IN ('queued','offered','claimed','running') THEN dedup_hash END)",
+            )
+
+    async def _ensure_capacity_tables(self, raw: Any) -> None:
+        """Create the Phase 5 capacity ledger tables if absent (additive DDL)."""
+        existing = {
+            str(r[0]).upper()
+            for r in await _raw_execute(
+                raw,
+                "SELECT table_name FROM user_tables WHERE table_name IN ('CAPACITY_LEDGER','CAPACITY_USAGE')",
+            )
+        }
+        if "CAPACITY_LEDGER" not in existing:
+            await _raw_execute(
+                raw,
+                "CREATE TABLE capacity_ledger (service VARCHAR2(64) PRIMARY KEY, in_flight NUMBER DEFAULT 0, "
+                "tokens_used NUMBER DEFAULT 0, spent_usd NUMBER DEFAULT 0, limited_until NUMBER DEFAULT 0, "
+                "window_start NUMBER DEFAULT 0, updated_at NUMBER DEFAULT 0)",
+            )
+        if "CAPACITY_USAGE" not in existing:
+            await _raw_execute(
+                raw,
+                "CREATE TABLE capacity_usage (dedup_key VARCHAR2(200) PRIMARY KEY, service VARCHAR2(64), "
+                "tokens NUMBER DEFAULT 0, cost_usd NUMBER DEFAULT 0, ts NUMBER)",
             )
 
     async def _verify_schema(self, raw: Any) -> None:

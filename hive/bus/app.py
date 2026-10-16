@@ -26,6 +26,7 @@ from hive.bus.deps import (
 )
 
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
+from hive.bus.domain.capacity_ledger import flush_capacity_ledger, load_capacity_ledger
 from hive.bus.domain.reaper import select_orphan_claims
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
 from hive.bus.routers.admin import router as _admin_router
@@ -412,6 +413,12 @@ async def reaper_task(app: FastAPI):
                             f"jobs (test<{RETAIN_TEST_JOBS_DAYS}d / done<{RETAIN_DONE_JOBS_DAYS}d)",
                             flush=True,
                         )
+                # Persist the capacity ledger (Phase 5) — idempotent keyed SET-upsert
+                # so a restart/replay converges instead of double-counting.
+                try:
+                    await flush_capacity_ledger(hive_repo())
+                except Exception as ce:  # noqa: BLE001
+                    print(f"capacity ledger flush skipped: {ce}", flush=True)
         except Exception as e:
             print(f"reaper error: {e}", flush=True)
 
@@ -423,6 +430,14 @@ async def lifespan(app: FastAPI):
     # additive migrations (SqliteHiveRepository.init); Oracle + Db2 converge via
     # their repository init(). No per-backend branching in the bus.
     await repo.init()
+    # Hydrate the per-service capacity ledger from persisted state (Phase 5).
+    # Best-effort: never fatal (a repo without the capacity surface, or a fresh DB).
+    try:
+        loaded = await load_capacity_ledger(repo)
+        if loaded:
+            print(f"capacity ledger: hydrated {loaded} service(s)", flush=True)
+    except Exception as ce:  # noqa: BLE001
+        print(f"capacity ledger hydrate skipped: {ce}", flush=True)
     task = asyncio.create_task(reaper_task(app))
     app.state.reaper_task = task
     try:

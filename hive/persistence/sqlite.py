@@ -197,6 +197,29 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
   created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_sched_next ON scheduled_jobs(next_fire_at, enabled);
+
+-- Per-service capacity ledger (Phase 5). Persisted so admission state survives a
+-- bus restart and is shared; every write is a keyed SET-upsert (idempotent).
+CREATE TABLE IF NOT EXISTS capacity_ledger (
+  service TEXT PRIMARY KEY,
+  in_flight INTEGER NOT NULL DEFAULT 0,
+  tokens_used INTEGER NOT NULL DEFAULT 0,
+  spent_usd REAL NOT NULL DEFAULT 0,
+  limited_until REAL NOT NULL DEFAULT 0,
+  window_start REAL NOT NULL DEFAULT 0,
+  updated_at REAL NOT NULL DEFAULT 0
+);
+
+-- Dedup keys for usage folds: a replayed telemetry report (same key) must not
+-- double-count into the ledger. The UNIQUE key makes the fold idempotent.
+CREATE TABLE IF NOT EXISTS capacity_usage (
+  dedup_key TEXT PRIMARY KEY,
+  service TEXT NOT NULL,
+  tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0,
+  ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_cap_usage_service_ts ON capacity_usage(service, ts);
 """
 
 
@@ -1716,3 +1739,79 @@ class SqliteHiveRepository(HiveMindRepository):
             tuple(params),
         ) as cur:
             return [r[0] async for r in cur]
+
+    # ---- capacity ledger (Phase 5) ----
+    async def capacity_state_load(self, tx: Transaction) -> list[tuple[Any, ...]]:
+        """Every persisted per-service counter row (service, in_flight, tokens_used,
+        spent_usd, limited_until, window_start, updated_at)."""
+        db = tx
+        async with db.execute(
+            "SELECT service, in_flight, tokens_used, spent_usd, limited_until, window_start, updated_at "
+            "FROM capacity_ledger"
+        ) as cur:
+            return [tuple(r) async for r in cur]
+
+    async def capacity_state_save(self, tx: Transaction, **fields: Any) -> None:
+        """Idempotent keyed SET-upsert of one service's counters.
+
+        SET semantics (not increments) so re-saving the same state is a no-op —
+        a restart or a replay converges instead of double-counting. Written as
+        SELECT + INSERT/UPDATE (backend-neutral; the Oracle adapter translates)."""
+        db = tx
+        service = fields["service"]
+        vals = (
+            int(fields.get("in_flight", 0)),
+            int(fields.get("tokens_used", 0)),
+            float(fields.get("spent_usd", 0.0)),
+            float(fields.get("limited_until", 0.0)),
+            float(fields.get("window_start", 0.0)),
+            float(fields.get("updated_at", 0.0)),
+        )
+        async with db.execute("SELECT 1 FROM capacity_ledger WHERE service=?", (service,)) as cur:
+            exists = await cur.fetchone()
+        if exists:
+            await db.execute(
+                "UPDATE capacity_ledger SET in_flight=?, tokens_used=?, spent_usd=?, limited_until=?, "
+                "window_start=?, updated_at=? WHERE service=?",
+                (*vals, service),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO capacity_ledger (in_flight, tokens_used, spent_usd, limited_until, window_start, "
+                "updated_at, service) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (*vals, service),
+            )
+
+    async def capacity_fold_usage(
+        self, tx: Transaction, *, dedup_key: str, service: str, tokens: int, cost_usd: float, now: float
+    ) -> bool:
+        """Fold one usage report into a service's window counters — idempotently.
+
+        The ``dedup_key`` (e.g. a job id + attempt) is the idempotency key: if it
+        was already folded, this is a no-op and returns False. Returns True when
+        the fold applied. The increments are guarded by the key, so replaying the
+        same report never double-counts."""
+        db = tx
+        async with db.execute("SELECT 1 FROM capacity_usage WHERE dedup_key=?", (dedup_key,)) as cur:
+            if await cur.fetchone():
+                return False  # already folded — idempotent
+        await db.execute(
+            "INSERT INTO capacity_usage (dedup_key, service, tokens, cost_usd, ts) VALUES (?, ?, ?, ?, ?)",
+            (dedup_key, service, int(tokens), float(cost_usd), float(now)),
+        )
+        async with db.execute(
+            "SELECT 1 FROM capacity_ledger WHERE service=?", (service,)
+        ) as cur:
+            exists = await cur.fetchone()
+        if exists:
+            await db.execute(
+                "UPDATE capacity_ledger SET tokens_used=COALESCE(tokens_used,0)+?, "
+                "spent_usd=COALESCE(spent_usd,0)+?, updated_at=? WHERE service=?",
+                (int(tokens), float(cost_usd), float(now), service),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO capacity_ledger (tokens_used, spent_usd, updated_at, service) VALUES (?, ?, ?, ?)",
+                (int(tokens), float(cost_usd), float(now), service),
+            )
+        return True
