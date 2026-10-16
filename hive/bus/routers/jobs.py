@@ -10,7 +10,7 @@ import json
 import time
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 
 import queue_logic
 
@@ -20,10 +20,12 @@ except ModuleNotFoundError:
     from hive.persistence import _sqlite_async as aiosqlite
 
 from hive import scheduler as sched
+from hive.persistence.sqlite import SqlExpr
 from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
     CLAIM_SCAN_WINDOW,
     HOST_DENYLIST,
+    TERMINAL_JOB_STATUSES,
     VALID_JOB_STATUSES,
     clamp_limit,
     connect_db,
@@ -44,12 +46,25 @@ from hive.bus.domain.eligibility import (
 from hive.bus.domain.jobs import (
     CACHE_TTL_SECONDS,
     CLAIM_LEASE_SECONDS,
+    DECLINE_REASON_PREFIXES,
+    MAX_DECLINE_REQUEUES,
+    STATUS_TRANSITIONS,
+    SUBSCRIPTION_PROVIDERS,
+    _safe_nonneg_int,
+    _safe_str,
     cache_key_for,
+    cache_store,
+    estimate_cost,
+    field_was_set,
+    hallucination_check,
     is_dedup_violation,
     json_list,
+    normalize_result_payload,
+    stable_worker_id,
+    valid_completion_proof,
 )
 from hive.bus.domain.workspace import resolve_workspace_shadow
-from hive.bus.schemas import JobCreate
+from hive.bus.schemas import JobCreate, JobUpdate
 from hive.core.models import COST_TIERS
 
 router = APIRouter()
@@ -671,3 +686,386 @@ async def dequeue_next_job(agent_urn: str):
             "X-Hive-Claim-Detail": "no queued jobs matched agent eligibility, dependencies, backoff, or cost tier",
         },
     )
+
+
+@router.patch("/v1/jobs/{job_id}")
+async def update_job(job_id: str, req: JobUpdate):
+    now = time.time()
+    if req.status not in VALID_JOB_STATUSES:
+        raise HTTPException(
+            422,
+            f"unsupported job status {req.status!r}; valid statuses: {sorted(VALID_JOB_STATUSES)}",
+        )
+    original_claimed_by_was_set = field_was_set(req, "claimed_by")
+    original_result_mnemos_was_set = field_was_set(req, "result_mnemos_id")
+    # #3 FIX: Hallucination guard now surfaces failure_reason + exit_code=-2.
+    halluc_reason = None
+    completion_rejected = False
+    if req.status == "done" and req.result:
+        halluc_reason = hallucination_check(req.result)
+        if halluc_reason:
+            patched = dict(req.result or {})
+            patched["exit_code"] = -2
+            patched["failure_reason"] = f"hallucination_guard:{halluc_reason}"
+            patched["_hallucination_guard"] = halluc_reason
+            req = JobUpdate(
+                status="failed",
+                result=patched,
+                claimed_by=req.claimed_by,
+                tokens_in=req.tokens_in,
+                tokens_out=req.tokens_out,
+                result_mnemos_id=req.result_mnemos_id,
+            )
+    req.result = normalize_result_payload(req.status, req.result)
+
+    claimed_by_was_set = original_claimed_by_was_set
+    result_mnemos_was_set = original_result_mnemos_was_set
+    patch_payload = req.model_dump(exclude_unset=True) if hasattr(req, "model_dump") else req.dict(exclude_unset=True)
+    cost_estimate = None
+
+    # Skip releases are not failures. DECLINE_REASON_PREFIXES is intentionally
+    # narrow unless a future real failure release reason needs dead-letter counting.
+    decline_reason = None
+    dead_lettered = False
+    if req.status == "queued" and isinstance(req.result, dict):
+        _werr = str(req.result.get("worker_error") or "")
+        if _werr in DECLINE_REASON_PREFIXES or any(_werr.startswith(p + ":") for p in DECLINE_REASON_PREFIXES):
+            decline_reason = _werr
+
+    # Storage via the HiveMindRepository ABC on ONE transaction (EPIMONE shape).
+    async with hive_repo().connection() as tx:
+        current = await hive_repo().job_update_context(tx, job_id)
+        if not current:
+            raise HTTPException(404, f"job not found: {job_id}")
+        (
+            old_status,
+            old_claimed_by,
+            prov,
+            mod,
+            retry_count,
+            max_retries,
+            decline_count,
+            job_kind,
+            job_repo,
+        ) = current
+
+        if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
+            raise HTTPException(409, f"invalid status transition {old_status!r} -> {req.status!r}")
+
+        if (
+            old_status in TERMINAL_JOB_STATUSES
+            and req.status != old_status
+            and not (old_status in {"done", "failed"} and req.status == "cancelled")
+        ):  # retire fake/dup completions and superseded failures
+            raise HTTPException(409, f"terminal job status {old_status!r} cannot be reopened by PATCH")
+
+        if old_status in {"queued", "offered"} and req.status in {"claimed", "running"}:
+            raise HTTPException(
+                409,
+                "claim bypass rejected: use POST /v1/jobs/next or POST /v1/jobs/{job_id}/claim "
+                "so agent registration, capabilities, dependencies, and cost tier are checked",
+            )
+
+        release_to_queue = req.status == "queued" and old_status in {"claimed", "running", "offered"}
+        if req.status == "queued" and old_status in {"claimed", "running", "offered"}:
+            if not old_claimed_by:
+                raise HTTPException(409, "cannot release a job with no current claimant")
+            if not claimed_by_was_set or req.claimed_by != old_claimed_by:
+                raise HTTPException(403, "release to queued requires claimed_by to match the current claimant")
+
+        if claimed_by_was_set and req.claimed_by is None:
+            raise HTTPException(422, "claimed_by=null is not accepted; provide the current claimant urn")
+
+        if claimed_by_was_set and req.claimed_by is not None:
+            if old_claimed_by and req.claimed_by != old_claimed_by:
+                raise HTTPException(
+                    403,
+                    f"claimed_by overwrite rejected: current={old_claimed_by!r} requested={req.claimed_by!r}",
+                )
+
+        if old_claimed_by and req.status in {"claimed", "running", "done", "failed", "cancelled"}:
+            if not claimed_by_was_set or req.claimed_by != old_claimed_by:
+                raise HTTPException(403, "job update requires claimed_by to match the current claimant")
+
+        effective_claimed_by = None if release_to_queue else (req.claimed_by or old_claimed_by)
+        if req.status in {"claimed", "running"} and not effective_claimed_by:
+            raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
+
+        commit_required = (
+            bool(job_repo)
+            or str(job_kind) in ("riskyeats", "code")
+            or str(job_kind).startswith(
+                ("riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:", "ic-engine", "investorclaw", "ncz-os")
+            )
+        )
+        if req.status == "done" and commit_required:
+            proof = req.result or {}
+            if not valid_completion_proof(proof):
+                req.status = "needs-review"
+                completion_rejected = True
+                req.result = {**proof, "failure_reason": "completion_evidence_missing"}
+                patch_payload["status"] = req.status
+                patch_payload["result"] = req.result
+
+        # Build the SET map for the CAS UPDATE (column names are code-side).
+        sets: dict = {"status": req.status, "last_update_at": now}
+        if req.status in TERMINAL_JOB_STATUSES:
+            sets["ended_at"] = now
+        if req.result is not None:
+            sets["result"] = json.dumps(req.result)
+        if release_to_queue:
+            sets.update(
+                {
+                    "claimed_by": None,
+                    "claimed_at": None,
+                    "claimed_runtime": None,
+                    "claimed_model": None,
+                    "claimed_provider": None,
+                    "claimed_cost_tier": None,
+                    "ended_at": None,
+                }
+            )
+            # GRAEAE dispatch consensus 1.0 SHIP-FIRST: exponential backoff on EVERY
+            # release (±20% jitter) so a job no local worker can run cannot hot-loop.
+            import random as _rnd
+
+            _rc = int(retry_count or 0) + 1
+            _bo = min(5.0 * (2 ** min(_rc, 6)), 300.0) * (1.0 + _rnd.uniform(-0.2, 0.2))
+            sets["retry_count"] = SqlExpr("retry_count+1")
+            sets["retry_backoff_until"] = now + _bo
+        if req.status in {"claimed", "running"}:
+            sets["claim_lease_expires_at"] = now + CLAIM_LEASE_SECONDS
+        if req.status in TERMINAL_JOB_STATUSES or req.status == "queued":
+            sets["claim_lease_expires_at"] = None
+        if result_mnemos_was_set:
+            sets["result_mnemos_id"] = req.result_mnemos_id
+
+        if req.tokens_in is not None or req.tokens_out is not None:
+            t_in = int(req.tokens_in or 0)
+            t_out = int(req.tokens_out or 0)
+            cost_estimate = estimate_cost(prov or "unknown", mod or "unknown", t_in, t_out)
+            sets["tokens_in"] = t_in
+            sets["tokens_out"] = t_out
+            sets["estimated_cost_usd"] = cost_estimate
+
+        # Routing re-assignment: only allowed for non-terminal, non-claimed jobs.
+        if field_was_set(req, "eligible_kinds") and req.eligible_kinds is not None:
+            if old_status not in {"queued", "offered"}:
+                raise HTTPException(
+                    409, f"eligible_kinds can only be updated on queued/offered jobs, not {old_status!r}"
+                )
+            sets["eligible_kinds"] = json.dumps(req.eligible_kinds)
+        if field_was_set(req, "eligible_hosts") and req.eligible_hosts is not None:
+            if old_status not in {"queued", "offered"}:
+                raise HTTPException(
+                    409, f"eligible_hosts can only be updated on queued/offered jobs, not {old_status!r}"
+                )
+            sets["eligible_hosts"] = json.dumps(req.eligible_hosts)
+
+        # Thrash fix: compare-and-set on the observed status.
+        if await hive_repo().patch_job_status(tx, job_id, sets=sets, expected_status=old_status) == 0:
+            raise HTTPException(
+                409, f"job {job_id} status changed concurrently (expected {old_status!r}); retry"
+            )
+
+        # Optional real-failure release counting.
+        if decline_reason is not None and release_to_queue:
+            new_decline_count = (decline_count or 0) + 1
+            if new_decline_count >= MAX_DECLINE_REQUEUES:
+                dl_result = {
+                    "dead_letter": True,
+                    "decline_count": new_decline_count,
+                    "last_decline_reason": decline_reason,
+                    "note": "thrash_guard:max_decline_requeues_exceeded",
+                    "last_decline_result": req.result,
+                }
+                rc_dl = await hive_repo().patch_job_status(
+                    tx,
+                    job_id,
+                    sets={
+                        "status": "dead-letter",
+                        "decline_count": new_decline_count,
+                        "ended_at": now,
+                        "claim_lease_expires_at": None,
+                        "result": json.dumps(dl_result),
+                    },
+                    expected_status="queued",
+                )
+                dead_lettered = rc_dl >= 1
+            else:
+                await hive_repo().patch_job_status(
+                    tx, job_id, sets={"decline_count": new_decline_count}, expected_status="queued"
+                )
+
+        # Roll MTD spend onto claimer (subscription throttle requires this).
+        if cost_estimate and cost_estimate > 0 and effective_claimed_by:
+            await hive_repo().agent_spend_add(tx, urn=effective_claimed_by, delta=cost_estimate)
+
+        # On failed: auto-retry if under max_retries (exponential backoff).
+        retried = False
+        if req.status == "failed" and retry_count < max_retries:
+            backoff = 30.0 * (2**retry_count)
+            next_at = time.time() + backoff
+            await hive_repo().patch_job_status(
+                tx,
+                job_id,
+                sets={
+                    "status": "queued",
+                    "retry_count": SqlExpr("retry_count+1"),
+                    "retry_backoff_until": next_at,
+                    "claimed_by": None,
+                    "claimed_at": None,
+                    "claimed_runtime": None,
+                    "claimed_model": None,
+                    "claimed_provider": None,
+                    "claimed_cost_tier": None,
+                    "ended_at": None,
+                    "result": None,
+                    "tokens_in": None,
+                    "tokens_out": None,
+                    "estimated_cost_usd": None,
+                    "claim_lease_expires_at": None,
+                },
+            )
+            retried = True
+
+        # On done/failed/cancelled: roll per-worker per-kind stats (capability scoring).
+        if req.status in TERMINAL_JOB_STATUSES and old_status not in TERMINAL_JOB_STATUSES:
+            jrow = await hive_repo().job_stats_context(tx, job_id)
+            if jrow:
+                (
+                    kind_j,
+                    desc_j,
+                    mtier,
+                    reqcaps_json,
+                    mdl_j,
+                    prov_j,
+                    claimed_by_j,
+                    result_j,
+                    started_j,
+                ) = jrow
+                try:
+                    _rd = json.loads(result_j) if result_j else (req.result or {})
+                except Exception:
+                    _rd = req.result or {}
+                if not isinstance(_rd, dict):
+                    _rd = {}
+                rt_in = _safe_nonneg_int(req.tokens_in if req.tokens_in is not None else _rd.get("tokens_in"))
+                rt_out = _safe_nonneg_int(req.tokens_out if req.tokens_out is not None else _rd.get("tokens_out"))
+                rt_reason = _safe_nonneg_int(_rd.get("tokens_reasoning"))
+                if rt_in == 0 and rt_out == 0 and _rd.get("tokens_total"):
+                    rt_out = _safe_nonneg_int(_rd.get("tokens_total"))
+                eff_model = _safe_str(_rd.get("gateway_model") or mdl_j)
+                eff_prov = _safe_str(_rd.get("gateway_provider") or prov_j)
+                try:
+                    job_cost = estimate_cost(eff_prov, eff_model, rt_in, rt_out) or 0
+                    job_cost = max(job_cost, 0)
+                except Exception as _ce:  # noqa: BLE001
+                    print(f"cost estimate skipped for {job_id}: {_ce}", flush=True)
+                    job_cost = 0
+                if cost_estimate is None and job_cost:
+                    cost_estimate = job_cost
+                if claimed_by_j and kind_j:
+                    worker_key = stable_worker_id(claimed_by_j)
+                    duration = (time.time() - (started_j or time.time())) if started_j else 0
+                    col = {"done": "success_count", "failed": "fail_count", "cancelled": "cancelled_count"}[req.status]
+                    await hive_repo().upsert_worker_kind_stats(
+                        tx,
+                        urn=worker_key,
+                        kind=kind_j,
+                        column=col,
+                        tokens_in=rt_in,
+                        tokens_out=rt_out,
+                        cost_usd=job_cost or 0,
+                        duration_sec=duration,
+                        last_run=time.time(),
+                    )
+                    # Per-job cost ledger row. Best-effort.
+                    try:
+                        await hive_repo().usage_ledger_insert(
+                            tx,
+                            provider=eff_prov,
+                            model=eff_model,
+                            task_kind=kind_j,
+                            tokens_in=rt_in,
+                            tokens_out=rt_out,
+                            tokens_reasoning=rt_reason,
+                            est_cost_usd=job_cost or 0,
+                            latency_ms=max(0, int(duration * 1000)),
+                            outcome="ok" if req.status == "done" else "err",
+                            caller_subsystem="hive",
+                            tier=(mtier or "A").upper(),
+                            session_id=claimed_by_j,
+                            request_count=1,
+                            subscription_amortized=1 if (eff_prov or "").lower() in SUBSCRIPTION_PROVIDERS else 0,
+                            path_kind=str(_rd.get("via") or "worker"),
+                        )
+                    except Exception as _le:
+                        print(f"usage_ledger write skipped for {job_id}: {_le}", flush=True)
+                if req.status == "done":
+                    ck = cache_key_for(kind_j, desc_j, (mtier or "A").upper(), json_list(reqcaps_json))
+                    rdict = json.loads(result_j) if result_j else (req.result or {})
+                    ec = (rdict or {}).get("exit_code")
+                    _nr = bool((rdict or {}).get("needs_review")) or (rdict or {}).get("status") == "needs-review"
+                    if (ec == 0 or ec is None) and not _nr:
+                        await hive_repo().cache_store(
+                            tx,
+                            cache_key=ck,
+                            source_job_id=job_id,
+                            result=rdict,
+                            result_mnemos_id=req.result_mnemos_id,
+                            model=mdl_j or "unknown",
+                            provider=prov_j or "unknown",
+                            cost_for_save=cost_estimate or 0,
+                        )
+
+        await hive_repo().insert_job_audit(
+            tx,
+            job_id=job_id,
+            ts=now,
+            actor_urn=req.claimed_by or old_claimed_by,
+            old_status=old_status,
+            new_status="dead-letter" if dead_lettered else ("queued" if retried else req.status),
+            old_claimed_by=old_claimed_by,
+            new_claimed_by=None if release_to_queue else effective_claimed_by,
+            patch_json=json.dumps(patch_payload, default=str),
+        )
+        await tx.commit()
+
+    async with hive_repo().connection() as event_tx:
+        if req.status == "failed" and retry_count < max_retries:
+            await emit_event(
+                event_tx,
+                "job.retry",
+                {"id": job_id, "retry_count": retry_count + 1, "max_retries": max_retries},
+            )
+        if dead_lettered:
+            await emit_event(
+                event_tx,
+                "job.dead-letter",
+                {
+                    "id": job_id,
+                    "claimed_by": req.claimed_by or old_claimed_by,
+                    "last_decline_reason": decline_reason,
+                    "decline_threshold": MAX_DECLINE_REQUEUES,
+                },
+            )
+        else:
+            await emit_event(
+                event_tx,
+                f"job.{req.status}",
+                {
+                    "id": job_id,
+                    "claimed_by": req.claimed_by or old_claimed_by,
+                    "tokens_in": req.tokens_in,
+                    "tokens_out": req.tokens_out,
+                    "estimated_cost_usd": cost_estimate,
+                },
+            )
+        await event_tx.commit()
+    if completion_rejected:
+        return JSONResponse(
+            status_code=409,
+            content={"ok": False, "status": "needs-review", "reason": "completion_evidence_missing"},
+        )
+    return {"ok": True, "ts": now, "estimated_cost_usd": cost_estimate, "dead_lettered": dead_lettered}
