@@ -31,6 +31,21 @@ _ORACLE_DSN = os.environ.get("ORACLE_DSN", "oracle://mnemos:mnemos_dev@127.0.0.1
 _SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("AGENT_BUS_SQLITE_BUSY_TIMEOUT_MS", "5000"))
 
 ACTIVE_AGENT_STATUSES = {"online", "idle"}
+VALID_AGENT_STATUSES = {"online", "idle", "stale", "offline", "error"}
+AUTONOMY_LEVELS = {"autonomous", "confirm-risky", "interactive", "unknown"}
+AUTH_METHODS = {"subscription", "api", "free", "unknown"}
+DEFAULT_PLAN_CAPS = {
+    "subscription": 200.0,
+    "api": 1000.0,
+    "free": 0.0,
+    "unknown": 50.0,
+}
+HOST_DENYLIST: set[str] = {h.strip().lower() for h in os.environ.get("HIVE_HOST_DENYLIST", "").split(",") if h.strip()}
+
+
+def make_urn(kind: str, host: str, session_id: str) -> str:
+    return f"urn:agent:{kind}:{host}:{session_id}"
+
 
 # subscriber_id -> queue (shared object; agent_bus imports THIS dict)
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}
