@@ -17,7 +17,6 @@ import re
 import secrets
 import sys
 import time
-import uuid
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
@@ -26,14 +25,11 @@ try:
 except ModuleNotFoundError:
     pass
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.responses import JSONResponse
-from sse_starlette.sse import EventSourceResponse
 
 from hive.bus.deps import (
-    EVENT_QUEUE,
     _cascade_delete_jobs,
-    clamp_limit,
     connect_db,
     emit_event,
     hive_repo,
@@ -45,6 +41,7 @@ from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export f
 from hive.bus.routers.admin import router as _admin_router
 from hive.bus.routers.agents import heartbeat, list_agents, register
 from hive.bus.routers.agents import router as _agents_router
+from hive.bus.routers.events import router as _events_router
 from hive.bus.routers.jobs import (  # noqa: F401 (re-export)
     auto_retry_job,
     claim_job,
@@ -1384,6 +1381,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 app.include_router(_repos_router)
 app.include_router(_stats_router)
+app.include_router(_events_router)
 app.include_router(_messages_router)
 app.include_router(_agents_router)
 app.include_router(_admin_router)
@@ -1865,83 +1863,7 @@ async def knemon_spend(since_hours: int = 168):
 # /v1/messages routes moved to hive.bus.routers.messages (Phase 1c).
 
 
-@app.get("/v1/events")
-async def stream_events(request: Request, since_id: int | None = None):
-    """SSE stream of events. Optional since_id for catch-up."""
-    if len(EVENT_QUEUE) >= MAX_EVENT_SUBSCRIBERS:
-        raise HTTPException(503, f"too many event subscribers; max={MAX_EVENT_SUBSCRIBERS}")
-    sub_id = str(uuid.uuid4())
-    queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-    EVENT_QUEUE[sub_id] = queue
-
-    async def gen():
-        try:
-            # catch-up phase
-            if since_id is not None:
-                async with connect_db() as db:
-                    async with db.execute(
-                        "SELECT id, ts, kind, payload FROM events WHERE id > ? ORDER BY id ASC",
-                        (since_id,),
-                    ) as cur:
-                        async for r in cur:
-                            yield {
-                                "id": str(r[0]),
-                                "data": json.dumps(
-                                    {
-                                        "ts": r[1],
-                                        "kind": r[2],
-                                        "payload": json.loads(r[3]),
-                                    }
-                                ),
-                            }
-            # live stream — use un-typed events (event: message) so browser onmessage fires
-            last_ping = time.time()
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    evt = await asyncio.wait_for(queue.get(), timeout=SSE_PING_INTERVAL)
-                    yield {
-                        "data": json.dumps(evt),
-                    }
-                except asyncio.TimeoutError:  # noqa: UP041 (keep explicit for the SSE ping path)
-                    if time.time() - last_ping >= SSE_PING_INTERVAL:
-                        yield {"event": "ping", "data": str(int(time.time()))}
-                        last_ping = time.time()
-        finally:
-            EVENT_QUEUE.pop(sub_id, None)
-
-    return EventSourceResponse(gen())
-
-
-@app.get("/v1/events/log")
-async def events_log(since_id: int | None = None, limit: int = 100):
-    """JSON polling alternative to SSE."""
-    limit = clamp_limit(limit, default=100, max_limit=1000)
-    sql = "SELECT id, ts, kind, payload, agent_urn FROM events"
-    args: list = []
-    if since_id is not None:
-        sql += " WHERE id > ?"
-        args.append(since_id)
-    sql += " ORDER BY id ASC LIMIT ?"
-    args.append(limit)
-    rows = []
-    async with connect_db() as db, db.execute(sql, args) as cur:
-        async for r in cur:
-            rows.append(
-                {
-                    "id": r[0],
-                    "ts": r[1],
-                    "kind": r[2],
-                    "payload": json.loads(r[3]),
-                    "agent_urn": r[4],
-                }
-            )
-    return {
-        "count": len(rows),
-        "events": rows,
-        "last_id": rows[-1]["id"] if rows else since_id,
-    }
+# /v1/events + /v1/events/log moved to hive.bus.routers.events (Phase 1c).
 
 
 # ---------- minimal MCP shim ----------

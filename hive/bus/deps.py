@@ -50,6 +50,9 @@ def make_urn(kind: str, host: str, session_id: str) -> str:
 
 # subscriber_id -> queue (shared object; agent_bus imports THIS dict)
 EVENT_QUEUE: dict[str, asyncio.Queue] = {}
+#: SSE stream knobs (used by the events router).
+SSE_PING_INTERVAL = 15.0
+MAX_EVENT_SUBSCRIBERS = int(os.environ.get("AGENT_BUS_MAX_EVENT_SUBSCRIBERS", "100"))
 
 _HIVE_REPO = None
 
