@@ -33,6 +33,173 @@ NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
 NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
 
 
+
+DDL = """
+-- Fresh-DB shape; matches what the code actually reads & writes
+-- (graeae:schema-drift fix 2026-05-23). For live DBs the lifespan
+-- migrator below issues idempotent ALTER/CREATE to converge.
+CREATE TABLE IF NOT EXISTS agents (
+  urn TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  host TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  pid INTEGER,
+  capabilities TEXT,
+  version TEXT,
+  started_at REAL NOT NULL,
+  last_heartbeat REAL NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('online','idle','stale','offline','error')),
+  metadata TEXT,
+  -- v0.2 cost/runtime/autonomy columns (graeae:schema-drift)
+  runtime TEXT,
+  model TEXT,
+  provider TEXT,
+  autonomy_level TEXT,
+  cost_tier TEXT,
+  current_load TEXT,
+  auth_method TEXT,
+  plan_cap_usd REAL,
+  plan_period_used_usd REAL DEFAULT 0,
+  subscription_pools TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status);
+CREATE INDEX IF NOT EXISTS idx_agents_kind        ON agents(kind);
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  submitter_urn TEXT NOT NULL,                  -- who created the work (user/human OR delegating agent)
+  parent_job_id TEXT,
+  kind TEXT NOT NULL,                           -- code-edit/research/review/build/test/etc
+  description TEXT,
+  priority INTEGER NOT NULL DEFAULT 0,          -- higher = more urgent
+  deadline REAL,
+  required_capabilities TEXT,                   -- json array; worker must have ALL
+  eligible_kinds TEXT,                          -- json array; agent kinds eligible (null = any)
+  eligible_hosts TEXT,                          -- json array; agent hosts eligible (null = any); e.g. ["cixmini"]
+  site TEXT,                                    -- git_sites.json key (github/gitlab-ncz/codeberg/internal)
+  repo TEXT,                                    -- owner/name path on that site
+  head_branch TEXT,                             -- branch / PR head to check out
+  pr_number INTEGER,                            -- PR/MR number (forge-specific ref scheme)
+  project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
+  status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review')),
+  claimed_by TEXT,                              -- worker urn (set on claim/dequeue)
+  claimed_at REAL,
+  started_at REAL NOT NULL,                     -- when job ENTERED queue
+  ended_at REAL,
+  result TEXT,
+  -- v0.2 cost/autonomy/retry columns (graeae:schema-drift)
+  required_autonomy TEXT,
+  max_cost_tier TEXT,
+  preferred_providers TEXT,                     -- json array
+  preferred_models TEXT,                        -- json array
+  claimed_runtime TEXT,
+  claimed_model TEXT,
+  claimed_provider TEXT,
+  claimed_cost_tier TEXT,
+  tokens_in INTEGER,
+  tokens_out INTEGER,
+  estimated_cost_usd REAL,
+  mnemos_refs TEXT,                             -- json array of mem_* ids
+  result_mnemos_id TEXT,
+  required_resources TEXT,                      -- json
+  claimed_host_caps TEXT,                       -- json
+  tags TEXT,                                    -- json array
+  depends_on TEXT,                              -- json array of job ids
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  max_retries INTEGER NOT NULL DEFAULT 2,
+  retry_backoff_until REAL,
+  last_update_at REAL,
+  claim_lease_expires_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status            ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_submitter         ON jobs(submitter_urn);
+CREATE INDEX IF NOT EXISTS idx_jobs_claimed_by        ON jobs(claimed_by);
+CREATE INDEX IF NOT EXISTS idx_jobs_parent            ON jobs(parent_job_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_queue             ON jobs(status, priority DESC, started_at ASC);
+
+CREATE TABLE IF NOT EXISTS job_audit_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id TEXT NOT NULL,
+  ts REAL NOT NULL,
+  actor_urn TEXT,
+  old_status TEXT,
+  new_status TEXT,
+  old_claimed_by TEXT,
+  new_claimed_by TEXT,
+  patch TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_audit_job_ts ON job_audit_log(job_id, ts);
+
+CREATE TABLE IF NOT EXISTS messages (
+  id TEXT PRIMARY KEY,
+  from_urn TEXT NOT NULL,
+  to_urn TEXT,
+  in_reply_to TEXT,
+  topic TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_to    ON messages(to_urn);
+CREATE INDEX IF NOT EXISTS idx_messages_topic ON messages(topic);
+CREATE INDEX IF NOT EXISTS idx_messages_ts    ON messages(ts);
+
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts REAL NOT NULL,
+  kind TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  agent_urn TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_events_ts    ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_kind  ON events(kind);
+CREATE INDEX IF NOT EXISTS idx_events_agent ON events(agent_urn);
+
+-- v0.2 tables (graeae:schema-drift fix 2026-05-23)
+CREATE TABLE IF NOT EXISTS hive_cache (
+  cache_key TEXT PRIMARY KEY,
+  result_json TEXT NOT NULL,
+  source_job_id TEXT,
+  result_mnemos_id TEXT,
+  hit_count INTEGER NOT NULL DEFAULT 0,
+  cost_saved_usd REAL NOT NULL DEFAULT 0,
+  model TEXT,
+  provider TEXT,
+  cached_at REAL NOT NULL,
+  last_hit_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_hive_cache_cached_at ON hive_cache(cached_at);
+
+CREATE TABLE IF NOT EXISTS worker_kind_stats (
+  urn TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  success_count INTEGER NOT NULL DEFAULT 0,
+  fail_count INTEGER NOT NULL DEFAULT 0,
+  cancelled_count INTEGER NOT NULL DEFAULT 0,
+  total_tokens_in INTEGER NOT NULL DEFAULT 0,
+  total_tokens_out INTEGER NOT NULL DEFAULT 0,
+  total_cost_usd REAL NOT NULL DEFAULT 0,
+  total_duration_sec REAL NOT NULL DEFAULT 0,
+  last_run REAL,
+  PRIMARY KEY (urn, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_wkstats_kind ON worker_kind_stats(kind);
+
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  created_by_urn TEXT NOT NULL,
+  interval_seconds INTEGER NOT NULL,
+  job_template TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  last_fired_at REAL,
+  next_fire_at REAL NOT NULL,
+  fire_count INTEGER NOT NULL DEFAULT 0,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sched_next ON scheduled_jobs(next_fire_at, enabled);
+"""
+
+
 class SqliteHiveRepository(HiveMindRepository):
     #: Backend lock clause for the auto-retry row read. SQLite serialises via the
     #: connection; Oracle/Db2 override this to add FOR UPDATE. Kept as a class
@@ -44,13 +211,193 @@ class SqliteHiveRepository(HiveMindRepository):
         self.busy_timeout_ms = busy_timeout_ms
 
     async def init(self, schema: str | None = None) -> None:
+        """Create/converge the schema. Owns ALL sqlite DDL (Phase 1e): base
+        schema, additive live-column migrations, status-CHECK rebuilds, and
+        idempotent index re-creates. Called by the bus lifespan via repo.init()."""
         db_dir = os.path.dirname(self.db_path)
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
         async with self.connection() as db:
-            if schema:
-                await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
-                await db.executescript(schema)
+            await db.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")
+            await db.executescript(schema or DDL)
+
+            # graeae:schema-drift (2026-05-23): additive migrations for live DBs.
+            # New-column indexes stay out of SCHEMA because CREATE INDEX fails on
+            # old live tables until the corresponding ALTER TABLE has run.
+            async def _ensure_column(conn, table: str, col: str, ddl_fragment: str) -> None:
+                cursor = await conn.execute(f"PRAGMA table_info({table})")
+                cols = {row[1] for row in await cursor.fetchall()}
+                if col not in cols:
+                    await conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl_fragment}")
+
+            async def _ensure_agents_status_allows_stale(conn) -> None:
+                async with conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'") as cur:
+                    row = await cur.fetchone()
+                table_sql = row[0] if row else ""
+                if "stale" in table_sql:
+                    return
+                cols = (
+                    "urn",
+                    "kind",
+                    "host",
+                    "session_id",
+                    "pid",
+                    "capabilities",
+                    "version",
+                    "started_at",
+                    "last_heartbeat",
+                    "status",
+                    "metadata",
+                    "runtime",
+                    "model",
+                    "provider",
+                    "autonomy_level",
+                    "cost_tier",
+                    "current_load",
+                    "auth_method",
+                    "plan_cap_usd",
+                    "plan_period_used_usd",
+                    "subscription_pools",
+                )
+                col_list = ", ".join(cols)
+                await conn.execute("ALTER TABLE agents RENAME TO agents__pre_stale_migration")
+                await conn.execute(
+                    "CREATE TABLE agents ("
+                    "urn TEXT PRIMARY KEY, "
+                    "kind TEXT NOT NULL, "
+                    "host TEXT NOT NULL, "
+                    "session_id TEXT NOT NULL, "
+                    "pid INTEGER, "
+                    "capabilities TEXT, "
+                    "version TEXT, "
+                    "started_at REAL NOT NULL, "
+                    "last_heartbeat REAL NOT NULL, "
+                    "status TEXT NOT NULL CHECK(status IN ('online','idle','stale','offline','error')), "
+                    "metadata TEXT, "
+                    "runtime TEXT, "
+                    "model TEXT, "
+                    "provider TEXT, "
+                    "autonomy_level TEXT, "
+                    "cost_tier TEXT, "
+                    "current_load TEXT, "
+                    "auth_method TEXT, "
+                    "plan_cap_usd REAL, "
+                    "plan_period_used_usd REAL DEFAULT 0, "
+                    "subscription_pools TEXT)"
+                )
+                await conn.execute(f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration")
+                await conn.execute("DROP TABLE agents__pre_stale_migration")
+
+            async def _ensure_jobs_status_allows_dead_letter(conn) -> None:
+                # Thrash fix (2026-06-02): older live jobs tables have a CHECK(status
+                # IN (...)) that predates 'dead-letter'/'failed_completion'. SQLite
+                # cannot ALTER a CHECK in place, so rebuild the table preserving its
+                # (possibly drifted) columns + data. No-op when the constraint is
+                # already permissive or absent (fresh DBs are created from SCHEMA,
+                # which already lists dead-letter).
+                async with conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='jobs'") as cur:
+                    row = await cur.fetchone()
+                table_sql = row[0] if row else ""
+                if not table_sql:
+                    return  # no jobs table yet (e.g. 0-byte/mid-recovery DB) — SCHEMA will create it
+                if "CHECK" not in table_sql.upper() or "dead-letter" in table_sql:
+                    return  # no status CHECK, or already permissive — nothing to do
+                async with conn.execute("PRAGMA table_info(jobs)") as cur:
+                    old_cols = [r[1] for r in await cur.fetchall()]
+                await conn.execute("ALTER TABLE jobs RENAME TO jobs__pre_deadletter_migration")
+                await conn.executescript(SCHEMA)  # recreate jobs (+others, all IF NOT EXISTS) with new CHECK
+                # Copy only columns common to old + recreated table — guards against
+                # drift columns the recreated SCHEMA lacks (the live_columns ALTERs
+                # below re-add any expected-but-missing ones afterwards).
+                async with conn.execute("PRAGMA table_info(jobs)") as cur:
+                    new_cols = {r[1] for r in await cur.fetchall()}
+                common = [c for c in old_cols if c in new_cols]
+                col_list = ", ".join(common)
+                await conn.execute(f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration")
+                await conn.execute("DROP TABLE jobs__pre_deadletter_migration")
+
+            live_columns = (
+                # agents — v0.2 cost/runtime/autonomy columns
+                ("agents", "runtime", "runtime TEXT"),
+                ("agents", "model", "model TEXT"),
+                ("agents", "provider", "provider TEXT"),
+                ("agents", "autonomy_level", "autonomy_level TEXT"),
+                ("agents", "cost_tier", "cost_tier TEXT"),
+                ("agents", "current_load", "current_load TEXT"),
+                ("agents", "auth_method", "auth_method TEXT"),
+                ("agents", "plan_cap_usd", "plan_cap_usd REAL"),
+                ("agents", "plan_period_used_usd", "plan_period_used_usd REAL DEFAULT 0"),
+                ("agents", "subscription_pools", "subscription_pools TEXT"),
+                # jobs — project tag + v0.2 cost/autonomy/retry columns
+                ("jobs", "project", "project TEXT"),
+                ("jobs", "eligible_hosts", "eligible_hosts TEXT"),
+                ("jobs", "required_autonomy", "required_autonomy TEXT"),
+                ("jobs", "max_cost_tier", "max_cost_tier TEXT"),
+                ("jobs", "preferred_providers", "preferred_providers TEXT"),
+                ("jobs", "preferred_models", "preferred_models TEXT"),
+                ("jobs", "claimed_runtime", "claimed_runtime TEXT"),
+                ("jobs", "claimed_model", "claimed_model TEXT"),
+                ("jobs", "claimed_provider", "claimed_provider TEXT"),
+                ("jobs", "claimed_cost_tier", "claimed_cost_tier TEXT"),
+                ("jobs", "tokens_in", "tokens_in INTEGER"),
+                ("jobs", "tokens_out", "tokens_out INTEGER"),
+                ("jobs", "estimated_cost_usd", "estimated_cost_usd REAL"),
+                ("jobs", "mnemos_refs", "mnemos_refs TEXT"),
+                ("jobs", "result_mnemos_id", "result_mnemos_id TEXT"),
+                ("jobs", "required_resources", "required_resources TEXT"),
+                ("jobs", "claimed_host_caps", "claimed_host_caps TEXT"),
+                ("jobs", "tags", "tags TEXT"),
+                ("jobs", "depends_on", "depends_on TEXT"),
+                ("jobs", "retry_count", "retry_count INTEGER NOT NULL DEFAULT 0"),
+                ("jobs", "max_retries", "max_retries INTEGER NOT NULL DEFAULT 2"),
+                ("jobs", "retry_backoff_until", "retry_backoff_until REAL"),
+                ("jobs", "last_update_at", "last_update_at REAL"),
+                ("jobs", "claim_lease_expires_at", "claim_lease_expires_at REAL"),
+                # Thrash fix (2026-06-02): per-job count of worker-decline requeues.
+                ("jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0"),
+                ("jobs", "site", "site TEXT"),
+                ("jobs", "repo", "repo TEXT"),
+                ("jobs", "head_branch", "head_branch TEXT"),
+                ("jobs", "pr_number", "pr_number INTEGER"),
+            )
+            # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
+            # rebuild recreates the table from SCHEMA (sans drift columns), then the
+            # loop re-adds any missing columns (incl. decline_count) to the new table.
+            # (SQLite-only path — Oracle/Db2 converge via their repository init().)
+            await _ensure_jobs_status_allows_dead_letter(db)
+            for table, col, ddl_fragment in live_columns:
+                await _ensure_column(db, table, col, ddl_fragment)
+            await _ensure_agents_status_allows_stale(db)
+
+            # (Oracle decline_count / CK_HIVE_JOBS_STATUS DDL removed: it was a
+            # superseded duplicate of OracleHiveRepository.init/_apply_migrations,
+            # which Oracle now runs via repo.init() above.)
+
+            # Idempotent index re-creates (in case live DB pre-dates an index).
+            live_indexes = (
+                "CREATE INDEX IF NOT EXISTS idx_agents_status      ON agents(status)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_kind        ON agents(kind)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_runtime     ON agents(runtime)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_model       ON agents(model)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_provider    ON agents(provider)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_cost_tier   ON agents(cost_tier)",
+                "CREATE INDEX IF NOT EXISTS idx_agents_auth_method ON agents(auth_method)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_project           ON jobs(project)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_autonomy          ON jobs(required_autonomy)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_max_cost_tier     ON jobs(max_cost_tier)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_claimed_provider  ON jobs(claimed_provider)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_claimed_tier      ON jobs(claimed_cost_tier)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_backoff           ON jobs(retry_backoff_until)",
+                "CREATE INDEX IF NOT EXISTS idx_jobs_claim_lease       ON jobs(claim_lease_expires_at)",
+                "CREATE TABLE IF NOT EXISTS job_audit_log ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, ts REAL NOT NULL, "
+                "actor_urn TEXT, old_status TEXT, new_status TEXT, old_claimed_by TEXT, "
+                "new_claimed_by TEXT, patch TEXT NOT NULL)",
+                "CREATE INDEX IF NOT EXISTS idx_job_audit_job_ts ON job_audit_log(job_id, ts)",
+            )
+            for stmt in live_indexes:
+                await db.execute(stmt)
+            await db.commit()
             await self._ensure_column(db, "jobs", "dedup_hash", "dedup_hash TEXT")
             await self._ensure_column(db, "jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0")
             await db.execute(
