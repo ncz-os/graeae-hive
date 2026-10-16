@@ -111,8 +111,34 @@ class SqliteHiveRepository(HiveMindRepository):
             )
             await db.commit()
 
-    async def heartbeat_agent(self, *, urn: str, ts: float, status: str, metadata_json: str | None = None) -> int:
+    async def heartbeat_agent(
+        self,
+        *,
+        urn: str,
+        ts: float,
+        status: str,
+        metadata_json: str | None = None,
+        metadata_patch: dict[str, Any] | None = None,
+    ) -> int:
         async with self.connection() as db:
+            # A patch is merged with the stored metadata INSIDE the storage layer
+            # (one connection) so read-merge-write is atomic — the endpoint no
+            # longer needs a raw SELECT. Mirrors the old endpoint merge idiom.
+            if metadata_patch is not None:
+                async with db.execute(
+                    "SELECT metadata FROM agents WHERE urn=?", (urn,)
+                ) as meta_cur:
+                    meta_row = await meta_cur.fetchone()
+                if not meta_row:
+                    return 0
+                try:
+                    existing = json.loads(meta_row[0]) if meta_row[0] else {}
+                except Exception:
+                    existing = {}
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing.update(metadata_patch)
+                metadata_json = json.dumps(existing, default=str)
             if metadata_json is not None:
                 cur = await db.execute(
                     "UPDATE agents SET last_heartbeat=?, status=?, metadata=? WHERE urn=?",

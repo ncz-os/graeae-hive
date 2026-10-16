@@ -52,7 +52,13 @@ class HiveMindRepository(ABC):
 
     @abstractmethod
     async def heartbeat_agent(
-        self, *, urn: str, ts: float, status: str, metadata_json: str | None = None
+        self,
+        *,
+        urn: str,
+        ts: float,
+        status: str,
+        metadata_json: str | None = None,
+        metadata_patch: dict[str, Any] | None = None,
     ) -> int: ...
 
     @abstractmethod

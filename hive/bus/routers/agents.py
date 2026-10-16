@@ -291,34 +291,16 @@ async def heartbeat(req: AgentHeartbeat):
             422,
             f"agent status must be one of {sorted(VALID_AGENT_STATUSES)}, got {status!r}",
         )
-    async with connect_db() as db:
-        if req.metadata is not None:
-            async with db.execute(
-                "SELECT metadata FROM agents WHERE urn=?",
-                (req.urn,),
-            ) as meta_cur:
-                meta_row = await meta_cur.fetchone()
-            if not meta_row:
-                raise HTTPException(404, f"agent not found: {req.urn}")
-            try:
-                existing_meta = json.loads(meta_row[0]) if meta_row[0] else {}
-            except Exception:
-                existing_meta = {}
-            if not isinstance(existing_meta, dict):
-                existing_meta = {}
-            existing_meta.update(req.metadata)
-            cur = await db.execute(
-                "UPDATE agents SET last_heartbeat=?, status=?, metadata=? WHERE urn=?",
-                (now, status, json.dumps(existing_meta, default=str), req.urn),
-            )
-        else:
-            cur = await db.execute(
-                "UPDATE agents SET last_heartbeat=?, status=? WHERE urn=?",
-                (now, status, req.urn),
-            )
-        await db.commit()
-        if cur.rowcount == 0:
-            raise HTTPException(404, f"agent not found: {req.urn}")
+    # Storage via the HiveMindRepository ABC: the metadata merge happens inside
+    # the storage layer (one connection), so no raw SELECT here.
+    rowcount = await hive_repo().heartbeat_agent(
+        urn=req.urn,
+        ts=now,
+        status=status,
+        metadata_patch=req.metadata if req.metadata is not None else None,
+    )
+    if rowcount == 0:
+        raise HTTPException(404, f"agent not found: {req.urn}")
     return {"ack": True, "ts": now}
 
 
