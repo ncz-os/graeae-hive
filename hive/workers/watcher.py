@@ -18,18 +18,20 @@ Env:
   CLAIM_JOBS                if "1", actively claim eligible jobs and dispatch to local executor (default "0" = passive monitor only)
 """
 from __future__ import annotations
+
+import contextlib
 import json
 import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
-import signal
+import urllib.request
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
 # C1: bus transport auth bearer token (env-sourced, never baked in).
@@ -207,10 +209,8 @@ def static_specs() -> dict:
 def dynamic_load() -> dict:
     """Snapshot of current load."""
     out = {"ts": time.time()}
-    try:
+    with contextlib.suppress(Exception):
         out["load_1min"], out["load_5min"], out["load_15min"] = os.getloadavg()
-    except Exception:
-        pass
     if _IS_MACOS:
         try:
             r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
@@ -337,10 +337,8 @@ def dynamic_load() -> dict:
                 parts = lines[-1].split()
                 # us sy id format
                 if len(parts) >= 5:
-                    try:
+                    with contextlib.suppress(Exception):
                         out["cpu_used_pct"] = float(parts[-5]) + float(parts[-4])
-                    except Exception:
-                        pass
         else:
             # /proc/stat — single-sample using `top -bn2 -d 0.5`-style isn't portable;
             # use two reads of /proc/stat 200ms apart
@@ -389,7 +387,7 @@ def dynamic_load() -> dict:
                 for line in r.stdout.strip().splitlines():
                     parts = [p.strip() for p in line.split(",")]
                     if len(parts) >= 5:
-                        try:
+                        with contextlib.suppress(Exception):
                             gpus_rt.append({
                                 "vendor": "nvidia",
                                 "name": parts[0],
@@ -399,8 +397,6 @@ def dynamic_load() -> dict:
                                 "temp_c": float(parts[4]) if parts[4] else None,
                                 "power_w": float(parts[5]) if len(parts) > 5 and parts[5] not in ("", "[Not Supported]") else None,
                             })
-                        except Exception:
-                            pass
             except Exception:
                 pass
         if shutil.which("rocm-smi"):

@@ -50,6 +50,13 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
+# Migrated legacy satellites (Phase 2). They were standalone root scripts with
+# pre-existing style (one-line statements, imports below a logger line, bare
+# excepts). Kept verbatim to preserve behaviour on live services; clean up
+# incrementally rather than mass-editing a running bridge/watcher/doctor.
+"hive/workers/watcher.py" = ["E701", "E702", "E402", "E722", "E741", "SIM115"]
+"hive/mcp/bridge.py" = ["E402", "E722"]
+"hive/workers/doctor.py" = ["E402", "E722"]
 "test_*.py" = ["B011"]  # assert False is fine in tests
 "tests/*" = ["B011"]
 

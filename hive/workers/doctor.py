@@ -46,8 +46,8 @@ import json
 import logging
 import os
 import re
-import signal
 import shlex
+import signal
 import socket
 import subprocess
 import sys
@@ -897,9 +897,9 @@ def _build_token_fix_codex_task(offending_host: str) -> str:
             f'~/Library/LaunchAgents/com.zeroclaw.gateway.plist'
         )
         restart_worker = (
-            f'pkill -f zeroclaw-wss-worker 2>/dev/null || true; '
-            f'sleep 1; '
-            f'nohup ~/zeroclaw-wss-worker &>/dev/null &'
+            'pkill -f zeroclaw-wss-worker 2>/dev/null || true; '
+            'sleep 1; '
+            'nohup ~/zeroclaw-wss-worker &>/dev/null &'
         )
         restart_cmd = f'{restart_gateway}; {restart_worker}'
     else:
@@ -1062,8 +1062,8 @@ def _match_known_signature(job: dict, base_kind: str,
             return {
                 "action_type": "escalate",
                 "confidence": 1.0,
-                "reason": ("token-mismatch on %s but FLEET_LAN_TOKEN is not "
-                           "configured; cannot safely auto-fix" % offending_host),
+                "reason": (f"token-mismatch on {offending_host} but FLEET_LAN_TOKEN is not "
+                           "configured; cannot safely auto-fix"),
             }
 
         _record_token_fix_attempt(offending_host)
@@ -1322,10 +1322,7 @@ def process_triage_job(job: dict) -> dict:
 
     if a == "release_to_queue":
         rk = action.get("release_eligible_kinds")
-        if isinstance(rk, list):
-            rk_clean = [k for k in rk if isinstance(k, str) and k]
-        else:
-            rk_clean = None
+        rk_clean = [k for k in rk if isinstance(k, str) and k] if isinstance(rk, list) else None
         parts.append(action_release_to_queue(job_id, rk_clean))
         released = True
     elif a == "restart_service" and conf >= 0.7:

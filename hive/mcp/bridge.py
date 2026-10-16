@@ -22,6 +22,7 @@ Tools:
   mnemos.memory_get         -> GET /v1/memories/{id}
 """
 from __future__ import annotations
+
 import json
 import logging
 import os
@@ -44,7 +45,7 @@ except PackageNotFoundError as exc:
 if MCP_VERSION.split(".", 1)[0] != "2":
     raise RuntimeError(f"mcp_bridge requires mcp>=2,<3; found {MCP_VERSION}")
 
-from mcp.server import Server, NotificationOptions
+from mcp.server import NotificationOptions, Server
 from mcp.server.auth.middleware.auth_context import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
 from mcp.server.sse import SseServerTransport
@@ -55,10 +56,10 @@ from mcp.types import (
     ListResourcesResult,
     ListToolsResult,
     PaginatedRequestParams,
-    Tool,
-    TextContent,
-    Resource,
     Prompt,
+    Resource,
+    TextContent,
+    Tool,
 )
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -410,7 +411,7 @@ async def handle_call_tool(
         elif name == "hive_job_create":
             r = await _hive("POST", "/v1/jobs", json=args)
         elif name == "hive_job_next":
-            r = await _hive("POST", f"/v1/jobs/next", params={"agent_urn": args["agent_urn"]})
+            r = await _hive("POST", "/v1/jobs/next", params={"agent_urn": args["agent_urn"]})
         elif name == "hive_job_list":
             r = await _hive("GET", "/v1/jobs", params={k: v for k, v in args.items() if v})
         elif name == "hive_job_update":
