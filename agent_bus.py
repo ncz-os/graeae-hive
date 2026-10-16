@@ -61,6 +61,10 @@ from hive.bus.domain.eligibility import (
 )
 from hive.bus.domain.jobs import (
     CACHE_TTL_SECONDS,
+    CLAIM_LEASE_SECONDS,
+    DECLINE_REASON_PREFIXES,
+    MAX_DECLINE_REQUEUES,
+    STATUS_TRANSITIONS,
     SUBSCRIPTION_PROVIDERS,
     cache_key_for,
     cache_lookup,
@@ -69,6 +73,7 @@ from hive.bus.domain.jobs import (
     estimate_cost,
     hallucination_check,
     normalize_result_payload,
+    valid_completion_proof,
 )
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
 from hive.bus.routers.admin import router as _admin_router
@@ -865,42 +870,9 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
-MAX_DECLINE_REQUEUES = 3
-DECLINE_REASON_PREFIXES: tuple[str, ...] = (
-    "no_workspace_for_kind",
-    "no_workspace_for_repo",
-)  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
-STATUS_TRANSITIONS: dict[str, set[str]] = {
-    "queued": {"queued", "offered", "claimed", "cancelled"},
-    "offered": {"queued", "claimed", "cancelled"},
-    "claimed": {
-        "queued",
-        "claimed",
-        "running",
-        "done",
-        "failed",
-        "cancelled",
-        "needs-review",
-    },
-    "running": {"queued", "running", "done", "failed", "cancelled", "needs-review"},
-    "needs-review": {
-        "needs-review",
-        "done",
-        "failed",
-        "cancelled",
-    },  # awaiting review; promotable
-    "done": {
-        "done",
-        "cancelled",
-    },  # allow cancelling fake/duplicate completions out of done
-    # A failed job may be RETIRED as cancelled (superseded work), never
-    # reopened -- same exception as done -> cancelled. Without it a
-    # superseded failure stayed "failed" forever (2026-10-03).
-    "failed": {"failed", "cancelled"},
-    "cancelled": {"cancelled"},
-    "dead-letter": {"dead-letter"},  # terminal; idempotent same-status PATCH only
-}
-CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
+# job consts (MAX_DECLINE_REQUEUES/DECLINE_REASON_PREFIXES/STATUS_TRANSITIONS/CLAIM_LEASE_SECONDS) moved to hive.bus.domain.jobs (imported above).
+
+
 #: Eligibility is evaluated in Python (job_agent_eligible), so the candidate
 #: query cannot know which rows THIS agent can take. A single fixed window
 #: therefore starves any agent whose work sits behind rows it is ineligible
@@ -940,30 +912,7 @@ def field_was_set(model: BaseModel, name: str) -> bool:
     return name in fields_set
 
 
-def valid_completion_proof(proof: dict) -> bool:
-    """Fail closed on missing Git evidence, including successful subprocesses.
-
-    NOTE (operator directive 2026-10-15): the `remote_verified` / `remote_sha`
-    checks were removed together with the Spark remote-agent path (see
-    docs/refactor-proposal-harness-agnostic-20261015.md § "Operator directive").
-    Local Git evidence is now the sole completion gate — completion is proven
-    at the bus against local repo state, not by a remote-agent attestation.
-    The gate still fails closed: every listed field must be present and exact.
-    """
-    sha = proof.get("head_sha")
-    commits = proof.get("commits")
-    files = proof.get("files_changed")
-    return bool(
-        isinstance(sha, str)
-        and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha)
-        and isinstance(commits, list)
-        and sha in commits
-        and all(isinstance(c, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", c) for c in commits)
-        and isinstance(files, list)
-        and files
-        and all(isinstance(f, str) and f for f in files)
-        and proof.get("worktree_clean") is True
-    )
+# valid_completion_proof moved to hive.bus.domain.jobs (imported above).
 
 
 # job result helpers + result-cache moved to hive.bus.domain.jobs (Phase 1c).
