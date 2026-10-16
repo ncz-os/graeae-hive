@@ -11,6 +11,7 @@ Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central 
 from __future__ import annotations
 
 import asyncio
+import hashlib as _hashlib
 import hmac
 import json
 import os
@@ -72,6 +73,7 @@ from hive.bus.schemas import (
     RequeueRequest,
 )
 from hive.core.models import COST_TIERS, cost_tier_for, knemon_candidates, rate_for
+
 # Re-exported for back-compat: mcp_bridge consumers + tests read these off agent_bus.
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES  # noqa: F401
 
@@ -1072,7 +1074,7 @@ def hallucination_check(result: dict) -> str | None:
 # Memoize (kind, description, max_cost_tier, sorted-required-capabilities) → result.
 # When identical job submitted, return cached result instantly. Cuts LLM spend
 # 30-70% on repetitive work + avoids NGC 429 storms from duplicate dispatches.
-import hashlib as _hashlib
+# (hashlib imported at module top.)
 
 CACHE_TTL_SECONDS = 24 * 3600  # 24h default; idempotent work like compiles/lints often valid much longer
 
