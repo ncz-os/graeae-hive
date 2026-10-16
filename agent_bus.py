@@ -28,7 +28,6 @@ except ModuleNotFoundError:
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 import retry_policy
@@ -52,18 +51,22 @@ from hive.bus.domain.eligibility import (
     agent_kind_aliases,
     job_agent_eligible,
 )
-from hive.bus.domain.jobs import (
+from hive.bus.domain.jobs import (  # noqa: E402
     CLAIM_LEASE_SECONDS,
     DECLINE_REASON_PREFIXES,
     MAX_DECLINE_REQUEUES,
     STATUS_TRANSITIONS,
     SUBSCRIPTION_PROVIDERS,
+    _safe_nonneg_int,
+    _safe_str,
     cache_key_for,
     cache_store,
     estimate_cost,
+    field_was_set,
     hallucination_check,
     json_list,
     normalize_result_payload,
+    stable_worker_id,
     valid_completion_proof,
 )
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
@@ -553,58 +556,9 @@ class OracleConnection:
             await result
 
 
-def stable_worker_id(urn: str) -> str:
-    """Collapse a session URN to a stable per-worker identity for stats.
+# stable_worker_id / MAX_REPORTED_TOKENS / _safe_nonneg_int / _safe_str
+# moved to hive.bus.domain.jobs (imported above).
 
-    ``urn:agent:<kind>:<host>:<session_uuid>`` -> ``urn:agent:<kind>:<host>``.
-    The session segment changes on every worker restart, so keying worker
-    stats by the full URN fragments one worker's history across thousands of
-    rows (3,176 rows / 43 live workers observed 2026-06-08). Keying by the
-    stable prefix aggregates a worker's runs across restarts. Non-conforming
-    URNs are returned unchanged.
-    """
-    if not urn:
-        return urn
-    parts = urn.split(":")
-    # urn:agent:<kind>:<host>:<session> -> 5 parts; drop the trailing session.
-    # Drop ONLY the trailing session segment so colon-bearing hosts (IPv6) are
-    # preserved — splitting on ':' and keeping parts[:4] would corrupt them.
-    if len(parts) >= 5 and parts[0] == "urn" and parts[1] == "agent":
-        return urn.rsplit(":", 1)[0]
-    return urn
-
-
-MAX_REPORTED_TOKENS = 100_000_000  # sane ceiling; rejects absurd worker telemetry
-
-
-def _safe_nonneg_int(v, default: int = 0) -> int:
-    """Coerce an untrusted worker-reported value to a clamped non-negative int.
-
-    Worker result bodies are runtime/untrusted; a malformed token field
-    (``"12.5"``, ``{}``, ``None``, a negative, ``Infinity``/``NaN`` which JSON
-    can carry, a 100-digit string) must NOT raise on the hot job-completion
-    path, decrement cumulative counters, or overflow the numeric column."""
-    if isinstance(v, bool):  # bool is an int subclass — never a token count
-        return default
-    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
-        return default
-    try:
-        n = int(v)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    if n <= 0:
-        return 0
-    return min(n, MAX_REPORTED_TOKENS)
-
-
-def _safe_str(v, default: str = "unknown") -> str:
-    if v is None:
-        return default
-    try:
-        s = str(v).strip()
-        return s or default
-    except Exception:  # noqa: BLE001
-        return default
 
 
 # ---------- schema ----------
@@ -869,11 +823,7 @@ KIND_HOST_AFFINITY: dict[str, list[str]] = {
 # json_list moved to hive.bus.domain.jobs (imported above).
 
 
-def field_was_set(model: BaseModel, name: str) -> bool:
-    fields_set = getattr(model, "model_fields_set", None)
-    if fields_set is None:
-        fields_set = getattr(model, "__fields_set__", set())
-    return name in fields_set
+# field_was_set moved to hive.bus.domain.jobs (imported above).
 
 
 # valid_completion_proof moved to hive.bus.domain.jobs (imported above).

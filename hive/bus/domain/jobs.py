@@ -34,6 +34,64 @@ def json_list(raw: str | None) -> list:
         return []
     return [x for x in val if isinstance(x, str)] if isinstance(val, list) else []
 
+
+MAX_REPORTED_TOKENS = 100_000_000  # sane ceiling; rejects absurd worker telemetry
+
+
+def field_was_set(model, name: str) -> bool:
+    """Pydantic v1/v2 'was this field explicitly supplied?' check."""
+    fields_set = getattr(model, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(model, "__fields_set__", set())
+    return name in fields_set
+
+
+def _safe_nonneg_int(v, default: int = 0) -> int:
+    """Coerce an untrusted worker-reported value to a clamped non-negative int.
+
+    Worker result bodies are runtime/untrusted; a malformed token field
+    (``"12.5"``, ``{}``, ``None``, a negative, ``Infinity``/``NaN`` which JSON
+    can carry, a 100-digit string) must NOT raise on the hot job-completion
+    path, decrement cumulative counters, or overflow the numeric column."""
+    if isinstance(v, bool):  # bool is an int subclass — never a token count
+        return default
+    if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+        return default
+    try:
+        n = int(v)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if n <= 0:
+        return 0
+    return min(n, MAX_REPORTED_TOKENS)
+
+
+def _safe_str(v, default: str = "unknown") -> str:
+    if v is None:
+        return default
+    try:
+        s = str(v).strip()
+        return s or default
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def stable_worker_id(urn: str) -> str:
+    """Collapse a session URN to a stable per-worker identity for stats.
+
+    ``urn:agent:<kind>:<host>:<session_uuid>`` -> ``urn:agent:<kind>:<host>``.
+    The session segment changes on every worker restart, so keying worker
+    stats by the full URN fragments one worker's history across thousands of
+    rows. Keying by the stable prefix aggregates a worker's runs across
+    restarts. Non-conforming URNs are returned unchanged.
+    """
+    if not urn:
+        return urn
+    parts = urn.split(":")
+    if len(parts) >= 5 and parts[0] == "urn" and parts[1] == "agent":
+        return urn.rsplit(":", 1)[0]
+    return urn
+
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
