@@ -3661,30 +3661,6 @@ async def update_job(job_id: str, req: JobUpdate):
                 existing_result,
             ) = current
 
-            # Preserve reviewer-owned keys across a worker's result write. The
-            # hive auto-reviewer appends hive_reviews to result, but a worker's
-            # later result PATCH REPLACED the whole result column and silently
-            # dropped the review (34 jobs lost their review this way; found
-            # 2026-10-16). Carry the reviewer keys over when the incoming result
-            # does not supply them, so a review is never clobbered.
-            if isinstance(req.result, dict):
-                _prev = existing_result
-                if isinstance(_prev, str):
-                    try:
-                        _prev = json.loads(_prev)
-                    except Exception:
-                        _prev = None
-                if isinstance(_prev, dict):
-                    # Copy rather than mutate req.result in place (no side
-                    # effect on the caller's request object), then reassign.
-                    _merged = dict(req.result)
-                    for _rk in ("hive_reviews", "deepseek_reviews"):
-                        if _prev.get(_rk) and not _merged.get(_rk):
-                            _merged[_rk] = _prev[_rk]
-                    if _merged != req.result:
-                        req.result = _merged
-                        patch_payload["result"] = req.result
-
             if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
                 await db.execute("ROLLBACK")
                 raise HTTPException(
@@ -3804,14 +3780,39 @@ async def update_job(job_id: str, req: JobUpdate):
                     patch_payload["status"] = req.status
                     patch_payload["result"] = req.result
 
+            # Preserve reviewer-owned keys across a worker's result write. The
+            # hive auto-reviewer appends hive_reviews to result, but this
+            # endpoint used to REPLACE the whole result column, so a worker's
+            # later result write silently dropped the review (34 jobs lost their
+            # review this way; found 2026-10-16). Merge the prior reviewer keys
+            # into a LOCAL copy -- req is left untouched -- and write that.
+            effective_result = req.result
+            if isinstance(effective_result, dict):
+                _prev = existing_result
+                if isinstance(_prev, str):
+                    try:
+                        _prev = json.loads(_prev)
+                    except Exception:
+                        _prev = None
+                if isinstance(_prev, dict):
+                    _merged = dict(effective_result)
+                    for _rk in ("hive_reviews", "deepseek_reviews"):
+                        if _prev.get(_rk) and not _merged.get(_rk):
+                            _merged[_rk] = _prev[_rk]
+                    if _merged != effective_result:
+                        effective_result = _merged
+                        # Keep the WS push payload consistent with what we write
+                        # (it is json.dumps'd for the socket, so a dict is fine).
+                        patch_payload["result"] = effective_result
+
             fields = ["status=?", "last_update_at=?"]
             args: list = [req.status, now]
             if req.status in TERMINAL_JOB_STATUSES:
                 fields.append("ended_at=?")
                 args.append(now)
-            if req.result is not None:
+            if effective_result is not None:
                 fields.append("result=?")
-                args.append(json.dumps(req.result))
+                args.append(json.dumps(effective_result))
             if release_to_queue:
                 fields.extend(
                     [
