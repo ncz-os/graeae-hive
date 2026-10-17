@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AgentRegister(BaseModel):
@@ -120,6 +120,29 @@ class JobUpdate(BaseModel):
     # Routing re-assignment (queued/offered jobs only — use status=queued to re-route)
     eligible_kinds: list[str] | None = None
     eligible_hosts: list[str] | None = None
+    # MODEL PROVENANCE (2026-10-16). Workers report the runtime/model/provider/
+    # cost-tier they ACTUALLY used when an attempt starts and on lease renewal.
+    # Previously these keys were silently dropped (pydantic ignores extras), so
+    # the bus kept showing the agent's registration model (e.g. 'zoder')
+    # forever. Optional + strip + bounded: unset/None never clobbers the row.
+    claimed_model: str | None = Field(None, max_length=128)
+    claimed_provider: str | None = Field(None, max_length=128)
+    claimed_runtime: str | None = Field(None, max_length=128)
+    claimed_cost_tier: str | None = Field(None, max_length=128)
+
+    @field_validator(
+        "claimed_model",
+        "claimed_provider",
+        "claimed_runtime",
+        "claimed_cost_tier",
+        mode="before",
+    )
+    @classmethod
+    def _strip_provenance(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
 
 
 class ScheduleCreate(BaseModel):

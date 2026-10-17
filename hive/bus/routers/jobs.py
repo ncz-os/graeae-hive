@@ -75,7 +75,8 @@ router = APIRouter()
 _JOB_COLUMNS = (
     "id, submitter_urn, parent_job_id, kind, description, priority, status, "
     "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count"
+    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count, "
+    "claimed_model, claimed_provider, claimed_runtime, claimed_cost_tier"
 )
 
 
@@ -151,6 +152,10 @@ async def get_job(job_id: str):
         "pr_number": r[18],
         "max_retries": r[19],
         "retry_count": r[20],
+        "claimed_model": r[21],
+        "claimed_provider": r[22],
+        "claimed_runtime": r[23],
+        "claimed_cost_tier": r[24],
     }
 
 
@@ -720,6 +725,10 @@ async def update_job(job_id: str, req: JobUpdate):
                 tokens_in=req.tokens_in,
                 tokens_out=req.tokens_out,
                 result_mnemos_id=req.result_mnemos_id,
+                claimed_model=req.claimed_model,
+                claimed_provider=req.claimed_provider,
+                claimed_runtime=req.claimed_runtime,
+                claimed_cost_tier=req.claimed_cost_tier,
             )
     req.result = normalize_result_payload(req.status, req.result)
 
@@ -860,6 +869,32 @@ async def update_job(job_id: str, req: JobUpdate):
             sets["claim_lease_expires_at"] = None
         if result_mnemos_was_set:
             sets["result_mnemos_id"] = req.result_mnemos_id
+
+        # ---- model provenance (2026-10-16) --------------------------------
+        # The worker reports the model it ACTUALLY ran (attempt start + lease
+        # renewal). Allowed only for the CURRENT claimant, only while the job
+        # is claimed/running or on the terminal done/failed write, and never
+        # with None (an absent/blank value leaves the column untouched).
+        if not release_to_queue and req.status in {"claimed", "running", "done", "failed"}:
+            prov_fields = {
+                "claimed_model": req.claimed_model,
+                "claimed_provider": req.claimed_provider,
+                "claimed_runtime": req.claimed_runtime,
+                "claimed_cost_tier": req.claimed_cost_tier,
+            }
+            prov_sets = {k: v for k, v in prov_fields.items() if v}
+            if req.status == "done" and isinstance(req.result, dict):
+                models = req.result.get("models")
+                author = models.get("author") if isinstance(models, dict) else None
+                if isinstance(author, str) and author.strip() and "claimed_model" not in prov_sets:
+                    prov_sets["claimed_model"] = author.strip()
+            if prov_sets:
+                if not old_claimed_by or req.claimed_by != old_claimed_by:
+                    raise HTTPException(
+                        403,
+                        "provenance update requires claimed_by to match the current claimant",
+                    )
+                sets.update(prov_sets)
 
         if req.tokens_in is not None or req.tokens_out is not None:
             t_in = int(req.tokens_in or 0)
