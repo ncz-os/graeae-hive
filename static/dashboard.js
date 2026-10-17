@@ -30,6 +30,7 @@ async function api(method,path,body,retry=true){
   return j;
 }
 function relTime(ts){if(!ts)return '';const d=(Date.now()/1000-ts);if(d<60)return Math.round(d)+'s ago';if(d<3600)return Math.round(d/60)+'m ago';return Math.round(d/3600)+'h ago';}
+function untilTime(ts){if(!ts)return '';const d=(ts-Date.now()/1000);if(d<=0)return 'expired';if(d<60)return 'in '+Math.round(d)+'s';if(d<3600)return 'in '+Math.round(d/60)+'m';return 'in '+Math.round(d/3600)+'h';}
 function pbar(p){return `<span class="pbar"><span class="pbar-fill" style="width:${Math.min(100,p)}%"></span></span>`;}
 function badgeCls(s){return 'badge badge-'+(s||'queued');}
 
@@ -167,6 +168,9 @@ function showJobModal(job){
   meta.innerHTML=[
     `<span class="${badgeCls(job.status)}">${esc(job.status)}</span>`,
     job.claimed_by?`<span>claimed by ${esc(job.claimed_by.split(':').slice(2,4).join('@'))}</span>`:'',
+    job.claimed_at?`<span>claimed ${relTime(job.claimed_at)}</span>`:'',
+    job.last_update_at?`<span>updated ${relTime(job.last_update_at)}</span>`:'',
+    job.claim_lease_expires_at?`<span>lease ${untilTime(job.claim_lease_expires_at)}</span>`:'',
     `<span>created ${relTime(job.started_at)}</span>`,
     job.ended_at?`<span>ended ${relTime(job.ended_at)}</span>`:'',
     job.estimated_cost_usd?`<span>$${job.estimated_cost_usd.toFixed(4)}</span>`:'',
@@ -299,12 +303,13 @@ async function refreshRunning(){
   // kinds, NOT one card per instance. kind==zeroclaw is the build fan-out pool.
   // Maps use Object.create(null) because keys are untrusted URN/host strings
   // (avoids __proto__/constructor prototype-pollution + Object.values drops).
-  const [aj,jj]=await Promise.all([
+  const [aj,jj,cj]=await Promise.all([
     api('GET','/v1/agents?status=online').catch(()=>({agents:null})),
     api('GET','/v1/jobs?status=running&limit=200').catch(()=>({jobs:[]})),
+    api('GET','/v1/jobs?status=claimed&limit=200').catch(()=>({jobs:[]})),
   ]);
   const agents=(Array.isArray(aj.agents)?aj.agents:[]).filter(a=>a&&a.kind==='zeroclaw');
-  const jobs=jj.jobs||[];
+  const jobs=[...(jj.jobs||[]),...(cj.jobs||[])];
   const byClaimer=Object.create(null);
   for(const j of jobs){ if(j.claimed_by) byClaimer[j.claimed_by]=j; }
   const hosts=Object.create(null);
@@ -474,14 +479,15 @@ async function refreshDoctor(){
 
 async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFailed) */ }
   async function refreshFailed(){
-    // UNIFIED TRIAGE QUEUE (operator 2026-06-04): one queue, all non-done/non-cancelled
-    // statuses, color-coded + priority. Replaces the separate Failed + Doctor panels.
-    const sts=['dead-letter','failed','running','claimed','offered','queued'];
+    // TRIAGE QUEUE (2026-10-17): only jobs that need attention. Healthy in-flight
+    // work lives in the Jobs (queued/offered) + Workers (claimed/running) panels;
+    // it must NOT appear here as a triage entry.
+    const sts=['dead-letter','failed','needs-review'];
     const res=await Promise.all(sts.map(st=>api('GET',`/v1/jobs?status=${st}&limit=${st==='queued'?300:100}`).catch(()=>({jobs:[]}))));
     let jobs=[];
     sts.forEach((st,i)=>{(res[i].jobs||[]).forEach(j=>{if(!j.status)j.status=st;jobs.push(j);});});
     _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
-    const order={'dead-letter':0,failed:1,running:2,claimed:3,offered:4,queued:5};
+    const order={'dead-letter':0,failed:1,'needs-review':2};
     jobs.sort((a,b)=>{const ao=order[a.status]??9,bo=order[b.status]??9;if(ao!==bo)return ao-bo;return (b.priority||0)-(a.priority||0);});
     if(unchanged('failed',jobs))return;
     const cntEl=document.getElementById('failed-cnt');
@@ -489,7 +495,7 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
     const el=document.getElementById('failed-list');
     if(!el)return;
     el.innerHTML='';
-    if(!jobs.length){ el.innerHTML='<div class="failed-panel-empty">Queue empty — nothing in flight ✓</div>'; return; }
+    if(!jobs.length){ el.innerHTML='<div class="failed-panel-empty">Nothing needs triage ✓</div>'; return; }
     for(const j of jobs.slice(0,150)){
       const r=j.result||{};
       const reason=r.failure_reason||r.stderr||r.error||r.note||r.worker_error||r.summary||'';
@@ -498,7 +504,7 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
       card.onclick=()=>showJobModal(j);
       const jid=j.id, prio=j.priority||0;
       const pcls=prio>=80?'pri-hi':(prio>=40?'pri-mid':'pri-lo');
-      const isTerminal=(j.status==='failed'||j.status==='dead-letter');
+      const isTerminal=(j.status==='failed'||j.status==='dead-letter'||j.status==='needs-review');
       const acts=isTerminal?`<div class="fc-acts" onclick="event.stopPropagation()">
           <button class="btn btn-ghost btn-sm" onclick="resubmitFailed('${jid}')">🔁 Resubmit</button>
           <button class="btn btn-primary btn-sm" onclick="triageAndResubmit('${jid}')">🔍 Triage &amp; Resubmit</button>
