@@ -22,6 +22,11 @@ from .sqlite import SqliteHiveRepository
 
 _ORACLE_JOB_ADDITIONS = {
     "REQUIRED_AUTONOMY": "required_autonomy VARCHAR2(32)",
+    # Fault 2026-10-17: both were in _ORACLE_REQUIRED_JOB_COLUMNS but were NOT
+    # in this additive map, so a legacy HIVE_JOBS never got them -> verification
+    # warned / inserts and reads of the submitter's prefs silently failed.
+    "PREFERRED_PROVIDERS": "preferred_providers CLOB CHECK (preferred_providers IS JSON)",
+    "PREFERRED_MODELS": "preferred_models CLOB CHECK (preferred_models IS JSON)",
     "REQUIRED_RESOURCES": "required_resources CLOB CHECK (required_resources IS JSON)",
     "CLAIMED_HOST_CAPS": "claimed_host_caps CLOB CHECK (claimed_host_caps IS JSON)",
     "PROJECT": "project VARCHAR2(120)",

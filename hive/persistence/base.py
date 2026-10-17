@@ -155,6 +155,10 @@ class HiveMindRepository(ABC):
     async def completed_job_ids(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]: ...
 
     @abstractmethod
+    async def dependencies_satisfied(self, tx: Transaction, job_id: str) -> bool:
+        """True when every ``depends_on`` job of ``job_id`` is status='done'."""
+
+    @abstractmethod
     async def claim_job(
         self,
         tx: Transaction,
@@ -206,9 +210,7 @@ class HiveMindRepository(ABC):
     async def cache_stats(self, tx: Transaction, *, top_n: int) -> dict[str, Any]: ...
 
     @abstractmethod
-    async def cost_stats_rows(
-        self, tx: Transaction, *, group_by: str, cutoff: float
-    ) -> list[dict[str, Any]]: ...
+    async def cost_stats_rows(self, tx: Transaction, *, group_by: str, cutoff: float) -> list[dict[str, Any]]: ...
 
     @abstractmethod
     async def spend_summary(self, tx: Transaction, *, cutoff: float) -> dict[str, Any]: ...
@@ -274,9 +276,7 @@ class HiveMindRepository(ABC):
     async def select_due_schedules(self, tx: Transaction, *, now: float) -> list[tuple]: ...
 
     @abstractmethod
-    async def mark_schedule_fired(
-        self, tx: Transaction, *, sched_id: str, now: float, next_at: float
-    ) -> None: ...
+    async def mark_schedule_fired(self, tx: Transaction, *, sched_id: str, now: float, next_at: float) -> None: ...
 
     @abstractmethod
     async def select_stale_queued_job_ids(self, tx: Transaction, *, cutoff: float) -> list[str]: ...
