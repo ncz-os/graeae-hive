@@ -686,7 +686,14 @@ async function refreshGPU(){
     const mu = g.mem_used_mib, mt = g.mem_total_mib;
     const memPct = (mu!=null && mt && mt>0) ? (100*mu/mt) : null;
     const memCls = memPct==null?'load-ok':memPct<70?'load-ok':memPct<90?'load-warn':'load-crit';
-    const memCell = (mu!=null && mt!=null && mt>0) ? `<span class="load-bar" style="width:60px"><span class="load-bar-fill ${memCls}" style="width:${memPct||0}%"></span></span> ${(mu/1024).toFixed(1)}/${(mt/1024).toFixed(1)} GiB` : '-';
+    // APUs (Radeon 780M etc.): mem_* is VRAM+GTT; label the shared pool as 'shared'
+    // with the GTT figure so a loaded model in system RAM is visible.
+    let memLabel = (mu!=null && mt!=null) ? `${(mu/1024).toFixed(1)}/${(mt/1024).toFixed(1)} GiB` : '-';
+    if (g.unified_memory && mu!=null && mt!=null) {
+      const gttU = g.gtt_used_mib!=null ? `${(g.gtt_used_mib/1024).toFixed(1)}G GTT` : 'GTT shared';
+      memLabel = `${(mu/1024).toFixed(1)}/${(mt/1024).toFixed(1)} GiB <small class="dim">shared ${gttU}</small>`;
+    }
+    const memCell = (mu!=null && mt!=null && mt>0) ? `<span class="load-bar" style="width:60px" title="${esc(g.unified_memory?'APU shared memory: VRAM+GTT (system RAM)':'VRAM')}"><span class="load-bar-fill ${memCls}" style="width:${memPct||0}%"></span></span> ${memLabel}` : '-';
     const temp = g.temp_c, tempColor = temp==null?'#8b949e':temp<70?'#7ee787':temp<85?'#9e6a03':'#da3633';
     const tempCell = temp==null ? '-' : `<span style="color:${tempColor}">${temp.toFixed(0)}°C</span>`;
     const power = g.power_w, powerCell = power==null||power===0 ? '-' : `${power.toFixed(0)}W`;
