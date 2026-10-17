@@ -994,6 +994,25 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
     return f"requeued {len(target_ids)} jobs of {base_kind} (api={code2})"
 
 
+def _children_of(parent_ids: list[str], limit: int = 200) -> list[str]:
+    """Ids of jobs whose parent_job_id is one of `parent_ids`.
+
+    Uses the bus's parent_job_id filter (one query per parent) rather than
+    pulling the whole jobs table. Best-effort: an unreachable bus returns no
+    children, which leaves the purge exactly as it was before this check.
+    """
+    found: list[str] = []
+    for pid in parent_ids[:20]:
+        code, resp = _http("GET", f"/v1/jobs?parent_job_id={pid}&limit={int(limit)}", timeout=10.0)
+        if code != 200 or not resp:
+            continue
+        for child in resp.get("jobs", []) or []:
+            cid = child.get("id")
+            if cid and cid not in found:
+                found.append(cid)
+    return found
+
+
 def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
     if not base_kind:
         return "cancel_jobs missing base_kind"
@@ -1010,36 +1029,135 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
         return f"DRY_RUN: would cancel {len(target_ids)} jobs of {base_kind}"
+    # A purge deletes the parent row outright, so its children (parent_job_id)
+    # would be orphaned in the queue with nothing to account for them. Pull
+    # every child of a purged parent into the same purge. Children are purged
+    # with the same status filter, so an in-flight or historical child of a
+    # failed parent is left in place rather than deleted out from under a worker.
+    child_ids = _children_of(target_ids)
+    purge_ids = target_ids + [cid for cid in child_ids if cid not in target_ids]
     # Failed jobs are terminal and cannot be PATCHed, so a cancel removes them
     # from the queue with the bus purge (failed status only, explicit ids).
-    # The ids stay on record in this triage job's result and the broadcast.
+    # This is a HARD DELETE (hive.bus.routers.admin.purge_jobs -> DELETE), not
+    # a failed->cancelled transition: the row and its audit log are gone. The
+    # ids stay on record in this triage job's result and the broadcast.
     code2, resp2 = _http("POST", "/v1/jobs/purge", {
-        "ids": target_ids,
+        "ids": purge_ids,
         "status": "failed",
         "reason": f"doctor-cancel:{base_kind}",
     })
     broadcast_doctor_message("doctor.cancel", {
         "host": AGENT_HOST,
         "base_kind": base_kind,
-        "job_ids": target_ids,
+        "job_ids": purge_ids,
         "reason": "doctor-determined-structural-failure",
         "api": code2,
     })
     removed = (resp2 or {}).get("deleted") if isinstance(resp2, dict) else None
-    return f"cancelled {removed if removed is not None else '?'}/{len(target_ids)} failed jobs of {base_kind} (api={code2}): {', '.join(target_ids)}"
+    # Report the confirmed count against the requested count, and say so when
+    # the API did not confirm every id (a partial delete is a failure signal).
+    summary = (f"cancelled {removed if removed is not None else '?'}/{len(purge_ids)} "
+               f"failed jobs of {base_kind} (api={code2}): {', '.join(purge_ids)}")
+    if removed is not None and removed != len(purge_ids):
+        summary += f"; PARTIAL: {len(purge_ids) - removed} job(s) not deleted"
+    return summary
 
 
-# Codex runs only on explicit request, never as a default target.
+# Fleet harness kinds (hive/harness/base.py:46) minus non-workers. Codex runs
+# only on explicit request, never as a default target, and 'doctor' must never
+# be here: a doctor-eligible job would be re-claimed by this same pool and loop.
+# This is an ALLOWLIST of worker kinds, so an LLM-supplied job kind
+# ("fix:hive-one") or "doctor" cannot leave the job queued with nothing able
+# to claim it.
 DEFAULT_RELEASE_KINDS = ["zeroclaw", "opencode"]
-RELEASABLE_KINDS = frozenset(DEFAULT_RELEASE_KINDS)
+RELEASABLE_KINDS = frozenset({"zeroclaw", "opencode", "zoder", "claude"})
 
 # Failures no retry can fix: the submitter has to create the branch or map the
 # repo first. Escalated without an LLM call.
+# NOTE: no_repo_mapping is NOT here. It is deployment-dependent (the worker's
+# REPO_MAP vs the bus catalog), so it is classified per job below via
+# hive.bus.domain.jobs.is_unresolvable_release -- escalating every occurrence
+# would kill jobs a stale worker merely declined (audit BLOCKING-1).
 _UNSCHEDULABLE_RE = re.compile(
-    r"Remote branch \S+ not found|couldn't find remote ref|no_repo_mapping"
+    r"Remote branch \S+ not found|couldn't find remote ref"
     r"|unknown repo|could not resolve repo",
     re.IGNORECASE,
 )
+
+
+def _repo_catalog_filter():
+    """Loader for hive.bus.domain.jobs.repo_in_catalog (patchable in tests).
+
+    The doctor is otherwise stdlib-only, so the hive import is deferred: the
+    signature phase only pays for it when a failed result mentions
+    no_repo_mapping. An unimportable catalog falls back to repo_in_catalog's
+    own fail-open behaviour (unknown repo -> might be present -> retry)."""
+    try:
+        from hive.bus.domain.jobs import repo_in_catalog
+    except Exception:  # noqa: BLE001 - catalog unavailable: never kill the job
+        return lambda repo: True
+    return repo_in_catalog
+
+
+repo_in_catalog = _repo_catalog_filter()
+
+
+def _is_unschedulable(failed: list[dict]) -> str | None:
+    """The unschedulable reason in `failed`, or None.
+
+    no_repo_mapping is counted ONLY when the job's repo is genuinely absent
+    from the bus catalog. A catalog-present repo means a STALE WORKER: the job
+    must be requeued/routed, never escalated (hive.bus.domain.jobs:135-157)."""
+    for fj in failed[:8]:
+        result = fj.get("result") or ""
+        if isinstance(result, dict):
+            try:
+                result = json.dumps(result)
+            except Exception:
+                result = str(result)
+        text = str(result)[:3000]
+        match = _UNSCHEDULABLE_RE.search(text)
+        if match:
+            return match.group(0)
+        if re.search(r"no_repo_mapping", text, re.IGNORECASE):
+            if not repo_in_catalog(fj.get("repo")):
+                return "no_repo_mapping"
+    return None
+
+
+def _release_job(job_id: str, release_eligible_kinds: list | None) -> tuple[str, bool]:
+    """Release `job_id` to the queue. Returns (summary, bus_accepted).
+
+    The boolean is the AUTHORITY: main() skips the terminal PATCH only when the
+    bus actually accepted the requeue. A rejected PATCH (e.g. 404: the job is
+    gone or already terminal) must report False so the caller still terminates
+    the job instead of leaving it in 'running' until its lease expires."""
+    if release_eligible_kinds and isinstance(release_eligible_kinds, list):
+        # Only real worker kinds: an LLM-supplied job kind or "doctor" would
+        # leave the job queued with nothing able to claim it.
+        new_kinds = [k for k in release_eligible_kinds if k in RELEASABLE_KINDS]
+    else:
+        new_kinds = []
+    # If LLM didn't give us anything usable, broaden to all workers.
+    if not new_kinds:
+        new_kinds = list(DEFAULT_RELEASE_KINDS)
+    if DRY_RUN:
+        return f"DRY_RUN: would release {job_id[:12]} with eligible_kinds={new_kinds}", True
+    # Bus contract: eligible_kinds can only be updated on queued/offered jobs.
+    # Our job is currently 'running' (we patched it on claim), so we must
+    # release in TWO steps: (1) status running→queued (clears claimed_by),
+    # (2) PATCH eligible_kinds on the now-queued job.
+    code1, resp1 = _http("PATCH", f"/v1/jobs/{job_id}",
+                         {"status": "queued", "claimed_by": _urn})
+    if code1 not in (200, 201, 204):
+        return f"release step 1 FAILED code={code1} resp={str(resp1)[:200]}", False
+    code2, resp2 = _http("PATCH", f"/v1/jobs/{job_id}",
+                         {"status": "queued", "eligible_kinds": new_kinds})
+    if code2 in (200, 201, 204):
+        return f"released {job_id[:12]} → queued, eligible_kinds={new_kinds}", True
+    # Step 1 already succeeded so the job IS released; the kind retag just failed.
+    return (f"released {job_id[:12]} → queued (eligible_kinds retag failed "
+            f"code={code2} resp={str(resp2)[:200]})"), True
 
 
 def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) -> str:
@@ -1051,32 +1169,7 @@ def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) ->
     CRITICAL: release MUST exclude 'doctor' from eligible_kinds, otherwise
     the doctor pool will re-claim the job and trigger a loop (caught by
     loop detection but burns LLM calls and human attention)."""
-    if release_eligible_kinds and isinstance(release_eligible_kinds, list):
-        # Only real worker kinds: an LLM-supplied job kind or "doctor" would
-        # leave the job queued with nothing able to claim it.
-        new_kinds = [k for k in release_eligible_kinds if k in RELEASABLE_KINDS]
-    else:
-        new_kinds = []
-    # If LLM didn't give us anything usable, broaden to all workers.
-    if not new_kinds:
-        new_kinds = list(DEFAULT_RELEASE_KINDS)
-    if DRY_RUN:
-        return f"DRY_RUN: would release {job_id[:12]} with eligible_kinds={new_kinds}"
-    # Bus contract: eligible_kinds can only be updated on queued/offered jobs.
-    # Our job is currently 'running' (we patched it on claim), so we must
-    # release in TWO steps: (1) status running→queued (clears claimed_by),
-    # (2) PATCH eligible_kinds on the now-queued job.
-    code1, resp1 = _http("PATCH", f"/v1/jobs/{job_id}",
-                         {"status": "queued", "claimed_by": _urn})
-    if code1 not in (200, 201, 204):
-        return f"release step 1 FAILED code={code1} resp={str(resp1)[:200]}"
-    code2, resp2 = _http("PATCH", f"/v1/jobs/{job_id}",
-                         {"status": "queued", "eligible_kinds": new_kinds})
-    if code2 in (200, 201, 204):
-        return f"released {job_id[:12]} → queued, eligible_kinds={new_kinds}"
-    # Step 1 already succeeded so the job IS released; the kind retag just failed.
-    return (f"released {job_id[:12]} → queued (eligible_kinds retag failed "
-            f"code={code2} resp={str(resp2)[:200]})")
+    return _release_job(job_id, release_eligible_kinds)[0]
 
 
 def apply_release(job_id: str, is_explicit_triage: bool, base_kind: str,
@@ -1086,10 +1179,18 @@ def apply_release(job_id: str, is_explicit_triage: bool, base_kind: str,
     On a triage:<kind> wrapper, "release" means re-run the ORIGINAL failed
     job(s) of that kind; releasing the wrapper itself would leave the failed
     jobs untouched and park the wrapper in the queue. Only a job the doctor
-    claimed directly is handed back to the regular queue."""
+    claimed directly is handed back to the regular queue.
+
+    ``released`` is True ONLY when the job actually left the doctor's hands
+    (the bus accepted the requeue). main() skips the terminal PATCH when it is
+    True, so a failed release must report False or the job hangs in 'running'
+    until its claim lease expires and the cycle repeats."""
     if is_explicit_triage:
-        return action_resubmit_jobs(base_kind), False
-    return action_release_to_queue(job_id, release_eligible_kinds), True
+        # The wrapper is answered by the triage result itself; the failed jobs
+        # were requeued, so the wrapper is finished -- never "released".
+        text = action_resubmit_jobs(base_kind)
+        return text, False
+    return _release_job(job_id, release_eligible_kinds)
 
 
 def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str:
@@ -1300,9 +1401,19 @@ def _match_known_signature(job: dict, base_kind: str,
     Current signatures:
       - token_mismatch: 'no token for host' / 'pair gateway first via POST /pair'
     """
-    # Build searchable text from job description + failed-job results
+    # Build searchable text from job description + failed-job results.
+    # A doctor-authored job must NOT be judged on its own stored failure: a
+    # doctor:* job that failed with a transient error would match its own
+    # "ConnectionClosed" and release itself, skipping the terminal PATCH.
+    own_failures = [
+        fj for fj in failed[:8]
+        if not (
+            str(fj.get("kind") or "").startswith(DOCTOR_CLAIM_KIND_PREFIXES)
+            or (_urn and str(fj.get("claimed_by") or "") == _urn)
+        )
+    ]
     search_text = (job.get("description") or "")[:10000]
-    for fj in failed[:8]:
+    for fj in own_failures:
         result = fj.get("result") or ""
         if isinstance(result, dict):
             try:
@@ -1311,10 +1422,10 @@ def _match_known_signature(job: dict, base_kind: str,
                 result = str(result)
         search_text += " " + str(result)[:3000]
 
-    unschedulable = _UNSCHEDULABLE_RE.search(search_text)
-    if unschedulable:
+    unsched = _is_unschedulable(own_failures)
+    if unsched:
         return {"action_type": "escalate", "confidence": 1.0,
-                "reason": f"unschedulable ({unschedulable.group(0)}): the submitter must "
+                "reason": f"unschedulable ({unsched}): the submitter must "
                           "create the branch or map the repo; a retry cannot fix it; no LLM"}
 
     # Transient gateway/session error (ws-400 / ConnectionClosed) — e.g. a worker
@@ -1559,6 +1670,7 @@ def process_triage_job(job: dict) -> dict:
         log.info("doctor decision (SIGNATURE-MATCH): action=%s reason=%s", a, reason)
         parts = [f"action={a}", f"conf={known_action.get('confidence', 1.0):.2f}",
                  f"reason={reason}"]
+        released = False
         if a == "dispatch_codex_fix":
             parts.append(action_dispatch_codex_fix(
                 known_action.get("codex_task"), job_id))
@@ -1571,12 +1683,12 @@ def process_triage_job(job: dict) -> dict:
             })
             # Re-run the failed work now the offending host is fixed (the
             # original jobs for a triage wrapper, else this job itself).
-            text, _ = apply_release(
+            text, released = apply_release(
                 job_id, is_explicit_triage, base_kind,
                 known_action.get("release_eligible_kinds"))
             parts.append(text)
         elif a == "release_to_queue":
-            text, _ = apply_release(
+            text, released = apply_release(
                 job_id, is_explicit_triage, base_kind,
                 known_action.get("release_eligible_kinds"))
             parts.append(text)
@@ -1597,8 +1709,7 @@ def process_triage_job(job: dict) -> dict:
             "base_kind": base_kind,
             "failed_count_seen": len(failed),
             "auto_detected": True,
-            "released_to_queue": (
-                a in ("dispatch_codex_fix", "release_to_queue") and not is_explicit_triage),
+            "released_to_queue": released,
         }
 
     prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
@@ -1859,6 +1970,9 @@ def main():
                     # Don't overwrite with done/failed; just log + broadcast.
                     status = "released"
                 else:
+                    # Covers a release that reported False because the bus
+                    # rejected it: without this PATCH the job would sit in
+                    # 'running' until its claim lease expired and loop.
                     status = "done" if result.get("exit_code", 1) == 0 else "failed"
                     patch_job(job_id, status, result)
                 log.info("job %s → %s in %ds: %s",

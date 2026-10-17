@@ -4,11 +4,31 @@
 **Reviewed commit:** `b3355544d661471ce77989330e553b5d720a0fad` ("fix(doctor): act on the failed job, not the triage wrapper")
 **Base:** `ad1f717` ("fix(doctor): triage each failed job, and leave protected owners alone")
 **Scope:** `hive/workers/doctor.py`, `test_doctor_triage_actions.py`
-**Mode:** READ-ONLY. No production code edited; this document is the only artifact.
+**Mode:** originally READ-ONLY; the findings below were **fixed** in the follow-up
+commit on this branch (see "Resolution" at the end).
 **Verdict:** **REQUEST CHANGES** — the four headline fixes are directionally correct
 and the new tests pass, but two of them carry false-positive / loop paths that can
 re-enter the exact bugs they set out to remove, and a third uses the wrong worker
 kind vocabulary. Details and evidence below.
+
+---
+
+## Resolution (follow-up commit)
+
+All findings are addressed; the six findings below are preserved as the original
+review record.
+
+| # | Fix |
+|---|-----|
+| F1 | `_UNSCHEDULABLE_RE` no longer contains `no_repo_mapping`. A new `_is_unschedulable()` classifies it per job through `hive.bus.domain.jobs.repo_in_catalog` — catalog-present (stale worker) falls through to normal triage, catalog-absent escalates. Missing branch / unknown ref still escalate with no LLM call. |
+| F2 | `RELEASABLE_KINDS` is now `{zeroclaw, opencode, zoder, claude}` — the fleet harness kinds minus `generic`/`codex`. `doctor` and job kinds remain excluded. |
+| F3 | `_match_known_signature` ignores doctor-authored failures (kind `doctor:*`/`triage:*`, or claimed by `_urn`) so the doctor cannot read its own failure as transient; `_release_job()` returns the real bus outcome; `apply_release()` propagates it; the signature-phase `released_to_queue` now tracks the actual call instead of a constant; `main()` still PATCHes terminally when it is False. |
+| F4 | Unchanged by request — a no-op resubmit still marks the wrapper done; the summary text says so. |
+| F5 | `action_cancel_jobs` pulls children of purged parents into the purge via the bus `parent_job_id` filter, and reports a `PARTIAL:` marker when the API confirms fewer deletes than requested. |
+| F6 | Out of scope for this round (failed-scan window); noted above. |
+
+Test evidence: the new cases fail against `b335554`'s `doctor.py` (3 failed, 7
+errors) and pass after the fix (14 passed).
 
 ---
 

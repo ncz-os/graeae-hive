@@ -23,7 +23,8 @@ def calls(monkeypatch):
         doctor, "action_resubmit_jobs", lambda bk, n=20: seen["resubmit"].append(bk) or f"requeued {bk}"
     )
     monkeypatch.setattr(
-        doctor, "action_release_to_queue", lambda jid, kinds: seen["release"].append((jid, kinds)) or f"released {jid}"
+        doctor, "_release_job",
+        lambda jid, kinds: seen["release"].append((jid, kinds)) or (f"released {jid}", True),
     )
     return seen
 
@@ -82,12 +83,106 @@ def test_release_kinds_are_real_worker_kinds_and_never_default_to_codex(monkeypa
     assert sent[-1]["eligible_kinds"] == ["zeroclaw", "opencode"]
 
 
+# ── reviewer round: no_repo_mapping is deployment-dependent ──────────────
+def test_no_repo_mapping_on_a_catalog_present_repo_is_not_unschedulable(monkeypatch, calls):
+    """A stale worker's no_repo_mapping must NOT be escalated (BLOCKING-1)."""
+    monkeypatch.setattr(doctor, "repo_in_catalog", lambda repo: True)
+    failed = [
+        {"id": "f1", "kind": "fix:hive-one", "repo": "graeae-hive",
+         "result": {"worker_error": "no_repo_mapping"}},
+    ]
+    _llm_decides(monkeypatch, calls, {"action_type": "release_to_queue", "confidence": 0.9}, failed)
+    out = doctor.process_triage_job({"id": "t1", "kind": "triage:fix:hive-one", "description": ""})
+    assert calls["llm"] == 1, "catalog-present repo must fall through, not escalate"
+    assert out["action"]["action_type"] == "release_to_queue"
+    assert calls["resubmit"] == ["fix:hive-one"]
+
+
+def test_no_repo_mapping_on_a_catalog_absent_repo_is_unschedulable(monkeypatch, calls):
+    monkeypatch.setattr(doctor, "repo_in_catalog", lambda repo: False)
+    failed = [
+        {"id": "f1", "kind": "fix:hive-one", "repo": "definitely-absent-zzz",
+         "result": {"worker_error": "no_repo_mapping"}},
+    ]
+    _llm_decides(monkeypatch, calls, {"action_type": "release_to_queue"}, failed)
+    out = doctor.process_triage_job({"id": "t1", "kind": "triage:fix:hive-one", "description": ""})
+    assert calls["llm"] == 0
+    assert out["action"]["action_type"] == "escalate"
+    assert calls["resubmit"] == [] and calls["release"] == []
+
+
+def test_missing_branch_still_escalates_without_the_repo_check(monkeypatch, calls):
+    monkeypatch.setattr(doctor, "repo_in_catalog", lambda repo: True)
+    failed = [
+        {"id": "f1", "kind": "fix:hive-one",
+         "result": {"error": "clone_failed: fatal: Remote branch fix/x not found in upstream origin"}},
+    ]
+    _llm_decides(monkeypatch, calls, {"action_type": "release_to_queue"}, failed)
+    out = doctor.process_triage_job({"id": "t1", "kind": "triage:fix:hive-one", "description": ""})
+    assert calls["llm"] == 0
+    assert out["action"]["action_type"] == "escalate"
+
+
+# ── reviewer round: release reports actual HTTP outcome ──────────────────
+def test_apply_release_reports_failure_when_the_patch_fails(monkeypatch):
+    monkeypatch.setattr(doctor, "DRY_RUN", False)
+    monkeypatch.setattr(doctor, "_http", lambda m, path, body=None, timeout=0: (404, {"detail": "job not found"}))
+    text, released = doctor.apply_release("j1", False, "fix:hive-one", None)
+    assert released is False, "a failed release must not claim the job was requeued"
+    assert "FAILED" in text
+
+
+def test_apply_release_reports_success_when_the_patch_succeeds(monkeypatch):
+    monkeypatch.setattr(doctor, "DRY_RUN", False)
+    monkeypatch.setattr(doctor, "_http", lambda m, path, body=None, timeout=0: (200, {}))
+    text, released = doctor.apply_release("j1", False, "fix:hive-one", None)
+    assert released is True
+
+
+# ── reviewer round: doctor must not release itself on its own failure ────
+def test_doctor_kind_never_self_releases_on_its_own_failure(monkeypatch, calls):
+    """A doctor:* job reading its own stored result must not see a transient
+    signature and release itself (that skipped the terminal PATCH)."""
+    self_failed = {
+        "id": "d1",
+        "kind": "doctor:wakeup:[fix:hive-one]",
+        "result": {"exit_code": 2, "stdout": "doctor agent failed",
+                   "stderr": "ws_exception: ConnectionClosed"},
+    }
+    _llm_decides(monkeypatch, calls, {"action_type": "no_action", "confidence": 0.9}, [self_failed])
+    out = doctor.process_triage_job({"id": "d1", "kind": "doctor:wakeup:[fix:hive-one]",
+                                     "description": "wakeup"})
+    assert out["action"]["action_type"] == "no_action"
+    assert calls["release"] == []
+    assert out["released_to_queue"] is False
+
+
+# ── reviewer round: fleet harness kinds are releasable ──────────────────
+def test_release_kinds_include_zoder_and_claude(monkeypatch):
+    sent = []
+    monkeypatch.setattr(doctor, "DRY_RUN", False)
+    monkeypatch.setattr(doctor, "_http", lambda m, path, body=None, timeout=0: sent.append(body) or (200, {}))
+    doctor.action_release_to_queue("j1", ["zoder", "claude", "doctor", "fix:hive-one"])
+    assert sent[-1]["eligible_kinds"] == ["zoder", "claude"]
+
+
+def test_release_kinds_never_include_doctor_even_if_only_doctor_is_offered(monkeypatch):
+    sent = []
+    monkeypatch.setattr(doctor, "DRY_RUN", False)
+    monkeypatch.setattr(doctor, "_http", lambda m, path, body=None, timeout=0: sent.append(body) or (200, {}))
+    doctor.action_release_to_queue("j1", ["doctor"])
+    assert "doctor" not in sent[-1]["eligible_kinds"]
+    assert sent[-1]["eligible_kinds"] == doctor.DEFAULT_RELEASE_KINDS
+
+
 def test_cancel_removes_the_failed_jobs(monkeypatch):
     posted = []
     failed = {"jobs": [{"id": "a", "kind": "fix:hive-one"}, {"id": "b", "kind": "fix:other"}]}
 
     def fake_http(method, path, body=None, timeout=0):
         if method == "GET":
+            if path.startswith("/v1/jobs?parent_job_id="):
+                return 200, {"jobs": []}
             return 200, failed
         posted.append((path, body))
         return 200, {"deleted": len(body["ids"])}
@@ -98,3 +193,29 @@ def test_cancel_removes_the_failed_jobs(monkeypatch):
     out = doctor.action_cancel_jobs("fix:hive-one")
     assert posted == [("/v1/jobs/purge", {"ids": ["a"], "status": "failed", "reason": "doctor-cancel:fix:hive-one"})]
     assert out.startswith("cancelled 1/1")
+
+
+def test_cancel_also_cancels_child_jobs_of_the_purged_parents(monkeypatch):
+    """Purging a parent must not orphan its children in the queue."""
+    failed = {"jobs": [{"id": "a", "kind": "fix:hive-one"}]}
+    children = {"jobs": [{"id": "child1", "kind": "fix:hive-one", "parent_job_id": "a"},
+                         {"id": "child2", "kind": "fix:hive-one", "parent_job_id": "zzz"}]}
+    calls = []
+
+    def fake_http(method, path, body=None, timeout=0):
+        if method == "GET":
+            if path.startswith("/v1/jobs?parent_job_id="):
+                pid = path.split("parent_job_id=")[1].split("&")[0]
+                return 200, {"jobs": [c for c in children["jobs"] if c["parent_job_id"] == pid]}
+            return 200, failed
+        calls.append((path, body))
+        return 200, {"deleted": 1}
+
+    monkeypatch.setattr(doctor, "DRY_RUN", False)
+    monkeypatch.setattr(doctor, "_http", fake_http)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    out = doctor.action_cancel_jobs("fix:hive-one")
+    # Only child1 descends from a purged parent; child2 is left alone.
+    purge = [c for c in calls if c[0] == "/v1/jobs/purge"]
+    assert purge and purge[0][1]["ids"] == ["a", "child1"]
+    assert "child1" in out and "child2" not in out
