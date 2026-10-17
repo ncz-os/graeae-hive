@@ -59,6 +59,32 @@ class UnresolvableReleaseTests(unittest.TestCase):
         self.assertTrue(is_unresolvable_release("no_workspace_for_kind"))
         self.assertTrue(is_unresolvable_release("no_workspace_for_repo"))
 
+    def test_workspace_reason_prefix_detail_counts(self):
+        # Regression (audit review of 23446a7): only the BARE reason counted.
+        # The worker emits "no_workspace_for_kind:<detail>"; that form must count
+        # too, or the job requeues forever.
+        for reason in ("no_workspace_for_kind:code", "no_workspace_for_repo:graeae-hive"):
+            self.assertTrue(is_unresolvable_release(reason), reason)
+
+    def test_substring_only_repo_is_treated_as_absent(self):
+        # "raeae-hive" is a SUBSTRING of the catalog id "graeae-hive" -- fuzzy
+        # resolve() matched it, so no_repo_mapping was never counted. ('hive'
+        # itself is a real alias of graeae-hive-mind, so it must still resolve.)
+        from hive.bus.domain.jobs import repo_in_catalog
+
+        probe = "raeae-hive"
+        self.assertFalse(repo_in_catalog(probe), f"{probe!r} is not a catalog id/alias")
+        self.assertTrue(is_unresolvable_release("no_repo_mapping", job_repo=probe))
+        # exact id and exact alias still resolve
+        self.assertTrue(repo_in_catalog(CATALOG_PRESENT_REPO))
+        self.assertFalse(is_unresolvable_release("no_repo_mapping", job_repo=CATALOG_PRESENT_REPO))
+        entry = __import__("hive.repos", fromlist=["x"]).find_exact(CATALOG_PRESENT_REPO)
+        alias = (entry.get("aliases") or [None])[0]
+        if alias:
+            self.assertTrue(repo_in_catalog(alias), alias)
+            self.assertTrue(repo_in_catalog(alias.upper()), f"{alias} (case-insensitive)")
+            self.assertFalse(is_unresolvable_release("no_repo_mapping", job_repo=alias))
+
     def test_prefix_form_matches(self):
         self.assertTrue(is_unresolvable_release("no_repo_mapping:ssh://x/y.git", job_repo=CATALOG_ABSENT_REPO))
         self.assertFalse(is_unresolvable_release("no_repo_mapping:ssh://x/y.git", job_repo=CATALOG_PRESENT_REPO))

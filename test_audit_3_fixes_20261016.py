@@ -60,6 +60,12 @@ CODE_KIND_READONLY_LOOKALIKE = (
 
 
 # ───────────────────────────── Fix A: unresolvable release ─────────────────────────────
+def _resolve_fuzzy(query: str) -> list:
+    from hive.repos import resolve
+
+    return resolve(query, limit=1)
+
+
 class UnresolvableReleaseAudit(unittest.TestCase):
     """fix/hive-unresolvable-release-20261016."""
 
@@ -114,6 +120,56 @@ class UnresolvableReleaseAudit(unittest.TestCase):
             self.assertTrue(is_unresolvable_release(reason, job_repo=CATALOG_PRESENT_REPO), reason)
             self.assertTrue(is_unresolvable_release(reason, job_repo=CATALOG_ABSENT_REPO), reason)
             self.assertTrue(is_unresolvable_release(reason, job_repo=None), reason)
+
+    def test_BLOCKING1_substring_only_repo_IS_counted(self):
+        """Follow-up defect: the catalog check fell back to fuzzy resolve().
+
+        resolve() ranks prefix AND substring hits, so ``"raeae-hive"`` matched
+        the catalog entry ``graeae-hive`` and the repo looked catalog-present ->
+        no_repo_mapping was never counted -> the job requeued forever. Exact
+        matching only.
+        """
+        # NOTE: 'hive' alone is an exact ALIAS of graeae-hive-mind in the live
+        # catalog, so it legitimately resolves. The substring-only probe is a
+        # proper substring that is not any id/alias, e.g. 'raeae-hive'.
+        repo = "raeae-hive"
+        self.assertTrue(
+            repo_in_catalog(CATALOG_PRESENT_REPO),
+            f"{CATALOG_PRESENT_REPO!r} must be a catalog repo",
+        )
+        self.assertTrue(
+            _resolve_fuzzy(repo),
+            f"sanity: {repo!r} IS a fuzzy substring hit, so this is the regression case",
+        )
+        self.assertFalse(repo_in_catalog(repo), f"{repo!r} must not count as catalog-present")
+        self.assertTrue(is_unresolvable_release("no_repo_mapping", job_repo=repo))
+        self.assertTrue(is_unresolvable_release("no_repo_mapping:ssh://x/y.git", job_repo=repo))
+
+    def test_BLOCKING1_exact_id_and_alias_are_NOT_counted(self):
+        """Exact id and exact (case-insensitive) alias still count as present."""
+        from hive.repos import find_exact
+
+        entry = find_exact(CATALOG_PRESENT_REPO)
+        self.assertIsNotNone(entry)
+        for repo in (CATALOG_PRESENT_REPO, CATALOG_PRESENT_REPO.upper()):
+            self.assertTrue(repo_in_catalog(repo), f"{repo!r} is the exact id")
+            self.assertFalse(is_unresolvable_release("no_repo_mapping", job_repo=repo))
+        alias = (entry.get("aliases") or [None])[0]
+        if alias:
+            for repo in (alias, alias.upper()):
+                self.assertTrue(repo_in_catalog(repo), f"{repo!r} is an exact alias")
+                self.assertFalse(is_unresolvable_release("no_repo_mapping", job_repo=repo))
+        # and nothing resolves fuzzily in repo_in_catalog any more
+        src = (Path(__file__).parent / "hive" / "bus" / "domain" / "jobs.py").read_text()
+        fn = src.split("def repo_in_catalog", 1)[1].split("\ndef ", 1)[0]
+        self.assertNotIn("_repo_catalog.resolve", fn, "repo_in_catalog must not fall back to the fuzzy ranker")
+
+    def test_BLOCKING1_workspace_reason_detail_form_still_counts(self):
+        """Regression: only the bare workspace reason counted after 23446a7."""
+        for reason in ("no_workspace_for_kind:x", "no_workspace_for_kind:code",
+                       "no_workspace_for_repo:graeae-hive", "no_workspace_for_kind",
+                       "no_workspace_for_repo"):
+            self.assertTrue(is_unresolvable_release(reason), reason)
 
     def test_BLOCKING1_catalog_lookup_is_in_process(self):
         """No hot-path HTTP: the catalog comes from hive.repos (a local file)."""

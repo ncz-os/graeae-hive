@@ -110,6 +110,13 @@ JOB_LEVEL_DECLINE_REASONS: tuple[str, ...] = (
 # reason ``no_repo_mapping`` (see is_unresolvable_release).
 NO_REPO_MAPPING_DECLINE_BUDGET = 20
 
+# The workspace reasons in DECLINE_REASON_PREFIXES that take a ``:<detail>``
+# suffix on the wire (e.g. "no_workspace_for_kind:read-only").
+WORKSPACE_DECLINE_REASONS: tuple[str, ...] = (
+    "no_workspace_for_kind",
+    "no_workspace_for_repo",
+)
+
 DECLINE_REASON_PREFIXES: tuple[str, ...] = (
     "no_workspace_for_kind",
     "no_workspace_for_repo",
@@ -143,7 +150,7 @@ def is_unresolvable_release(reason: str, *, job_repo: str | None = None) -> bool
     r = reason or ""
     if r in JOB_LEVEL_DECLINE_REASONS or any(r.startswith(p + ":") for p in JOB_LEVEL_DECLINE_REASONS):
         return True
-    if r in ("no_workspace_for_kind", "no_workspace_for_repo"):
+    if any(r == p or r.startswith(p + ":") for p in WORKSPACE_DECLINE_REASONS):
         return True
     if r == "no_repo_mapping" or r.startswith("no_repo_mapping:"):
         return not repo_in_catalog(job_repo)
@@ -166,9 +173,11 @@ def repo_in_catalog(job_repo: str | None) -> bool:
     try:
         from hive import repos as _repo_catalog
 
-        if _repo_catalog.get_repo(repo) is not None:
-            return True
-        return bool(_repo_catalog.resolve(repo, limit=1))
+        # EXACT match only (audit BLOCKING-1 follow-up): the fuzzy ranker made a
+        # genuinely-absent repo whose name is a prefix/substring of a catalog id
+        # ("raeae-hive" vs "graeae-hive") look catalog-present, so no_repo_mapping
+        # was never counted and the job requeued forever.
+        return _repo_catalog.find_exact(repo) is not None
     except Exception:  # noqa: BLE001 - catalog unavailable: do not kill the job
         return True
 
