@@ -779,19 +779,10 @@ class SqliteHiveRepository(HiveMindRepository):
                     ) = r
                     if urn_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
                         continue
-                    if j_deps_json:
-                        # Distinct ids: COUNT(*) of matching rows never exceeds
-                        # the distinct count, so a repeated id would block forever.
-                        deps = list(dict.fromkeys(json_list(j_deps_json)))
-                        if deps:
-                            ph = ",".join("?" * len(deps))
-                            async with db.execute(
-                                f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
-                                tuple(deps),
-                            ) as dc:
-                                done_count = (await dc.fetchone())[0]
-                            if done_count < len(deps):
-                                continue
+                    # Same fail-closed gate as claim_job: distinct ids, and
+                    # unreadable depends_on never skips its prerequisites.
+                    if j_deps_json and not await self._deps_all_done(db, j_deps_json):
+                        continue
                     if _j_kinds_json:
                         kinds = set(json_list(_j_kinds_json))
                         if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):

@@ -314,6 +314,38 @@ class DependencyGatingTests(_RepoCase):
             )
         self.assertIsNone(claimed)
 
+    async def test_fallback_claim_path_fails_closed_on_malformed_deps(self):
+        repo = await self._repo()
+        urn = await self._agent(repo)
+        await self._insert(repo, "corrupt")
+        async with repo.connection() as db:
+            await db.execute("UPDATE jobs SET depends_on=? WHERE id='corrupt'", ("{not json",))
+            await db.commit()
+
+        def lenient(value):
+            try:
+                parsed = json.loads(value) if value else []
+            except ValueError:
+                return []
+            return parsed if isinstance(parsed, list) else []
+
+        now = time.time()
+        async with repo.connection() as tx:
+            claimed = await repo.claim_next_job(
+                tx,
+                agent_urn=urn,
+                now=now,
+                active_statuses={"online", "idle"},
+                claim_lease_seconds=60,
+                host_denylist=set(),
+                match_capabilities=lambda labels, caps: type("M", (), {"eligible": True})(),
+                kind_aliases=lambda kind, runtime: {kind},
+                json_list=lenient,
+                cost_tiers=["A", "B", "C"],
+                throttle_headroom=0.9,
+            )
+        self.assertIsNone(claimed)
+
     async def test_batch_dequeue_skips_blocked_job(self):
         repo = await self._repo()
         urn = await self._agent(repo)
