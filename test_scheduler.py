@@ -12,7 +12,7 @@ Coverage matrix (per task 2026-10-01):
     worker urns in the test corpus so the regression covers the four canonical
     workers named in the rollout directive
   * mixed local/EIH/MiniMax jobs — local = any worker (general pool),
-    EIH = NGC Enterprise Inference Hub = ngc-proxy provider chain,
+    EIH = NVIDIA EIH provider (integrate.api.nvidia.com),
     MiniMax = MiniMax-M3 capacity pool; verifies the MiniMax pool rejects
     jobs beyond the 5-slot cap while letting other routes through unaffected
   * retries — a job with retry_count > 0 retains its role/build requirement
@@ -423,7 +423,7 @@ check(
 
 # ── Mixed local / EIH / MiniMax job dispatch ──────────────────────────────
 # "local" = local-llamacpp provider chain (general worker, no special pool).
-# "EIH"   = ngc-proxy (NGC Enterprise Inference Hub) provider chain —
+# "EIH"   = NVIDIA EIH provider (integrate.api.nvidia.com) —
 #            also general worker (no special pool).
 # "MiniMax" = MiniMax-M3 capacity pool — this IS the global pool, not a
 #             per-worker route. The dispatch decision for a MiniMax job is
