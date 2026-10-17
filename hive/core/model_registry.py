@@ -54,9 +54,10 @@ GENERATED_DIR = HERE / "generated"
 BUS_BEGIN = "# --- BEGIN GENERATED (hive.core.model_registry) ---"
 BUS_END = "# --- END GENERATED (hive.core.model_registry) ---"
 
-# The one legal Nemotron in the registry (operator correction 2026-10-17: it
-# alone ships on the EIH endpoint prefix; a Nemotron model may also map to a
-# non-EIH host slot — see the placement rules below).
+# The one legal Nemotron in the registry (operator correction 2026-10-17: it is
+# the only Nemotron this registry knows, a backup REVIEWER, and its placement is
+# NOT EIH-only — any host slot whose route it allows may map it; TYDEUS serves a
+# Nemotron backup under test as served name 'nemotron35' on vLLM :8010).
 NEMOTRON_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 EIH_HOST = "eih"
 
@@ -88,11 +89,12 @@ KNOWN_ROUTES = frozenset(
     {"knemon", "zoder.coder", "zoder.reviewer", "zoder.reviewer.backup", "zeroclaw.default"}
 )
 DEEPSEEK_DIRECT_ENDPOINT = "https://api.deepseek.com/v1"
-# Nemotron is NOT EIH-only: any host slot may carry a Nemotron model as long as
-# the slot's route is one the model allows (operator correction 2026-10-17).
 # Retired endpoints: TYDEUS :8002 (the old coder route) and :4100 (the legacy
-# EIH gateway). Any host slot still pointing at one is an error. The served name
-# "nemotron35" is NOT retired — TYDEUS serves it on vLLM :8010.
+# EIH gateway). Any host slot still pointing at one is an error. (The TYDEUS
+# served name "nemotron35" on vLLM :8010 is NOT retired — see the Nemotron
+# note above.) No retired endpoint tokens remain: the only tokens ever
+# registered were retired with the Nemotron host/slot rule (operator
+# correction 2026-10-17).
 RETIRED_ENDPOINT_PORTS = (
     ("8002", "TYDEUS :8002 (retired coder route)"),
     ("4100", "legacy EIH gateway :4100 (retired)"),
