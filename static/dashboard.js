@@ -171,6 +171,8 @@ function showJobModal(job){
     job.claimed_at?`<span>claimed ${relTime(job.claimed_at)}</span>`:'',
     job.last_update_at?`<span>updated ${relTime(job.last_update_at)}</span>`:'',
     job.claim_lease_expires_at?`<span>lease ${untilTime(job.claim_lease_expires_at)}</span>`:'',
+    job.claimed_model?`<span>model ${esc(job.claimed_model)}</span>`:'',
+    job.claimed_provider?`<span>provider ${esc(job.claimed_provider)}</span>`:'',
     `<span>created ${relTime(job.started_at)}</span>`,
     job.ended_at?`<span>ended ${relTime(job.ended_at)}</span>`:'',
     job.estimated_cost_usd?`<span>$${job.estimated_cost_usd.toFixed(4)}</span>`:'',
@@ -193,6 +195,7 @@ function showJobModal(job){
     if(r.files_changed&&r.files_changed.length)texts.push('FILES CHANGED\n'+r.files_changed.join('\n'));
     if(r.commits&&r.commits.length)texts.push('COMMITS\n'+r.commits.map(c=>(c&&c.sha)?(c.sha.slice(0,10)+' '+(c.subject||'')):c).join('\n'));
     if(r.review)texts.push('REVIEW: '+(r.review.verdict||'?')+(r.review.model?' ['+r.review.model+']':'')+'\n'+(r.review.text||''));
+    if(r.models)texts.push('MODELS\n'+JSON.stringify(r.models));
     if(r.unreviewed)texts.push('\u26a0 UNREVIEWED: '+r.unreviewed);
     if(r.pushed_branch)texts.push('PUSHED BRANCH\n'+r.pushed_branch+(r.pushed_remote?(' @ '+r.pushed_remote):''));
     if(r.failure_reason)texts.push('FAILURE\n'+r.failure_reason);
@@ -349,7 +352,7 @@ async function refreshRunning(){
     const card=document.createElement('div');
     card.className='worker-card'+(h.busy?'':' idle');
     if(h.busy){ const j0=h.jobs[0]; card.onclick=()=>showJobModal(j0); }
-    const jobKinds=h.jobs.map(j=>esc(j.kind||'?')).join(', ');
+    const jobKinds=h.jobs.map(j=>`${esc(j.kind||'?')} <span class="dim">[${esc(j.claimed_model||'model?')}]</span>`).join(', ');
     card.innerHTML=`
       <div class="wc-agent"><span class="wc-dot"></span>
         <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}</div>
