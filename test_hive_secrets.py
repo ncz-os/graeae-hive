@@ -9,6 +9,7 @@ still recognise) but never the literal. Bodies use obviously-fake text
 minimum-length quantifiers -- see hive/core/secrets.py.
 """
 
+import re
 import unittest
 
 from hive.core import secrets
@@ -45,6 +46,43 @@ class FixtureShapeTests(unittest.TestCase):
         self.assertEqual(len(FAKE_AWS_AKIA), 20)
         self.assertTrue(FAKE_AWS_AKIA.startswith("AKIA"))
         self.assertIn("EXAMPLE", FAKE_AWS_AKIA)
+
+
+class SourceHygieneTests(unittest.TestCase):
+    """A complete token literal must never come back into this file's source."""
+
+    # Token SHAPES, matched against the raw source text. Keep each pattern
+    # split so this guard cannot itself trip a scanner.
+    FORBIDDEN = (
+        re.compile("gl" + "pat" + "-" + r"[0-9A-Za-z_-]{18,}"),
+        re.compile("gh" + "[pousr]" + "_" + r"[0-9A-Za-z]{30,}"),
+        re.compile("github" + "_pat_" + r"[0-9A-Za-z_]{20,}"),
+        re.compile("sk" + "-" + r"(?:proj-|ant-)?[0-9A-Za-z_-]{20,}"),
+        re.compile("xA" + r"i-[0-9A-Za-z]{20,}"),
+        re.compile("AKIA" + r"[0-9A-Z]{16}\b"),
+        re.compile("ssh" + "pass" + r"\s+" + "-p" + r"\s+['\"]?[^\s'\"]"),
+    )
+
+    def test_no_complete_token_literal_in_source(self):
+        with open(__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        for pat in self.FORBIDDEN:
+            with self.subTest(pattern=pat.pattern):
+                self.assertIsNone(pat.search(src), f"token literal found: {pat.pattern}")
+
+    def test_fixtures_are_runtime_assembled(self):
+        # every fixture must exist as a value and be built from parts
+        for name in (
+            "FAKE_GLPAT",
+            "FAKE_GITHUB_PAT",
+            "FAKE_GITHUB_TOKEN",
+            "FAKE_OPENAI_KEY",
+            "FAKE_AWS_AKIA",
+            "FAKE_SSHPASS_PW",
+            "FAKE_BASIC_AUTH",
+        ):
+            with self.subTest(fixture=name):
+                self.assertIsInstance(globals().get(name), str)
 
 
 class ScanTests(unittest.TestCase):
