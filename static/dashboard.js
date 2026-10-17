@@ -257,15 +257,16 @@ async function refreshAgents(){
 }
 
 async function refreshJobs(){
-  const [q,offered]=await Promise.all([
+  const [q,offered,claimed]=await Promise.all([
     api('GET','/v1/jobs?status=queued&limit=250'),
     api('GET','/v1/jobs?status=offered&limit=25').catch(()=>({jobs:[]})),
+    api('GET','/v1/jobs?status=claimed&limit=250').catch(()=>({jobs:[]})),
   ]);
-  const all=[...(q.jobs||[]),...(offered.jobs||[])].sort((a,b)=>b.priority-a.priority);
+  const all=[...(q.jobs||[]),...(offered.jobs||[]),...(claimed.jobs||[])].sort((a,b)=>b.priority-a.priority);
   if(unchanged('jobs',all))return;
   const cnt=all.length;
   document.getElementById('queue-cnt').textContent=`(${cnt})`;
-  document.getElementById('meta-queue').textContent=cnt?cnt+' queued':'queue clear';
+  document.getElementById('meta-queue').textContent=cnt?cnt+' active':'queue clear';
   const tb=document.querySelector('#jobs-tbl tbody');tb.innerHTML='';
   for(const j of all){
     const r=tb.insertRow();
@@ -299,12 +300,13 @@ async function refreshRunning(){
   // kinds, NOT one card per instance. kind==zeroclaw is the build fan-out pool.
   // Maps use Object.create(null) because keys are untrusted URN/host strings
   // (avoids __proto__/constructor prototype-pollution + Object.values drops).
-  const [aj,jj]=await Promise.all([
+  const [aj,jj,cj]=await Promise.all([
     api('GET','/v1/agents?status=online').catch(()=>({agents:null})),
     api('GET','/v1/jobs?status=running&limit=200').catch(()=>({jobs:[]})),
+    api('GET','/v1/jobs?status=claimed&limit=200').catch(()=>({jobs:[]})),
   ]);
   const agents=(Array.isArray(aj.agents)?aj.agents:[]).filter(a=>a&&a.kind==='zeroclaw');
-  const jobs=jj.jobs||[];
+  const jobs=[...(jj.jobs||[]),...(cj.jobs||[])];
   const byClaimer=Object.create(null);
   for(const j of jobs){ if(j.claimed_by) byClaimer[j.claimed_by]=j; }
   const hosts=Object.create(null);
