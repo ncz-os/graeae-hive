@@ -132,6 +132,35 @@ CLUSTER_WINDOW_SEC = float(os.environ.get("CLUSTER_WINDOW_SEC", "21600"))  # onl
 _recent_auto_triage: dict[str, float] = {}
 AUTO_TRIAGE_COOLDOWN = float(os.environ.get("AUTO_TRIAGE_COOLDOWN", "3600"))  # 1h per base_kind
 
+# ── Dead-letter queue (DLQ) remediation ─────────────────────────────────────
+# Restored 2026-10-17: the Phase-2 refactor dropped the DLQ sweep that the
+# pre-refactor doctor had (commit 5e720f8), so dead-lettered jobs accumulated
+# with no automatic remediation.
+DLQ_SCAN_INTERVAL = float(os.environ.get("DLQ_SCAN_INTERVAL", str(SCAN_INTERVAL)))
+DLQ_APPLY = os.environ.get("DLQ_APPLY", "0") == "1"
+DLQ_MAX_PER_CYCLE = int(os.environ.get("DLQ_MAX_PER_CYCLE", "20"))
+# Once a dead-letter job has a logged decision, don't re-decide it every cycle.
+_dlq_seen: dict[str, float] = {}
+DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
+# Job-level "permanently unschedulable" decline reasons -> remove. Mirrors
+# hive.bus.domain.jobs.DECLINE_REASON_PREFIXES (kept literal: this module is
+# stdlib-only so it can run in the container without the hive package).
+DLQ_UNSCHEDULABLE_PREFIXES = (
+    "no_workspace_for_kind",
+    "no_workspace_for_repo",
+    "no_repo_mapping",
+    "malformed_job_id",
+    "invalid_head_branch",
+)
+# Transient / infra failure signatures -> safe to fix & resubmit.
+DLQ_TRANSIENT_RE = re.compile(
+    r"timed?\s*out|timeout|rate.?limit|\b429\b|too many requests|"
+    r"oom|out of memory|killed|signal\s*9|\b137\b|"
+    r"connection (reset|refused|aborted)|broken pipe|"
+    r"temporar|unavailable|\b50[0-9]\b|bad gateway|gateway time",
+    re.IGNORECASE,
+)
+
 # ── Token-mismatch auto-fix (2026-05-27) ──
 # When a worker fails with "no token for host" because its gateway-tokens.json
 # 127.0.0.1 entry drifted away from the gateway's paired_tokens, the doctor
@@ -232,6 +261,12 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
     token = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") or registering_orchestrator else HIVE_BUS_TOKEN
     if token:
         headers["authorization"] = f"Bearer {token}"
+    # MANDATORY: mutating routes require X-Hive-Actor naming a registered, ACTIVE
+    # agent (hive/bus/deps.require_mutation_actor). Without it every DLQ apply
+    # 401s and the job is then marked "seen" (never retried). The doctor's own
+    # registered URN qualifies.
+    if _urn and method.upper() in {"POST", "PATCH", "PUT", "DELETE"} and path != "/v1/agents/register":
+        headers["X-Hive-Actor"] = _urn
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -1357,12 +1392,127 @@ def process_triage_job(job: dict) -> dict:
 
 
 # ───────────────────────── Main loop ─────────────────────────
+# ───────────────────── dead-letter queue remediation ─────────────────────
+def fetch_dead_letter_jobs(limit: int = 200) -> list[dict]:
+    """Jobs in the terminal dead-letter queue, newest first."""
+    code, resp = _http("GET", f"/v1/jobs?status=dead-letter&limit={int(limit)}", timeout=15.0)
+    if code != 200 or not resp:
+        log.warning("fetch_dead_letter http=%s", code)
+        return []
+    jobs = resp.get("jobs", []) or []
+    jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
+    return jobs
+
+
+def _job_result_dict(job: dict) -> dict:
+    """Best-effort parse of a job's result field (may be dict or JSON string)."""
+    r = job.get("result")
+    if isinstance(r, dict):
+        return r
+    if isinstance(r, str) and r.strip():
+        try:
+            d = json.loads(r)
+            return d if isinstance(d, dict) else {"raw": r}
+        except Exception:
+            return {"raw": r}
+    return {}
+
+
+def classify_dead_letter(job: dict) -> tuple[str, str]:
+    """Decide remediation for one dead-letter job.
+
+    Returns ``(decision, reason)`` with decision in {resubmit, remove, needs-review}.
+    """
+    res = _job_result_dict(job)
+    decline_reason = str(res.get("last_decline_reason") or "").strip()
+    if decline_reason.startswith(DLQ_UNSCHEDULABLE_PREFIXES):
+        return "remove", f"unschedulable:{decline_reason}"
+    blob = " ".join(
+        str(res.get(k) or "") for k in ("error", "note", "stderr", "stdout", "last_decline_reason", "raw")
+    )
+    blob += " " + json.dumps(res.get("last_decline_result") or "")
+    if DLQ_TRANSIENT_RE.search(blob):
+        return "resubmit", "transient-infra-failure"
+    return "needs-review", "unclassified"
+
+
+def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
+    """Carry out a DLQ decision. No-op (logs intent only) unless DLQ_APPLY=1."""
+    jid = job.get("id", "")
+    if not DLQ_APPLY:
+        return f"DLQ_DRY_RUN: would {decision} {jid[:12]} ({reason})"
+    if decision == "resubmit":
+        code, resp = _http(
+            "POST", "/v1/admin/jobs/requeue", {"job_ids": [jid], "reason": f"doctor-dlq-resubmit:{reason}"}
+        )
+        if code in (200, 201):
+            return f"resubmitted {jid[:12]} via admin requeue"
+        return f"resubmit FAILED {jid[:12]} code={code} resp={str(resp)[:160]}"
+    if decision == "remove":
+        code, resp = _http(
+            "POST", "/v1/admin/jobs/purge", {"job_ids": [jid], "reason": f"doctor-dlq-remove:{reason}"}
+        )
+        if code in (200, 201, 204):
+            return f"removed {jid[:12]} via admin purge"
+        if code == 404:
+            return f"remove PENDING {jid[:12]}: /v1/admin/jobs/purge not on bus yet"
+        return f"remove FAILED {jid[:12]} code={code} resp={str(resp)[:160]}"
+    code, resp = _http(
+        "POST",
+        "/v1/admin/jobs/reclassify",
+        {"job_ids": [jid], "status": "needs-review", "reason": f"doctor-dlq-needs-review:{reason}"},
+    )
+    if code in (200, 201, 204):
+        return f"re-tagged {jid[:12]} -> needs-review"
+    if code == 404:
+        return f"needs-review PENDING {jid[:12]}: /v1/admin/jobs/reclassify not on bus yet"
+    return f"needs-review FAILED {jid[:12]} code={code} resp={str(resp)[:160]}"
+
+
+def handle_dead_letter_queue() -> dict:
+    """Scan the dead-letter queue, classify each not-yet-seen job, and remediate
+    (dry-run unless DLQ_APPLY=1). Broadcasts a doctor.dlq message per decision."""
+    now = time.time()
+    for k in [k for k, t in _dlq_seen.items() if now - t > DLQ_SEEN_TTL]:
+        _dlq_seen.pop(k, None)
+    jobs = fetch_dead_letter_jobs()
+    summary = {"scanned": len(jobs), "resubmit": 0, "remove": 0, "needs-review": 0, "skipped_seen": 0}
+    acted = 0
+    for job in jobs:
+        jid = job.get("id", "")
+        if not jid or jid in _dlq_seen:
+            summary["skipped_seen"] += 1
+            continue
+        if acted >= DLQ_MAX_PER_CYCLE:
+            break
+        decision, reason = classify_dead_letter(job)
+        outcome = remediate_dead_letter(job, decision, reason)
+        summary[decision] = summary.get(decision, 0) + 1
+        _dlq_seen[jid] = now
+        acted += 1
+        log.info("dlq %s kind=%s -> %s (%s): %s", jid[:12], job.get("kind", "?"), decision, reason, outcome)
+        broadcast_doctor_message(
+            "doctor.dlq",
+            {
+                "host": AGENT_HOST,
+                "job_id": jid,
+                "kind": job.get("kind"),
+                "decision": decision,
+                "reason": reason,
+                "apply": DLQ_APPLY,
+                "outcome": outcome,
+            },
+        )
+    return summary
+
+
 def main():
     log.info("starting on %s url=%s alias=%s dry_run=%s",
              AGENT_HOST, HIVE_URL, DOCTOR_AGENT_ALIAS, DRY_RUN)
     register()
     last_hb = time.time()
     last_scan = 0.0
+    last_dlq = 0.0
 
     while _running:
         try:
@@ -1370,6 +1520,15 @@ def main():
             if now - last_hb >= HEARTBEAT_INTERVAL:
                 heartbeat()
                 last_hb = now
+
+            # Periodic dead-letter-queue remediation (dry-run unless DLQ_APPLY=1).
+            if now - last_dlq >= DLQ_SCAN_INTERVAL:
+                last_dlq = now
+                try:
+                    s = handle_dead_letter_queue()
+                    log.info("dlq scan: %s (apply=%s)", s, DLQ_APPLY)
+                except Exception as e:
+                    log.warning("dlq scan error: %s", e)
 
             # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
             if now - last_scan >= SCAN_INTERVAL:

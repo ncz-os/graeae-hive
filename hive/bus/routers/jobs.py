@@ -46,7 +46,6 @@ from hive.bus.domain.eligibility import (
 from hive.bus.domain.jobs import (
     CACHE_TTL_SECONDS,
     CLAIM_LEASE_SECONDS,
-    DECLINE_REASON_PREFIXES,
     MAX_DECLINE_REQUEUES,
     STATUS_TRANSITIONS,
     SUBSCRIPTION_PROVIDERS,
@@ -58,7 +57,9 @@ from hive.bus.domain.jobs import (
     field_was_set,
     hallucination_check,
     is_dedup_violation,
+    is_unresolvable_release,
     json_list,
+    kind_requires_commit,
     normalize_result_payload,
     stable_worker_id,
     valid_completion_proof,
@@ -73,7 +74,9 @@ router = APIRouter()
 _JOB_COLUMNS = (
     "id, submitter_urn, parent_job_id, kind, description, priority, status, "
     "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count"
+    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count, "
+    "claimed_at, claim_lease_expires_at, last_update_at, claimed_model, claimed_provider, "
+    "claimed_runtime, claimed_cost_tier"
 )
 
 
@@ -149,6 +152,13 @@ async def get_job(job_id: str):
         "pr_number": r[18],
         "max_retries": r[19],
         "retry_count": r[20],
+        "claimed_at": r[21],
+        "claim_lease_expires_at": r[22],
+        "last_update_at": r[23],
+        "claimed_model": r[24],
+        "claimed_provider": r[25],
+        "claimed_runtime": r[26],
+        "claimed_cost_tier": r[27],
     }
 
 
@@ -459,7 +469,9 @@ async def dequeue_next_job(agent_urn: str):
         async with hive_repo().connection() as tx:
             agent_row = await hive_repo().agent_claim_context(tx, agent_urn)
             if not agent_row:
-                raise HTTPException(404, f"claim failed: agent not registered: {agent_urn}")
+                # 409 (not 404): matches what hive_worker.py's claim loop already
+                # handles by re-registering, so an unregistered worker self-heals.
+                raise HTTPException(409, f"claim failed: agent not registered: {agent_urn}")
             (
                 agent_kind,
                 caps_json,
@@ -730,7 +742,7 @@ async def update_job(job_id: str, req: JobUpdate):
     dead_lettered = False
     if req.status == "queued" and isinstance(req.result, dict):
         _werr = str(req.result.get("worker_error") or "")
-        if _werr in DECLINE_REASON_PREFIXES or any(_werr.startswith(p + ":") for p in DECLINE_REASON_PREFIXES):
+        if is_unresolvable_release(_werr):
             decline_reason = _werr
 
     # Storage via the HiveMindRepository ABC on ONE transaction (EPIMONE shape).
@@ -811,13 +823,7 @@ async def update_job(job_id: str, req: JobUpdate):
         if req.status in {"claimed", "running"} and not effective_claimed_by:
             raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
 
-        commit_required = (
-            bool(job_repo)
-            or str(job_kind) in ("riskyeats", "code")
-            or str(job_kind).startswith(
-                ("riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:", "ic-engine", "investorclaw", "ncz-os")
-            )
-        )
+        commit_required = kind_requires_commit(job_kind, job_repo)
         if req.status == "done" and commit_required:
             proof = req.result or {}
             if not valid_completion_proof(proof):
@@ -1146,7 +1152,7 @@ async def claim_job(job_id: str, by: str):
     async with hive_repo().connection() as tx:
         agent_row = await hive_repo().agent_claim_context(tx, by)
         if not agent_row:
-            raise HTTPException(404, f"claim failed: agent not registered: {by}")
+            raise HTTPException(409, f"claim failed: agent not registered: {by}")
         (
             agent_kind,
             caps_json,

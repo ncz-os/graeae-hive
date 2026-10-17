@@ -227,7 +227,10 @@ async def heartbeat(req: AgentHeartbeat):
         if rowcount:
             await tx.commit()
     if rowcount == 0:
-        raise HTTPException(404, f"agent not found: {req.urn}")
+        # 409 (not 404): the worker must (re)register. hive_worker.py's main loop
+        # re-registers on 409, so a worker whose URN the bus dropped self-heals
+        # instead of hammering 404s forever (2026-10-16: hydra zombie worker).
+        raise HTTPException(409, f"agent not registered: {req.urn}")
     return {"ack": True, "ts": now}
 
 

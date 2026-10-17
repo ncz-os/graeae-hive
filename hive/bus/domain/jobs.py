@@ -13,6 +13,7 @@ import os
 import re
 import time
 
+from hive.bus.domain.workspace import ADMISSION_NONCOMMIT_PREFIXES
 from hive.core.models import rate_for
 
 
@@ -99,7 +100,24 @@ MAX_DECLINE_REQUEUES = 3
 DECLINE_REASON_PREFIXES: tuple[str, ...] = (
     "no_workspace_for_kind",
     "no_workspace_for_repo",
+    # Worker-side JOB-LEVEL unschedulable reasons (hive_worker.py release_job):
+    # no worker can ever run these jobs, so without counting them the reclaim loop
+    # requeues forever (observed live 2026-10-16: a job with worker_error
+    # no_repo_mapping climbed to retry_count=5 with no dead-letter). Count them so
+    # the thrash guard terminates the loop.
+    "no_repo_mapping",
+    "malformed_job_id",
+    "invalid_head_branch",
 )  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
+
+
+def is_unresolvable_release(reason: str) -> bool:
+    """True if ``reason`` is a job-level unschedulable release that should count
+    toward the dead-letter threshold (exact match or ``reason:<detail>`` form)."""
+    r = reason or ""
+    return r in DECLINE_REASON_PREFIXES or any(r.startswith(p + ":") for p in DECLINE_REASON_PREFIXES)
+
+
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},
     "offered": {"queued", "claimed", "cancelled"},
@@ -131,6 +149,27 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     "dead-letter": {"dead-letter"},  # terminal; idempotent same-status PATCH only
 }
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
+
+
+def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
+    """Whether a ``done`` job must carry commit evidence.
+
+    Read-only kinds (review/analysis/investigation/triage/docs/design/...) never
+    produce a commit, so a review job that sets a ``repo`` (to clone the code
+    under review) must NOT be held to the commit-evidence gate. Regression
+    2026-10-16: ``review:...`` with ``repo`` set went ``needs-review`` with
+    ``completion_evidence_missing`` despite a clean verified run.
+    """
+    k = str(job_kind or "")
+    if any(k.startswith(p) for p in ADMISSION_NONCOMMIT_PREFIXES):
+        return False
+    return (
+        bool(job_repo)
+        or k in ("riskyeats", "code")
+        or k.startswith(
+            ("riskyeats:", "feat:", "fix:", "argonaut:", "riskybiz:", "mnemos:", "ic-engine", "investorclaw", "ncz-os")
+        )
+    )
 
 
 def valid_completion_proof(proof: dict) -> bool:
