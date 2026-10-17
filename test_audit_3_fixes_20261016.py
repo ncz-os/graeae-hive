@@ -13,7 +13,11 @@ Remediated in this branch:
     hot-path HTTP). A catalog-present repo is requeued/routed, never killed.
     ``malformed_job_id`` / ``invalid_head_branch`` keep counting.
 
-Still open (asserted as characterization until their fixes land): BLOCKING-2.
+  * BLOCKING-2 (fix B) — ``kind_requires_commit`` matches read-only kinds at a
+    TOKEN BOUNDARY: a kind is exempt only when it EQUALS a bare prefix or starts
+    with ``<prefix>:``. Code kinds wearing a read-only name
+    (``analysis-pipeline-fix``, ``reviewer-migration``,
+    ``design-system-update``, ...) are GATED again.
 
 Run: /usr/bin/python3 -m pytest -q test_audit_3_fixes_20261016.py
 """
@@ -35,6 +39,7 @@ from hive.bus.deps import hive_repo  # noqa: E402
 from hive.bus.domain.jobs import (  # noqa: E402
     MAX_DECLINE_REQUEUES,
     NO_REPO_MAPPING_DECLINE_BUDGET,
+    is_readonly_kind,
     is_unresolvable_release,
     kind_requires_commit,
     repo_in_catalog,
@@ -319,20 +324,69 @@ class CompletionGateAudit(unittest.TestCase):
         for p in bare:
             self.assertNotIn(":", p)
 
-    def test_BLOCKING2_code_job_lookalike_kind_skips_the_gate(self):
-        """BLOCKING-2: a code kind wearing a read-only name bypasses commit evidence.
+    def test_BLOCKING2_code_job_lookalike_kind_is_gated(self):
+        """BLOCKING-2: a code kind wearing a read-only name must NOT skip the gate.
 
-        kind_requires_commit applies startswith() with no token boundary, so
-        'analysis-pipeline-fix' matches the 'analysis' prefix and is exempt EVEN
-        WITH A REPO SET. Verified end-to-end: such a job PATCHes to 'done' with
-        an empty result (no head_sha/commits/files_changed) and no failure_reason.
-        Desired: gated. Current: exempt. Invert when fixed.
+        A plain startswith() let 'analysis-pipeline-fix' match the 'analysis'
+        prefix and be exempt EVEN WITH A REPO SET, so such a job PATCHed to
+        'done' with an empty result (no head_sha/commits/files_changed). The
+        exemption now requires a token boundary: the kind must EQUAL the bare
+        prefix or be followed by ':'.
         """
         for kind in CODE_KIND_READONLY_LOOKALIKE:
-            self.assertFalse(
+            self.assertTrue(
                 kind_requires_commit(kind, "graeae-hive"),
                 f"BLOCKING-2: code job {kind!r} with a repo set skips the commit-evidence gate",
             )
+            self.assertTrue(
+                kind_requires_commit(kind, "any"),
+                f"BLOCKING-2: code job {kind!r} with any repo skips the commit-evidence gate",
+            )
+            # A non-':' delimiter (or any other char) after the prefix -> not exempt.
+            self.assertFalse(
+                is_readonly_kind(kind),
+                f"BLOCKING-2: {kind!r} must not be classified read-only",
+            )
+
+    def test_BLOCKING2_legitimate_prefix_topic_forms_stay_exempt(self):
+        """'<prefix>:topic' and the bare prefix itself remain exempt."""
+        for kind in (
+            "review:topic",
+            "analysis:topic",
+            "investigation:topic",
+            "triage:topic",
+            "design:topic",
+            "research:topic",
+            "architecture:topic",
+            "docs:topic",
+            "track:topic",
+            "ops:topic",
+            "diag:topic",
+            "ping:topic",
+            "review",
+            "analysis",
+            "investigation",
+            "triage",
+            "design",
+            "research",
+            "architecture",
+        ):
+            self.assertTrue(is_readonly_kind(kind), f"{kind} must be read-only")
+            self.assertFalse(kind_requires_commit(kind, "graeae-hive"), kind)
+            self.assertFalse(kind_requires_commit(kind, None), kind)
+
+    def test_BLOCKING2_repo_less_lookalike_stays_exempt(self):
+        """No repo and not a code prefix -> exempt, unchanged from before."""
+        for kind in CODE_KIND_READONLY_LOOKALIKE:
+            self.assertFalse(kind_requires_commit(kind, None), kind)
+
+    def test_BLOCKING2_gate_boundary_characters(self):
+        """Only ':' (or end-of-string) may follow a bare read-only prefix."""
+        self.assertTrue(is_readonly_kind("review:"))
+        self.assertTrue(is_readonly_kind("review"))
+        for kind in ("review/", "review.x", "review_x", "reviewer", "reviews", "designs", "triage-"):
+            self.assertFalse(is_readonly_kind(kind), kind)
+            self.assertTrue(kind_requires_commit(kind, "graeae-hive"), kind)
 
 
 # ─────────────────────────── Fix C: unknown agent 409 ───────────────────────────

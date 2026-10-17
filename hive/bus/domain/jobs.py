@@ -215,6 +215,34 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
 
 
+def is_readonly_kind(job_kind: str) -> bool:
+    """Whether ``job_kind`` names a read-only kind, at a TOKEN BOUNDARY.
+
+    ``ADMISSION_NONCOMMIT_PREFIXES`` mixes delimited entries (``docs:``,
+    ``track:``, ``ops:``, ``diag:``, ``ping:``) with bare ones (``review``,
+    ``analysis``, ``investigation``, ``triage``, ``design``, ``research``,
+    ``architecture``, ...). At admission a bare prefix is a "kind family starts
+    with this word" shorthand, but for the commit-evidence gate it must not
+    swallow an unrelated code kind (audit BLOCKING-2, 2026-10-16): a plain
+    ``startswith`` made ``analysis-pipeline-fix``, ``reviewer-migration`` and
+    ``design-system-update`` exempt even with a repo set.
+
+    A kind is read-only only when it EQUALS a bare prefix or starts with
+    ``<prefix>:``. Any other character after the prefix (``e`` in ``reviewer``,
+    ``-`` in ``analysis-pipeline``) means NOT read-only. Delimited prefixes are
+    unchanged: ``docs:x`` exempt, ``docs`` itself exempt (equals the prefix
+    minus its ``:``).
+    """
+    k = str(job_kind or "")
+    for p in ADMISSION_NONCOMMIT_PREFIXES:
+        if p.endswith(":"):
+            if k == p or k.startswith(p):
+                return True
+        elif k == p or k.startswith(p + ":"):
+            return True
+    return False
+
+
 def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
     """Whether a ``done`` job must carry commit evidence.
 
@@ -223,9 +251,12 @@ def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
     under review) must NOT be held to the commit-evidence gate. Regression
     2026-10-16: ``review:...`` with ``repo`` set went ``needs-review`` with
     ``completion_evidence_missing`` despite a clean verified run.
+
+    The exemption is matched at a token boundary only — see
+    :func:`is_readonly_kind` (audit BLOCKING-2).
     """
     k = str(job_kind or "")
-    if any(k.startswith(p) for p in ADMISSION_NONCOMMIT_PREFIXES):
+    if is_readonly_kind(k):
         return False
     return (
         bool(job_repo)
