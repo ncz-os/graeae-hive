@@ -851,7 +851,11 @@ def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str
         "eligible_kinds": ["zeroclaw"],
         "max_cost_tier": "C",
         "priority": 80,
-        "required_capabilities": ["hard:codex"],
+        # 2026-10-17: Codex is never started unattended (operator 2026-10-10).
+        # Route the fix to a zoder worker on the escalation ladder instead;
+        # hard:verified-git-delivery also keeps the doctor (no such cap) and the
+        # minos codex-runtime workers from claiming it.
+        "required_capabilities": ["hard:verified-git-delivery", "route:flash"],
     }
     if DRY_RUN:
         return f"DRY_RUN: would submit codex sub-job ({len(codex_task)} chars)"
