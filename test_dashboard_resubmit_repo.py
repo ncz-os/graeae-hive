@@ -149,11 +149,14 @@ class DashboardResubmitRepoTest(unittest.TestCase):
         self.assertLess(clear_at, self.submit.index("WITHOUT a repo"))
         self.assertLess(clear_at, self.submit.index("queued"))
 
-    def test_edit_is_not_parented_and_closing_drops_carryover(self):
+    def test_edit_is_not_parented(self):
         self.assertIn("setCarryover(job,{parent_job_id:null})", self.js)
         self.assertIn("('parent_job_id' in opts)?opts.parent_job_id", self.js)
+
+    def test_collapsing_keeps_form_and_carryover_together(self):
         toggle = self.js[self.js.index("function toggleSubmit") : self.js.index("function setStatus")]
-        self.assertIn("if(!_submitOpen)cancelEdit();", toggle)
+        self.assertNotIn("cancelEdit", toggle)
+        self.assertNotIn("clearCarryover", toggle)
 
     def test_priority_zero_survives_fill(self):
         self.assertIn("job.priority??50", self.js)

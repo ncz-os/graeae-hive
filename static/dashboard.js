@@ -58,10 +58,9 @@ async function registerAgent(){
 
 // ── submit form ───────────────────────────────────────────────────────
 function toggleSubmit(){
+  // Collapsing only hides the form. Its visible values and the hidden
+  // carry-over stay together until submit, Cancel or Clear resets both.
   _submitOpen=!_submitOpen;
-  // Closing the panel abandons an edit/resubmit: its carry-over must not
-  // leak into the next, unrelated submit.
-  if(!_submitOpen)cancelEdit();
   document.getElementById('submit-body').className=_submitOpen?'open':'';
   document.getElementById('submit-toggle').textContent=_submitOpen?'▲ collapse':'▼ expand';
 }
