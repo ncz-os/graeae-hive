@@ -54,6 +54,29 @@ BUS_END = "# --- END GENERATED (hive.core.model_registry) ---"
 # The one legal Nemotron, and the only EIH endpoint prefix it may use.
 NEMOTRON_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 EIH_HOST = "eih"
+
+# ── NVIDIA EIH placement policy (operator 2026-10-17) ───────────────────────
+# Anything routed through NVIDIA EIH may serve ONLY Nemotron or an open-weight
+# model. Closed frontier models (openai/gpt-5.x, codex, anthropic, azure/*,
+# gemini, grok) are forbidden on EIH. DeepSeek is direct-only and may NEVER be
+# an EIH model.
+EIH_ENDPOINT_HOST = "integrate.api.nvidia.com"
+EIH_PROVIDERS = frozenset({"eih", "nvidia", "ngc", "nvidia-ngc"})
+# Model-key regexes (matched against the full "<provider>/<model>" key, case
+# insensitively) for open-weight families that are allowed to sit on EIH.
+OPEN_WEIGHT_EIH_ALLOWLIST: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"^z-ai/glm-",
+        r"^moonshotai/kimi-",
+        r"^qwen/",
+        r"^meta/llama",
+        r"^mistralai/",
+        r"^openai/gpt-oss-",
+        r"^google/gemma",
+    )
+)
+NEMOTRON_EIH_ENDPOINTS = (EIH_ENDPOINT_HOST, f"http://{EIH_HOST}:")
 NEMOTRON_ALLOWED_ROUTES = frozenset({"zoder.reviewer.backup"})
 DEEPSEEK_DIRECT_PROVIDERS = frozenset({"deepseek", "deepseek-direct"})
 KNOWN_ROUTES = frozenset(
@@ -195,13 +218,33 @@ def validate_invariants(reg: Registry) -> None:
             f"forbidden routes "
             f"{sorted(set(nm.routes) - NEMOTRON_ALLOWED_ROUTES)}"
         )
-    if not nm.endpoint.startswith(f"http://{EIH_HOST}:"):
-        raise RegistryError(f"{where}: {NEMOTRON_MODEL} endpoint must be EIH ({EIH_HOST}:)")
+    if not _is_eih_endpoint(nm.endpoint):
+        raise RegistryError(
+            f"{where}: {NEMOTRON_MODEL} endpoint must be EIH "
+            f"({EIH_ENDPOINT_HOST} or {EIH_HOST}:), got {nm.endpoint!r}"
+        )
 
     # Nemotron must never be a bus-router candidate or a coder route.
     for m in reg.models:
         if "nemotron" in m.model.lower() and m.key != NEMOTRON_MODEL:
             raise RegistryError(f"{where}: stray Nemotron {m.key!r}")
+
+    # ── EIH placement: Nemotron or open-weight only (operator 2026-10-17) ───
+    for m in reg.models:
+        if not _is_eih_model(m):
+            continue
+        if "deepseek" in m.model.lower():
+            raise RegistryError(
+                f"{where}: DeepSeek is direct-only — {m.key!r} may never run on EIH "
+                f"({EIH_ENDPOINT_HOST})"
+            )
+        if _is_nemotron(m) or _is_open_weight_eih(m):
+            continue
+        raise RegistryError(
+            f"{where}: EIH placement policy — {m.key!r} on EIH ({m.endpoint or m.provider}) "
+            f"must be a Nemotron model or match OPEN_WEIGHT_EIH_ALLOWLIST; closed "
+            f"frontier models are forbidden on EIH"
+        )
 
     # ── DeepSeek: direct-only ────────────────────────────────────────────────
     for m in reg.models:
@@ -238,6 +281,22 @@ def validate_invariants(reg: Registry) -> None:
     for host, assigns in reg.hosts.items():
         for slot, key in assigns.items():
             _validate_host_slot(reg, hosts_where, host, slot, key)
+
+
+def _is_eih_endpoint(endpoint: str) -> bool:
+    """True when an endpoint URL is served by NVIDIA EIH."""
+    ep = (endpoint or "").strip().lower()
+    return any(prefix in ep for prefix in NEMOTRON_EIH_ENDPOINTS)
+
+
+def _is_eih_model(m: ModelEntry) -> bool:
+    """True when a model is routed through NVIDIA EIH (API host or EIH provider)."""
+    return _is_eih_endpoint(m.endpoint) or m.provider in EIH_PROVIDERS
+
+
+def _is_open_weight_eih(m: ModelEntry) -> bool:
+    """True when a model key matches OPEN_WEIGHT_EIH_ALLOWLIST."""
+    return any(p.search(m.key) for p in OPEN_WEIGHT_EIH_ALLOWLIST)
 
 
 def _is_nemotron(m: ModelEntry) -> bool:

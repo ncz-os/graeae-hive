@@ -6,9 +6,9 @@ zoder_version = 1
 [agents.zoder_reviewer_backup]
 model = "nemotron-3-ultra-550b-a55b"
 provider = "nvidia"
-endpoint = "http://eih:8000/v1"
+endpoint = "https://integrate.api.nvidia.com/v1"
 cost_tier = "A"
-notes = "EIH-only backup reviewer. Fleet rule: never a knemon/coder candidate."
+notes = "EIH-only backup reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a knemon/coder candidate."
 
 # bus-router providers (KNEMON_PROVIDERS order)
 

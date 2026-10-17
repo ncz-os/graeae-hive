@@ -86,8 +86,6 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
     ("groq", "gpt-oss-120b"): (0.15, 0.6),
     ("groq", "gpt-oss-20b"): (0.075, 0.3),
     ("groq", "*"): (0.29, 0.59),
-    ("ngc-proxy", "gpt-5.5"): (0.0, 0.0),
-    ("ngc-proxy", "*"): (0.0, 0.0),
     ("deepseek-direct", "deepseek-v4-pro"): (0.435, 0.87),
     ("deepseek-direct", "deepseek-v4-flash"): (0.14, 0.28),
     ("deepseek-direct", "*"): (0.435, 0.87),
@@ -185,8 +183,6 @@ LLM_RATES: dict[tuple[str, str], tuple[float, float]] = {
     ("groq", "gpt-oss-120b"): (0.15, 0.60),
     ("groq", "gpt-oss-20b"): (0.075, 0.30),
     ("groq", "*"): (0.29, 0.59),
-    ("ngc-proxy", "gpt-5.5"): (0.0, 0.0),
-    ("ngc-proxy", "*"): (0.0, 0.0),
     ("deepseek-direct", "deepseek-v4-pro"): (0.435, 0.87),
     ("deepseek-direct", "deepseek-v4-flash"): (0.14, 0.28),
     ("deepseek-direct", "*"): (0.435, 0.87),
@@ -279,8 +275,9 @@ KNEMON_PROVIDERS: list[dict[str, Any]] = [
     },
     {"provider": "xai", "model": "grok-4.1-fast", "alias": "hive_xai_1", "tier": "B"},
     # REMOVED 2026-06-17 (operator: "remove ngc-review from all agents" +
-    # compute edict: EIH frontier forbidden). hive_ngc_1 (ngc-proxy gpt-5.5 via
-    # the .4 EIH gateway) is no longer a coding/review candidate for any agent.
+    # operator 2026-10-17 EIH placement policy: closed frontier models may not
+    # be served through NVIDIA EIH at all. The dead NGC-proxy gpt-5.5 entry is
+    # gone from the registry, so it is not a coding/review candidate either.
     # Bedrock Nova (funded AWS creds, worker agents shipped 2026-06-02):
     # cheap metered fallbacks (lite 0.06/0.24, micro 0.035/0.14).
     {

@@ -207,14 +207,6 @@ key = "groq/*"
 in = 0.29
 out = 0.59
 [[model]]
-key = "ngc-proxy/gpt-5.5"
-in = 0.0
-out = 0.0
-[[model]]
-key = "ngc-proxy/*"
-in = 0.0
-out = 0.0
-[[model]]
 key = "deepseek-direct/deepseek-v4-pro"
 in = 0.435
 out = 0.87
@@ -346,9 +338,9 @@ key = "nvidia/nemotron-3-ultra-550b-a55b"
 emit_rate = false
 in = 0.0
 out = 0.0
-endpoint = "http://eih:8000/v1"
+endpoint = "https://integrate.api.nvidia.com/v1"
 routes = ["zoder.reviewer.backup"]
-notes = "EIH-only backup reviewer. Fleet rule: never a knemon/coder candidate."
+notes = "EIH-only backup reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a knemon/coder candidate."
 
 [host.cerberus]
 zoder_reviewer = "local/gemma4-31b"

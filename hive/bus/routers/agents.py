@@ -90,12 +90,12 @@ async def register(req: AgentRegister):
     plan_cap_usd = req.plan_cap_usd if req.plan_cap_usd is not None else DEFAULT_PLAN_CAPS.get(auth_method, 50.0)
     provider = (req.provider or "unknown").lower()
     model = (req.model or "unknown").lower()
-    # EIH ban (operator 2026-06-18): the hive must never advertise EIH / gpt-5.5
-    # authoring labels. Unmanaged workers still default their register model to
-    # the legacy "gpt-5.5 (EIH via gateway :4100)" string; everything actually
-    # routes through the PYTHIA gateway (:4100) to MiniMax, so normalize any such
-    # label to the real served upstream and drop the openai provider so the
-    # registry reflects reality.
+    # EIH ban (operator 2026-06-18, reaffirmed 2026-10-17): the hive must never
+    # advertise an EIH or closed-frontier authoring label. Legacy workers may
+    # still register with an "eih"/"gpt-5.5" model string; the EIH gpt-5.5 route
+    # no longer exists, and closed frontier models are forbidden on EIH, so
+    # normalize any such label to the real served upstream (MiniMax) and drop the
+    # openai provider so the registry reflects reality.
     if "gpt-5.5" in model or "eih" in model:
         model = "minimax-m2.7"
         if provider == "openai":

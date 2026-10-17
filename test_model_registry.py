@@ -156,7 +156,7 @@ class TestInvariants(unittest.TestCase):
         self.assertEqual([m.key for m in nemo], [mr.NEMOTRON_MODEL])
         m = nemo[0]
         self.assertEqual(m.routes, ("zoder.reviewer.backup",))
-        self.assertTrue(m.endpoint.startswith("http://eih:"))
+        self.assertTrue(mr._is_eih_endpoint(m.endpoint), m.endpoint)
         self.assertEqual(self.reg.hosts["eih"]["zoder_reviewer_backup"], mr.NEMOTRON_MODEL)
 
     def test_nemotron_never_in_bus_router_or_coder(self):
@@ -177,8 +177,9 @@ class TestInvariants(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             text = REGISTRY.read_text()
             bad = text.replace(
-                'routes = ["zoder.reviewer.backup"]\nnotes = "EIH-only backup reviewer. '
-                'Fleet rule: never a knemon/coder candidate."',
+                'routes = ["zoder.reviewer.backup"]\nnotes = "EIH-only backup '
+                'reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a '
+                'knemon/coder candidate."',
                 'routes = ["zoder.reviewer.backup", "knemon"]\n'
                 'knemon_alias = "hive_nemotron_1"\n'
                 'knemon_tier = "A"\n'
@@ -194,7 +195,10 @@ class TestInvariants(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             text = REGISTRY.read_text()
-            bad = text.replace('endpoint = "http://eih:8000/v1"', 'endpoint = "http://pythia:8000/v1"')
+            bad = text.replace(
+                'endpoint = "https://integrate.api.nvidia.com/v1"',
+                'endpoint = "http://pythia:8000/v1"',
+            )
             self.assertNotEqual(bad, text)
             with self.assertRaises(mr.RegistryError) as ctx:
                 mr.load_registry(_write_registry(Path(td), bad))
@@ -477,3 +481,96 @@ class TestInvariants(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestEihPlacementPolicy(unittest.TestCase):
+    """Operator policy 2026-10-17: EIH serves Nemotron or open-weight only."""
+
+    def _registry_with(self, model_block: str) -> str:
+        return REGISTRY.read_text() + model_block
+
+    def _load(self, block: str):
+        with tempfile.TemporaryDirectory() as td:
+            return mr.load_registry(_write_registry(Path(td), self._registry_with(block)))
+
+    def test_shipped_registry_has_no_ngc_proxy_rates(self):
+        self.assertNotIn(("ngc-proxy", "gpt-5.5"), LLM_RATES)
+        self.assertNotIn(("ngc-proxy", "*"), LLM_RATES)
+        self.assertIsNone(self.reg_by_key("ngc-proxy/gpt-5.5"))
+
+    def reg_by_key(self, key: str):
+        return mr.load_registry(REGISTRY).by_key(key)
+
+    def test_shipped_nemotron_uses_the_eih_api_host(self):
+        entry = self.reg_by_key(mr.NEMOTRON_MODEL)
+        self.assertEqual(entry.endpoint, "https://integrate.api.nvidia.com/v1")
+
+    def test_rejects_gpt_5_5_on_eih(self):
+        block = (
+            '[[model]]\nkey = "openai/gpt-5.5-eih"\nin = 0.0\nout = 0.0\n'
+            'endpoint = "https://integrate.api.nvidia.com/v1"\n'
+        )
+        with self.assertRaises(mr.RegistryError) as ctx:
+            self._load(block)
+        self.assertIn("EIH placement policy", str(ctx.exception))
+
+    def test_rejects_anthropic_on_eih(self):
+        block = (
+            '[[model]]\nkey = "anthropic/claude-opus-4-7-eih"\nin = 0.0\nout = 0.0\n'
+            'endpoint = "https://integrate.api.nvidia.com/v1"\n'
+        )
+        with self.assertRaises(mr.RegistryError) as ctx:
+            self._load(block)
+        self.assertIn("anthropic/claude-opus-4-7-eih", str(ctx.exception))
+
+    def test_rejects_deepseek_on_eih(self):
+        block = (
+            '[[model]]\nkey = "deepseek-direct/deepseek-v4-flash-eih"\nin = 0.0\nout = 0.0\n'
+            'endpoint = "https://integrate.api.nvidia.com/v1"\n'
+        )
+        with self.assertRaises(mr.RegistryError) as ctx:
+            self._load(block)
+        self.assertIn("direct-only", str(ctx.exception))
+
+    def test_accepts_nemotron_and_open_weight_on_eih(self):
+        block = (
+            '[[model]]\nkey = "nvidia/nemotron-3-ultra-550b-a55b-alt"\nin = 0.0\nout = 0.0\n'
+            'endpoint = "https://integrate.api.nvidia.com/v1"\n'
+        )
+        # A second Nemotron is rejected by the one-and-only Nemotron rule, so
+        # assert the EIH pass itself accepts Nemotron-shaped placement.
+        with self.assertRaises(mr.RegistryError) as ctx:
+            self._load(block)
+        self.assertNotIn("EIH placement policy", str(ctx.exception))
+
+    def test_accepts_zai_glm_on_eih(self):
+        block = (
+            '[[model]]\nkey = "z-ai/glm-5.3"\nin = 0.0\nout = 0.0\n'
+            'endpoint = "https://integrate.api.nvidia.com/v1"\n'
+        )
+        reg = self._load(block)
+        self.assertIsNotNone(reg.by_key("z-ai/glm-5.3"))
+
+    def test_open_weight_allowlist_is_a_regex_tuple(self):
+        self.assertIsInstance(mr.OPEN_WEIGHT_EIH_ALLOWLIST, tuple)
+        self.assertTrue(all(hasattr(p, "search") for p in mr.OPEN_WEIGHT_EIH_ALLOWLIST))
+        for key in (
+            "z-ai/glm-5.3",
+            "moonshotai/kimi-k2.6",
+            "qwen/qwen3-32b",
+            "meta/llama-3.3-70b",
+            "mistralai/mistral-large",
+            "openai/gpt-oss-120b",
+            "google/gemma-4-31b",
+        ):
+            entry = mr.ModelEntry(
+                key=key, provider=key.split("/", 1)[0], model=key.split("/", 1)[1],
+                price_in=0.0, price_out=0.0,
+            )
+            self.assertTrue(mr._is_open_weight_eih(entry), key)
+        for key in ("openai/gpt-5.5", "anthropic/claude-opus-4-7", "xai/grok-4.3"):
+            entry = mr.ModelEntry(
+                key=key, provider=key.split("/", 1)[0], model=key.split("/", 1)[1],
+                price_in=0.0, price_out=0.0,
+            )
+            self.assertFalse(mr._is_open_weight_eih(entry), key)
