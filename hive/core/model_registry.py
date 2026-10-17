@@ -231,9 +231,13 @@ def validate_invariants(reg: Registry) -> None:
         aliases.add(m.knemon_alias)
 
     # ── Host placement: every [host.<name>] slot obeys the same rules ────────
+    # Bind the message prefix locally rather than leaning on the `where` defined
+    # at the top of this function: the host pass must build its own
+    # "<path>: host .. slot .. -> model .." context even if the preamble moves.
+    hosts_where = str(reg.path)
     for host, assigns in reg.hosts.items():
         for slot, key in assigns.items():
-            _validate_host_slot(reg, where, host, slot, key)
+            _validate_host_slot(reg, hosts_where, host, slot, key)
 
 
 def _is_nemotron(m: ModelEntry) -> bool:

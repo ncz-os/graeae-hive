@@ -351,6 +351,75 @@ class TestInvariants(unittest.TestCase):
         self.assertEqual(mr._slot_route("zoder_reviewer_backup"), "zoder.reviewer.backup")
         self.assertEqual(mr._slot_route("zeroclaw_default"), "zeroclaw.default")
 
+    def test_validate_invariants_has_no_unbound_names(self):
+        """Regression: the host pass must not depend on a name that can vanish.
+
+        A `where` that is only bound by the function preamble is fine at
+        runtime, but it is fragile — one edit to the preamble turns every
+        `[host.*]` entry into a NameError instead of a RegistryError. Assert the
+        host pass binds its own message prefix and that validate_invariants has
+        no name it references but never binds.
+        """
+        import ast
+        import builtins
+
+        tree = ast.parse(Path(mr.__file__).read_text())
+        fn = next(
+            n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "validate_invariants"
+        )
+        bound = {a.arg for a in fn.args.args}
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Assign):
+                bound |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+            elif isinstance(n, (ast.AnnAssign, ast.AugAssign)) and isinstance(n.target, ast.Name):
+                bound.add(n.target.id)
+            elif isinstance(n, (ast.For, ast.comprehension)):
+                bound |= {t.id for t in ast.walk(n.target) if isinstance(t, ast.Name)}
+            elif isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                bound.add(n.id)
+        module_names = set(dir(builtins))
+        module_names |= {
+            n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+        }
+        module_names |= {
+            t.id
+            for n in tree.body
+            if isinstance(n, ast.Assign)
+            for t in n.targets
+            if isinstance(t, ast.Name)
+        }
+        loads = {n.id for n in ast.walk(fn) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+        self.assertEqual(sorted(loads - bound - module_names), [])
+
+        # The host pass passes a locally-bound prefix, not the preamble's name.
+        host_pass = next(
+            n for n in ast.walk(fn) if isinstance(n, ast.For) and "hosts" in ast.dump(n)
+        )
+        self.assertIn("hosts_where", {n.id for n in ast.walk(host_pass) if isinstance(n, ast.Name)})
+
+    def test_load_registry_raises_registry_error_never_name_error(self):
+        """Every violating host slot fails as RegistryError (not a crash)."""
+        cases = {
+            "nemotron": (
+                'zoder_coder = "local/qwen38"',
+                f'zoder_coder = "{mr.NEMOTRON_MODEL}"',
+            ),
+            "retired": ('endpoint = "http://tydeus:8006/v1"', 'endpoint = "http://tydeus:8002/v1"'),
+        }
+        for label, (old, new) in cases.items():
+            with self.subTest(case=label):
+                text = REGISTRY.read_text().replace(old, new)
+                self.assertNotEqual(text, REGISTRY.read_text())
+                with tempfile.TemporaryDirectory() as td:
+                    try:
+                        mr.load_registry(_write_registry(Path(td), text))
+                    except mr.RegistryError:
+                        pass
+                    except NameError as exc:  # pragma: no cover - the regression
+                        self.fail(f"{label}: NameError instead of RegistryError: {exc}")
+                    else:  # pragma: no cover - the regression
+                        self.fail(f"{label}: violating registry loaded")
+
     # ── DeepSeek = direct only ──────────────────────────────────────────────
     def test_deepseek_is_direct_only(self):
         routed_third_party = []
