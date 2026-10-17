@@ -30,6 +30,7 @@ async function api(method,path,body,retry=true){
   return j;
 }
 function relTime(ts){if(!ts)return '';const d=(Date.now()/1000-ts);if(d<60)return Math.round(d)+'s ago';if(d<3600)return Math.round(d/60)+'m ago';return Math.round(d/3600)+'h ago';}
+function untilTime(ts){if(!ts)return '';const d=(ts-Date.now()/1000);if(d<=0)return 'expired';if(d<60)return 'in '+Math.round(d)+'s';if(d<3600)return 'in '+Math.round(d/60)+'m';return 'in '+Math.round(d/3600)+'h';}
 function pbar(p){return `<span class="pbar"><span class="pbar-fill" style="width:${Math.min(100,p)}%"></span></span>`;}
 function badgeCls(s){return 'badge badge-'+(s||'queued');}
 
@@ -167,6 +168,9 @@ function showJobModal(job){
   meta.innerHTML=[
     `<span class="${badgeCls(job.status)}">${esc(job.status)}</span>`,
     job.claimed_by?`<span>claimed by ${esc(job.claimed_by.split(':').slice(2,4).join('@'))}</span>`:'',
+    job.claimed_at?`<span>claimed ${relTime(job.claimed_at)}</span>`:'',
+    job.last_update_at?`<span>updated ${relTime(job.last_update_at)}</span>`:'',
+    job.claim_lease_expires_at?`<span>lease ${untilTime(job.claim_lease_expires_at)}</span>`:'',
     `<span>created ${relTime(job.started_at)}</span>`,
     job.ended_at?`<span>ended ${relTime(job.ended_at)}</span>`:'',
     job.estimated_cost_usd?`<span>$${job.estimated_cost_usd.toFixed(4)}</span>`:'',
