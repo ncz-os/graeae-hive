@@ -210,17 +210,26 @@ def load_registry(path: str | Path = DEFAULT_REGISTRY) -> Registry:
 
 
 def validate_invariants(reg: Registry) -> None:
-    """Fleet rules encoded as code — a registry that breaks them never loads."""
+    """Fleet rules encoded as code — a registry that breaks them never loads.
+
+    Operator correction 2026-10-17: a Nemotron model may sit in ANY host
+    slot whose route it allows, on ANY host. The ``_validate_host_slot``
+    pass below owns the route check; the Nemotron fleet rules in this
+    function are the backup-reviewer-only routes guard plus the
+    EIH-endpoint guard for the shipped Nemotron. The EIH
+    open-weight/Nemotron-only invariant and the DeepSeek direct-only
+    invariant are unchanged.
+    """
     where = str(reg.path)
 
     # ── Nemotron: every Nemotron in the registry is a backup reviewer only ──
-    # (operator correction 2026-10-17). The one Nemotron SHIPPED through EIH
-    # keeps its EIH endpoint; a second Nemotron may sit elsewhere (TYDEUS
-    # serves a backup under test as served name 'nemotron35', vLLM :8010).
-    # Host/slot placement is unconstrained beyond the model's own routes —
-    # see _validate_host_slot. The EIH open-weight/Nemotron-only invariant
-    # below is unchanged: a model routed through EIH is still required to be
-    # a Nemotron or match OPEN_WEIGHT_EIH_ALLOWLIST.
+    # (operator correction 2026-10-17). The Nemotron SHIPPED through EIH
+    # keeps its EIH endpoint; an additional Nemotron is permitted
+    # anywhere — TYDEUS serves a backup under test as served name
+    # 'nemotron35', vLLM :8010 — and must still be backup-reviewer-only.
+    # Host/slot placement is unconstrained beyond the model's own
+    # routes; the host/slot rule is enforced in _validate_host_slot by
+    # the route check, not by a Nemotron-shaped guard.
     nemo = [m for m in reg.models if "nemotron" in m.model.lower() or "nemotron" in m.provider.lower()]
     shipped = next((m for m in nemo if m.key == NEMOTRON_MODEL), None)
     if shipped is None:
@@ -228,28 +237,24 @@ def validate_invariants(reg: Registry) -> None:
             f"{where}: Nemotron rule — the shipped Nemotron {NEMOTRON_MODEL} is "
             f"missing; got {[m.key for m in nemo]}"
         )
-    if set(shipped.routes) - NEMOTRON_ALLOWED_ROUTES:
-        raise RegistryError(
-            f"{where}: Nemotron rule — {NEMOTRON_MODEL} is a backup reviewer only; "
-            f"forbidden routes "
-            f"{sorted(set(shipped.routes) - NEMOTRON_ALLOWED_ROUTES)}"
-        )
+    # Shipped Nemotron stays on EIH (operator correction 2026-10-17: only
+    # the SHIPPED Nemotron's endpoint is anchored to EIH; a second
+    # Nemotron is unrestricted).
     if not _is_eih_endpoint(shipped.endpoint):
         raise RegistryError(
             f"{where}: {NEMOTRON_MODEL} endpoint must be EIH "
             f"({EIH_ENDPOINT_HOST} or {EIH_HOST}:), got {shipped.endpoint!r}"
         )
-    # Every additional Nemotron (TYDEUS backup under test, etc.) is also a
-    # backup-reviewer-only model; its endpoint is unrestricted, its placement
-    # is unrestricted, and it must NOT carry a knemon or coder route.
+    # Unified backup-reviewer-only guard: the same routes guard runs
+    # for the shipped Nemotron and every additional Nemotron. This is
+    # the rule the host/slot pass delegates to: a Nemotron is welcome
+    # in any host slot, but the slot must be a backup-reviewer slot.
     for m in nemo:
-        if m.key == NEMOTRON_MODEL:
-            continue
-        if set(m.routes) - NEMOTRON_ALLOWED_ROUTES:
+        forbidden = set(m.routes) - NEMOTRON_ALLOWED_ROUTES
+        if forbidden:
             raise RegistryError(
                 f"{where}: Nemotron rule — {m.key} is a backup reviewer only; "
-                f"forbidden routes "
-                f"{sorted(set(m.routes) - NEMOTRON_ALLOWED_ROUTES)}"
+                f"forbidden routes {sorted(forbidden)}"
             )
 
     # ── EIH placement: Nemotron or open-weight only (operator 2026-10-17) ───
@@ -362,8 +367,25 @@ def _validate_host_slot(reg: Registry, where: str, host: str, slot: str, key: st
     """Reject a host slot that is unknown or points at a banned route.
 
     Covers review §3.1: a registry mapping ``[host.tydeus] zoder_reviewer =
-    'local/gemma4-31b'`` must fail to load, not emit a TOML. Nemotron is NOT
-    host-restricted — it may sit in any slot whose route it allows, on any host.
+    'local/gemma4-31b'`` must fail to load, not emit a TOML. The guards run
+    in this fixed order so the message names the fleet-level violation
+    when both apply:
+
+      1. unknown model (host slot references a key not in the registry)
+      2. DeepSeek direct-only invariant (DeepSeek models must resolve to
+         the direct provider / ``api.deepseek.com`` endpoint)
+      3. retired endpoint (:8002 / :4100 may never be referenced)
+      4. slot route must be one of the entry's allowed routes
+
+    Notably absent (operator correction 2026-10-17): there is **no**
+    Nemotron host/slot guard here. A Nemotron-shaped entry is welcome
+    in any ``[host.<name>]`` slot, on any host, as long as the slot is
+    in the entry's allowed routes — TYDEUS serves the Nemotron backup
+    under test as served name 'nemotron35' on vLLM :8010, and is wired
+    to its host slot by the registry itself. The backup-reviewer-only
+    routes guard for every Nemotron lives in ``validate_invariants``;
+    the EIH open-weight/Nemotron-only and DeepSeek direct-only
+    invariants do too.
     """
     site = f"{where}: host {host!r} slot {slot!r} -> model {key!r}"
 
