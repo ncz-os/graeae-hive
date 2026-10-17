@@ -77,7 +77,8 @@ _JOB_COLUMNS = (
     "id, submitter_urn, parent_job_id, kind, description, priority, status, "
     "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
     "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count, "
-    "claimed_model, claimed_provider, claimed_runtime, claimed_cost_tier"
+    "claimed_at, claim_lease_expires_at, last_update_at, claimed_model, claimed_provider, "
+    "claimed_runtime, claimed_cost_tier"
 )
 
 
@@ -174,10 +175,13 @@ async def get_job(job_id: str):
         "pr_number": r[18],
         "max_retries": r[19],
         "retry_count": r[20],
-        "claimed_model": r[21],
-        "claimed_provider": r[22],
-        "claimed_runtime": r[23],
-        "claimed_cost_tier": r[24],
+        "claimed_at": r[21],
+        "claim_lease_expires_at": r[22],
+        "last_update_at": r[23],
+        "claimed_model": r[24],
+        "claimed_provider": r[25],
+        "claimed_runtime": r[26],
+        "claimed_cost_tier": r[27],
     }
 
 
