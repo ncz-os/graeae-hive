@@ -428,21 +428,15 @@ class UnknownAgent409Audit(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cl.status_code, 409, cl.text)
         self.assertIn("agent status", cl.text, "must name the status error, not 'not registered'")
 
-    async def test_BLOCKING3_doctor_heartbeat_selfheal_is_dead_code(self):
-        """BLOCKING-3: hive/workers/doctor.py:291 re-registers only on 404.
-
-        After fix C an unknown URN yields 409, so the doctor's heartbeat takes no
-        branch and spins forever — the zombie-worker failure the fix set out to
-        cure, relocated into the doctor process. Desired: doctor self-heals on 409.
-        """
+    async def test_BLOCKING3_doctor_heartbeat_selfheals_on_409(self):
+        """BLOCKING-3 (fixed): the doctor re-registered only on 404, but the bus
+        returns 409 for an unknown agent URN, so its heartbeat spun forever.
+        The doctor now re-registers on both codes (test_doctor_reregister.py
+        covers the behaviour)."""
         src = (Path(__file__).parent / "hive" / "workers" / "doctor.py").read_text()
-        self.assertIn("if code == 404:", src)
-        self.assertIn(
-            "heartbeat 404",
-            src,
-            "BLOCKING-3 still open: doctor.py keys its heartbeat re-register on 404 "
-            "only, but the bus now returns 409 for an unknown agent URN",
-        )
+        self.assertIn("REREGISTER_CODES = (404, 409)", src)
+        heartbeat = src[src.index("def heartbeat(") : src.index("\ndef ", src.index("def heartbeat("))]
+        self.assertIn("if code in REREGISTER_CODES:", heartbeat)
 
 
 if __name__ == "__main__":
