@@ -96,6 +96,7 @@ function setCarryover(job,opts={}){
     eligible_hosts:(job&&job.eligible_hosts)||null,
     site:(job&&job.site)||null,
     pr_number:(job&&typeof job.pr_number==='number')?job.pr_number:null,
+    source_repo:(job&&job.repo)||'',
   };
 }
 function clearCarryover(){
@@ -103,7 +104,7 @@ function clearCarryover(){
 }
 function fillFormFromJob(job){
   document.getElementById('f-desc').value=job.description||'';
-  document.getElementById('f-priority').value=job.priority||50;
+  document.getElementById('f-priority').value=job.priority??50;
   document.getElementById('f-project').value=job.project||'';
   setSelectOrAdd(document.getElementById('f-kind'),job.kind||'investigation');
   document.getElementById('f-tier').value=(job.max_cost_tier||'B').toUpperCase();
@@ -145,7 +146,7 @@ async function submitJob(){
   // create a repo=None job that no worker can map (no_repo_mapping) and
   // dead-letters in ~70s. Warn — but allow the submit.
   const _co=_carryover;
-  const _warnedRepo=_co&&_co.parent_job_id&&repo==='';
+  const _warnedRepo=!!(_co&&_co.parent_job_id&&_co.source_repo&&repo==='');
   const body={
     submitter_urn:_myUrn,
     kind:document.getElementById('f-kind').value,
@@ -174,13 +175,14 @@ async function submitJob(){
       try{await api('PATCH','/v1/jobs/'+oldId,{status:'cancelled'});}catch(_){}
     }
     const shortId=r.id.slice(0,8);
+    // clearForm() resets the status line, so it runs before the messages.
+    clearForm();
     if(r.cache_hit){
       setStatus(`✓ Cache hit — job ${shortId} done instantly`);
     } else {
       setStatus(`✓ Job ${shortId} queued — watching for agent pickup…`);
     }
     if(_warnedRepo)setStatus(`⚠ Resubmitted WITHOUT a repo (source job had one) — workers can't map it, it will likely dead-letter. Reopen with repo filled in if that was a mistake.`,true);
-    clearForm();
     await refreshAll();
   }catch(e){
     setStatus('Error: '+e.message,true);

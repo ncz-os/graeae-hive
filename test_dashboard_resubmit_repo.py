@@ -132,11 +132,25 @@ class DashboardResubmitRepoTest(unittest.TestCase):
     # ── (3) empty-repo warning on resubmit ──────────────────────────────
     def test_submit_warns_when_source_had_repo_but_form_repo_is_empty(self):
         self.assertIn("setStatus", self.submit)
-        # detection: carry-over parent present + repo empty
-        self.assertRegex(self.submit, r"_warnedRepo\s*=\s*_co\s*&&\s*_co\.parent_job_id\s*&&\s*repo\s*===\s*''")
+        # detection: carry-over parent whose source job HAD a repo + repo empty
+        self.assertRegex(
+            self.submit,
+            r"_warnedRepo\s*=\s*!!\(\s*_co\s*&&\s*_co\.parent_job_id\s*&&\s*_co\.source_repo\s*&&\s*repo\s*===\s*''\s*\)",
+        )
+        self.assertRegex(self.js, r"source_repo\s*:\s*\(\s*job\s*&&\s*job\.repo\s*\)\s*\|\|\s*''")
         # and an error-styled warning is rendered
         self.assertRegex(self.submit, r"_warnedRepo\s*\)?\s*setStatus\(.*WITHOUT a repo", re.S)
         self.assertRegex(self.submit, r"setStatus\(.*WITHOUT a repo.*,\s*true\)", re.S)
+
+    def test_warning_is_not_wiped_by_clear_form(self):
+        """clearForm() ends with setStatus(''), so it must run before the
+        queued/warning messages or the operator never sees them."""
+        clear_at = self.submit.index("clearForm();")
+        self.assertLess(clear_at, self.submit.index("WITHOUT a repo"))
+        self.assertLess(clear_at, self.submit.index("queued"))
+
+    def test_priority_zero_survives_fill(self):
+        self.assertIn("job.priority??50", self.js)
 
     # ── sanity ──────────────────────────────────────────────────────────
     def test_js_still_parses(self):
