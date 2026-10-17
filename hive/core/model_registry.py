@@ -212,30 +212,44 @@ def validate_invariants(reg: Registry) -> None:
     """Fleet rules encoded as code — a registry that breaks them never loads."""
     where = str(reg.path)
 
-    # ── Nemotron: exactly one, backup reviewer only ──────────────────────────
+    # ── Nemotron: every Nemotron in the registry is a backup reviewer only ──
+    # (operator correction 2026-10-17). The one Nemotron SHIPPED through EIH
+    # keeps its EIH endpoint; a second Nemotron may sit elsewhere (TYDEUS
+    # serves a backup under test as served name 'nemotron35', vLLM :8010).
+    # Host/slot placement is unconstrained beyond the model's own routes —
+    # see _validate_host_slot. The EIH open-weight/Nemotron-only invariant
+    # below is unchanged: a model routed through EIH is still required to be
+    # a Nemotron or match OPEN_WEIGHT_EIH_ALLOWLIST.
     nemo = [m for m in reg.models if "nemotron" in m.model.lower() or "nemotron" in m.provider.lower()]
-    if [m.key for m in nemo] != [NEMOTRON_MODEL]:
+    shipped = next((m for m in nemo if m.key == NEMOTRON_MODEL), None)
+    if shipped is None:
         raise RegistryError(
-            f"{where}: Nemotron rule — the only Nemotron must be {NEMOTRON_MODEL}, got "
-            f"{[m.key for m in nemo]}"
+            f"{where}: Nemotron rule — the shipped Nemotron {NEMOTRON_MODEL} is "
+            f"missing; got {[m.key for m in nemo]}"
         )
-    nm = nemo[0]
-    if set(nm.routes) - NEMOTRON_ALLOWED_ROUTES:
+    if set(shipped.routes) - NEMOTRON_ALLOWED_ROUTES:
         raise RegistryError(
             f"{where}: Nemotron rule — {NEMOTRON_MODEL} is a backup reviewer only; "
             f"forbidden routes "
-            f"{sorted(set(nm.routes) - NEMOTRON_ALLOWED_ROUTES)}"
+            f"{sorted(set(shipped.routes) - NEMOTRON_ALLOWED_ROUTES)}"
         )
-    if not _is_eih_endpoint(nm.endpoint):
+    if not _is_eih_endpoint(shipped.endpoint):
         raise RegistryError(
             f"{where}: {NEMOTRON_MODEL} endpoint must be EIH "
-            f"({EIH_ENDPOINT_HOST} or {EIH_HOST}:), got {nm.endpoint!r}"
+            f"({EIH_ENDPOINT_HOST} or {EIH_HOST}:), got {shipped.endpoint!r}"
         )
-
-    # Nemotron must never be a bus-router candidate or a coder route.
-    for m in reg.models:
-        if "nemotron" in m.model.lower() and m.key != NEMOTRON_MODEL:
-            raise RegistryError(f"{where}: stray Nemotron {m.key!r}")
+    # Every additional Nemotron (TYDEUS backup under test, etc.) is also a
+    # backup-reviewer-only model; its endpoint is unrestricted, its placement
+    # is unrestricted, and it must NOT carry a knemon or coder route.
+    for m in nemo:
+        if m.key == NEMOTRON_MODEL:
+            continue
+        if set(m.routes) - NEMOTRON_ALLOWED_ROUTES:
+            raise RegistryError(
+                f"{where}: Nemotron rule — {m.key} is a backup reviewer only; "
+                f"forbidden routes "
+                f"{sorted(set(m.routes) - NEMOTRON_ALLOWED_ROUTES)}"
+            )
 
     # ── EIH placement: Nemotron or open-weight only (operator 2026-10-17) ───
     for m in reg.models:

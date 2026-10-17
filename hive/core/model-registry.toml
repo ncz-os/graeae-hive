@@ -316,12 +316,12 @@ out = 1.00
 # ── per-host engine placement ───────────────────────────────────────────────
 # Facts only; the generator turns these into TOML fragments.
 #
-# Nemotron: nvidia/nemotron-3-ultra-550b-a55b is the Nemotron this registry
-# knows, routed through EIH as a backup reviewer. It must never carry a
-# "knemon" route.
-# Placement is NOT EIH-only: a Nemotron model may be mapped into any host slot
-# whose route it allows (operator correction 2026-10-17). TYDEUS serves a
-# Nemotron backup model under test (served name 'nemotron35', vLLM :8010).
+# Nemotron: the registry carries two Nemotron models — the one SHIPPED
+# through EIH (`nvidia/nemotron-3-ultra-550b-a55b`, the backup reviewer)
+# and a TYDEUS backup under test (`nvidia/nemotron-35`, served name
+# 'nemotron35' on vLLM :8010). Both are backup-reviewer-only; only the
+# shipped one is routed through EIH. The EIH open-weight/Nemotron-only
+# and DeepSeek direct-only invariants are unchanged.
 
 [[model]]
 key = "local/qwen38"
@@ -345,11 +345,20 @@ out = 0.0
 endpoint = "https://integrate.api.nvidia.com/v1"
 routes = ["zoder.reviewer.backup"]
 notes = "Backup reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a knemon/coder candidate."
+[[model]]
+key = "nvidia/nemotron-35"
+emit_rate = false
+in = 0.0
+out = 0.0
+endpoint = "http://tydeus:8010/v1"
+routes = ["zoder.reviewer.backup"]
+notes = "TYDEUS backup under test (served name 'nemotron35', vLLM :8010). Backup-reviewer-only fleet rule applies; placement is NOT EIH-only (operator correction 2026-10-17)."
 
 [host.cerberus]
 zoder_reviewer = "local/gemma4-31b"
 [host.tydeus]
 zoder_coder = "local/qwen38"
+zoder_reviewer_backup = "nvidia/nemotron-35"
 [host.eih]
 zoder_reviewer_backup = "nvidia/nemotron-3-ultra-550b-a55b"
 

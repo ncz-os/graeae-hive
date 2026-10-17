@@ -150,22 +150,46 @@ class TestInvariants(unittest.TestCase):
     def setUp(self):
         self.reg = mr.load_registry(REGISTRY)
 
-    # ── Nemotron = backup reviewer ──────────────────────────────────────────
-    def test_nemotron_is_eih_only_backup_reviewer(self):
+    # ── Nemotron = backup reviewer only, placement NOT EIH-only ──────────────
+    def test_nemotron_entries_are_backup_reviewer_only(self):
+        """Operator correction 2026-10-17.
+
+        Two Nemotrons ship: the EIH-routed backup reviewer
+        (`nvidia/nemotron-3-ultra-550b-a55b`, the SHIPPED model) and the
+        TYDEUS backup under test (`nvidia/nemotron-35`, served name
+        'nemotron35', vLLM :8010). Both are backup-reviewer-only; only the
+        shipped one is on EIH. The EIH open-weight/Nemotron-only invariant
+        and DeepSeek direct-only invariant are unchanged.
+        """
         nemo = [m for m in self.reg.models if "nemotron" in m.model.lower()]
-        self.assertEqual([m.key for m in nemo], [mr.NEMOTRON_MODEL])
-        m = nemo[0]
-        self.assertEqual(m.routes, ("zoder.reviewer.backup",))
-        self.assertTrue(mr._is_eih_endpoint(m.endpoint), m.endpoint)
-        self.assertEqual(self.reg.hosts["eih"]["zoder_reviewer_backup"], mr.NEMOTRON_MODEL)
+        keys = [m.key for m in nemo]
+        self.assertIn(mr.NEMOTRON_MODEL, keys)
+        self.assertIn("nvidia/nemotron-35", keys)
+        for m in nemo:
+            self.assertEqual(m.routes, ("zoder.reviewer.backup",), m.key)
+        shipped = self.reg.by_key(mr.NEMOTRON_MODEL)
+        self.assertTrue(mr._is_eih_endpoint(shipped.endpoint), shipped.endpoint)
+        self.assertEqual(
+            self.reg.hosts["eih"]["zoder_reviewer_backup"], mr.NEMOTRON_MODEL
+        )
+        tydeus_nemo = self.reg.by_key("nvidia/nemotron-35")
+        self.assertEqual(tydeus_nemo.endpoint, "http://tydeus:8010/v1")
+        self.assertFalse(
+            mr._is_eih_endpoint(tydeus_nemo.endpoint), tydeus_nemo.endpoint
+        )
+        self.assertEqual(
+            self.reg.hosts["tydeus"]["zoder_reviewer_backup"], "nvidia/nemotron-35"
+        )
 
     def test_nemotron_never_in_bus_router_or_coder(self):
-        self.assertNotIn(mr.NEMOTRON_MODEL, {k["model"] for k in KNEMON_PROVIDERS})
         for m in self.reg.models:
-            if m.key == mr.NEMOTRON_MODEL:
-                continue
-            self.assertNotIn("nemotron", m.model.lower())
-        # ...and no host may install it as a coder
+            if "nemotron" in m.model.lower():
+                self.assertNotIn("knemon", m.routes, m.key)
+                self.assertNotIn("zoder.coder", m.routes, m.key)
+        self.assertNotIn(
+            "nemotron-3-ultra-550b-a55b", {k["model"] for k in KNEMON_PROVIDERS}
+        )
+        # ...and no host may install ANY Nemotron as a coder
         for host, assigns in self.reg.hosts.items():
             for slot, key in assigns.items():
                 if "nemotron" in key:
@@ -182,15 +206,17 @@ class TestInvariants(unittest.TestCase):
                 'knemon_alias = "hive_nemotron_1"\n'
                 'knemon_tier = "A"\n'
                 'knemon_order = 99',
+                1,
             )
             self.assertNotEqual(bad, text)
             with self.assertRaises(mr.RegistryError) as ctx:
                 mr.load_registry(_write_registry(Path(td), bad))
             self.assertIn("Nemotron", str(ctx.exception))
 
-    def test_registry_rejects_non_eih_nemotron(self):
-        import tempfile
-
+    def test_registry_rejects_non_eih_endpoint_for_shipped_nemotron(self):
+        """The Nemotron SHIPPED through EIH must keep its EIH endpoint; a
+        second Nemotron (TYDEUS :8010) may live elsewhere, so the check is
+        keyed to the shipped model only."""
         with tempfile.TemporaryDirectory() as td:
             text = REGISTRY.read_text()
             bad = text.replace(
@@ -201,18 +227,34 @@ class TestInvariants(unittest.TestCase):
             with self.assertRaises(mr.RegistryError) as ctx:
                 mr.load_registry(_write_registry(Path(td), bad))
             self.assertIn("EIH", str(ctx.exception))
+            self.assertIn(mr.NEMOTRON_MODEL, str(ctx.exception))
 
-    def test_registry_rejects_stray_second_nemotron(self):
-        import tempfile
-
+    def test_registry_rejects_nemotron_with_coder_route(self):
+        """A Nemotron model may NOT carry a zoder.coder route, wherever it
+        lives — the fleet rule Nemotron is backup-reviewer-only is unchanged."""
         with tempfile.TemporaryDirectory() as td:
             text = REGISTRY.read_text() + (
-                '[[model]]\nkey = "local/nemotron-mini"\nin = 0.0\nout = 0.0\n'
-                'endpoint = "http://tydeus:8000/v1"\n'
+                '[[model]]\nkey = "nvidia/nemotron-36"\nin = 0.0\nout = 0.0\n'
+                'endpoint = "http://tydeus:8010/v1"\n'
+                'routes = ["zoder.coder"]\n'
             )
             with self.assertRaises(mr.RegistryError) as ctx:
                 mr.load_registry(_write_registry(Path(td), text))
             self.assertIn("Nemotron", str(ctx.exception))
+            self.assertIn("zoder.coder", str(ctx.exception))
+
+    def test_registry_accepts_second_nemotron_elsewhere(self):
+        """Operator correction 2026-10-17: a second Nemotron (TYDEUS backup
+        under test) is welcome anywhere the operator wants to put it, as
+        long as it carries backup-reviewer-only routes."""
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text() + (
+                '[[model]]\nkey = "nvidia/nemotron-99"\nin = 0.0\nout = 0.0\n'
+                'endpoint = "http://tydeus:9090/v1"\n'
+                'routes = ["zoder.reviewer.backup"]\n'
+            )
+            reg = mr.load_registry(_write_registry(Path(td), text))
+            self.assertIsNotNone(reg.by_key("nvidia/nemotron-99"))
 
     # ── host.<name>.<slot> placement (review §3.1) ──────────────────────────
     def test_committed_registry_loads_with_host_slot_validation(self):
@@ -229,20 +271,28 @@ class TestInvariants(unittest.TestCase):
     def test_accepts_nemotron_on_tydeus_host_slot(self):
         """Operator correction 2026-10-17: Nemotron is NOT EIH-only.
 
-        TYDEUS serves a Nemotron backup model under test (served name
-        'nemotron35', vLLM on TYDEUS :8010), so a tydeus host slot may map a
-        Nemotron model as long as the slot's route is one it allows.
+        The committed registry already maps the TYDEUS backup under test
+        (`nvidia/nemotron-35`, vLLM :8010) into the tydeus
+        ``zoder_reviewer_backup`` slot, so the registry itself proves the
+        rule. A synthetic registry that maps a different Nemotron into a
+        fresh host (NOT EIH) with a matching route also loads.
         """
+        # (1) committed registry — the TYDEUS backup under test is wired.
+        reg = mr.load_registry(REGISTRY)
+        self.assertEqual(
+            reg.hosts["tydeus"]["zoder_reviewer_backup"], "nvidia/nemotron-35"
+        )
+        # (2) functional — adding a NEW host that maps a Nemotron into a
+        # backup-reviewer slot loads (no host restriction).
         with tempfile.TemporaryDirectory() as td:
-            text = REGISTRY.read_text().replace(
-                '[host.tydeus]\nzoder_coder = "local/qwen38"',
-                '[host.tydeus]\nzoder_coder = "local/qwen38"\n'
-                f'zoder_reviewer_backup = "{mr.NEMOTRON_MODEL}"',
+            text = REGISTRY.read_text() + (
+                '\n[host.apollo]\n'
+                f'zoder_reviewer_backup = "{mr.NEMOTRON_MODEL}"\n'
             )
             self.assertNotEqual(text, REGISTRY.read_text())
             reg = mr.load_registry(_write_registry(Path(td), text))
             self.assertEqual(
-                reg.hosts["tydeus"]["zoder_reviewer_backup"], mr.NEMOTRON_MODEL
+                reg.hosts["apollo"]["zoder_reviewer_backup"], mr.NEMOTRON_MODEL
             )
 
     def test_accepts_nemotron35_served_name_as_an_endpoint(self):
@@ -590,12 +640,14 @@ class TestEihPlacementPolicy(unittest.TestCase):
         block = (
             '[[model]]\nkey = "nvidia/nemotron-3-ultra-550b-a55b-alt"\nin = 0.0\nout = 0.0\n'
             'endpoint = "https://integrate.api.nvidia.com/v1"\n'
+            'routes = ["zoder.reviewer.backup"]\n'
         )
-        # A second Nemotron is rejected by the one-and-only Nemotron rule, so
-        # assert the EIH pass itself accepts Nemotron-shaped placement.
-        with self.assertRaises(mr.RegistryError) as ctx:
-            self._load(block)
-        self.assertNotIn("EIH placement policy", str(ctx.exception))
+        # A second Nemotron with backup-reviewer-only routes is welcome on
+        # EIH (operator correction 2026-10-17). The EIH placement pass must
+        # accept it; the fleet rule is "Nemotron or open-weight only on EIH"
+        # and a Nemotron-shaped model satisfies that rule.
+        reg = self._load(block)
+        self.assertIsNotNone(reg.by_key("nvidia/nemotron-3-ultra-550b-a55b-alt"))
 
     def test_accepts_zai_glm_on_eih(self):
         block = (
