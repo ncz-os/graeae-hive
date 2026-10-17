@@ -78,6 +78,165 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 
 _IS_MACOS = platform.system() == "Darwin"
 
+# APUs (Ryzen gfx1103/780M etc.) expose only a small VRAM carve-out; the rest
+# of the iGPU's memory lives in GTT (shared system RAM). Threshold: any
+# AMD card whose VRAM total is under 2 GiB is treated as an APU.
+_APU_VRAM_THRESHOLD_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def _apu_mem_from_sysfs(sysfs_root: str = "/sys") -> list[dict]:
+    """Fallback GPU runtime metrics read straight from amdgpu sysfs.
+
+    Used when rocm-smi is missing or fails. Only reports cards that expose
+    the mem_info_vram_* files (amdgpu driver). sysfs_root may be overridden
+    for testing (expects <root>/class/drm/card*/device).
+    """
+    import glob as _glob
+
+    out: list[dict] = []
+    for dev in sorted(_glob.glob(sysfs_root + "/class/drm/card*/device")):
+        pfx = dev + "/"
+        try:
+            with open(pfx + "mem_info_vram_total") as f:
+                vram_total = int(f.read().strip() or 0)
+            with open(pfx + "mem_info_vram_used") as f:
+                vram_used = int(f.read().strip() or 0)
+        except (OSError, ValueError):
+            continue  # not an amdgpu card (no vram info)
+        gtt_total = gtt_used = 0
+        with contextlib.suppress(OSError, ValueError):
+            with open(pfx + "mem_info_gtt_total") as f:
+                gtt_total = int(f.read().strip() or 0)
+        with contextlib.suppress(OSError, ValueError):
+            with open(pfx + "mem_info_gtt_used") as f:
+                gtt_used = int(f.read().strip() or 0)
+        util = None
+        with contextlib.suppress(OSError, ValueError):
+            with open(pfx + "gpu_busy_percent") as f:
+                util = float(f.read().strip() or 0)
+        entry = _amd_entry_from_bytes(
+            name=os.path.basename(dev.rsplit("/", 1)[0]),
+            util=util,
+            vram_used=vram_used, vram_total=vram_total,
+            gtt_used=gtt_used, gtt_total=gtt_total,
+            temp_c=None, power_w=None,
+        )
+        out.append(entry)
+    return out
+
+
+def _amd_entry_from_bytes(*, name: str, util, vram_used: int, vram_total: int,
+                          gtt_used: int, gtt_total: int, temp_c, power_w) -> dict:
+    """Build one gpus_runtime entry from raw byte counters.
+
+    APUs (VRAM total < 2 GiB) report VRAM+GTT as the memory figures and
+    unified_memory=True; discrete cards keep mem_* as VRAM-only.
+    """
+    unified = bool(vram_total and vram_total < _APU_VRAM_THRESHOLD_BYTES)
+    mem_used = vram_used + gtt_used if unified else vram_used
+    mem_total = vram_total + gtt_total if unified else vram_total
+    return {
+        "vendor": "amd", "name": name, "util_pct": util,
+        "mem_used_mib": int(mem_used / (1024 * 1024)),
+        "mem_total_mib": int(mem_total / (1024 * 1024)),
+        "vram_used_mib": int(vram_used / (1024 * 1024)),
+        "vram_total_mib": int(vram_total / (1024 * 1024)),
+        "gtt_used_mib": int(gtt_used / (1024 * 1024)),
+        "gtt_total_mib": int(gtt_total / (1024 * 1024)),
+        "unified_memory": unified,
+        "temp_c": temp_c, "power_w": power_w,
+    }
+
+
+def _parse_rocm_json(data: dict) -> list[dict]:
+    """Parse a rocm-smi --json payload (see --showmeminfo vram gtt)."""
+    gpus: list[dict] = []
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        name = v.get("Card SKU") or v.get("Card series") or v.get("Card model") or k
+        try:
+            util = float((v.get("GPU use (%)") or "0").replace("%", ""))
+        except (TypeError, ValueError):
+            util = None
+        vram_used = vram_total = gtt_used = gtt_total = 0
+        try:
+            vram_used = int(float(v.get("VRAM Total Used Memory (B)") or 0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            vram_total = int(float(v.get("VRAM Total Memory (B)") or 0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            gtt_used = int(float(v.get("GTT Total Used Memory (B)") or 0))
+        except (TypeError, ValueError):
+            pass
+        try:
+            gtt_total = int(float(v.get("GTT Total Memory (B)") or 0))
+        except (TypeError, ValueError):
+            pass
+        temp = None
+        for tk in v:
+            if "temperature" in tk.lower() and "edge" in tk.lower():
+                try:
+                    temp = float(v[tk])
+                    break
+                except (TypeError, ValueError):
+                    pass
+        try:
+            power = float((v.get("Average Graphics Package Power (W)") or "").replace("W", "").strip() or 0)
+        except (TypeError, ValueError):
+            power = None
+        gpus.append(_amd_entry_from_bytes(
+            name=name, util=util,
+            vram_used=vram_used, vram_total=vram_total,
+            gtt_used=gtt_used, gtt_total=gtt_total,
+            temp_c=temp, power_w=power,
+        ))
+    return gpus
+
+
+def _collect_amd_gpus(runtime_bin: str | None) -> list[dict]:
+    """Runtime AMD GPU metrics via rocm-smi, with an amdgpu-sysfs fallback.
+
+    On APUs (gfx1103 e.g. Radeon 780M: 512 MiB VRAM carve-out, model weights
+    live in GTT), mem_* combines VRAM+GTT and unified_memory is True so the
+    dashboard bars reflect what's actually loaded.
+    """
+    if runtime_bin:
+        try:
+            r = subprocess.run(
+                [runtime_bin, "--showproductname", "--showuse", "--showmemuse",
+                 "--showmeminfo", "vram", "gtt",
+                 "--showtemp", "--showpower", "--json"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.stdout and r.stdout.strip():
+                data = json.loads(r.stdout)
+                if isinstance(data, dict):
+                    gpus = _parse_rocm_json(data)
+                    if gpus:
+                        return gpus
+        except Exception:
+            pass
+    # rocm-smi missing or produced nothing — try amdgpu sysfs directly.
+    return _apu_mem_from_sysfs()
+
+
+def _amd_runtime_bin() -> str | None:
+    """Locate rocm-smi (PATH or /opt/rocm*/bin). Standalone-safe helper."""
+    p = shutil.which("rocm-smi")
+    if p:
+        return p
+    import glob as _glob
+
+    for d in sorted(_glob.glob("/opt/rocm-*/bin")) + ["/opt/rocm/bin"]:
+        cand = os.path.join(d, "rocm-smi")
+        if os.path.exists(cand):
+            return cand
+    return None
+
 
 def static_specs() -> dict:
     """One-shot specs gathered at startup."""
@@ -400,39 +559,7 @@ def dynamic_load() -> dict:
                             })
             except Exception:
                 pass
-        if shutil.which("rocm-smi"):
-            try:
-                r = subprocess.run(["rocm-smi", "--showproductname", "--showuse", "--showmemuse",
-                                    "--showtemp", "--showpower", "--json"],
-                                   capture_output=True, text=True, timeout=5)
-                data = json.loads(r.stdout) if r.stdout.strip() else {}
-                for k, v in data.items():
-                    if not isinstance(v, dict): continue
-                    name = v.get("Card SKU") or v.get("Card series") or v.get("Card model") or k
-                    try:
-                        util = float((v.get("GPU use (%)") or "0").replace("%",""))
-                    except: util = None
-                    try:
-                        mem_used = int(float(v.get("VRAM Total Used Memory (B)") or 0) / (1024*1024))
-                    except: mem_used = None
-                    try:
-                        mem_total = int(float(v.get("VRAM Total Memory (B)") or 0) / (1024*1024))
-                    except: mem_total = None
-                    temp = None
-                    for tk in v:
-                        if "temperature" in tk.lower() and "edge" in tk.lower():
-                            try: temp = float(v[tk]); break
-                            except: pass
-                    try:
-                        power = float((v.get("Average Graphics Package Power (W)") or "").replace("W","").strip() or 0)
-                    except: power = None
-                    gpus_rt.append({
-                        "vendor": "amd", "name": name, "util_pct": util,
-                        "mem_used_mib": mem_used, "mem_total_mib": mem_total,
-                        "temp_c": temp, "power_w": power,
-                    })
-            except Exception:
-                pass
+        gpus_rt.extend(_collect_amd_gpus(_amd_runtime_bin()))
         out["gpus_runtime"] = gpus_rt
     except Exception:
         pass
