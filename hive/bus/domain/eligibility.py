@@ -85,6 +85,20 @@ KIND_WORKSPACE_CAPABILITY: dict[str, str] = {
 HEAVY_REPO_KIND_PREFIXES = ("zeroclaw:", "ncz-os-zeroclaw:")
 
 
+# ── Doctor scope (2026-10-17) ──────────────────────────────────────────────
+# The doctor registers with kind "doctor". The bus matcher is kind-filtered
+# only by eligible_kinds, so a normal worker job (eligible_kinds
+# ["zeroclaw"], or the wildcard "*") matched the doctor too -- reproduced live
+# 2026-10-17: the doctor claimed fix:singularity-shell-about-graphic and had to
+# release it back (claim/release churn). The doctor is a triage brain, not an
+# executor, so scope it here at the source instead.
+DOCTOR_KIND = "doctor"
+DOCTOR_JOB_KIND_PREFIXES = ("triage:", "doctor:")
+# The doctor's own codex dispatches are round-tripped by the zero-triage path
+# (zeroclaw_doctor.py consumes them), not executed by the triage brain itself.
+DOCTOR_JOB_KIND_EXCLUDE_PREFIXES = ("doctor:codex-fix:",)
+
+
 THROTTLE_HEADROOM = 0.85  # at >=85% of plan cap, prefer non-subscription workers for tier-B/C jobs
 
 
@@ -155,6 +169,36 @@ def heavy_repo_required_for_kind(kind: str) -> bool:
     return any(kind.startswith(prefix) for prefix in HEAVY_REPO_KIND_PREFIXES)
 
 
+def agent_is_doctor(agent: dict[str, Any]) -> bool:
+    """True when this agent is a triage doctor (kind or runtime == 'doctor')."""
+    for key in ("kind", "runtime"):
+        if _norm_str(agent.get(key)) == DOCTOR_KIND:
+            return True
+    return False
+
+
+def _doctor_scope_allowed(job: dict[str, Any], kinds: set[str]) -> tuple[bool, str]:
+    """Doctor agents may only take triage:* / doctor:* work.
+
+    Escape hatch: a job whose eligible_kinds explicitly lists 'doctor' opts in
+    to the doctor directly. The wildcard "*" (and any other executor alias such
+    as "zeroclaw") is NOT an opt-in -- that is exactly what leaked a normal
+    worker job to the doctor.
+    """
+    j_kind = _norm_str(job.get("kind"))
+    if DOCTOR_KIND in kinds:
+        return True, "eligible"
+    if j_kind.startswith(DOCTOR_JOB_KIND_EXCLUDE_PREFIXES):
+        return False, f"doctor out of scope for excluded kind {j_kind!r} (codex-fix dispatch)"
+    if j_kind.startswith(DOCTOR_JOB_KIND_PREFIXES):
+        return True, "eligible"
+    return (
+        False,
+        f"doctor is out of scope for kind {j_kind!r} (eligible only for "
+        f"{list(DOCTOR_JOB_KIND_PREFIXES)} kinds, or jobs listing 'doctor' in eligible_kinds)",
+    )
+
+
 def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool, str]:
     agent_host = _norm_str(agent.get("host"))
     agent_caps = _norm_str_set(agent.get("capabilities"))
@@ -172,7 +216,13 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         )
 
     kinds = _norm_str_set(job.get("eligible_kinds"))
-    if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
+    if agent_is_doctor(agent):
+        doctor_ok, doctor_reason = _doctor_scope_allowed(job, kinds)
+        if not doctor_ok:
+            return False, doctor_reason
+        # In scope for the doctor: executor-kind filters (zeroclaw, "*", ...)
+        # are irrelevant -- the doctor scope above is the authority.
+    elif kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
         return (
             False,
             f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}",

@@ -96,6 +96,77 @@ def test_doctor_never_claims_its_own_fix_dispatch(doctor):
     assert not doctor.is_doctor_claimable("doctor:codex-fix:1729000000")
 
 
+# ───────────────────── bus-side matcher scope (source fix) ─────────────────────
+# The doctor used to be offered normal worker jobs (fix:singularity-shell-...,
+# eligible_kinds=["zeroclaw"]) and had to claim-then-release them. The scope now
+# lives in the bus matcher itself (hive/bus/domain/eligibility.py).
+from hive.bus.domain.eligibility import agent_kind_aliases, job_agent_eligible  # noqa: E402
+
+
+def _agent(kind, runtime=None, host="pythia"):
+    return {
+        "urn": f"urn:agent:{kind}:{host}:s",
+        "host": host,
+        "kind": kind,
+        "runtime": runtime or kind,
+        "capabilities": [],
+        "eligible_aliases": agent_kind_aliases(kind, runtime or kind),
+        "cost_tier": "B",
+    }
+
+
+def _job(kind, eligible_kinds=None):
+    return {
+        "id": "job-1",
+        "kind": kind,
+        "eligible_kinds": eligible_kinds,
+        "required_capabilities": [],
+        "eligible_hosts": None,
+        "max_cost_tier": "B",
+    }
+
+
+def test_doctor_ineligible_for_zeroclaw_fix_job():
+    ok, reason = job_agent_eligible(
+        _job("fix:singularity-shell-about-graphic", ["zeroclaw"]), _agent("doctor")
+    )
+    assert ok is False
+    assert "out of scope" in reason
+
+
+def test_doctor_ineligible_for_wildcard_worker_job():
+    ok, reason = job_agent_eligible(_job("build:native", ["*"]), _agent("doctor"))
+    assert ok is False
+    assert "out of scope" in reason
+
+
+@pytest.mark.parametrize("kind", ["triage:fix:x", "doctor:sweep", "triage:zeroclaw"])
+def test_doctor_eligible_for_triage_and_doctor_kinds(kind):
+    ok, reason = job_agent_eligible(_job(kind), _agent("doctor"))
+    assert ok is True, reason
+
+
+def test_doctor_ineligible_for_its_own_codex_fix_dispatch():
+    ok, reason = job_agent_eligible(_job("doctor:codex-fix:1"), _agent("doctor"))
+    assert ok is False
+    assert "codex-fix" in reason
+
+
+def test_doctor_eligible_when_job_lists_doctor_in_eligible_kinds():
+    ok, reason = job_agent_eligible(_job("feat:whatever", ["doctor"]), _agent("doctor"))
+    assert ok is True, reason
+
+
+def test_zeroclaw_worker_behaviour_is_unchanged():
+    # still eligible for its own executor job
+    assert job_agent_eligible(_job("fix:x", ["zeroclaw"]), _agent("zeroclaw"))[0] is True
+    # still NOT eligible for triage work unless the job advertises triage
+    ok, _ = job_agent_eligible(_job("triage:fix:x", ["triage"]), _agent("zeroclaw"))
+    assert ok is False
+    ok, _ = job_agent_eligible(_job("triage:fix:x", ["triage", "zeroclaw"]), _agent("zeroclaw"))
+    assert ok is True
+
+
 @pytest.mark.parametrize(
     "kind",
     [
