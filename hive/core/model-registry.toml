@@ -316,8 +316,10 @@ out = 1.00
 # ── per-host engine placement ───────────────────────────────────────────────
 # Facts only; the generator turns these into TOML fragments.
 #
-# Nemotron (fleet rule): nvidia/nemotron-3-ultra-550b-a55b is the ONLY Nemotron,
-# EIH-only, backup reviewer. It must never carry a "knemon" route.
+# Nemotron: nvidia/nemotron-3-ultra-550b-a55b is the only Nemotron routed
+# through EIH and is a backup reviewer. It must never carry a "knemon" route.
+# Placement is NOT EIH-only: a Nemotron model may be mapped into any host slot
+# whose route it allows (operator correction 2026-10-17).
 
 [[model]]
 key = "local/qwen38"
@@ -340,7 +342,7 @@ in = 0.0
 out = 0.0
 endpoint = "https://integrate.api.nvidia.com/v1"
 routes = ["zoder.reviewer.backup"]
-notes = "EIH-only backup reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a knemon/coder candidate."
+notes = "Backup reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a knemon/coder candidate."
 
 [host.cerberus]
 zoder_reviewer = "local/gemma4-31b"

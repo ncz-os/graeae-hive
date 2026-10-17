@@ -8,7 +8,7 @@ model = "nemotron-3-ultra-550b-a55b"
 provider = "nvidia"
 endpoint = "https://integrate.api.nvidia.com/v1"
 cost_tier = "A"
-notes = "EIH-only backup reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a knemon/coder candidate."
+notes = "Backup reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a knemon/coder candidate."
 
 # bus-router providers (KNEMON_PROVIDERS order)
 

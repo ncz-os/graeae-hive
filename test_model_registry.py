@@ -3,7 +3,7 @@
 The registry (hive/core/model-registry.toml) is the ONE source; these tests
 prove the committed consumers (hive/core/models.py tables + the per-host zoder /
 zeroclaw TOML fragments) match it byte-for-byte, and that the fleet rules —
-Nemotron EIH-only, DeepSeek direct-only — hold as CODE, not comments.
+Nemotron placement (not EIH-only), EIH open-weight-only, DeepSeek direct-only — hold as CODE, not comments.
 """
 
 from __future__ import annotations
@@ -150,7 +150,7 @@ class TestInvariants(unittest.TestCase):
     def setUp(self):
         self.reg = mr.load_registry(REGISTRY)
 
-    # ── Nemotron = EIH-only backup reviewer ─────────────────────────────────
+    # ── Nemotron = backup reviewer ──────────────────────────────────────────
     def test_nemotron_is_eih_only_backup_reviewer(self):
         nemo = [m for m in self.reg.models if "nemotron" in m.model.lower()]
         self.assertEqual([m.key for m in nemo], [mr.NEMOTRON_MODEL])
@@ -177,9 +177,7 @@ class TestInvariants(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             text = REGISTRY.read_text()
             bad = text.replace(
-                'routes = ["zoder.reviewer.backup"]\nnotes = "EIH-only backup '
-                'reviewer (NVIDIA EIH, integrate.api.nvidia.com). Fleet rule: never a '
-                'knemon/coder candidate."',
+                'routes = ["zoder.reviewer.backup"]',
                 'routes = ["zoder.reviewer.backup", "knemon"]\n'
                 'knemon_alias = "hive_nemotron_1"\n'
                 'knemon_tier = "A"\n'
@@ -228,21 +226,30 @@ class TestInvariants(unittest.TestCase):
                 entry = reg.by_key(key)
                 self.assertIn(mr._slot_route(slot), entry.routes, f"{host}.{slot}")
 
-    def test_rejects_nemotron_on_tydeus_coder_slot(self):
-        """§3.1 (2): the review's exact mutation — Nemotron as TYDEUS coder."""
+    def test_accepts_nemotron_on_tydeus_host_slot(self):
+        """Operator correction 2026-10-17: Nemotron is NOT EIH-only.
+
+        TYDEUS serves a Nemotron backup model under test (served name
+        'nemotron35', vLLM on TYDEUS :8010), so a tydeus host slot may map a
+        Nemotron model as long as the slot's route is one it allows.
+        """
         with tempfile.TemporaryDirectory() as td:
             text = REGISTRY.read_text().replace(
                 '[host.tydeus]\nzoder_coder = "local/qwen38"',
-                f'[host.tydeus]\nzoder_coder = "{mr.NEMOTRON_MODEL}"',
+                '[host.tydeus]\nzoder_coder = "local/qwen38"\n'
+                f'zoder_reviewer_backup = "{mr.NEMOTRON_MODEL}"',
             )
             self.assertNotEqual(text, REGISTRY.read_text())
-            with self.assertRaises(mr.RegistryError) as ctx:
-                mr.load_registry(_write_registry(Path(td), text))
-            msg = str(ctx.exception)
-            self.assertIn("tydeus", msg)
-            self.assertIn("zoder_coder", msg)
-            self.assertIn(mr.NEMOTRON_MODEL, msg)
-            self.assertIn("Nemotron", msg)
+            reg = mr.load_registry(_write_registry(Path(td), text))
+            self.assertEqual(
+                reg.hosts["tydeus"]["zoder_reviewer_backup"], mr.NEMOTRON_MODEL
+            )
+
+    def test_accepts_nemotron35_served_name_as_an_endpoint(self):
+        """'nemotron35' is a live served name on TYDEUS :8010, not a retired token."""
+        self.assertNotIn("nemotron35", mr.RETIRED_ENDPOINT_TOKENS)
+        self.assertIsNone(mr._retired_endpoint("http://tydeus:8010/v1/nemotron35"))
+        self.assertIsNotNone(mr._retired_endpoint("http://tydeus:8002/v1"))
 
     def test_rejects_nemotron_in_eih_coder_slot(self):
         """Nemotron may only be the backup reviewer, even on EIH."""
@@ -254,7 +261,9 @@ class TestInvariants(unittest.TestCase):
             self.assertNotEqual(text, REGISTRY.read_text())
             with self.assertRaises(mr.RegistryError) as ctx:
                 mr.load_registry(_write_registry(Path(td), text))
-            self.assertIn("Nemotron", str(ctx.exception))
+            msg = str(ctx.exception)
+            self.assertIn("zoder_coder", msg)
+            self.assertIn("not an allowed route", msg)
 
     def test_rejects_deepseek_through_third_party_slot(self):
         """§3.1 (3): a slot may not resolve a DeepSeek model off the direct provider."""
@@ -295,7 +304,7 @@ class TestInvariants(unittest.TestCase):
             self.assertIn("deepseek-direct/deepseek-v4-orion", msg)
 
     def test_rejects_retired_tydeus_8002_endpoint_from_a_slot(self):
-        """§3.1 (4): the retired TYDEUS :8002 nemotron35 coder endpoint."""
+        """§3.1: the retired TYDEUS :8002 coder endpoint."""
         with tempfile.TemporaryDirectory() as td:
             text = REGISTRY.read_text().replace(
                 'endpoint = "http://tydeus:8006/v1"',
