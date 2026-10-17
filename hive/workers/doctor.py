@@ -123,6 +123,90 @@ _PHASE_BASE_URLS = {
     "fix": DOCTOR_FIX_BASE_URL,
 }
 
+# ── Failover chain (2026-10-17) ──
+# HYDRA (.78) and ACHILLES (.11) are BUILD hosts: their arm-orchestrator UNLOADS
+# the model while compiling, so whichever phase base points at one of them is
+# routinely down. DOCTOR_FALLBACK_BASE_URLS is a comma list tried in order after
+# the phase base, with DOCTOR_FALLBACK_MODELS a parallel list of model ids (the
+# CERBERUS rung serves a different model than the ROCm rungs, so the base and
+# its model must travel together). LOCAL ONLY: every default is an on-prem
+# llama-server; there is deliberately no remote/paid rung.
+DOCTOR_FALLBACK_BASE_URLS: list[str] = [
+    u.strip().rstrip("/")
+    for u in os.environ.get(
+        "DOCTOR_FALLBACK_BASE_URLS",
+        "http://192.0.2.78:8080/v1,"
+        "http://192.0.2.11:8080/v1,"
+        "http://192.0.2.96:8080/v1",
+    ).split(",")
+    if u.strip()
+]
+DOCTOR_FALLBACK_MODELS: list[str] = [
+    m.strip()
+    for m in os.environ.get(
+        "DOCTOR_FALLBACK_MODELS", "gemma4-e2b,gemma4-e2b,gemma4-31b"
+    ).split(",")
+    if m.strip()
+]
+
+
+def _phase_model(phase: str) -> str:
+    """The model id the operator configured for this phase.
+
+    DOCTOR_<PHASE>_MODEL, falling back to the doctor-wide open-weight model for
+    an unknown phase. A Codex/GPT alias can never be returned (Codex never runs
+    unattended — operator rule 2026-10-10), and neither can an empty value."""
+    alias = (_PHASE_MODELS.get(phase) or "").strip()
+    if not alias or _is_codex_alias(alias):
+        return DOCTOR_OPENWEIGHT_MODEL
+    return alias
+
+
+def _fallback_rungs(phase_base: str, phase_model: str | None = None) -> list[tuple[str, str]]:
+    """(base_url, model_id) rungs to try after the phase base.
+
+    One rung per DOCTOR_FALLBACK_BASE_URLS entry, excluding the phase base
+    itself. DOCTOR_FALLBACK_MODELS is the parallel model list; the two lists may
+    differ in length in either direction:
+      - more bases than models  -> the trailing bases reuse ``phase_model``
+        (never an index into a shorter list),
+      - more models than bases  -> the extra models are unused.
+    Duplicate bases are collapsed. Nothing here can raise IndexError."""
+    default_model = (phase_model or "").strip() or DOCTOR_OPENWEIGHT_MODEL
+    rungs: list[tuple[str, str]] = []
+    seen = {phase_base.rstrip("/")}
+    for idx, raw_base in enumerate(DOCTOR_FALLBACK_BASE_URLS):
+        base = (raw_base or "").strip().rstrip("/")
+        if not base or base in seen:
+            continue
+        seen.add(base)
+        model = (
+            (DOCTOR_FALLBACK_MODELS[idx] or "").strip()
+            if idx < len(DOCTOR_FALLBACK_MODELS)
+            else ""
+        )
+        rungs.append((base, model or default_model))
+    return rungs
+
+
+# Why a single endpoint attempt failed. Only transport errors, HTTP 5xx and an
+# empty completion are failover-eligible; a 4xx (bad model id, bad request) would
+# fail identically everywhere and must surface instead of being masked.
+_FAILOVER_ELIGIBLE_REASONS = ("transport", "http_5xx", "empty")
+
+
+def _classify_attempt_failure(reason: str) -> str:
+    """Classify a failed invocation reason for failover eligibility."""
+    text = (reason or "").lower()
+    m = re.search(r"\bhttp (\d{3})\b", text)
+    if m:
+        return "http_5xx" if int(m.group(1)) >= 500 else "http_4xx"
+    if "empty response" in text:
+        return "empty"
+    if "call failed at " in text or "call failed:" in text:
+        return "transport"
+    return "other"
+
 # Self-triage scanner config
 SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))   # seconds between failed-cluster scans
 CLUSTER_THRESHOLD = int(os.environ.get('CLUSTER_THRESHOLD', '1'))  # min failures of same base_kind to trigger a triage
@@ -310,7 +394,10 @@ def register() -> str:
         # Per-phase models (2026-06-02): triage model is the doctor's primary
         # diagnose model; review/fix models surfaced in metadata.phase_models.
         "model": DOCTOR_TRIAGE_MODEL,
-        "provider": ("codex" if DOCTOR_TRIAGE_MODEL in ("gateway", "codex", "openai", "gpt") else "openai-compatible"),
+        # Codex never runs unattended (operator 2026-10-10): a codex/gpt alias
+        # is a config error and the doctor registers as its local open-weight
+        # provider, matching what invoke_doctor_agent actually calls.
+        "provider": "openai-compatible",
         "autonomy_level": "autonomous",
         "auth_method": "subscription",
         "capabilities": [
@@ -347,12 +434,62 @@ def heartbeat():
 
 
 # ───────────────────────── Job claim/patch ─────────────────────────
+# CLAIM SCOPE (2026-10-17): the doctor only owns doctor/triage work. It used to
+# claim whatever /v1/jobs/next offered (which includes any job whose
+# eligible_kinds lists 'doctor'), then failed it in 0s because process_triage_job
+# is not an executor — observed as fix:singularity-shell-about-graphic being
+# failed instantly.
+DOCTOR_CLAIM_KIND_PREFIXES = ("triage:", "doctor:")
+# Its own dispatch kind (action_dispatch_codex_fix) is worker work, never the
+# doctor's to claim.
+DOCTOR_CLAIM_KIND_EXCLUDE_PREFIXES = ("doctor:codex-fix:",)
+
+
+def is_doctor_claimable(kind: str) -> bool:
+    """True only for triage:<base_kind> and doctor:* jobs (minus its own fix
+    dispatches). A normal worker job must never be claimed by the doctor."""
+    k = (kind or "").strip()
+    if not k:
+        return False
+    if any(k.startswith(p) for p in DOCTOR_CLAIM_KIND_EXCLUDE_PREFIXES):
+        return False
+    return any(k.startswith(p) for p in DOCTOR_CLAIM_KIND_PREFIXES)
+
+
+def release_out_of_scope_job(job: dict) -> str:
+    """Put a wrongly-claimed job straight back in the queue.
+
+    Released with worker_error 'released_by_host' — a skip/decline signal, NOT
+    a failure: the bus keeps it queued (no failed status, no dead-letter
+    counting) and the matcher routes it to a host that can execute it."""
+    job_id = (job or {}).get("id") or ""
+    kind = (job or {}).get("kind") or ""
+    body = {
+        "status": "queued",
+        "claimed_by": _urn,
+        "result": {"worker_error": "released_by_host", "kind": kind},
+    }
+    code, resp = _http("PATCH", f"/v1/jobs/{job_id}", body)
+    if code in (200, 201, 204):
+        log.warning("released out-of-scope job %s kind=%s back to queue", job_id[:12], kind)
+        return f"released {job_id[:12]} ({kind}) to queue (out of doctor scope)"
+    log.error("could not release out-of-scope job %s kind=%s code=%s resp=%s",
+              job_id[:12], kind, code, str(resp)[:200])
+    return f"failed to release out-of-scope job {job_id[:12]} code={code}"
+
+
 def claim_next_job() -> dict | None:
     code, resp = _http("POST", f"/v1/jobs/next?agent_urn={_urn}")
     if code == 204:
         return None
     if code in (200, 201) and resp:
-        return resp if isinstance(resp, dict) else None
+        job = resp if isinstance(resp, dict) else None
+        if job is not None and not is_doctor_claimable(job.get("kind", "")):
+            # The bus claim endpoint cannot be kind-filtered per agent, so the
+            # scope is enforced here: hand the job straight back, unfailed.
+            release_out_of_scope_job(job)
+            return None
+        return job
     if code not in (0, 204, 404):
         log.warning("claim_next %s: %s", code, str(resp)[:200])
     return None
@@ -497,7 +634,14 @@ DOCTOR_GATEWAY_TIMEOUT = int(os.environ.get("DOCTOR_GATEWAY_TIMEOUT", "180"))
 
 
 def _invoke_gateway(prompt: str) -> tuple[bool, str]:
-    """Reason via the LOCAL zeroclaw gateway codex chain — the SAME path the
+    """DEPRECATED / UNREACHABLE FROM THE DOCTOR LOOP (operator rule 2026-10-10).
+
+    Codex never runs unattended: invoke_doctor_agent() no longer calls this for
+    any alias — "gateway"/"codex"/"gpt" are treated as a config error and the
+    open-weight chain is used instead. Kept only so an operator can post a
+    manual, attended prompt to the local gateway.
+
+    Reason via the LOCAL zeroclaw gateway codex chain — the SAME path the
     workers use. The gateway KNEMON-routes POST /webhook to codex/gpt over
     ChatGPT-OAuth ($0, no API key, not the codex CLI subprocess). This is the
     doctor's DEFAULT reasoning path per operator doctrine 2026-06-03
@@ -609,42 +753,94 @@ def _invoke_openweight(
         return False, f"model {model_id} call failed at {base}: {e}"
 
 
+_CODEX_ALIASES = ("gateway", "codex", "openai", "gpt")
+# Emitted once per process: an operator who (re)introduces a Codex alias in
+# DOCTOR_<PHASE>_MODEL gets a loud, single config-error line — not a silent
+# per-job gateway call.
+_codex_alias_warned = False
+
+
+def _is_codex_alias(model_alias: str) -> bool:
+    alias = (model_alias or "").strip().lower()
+    return alias in _CODEX_ALIASES or alias.startswith("gpt-")
+
+
 def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     """Run the doctor LLM for a given PHASE using its configured model.
 
-    Phase model is selected via DOCTOR_<PHASE>_MODEL env (see _PHASE_MODELS):
-      - "codex"        -> local Codex CLI (adversarial review's strength)
-      - anything else  -> open-weight OpenAI-compatible path (e.g. deepseek)
+    Phase model/base come from DOCTOR_<PHASE>_MODEL / DOCTOR_<PHASE>_BASE_URL
+    (see _PHASE_MODELS / _PHASE_BASE_URLS) and default to a LOCAL llama-server.
 
-    Codex remains the REVIEW/verify model; triage defaults to cheap open-weight.
-    Anthropic/Together stay forbidden. Returns (ok, text); on failure the doctor
-    job fails visibly rather than silently switching providers."""
+    Failover (2026-10-17): the phase base is tried first, then every
+    DOCTOR_FALLBACK_BASE_URLS rung that differs from it, each with its parallel
+    DOCTOR_FALLBACK_MODELS id. Only transport errors, HTTP 5xx and an empty
+    completion move to the next rung — a 4xx is surfaced immediately. The
+    endpoint that answered is logged (and named in the returned text on
+    failover).
+
+    Codex/GPT aliases are a CONFIG ERROR (operator rule 2026-10-10: Codex never
+    runs unattended). They log once and use the open-weight chain; the local
+    gateway is never called automatically. Remote/paid providers are never a
+    fallback rung — every rung is an on-prem llama-server."""
+    global _codex_alias_warned
     model_alias = _PHASE_MODELS.get(phase, DOCTOR_TRIAGE_MODEL)
-    # Doctrine (operator 2026-06-03): the doctor reasons via the SAME local
-    # gateway codex path the workers use — ChatGPT-OAuth ($0), no API key, NOT
-    # the codex CLI subprocess, NEVER open-weight by default. The gateway
-    # KNEMON-routes /webhook to codex/gpt. Open-weight (deepseek) is FALLBACK
-    # only, for a genuine gateway outage.
-    if model_alias in ("gateway", "codex", "openai", "gpt") or model_alias.startswith("gpt-"):
-        ok, text = _invoke_gateway(prompt)
+    if _is_codex_alias(model_alias):
+        if not _codex_alias_warned:
+            _codex_alias_warned = True
+            log.error(
+                "CONFIG ERROR: DOCTOR_%s_MODEL=%r is a Codex/GPT alias, which never "
+                "runs unattended (operator rule 2026-10-10); using the open-weight "
+                "chain instead",
+                phase.upper(),
+                model_alias,
+            )
+        model_alias = DOCTOR_OPENWEIGHT_MODEL
+
+    phase_model = _phase_model(phase)
+    phase_base = _PHASE_BASE_URLS.get(phase, DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+
+    # Try the phase base first, then the local failover rungs.
+    chain: list[tuple[str, str]] = [(phase_base, phase_model)]
+    chain.extend(_fallback_rungs(phase_base, phase_model))
+
+    last_base, last_reason = phase_base, ""
+    for idx, (base, model) in enumerate(chain):
+        # Pass the model ONLY as the keyword: _invoke_openweight's second
+        # positional parameter is the alias label, not the model id.
+        ok, text = _invoke_openweight(
+            prompt, model_alias, base_url=base, model=model
+        )
         if ok and text.strip():
+            if idx == 0:
+                log.info("doctor phase=%s answered by %s model=%s", phase, base, model)
+            else:
+                log.warning(
+                    "doctor phase=%s FAILOVER: %s (model=%s) answered after %s failed (%s)",
+                    phase, base, model, last_base, str(last_reason)[:160],
+                )
+                text = (
+                    f"[doctor failover: {base} model={model} after {last_base} "
+                    f"failed: {str(last_reason)[:160]}]\n{text}"
+                )
             return True, text
-        if not _gateway_failure_allows_fallback(text):
-            return False, f"gateway codex failed: {text}"
-        log.warning("gateway codex transport outage (%s) — open-weight fallback", str(text)[:200])
-        ok2, text2 = _invoke_openweight(prompt, DOCTOR_OPENWEIGHT_MODEL)
-        if ok2 and text2.strip():
-            return True, text2
-        return False, f"gateway codex failed: {text}; open-weight fallback failed: {text2}"
-    ok, text = _invoke_openweight(
-        prompt,
-        model_alias,
-        base_url=_PHASE_BASE_URLS.get(phase, DOCTOR_OPENWEIGHT_BASE_URL),
-        model=model_alias,
+
+        last_base, last_reason = base, text
+        kind = _classify_attempt_failure(text)
+        if kind not in _FAILOVER_ELIGIBLE_REASONS:
+            log.warning(
+                "doctor phase=%s endpoint %s failed non-retryably (%s): %s",
+                phase, base, kind, str(text)[:200],
+            )
+            break
+        log.warning(
+            "doctor phase=%s endpoint %s failed (%s) — trying next local endpoint",
+            phase, base, kind,
+        )
+
+    return False, (
+        f"model ({model_alias}) failed on every local endpoint; "
+        f"last {last_base}: {last_reason}"
     )
-    if ok and text.strip():
-        return True, text
-    return False, f"model ({model_alias}) failed: {text}"
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
