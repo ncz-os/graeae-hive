@@ -1,0 +1,361 @@
+# THE declarative source for model/provider routing facts.
+#
+# Phase 6 (docs/decision-phase6-model-router-registry-20261016.md): one source
+# generates the bus routing tables in hive/core/models.py AND the per-host
+# zoder/zeroclaw TOML fragments. Consumers are GENERATED — never hand-edited.
+#
+# This cut is BEHAVIOR-PRESERVING: every value below re-states today's values
+# exactly. Regenerating must be a no-op (see test_model_registry.py).
+
+schema_version = 1
+
+# ── cost tiers ──────────────────────────────────────────────────────────────
+# A = FREE / local / on-prem NGC   B = MID (cheap paid)   C = PREMIUM (reserve)
+[[provider]]
+name = "ngc"
+cost_tier = "A"
+[[provider]]
+name = "nvidia"
+cost_tier = "A"
+[[provider]]
+name = "nvidia-ngc"
+cost_tier = "A"
+[[provider]]
+name = "local-llamacpp"
+cost_tier = "A"
+[[provider]]
+name = "local-vllm"
+cost_tier = "A"
+[[provider]]
+name = "ollama"
+cost_tier = "A"
+[[provider]]
+name = "ollama-cerberus"
+cost_tier = "A"
+[[provider]]
+name = "local"
+cost_tier = "A"
+[[provider]]
+name = "pantheon"
+cost_tier = "A"
+[[provider]]
+name = "groq"
+cost_tier = "B"
+[[provider]]
+name = "xai"
+cost_tier = "B"
+[[provider]]
+name = "deepseek"
+cost_tier = "B"
+[[provider]]
+name = "deepseek-direct"
+cost_tier = "B"
+[[provider]]
+name = "together"
+cost_tier = "B"
+[[provider]]
+name = "bedrock"
+cost_tier = "B"
+[[provider]]
+name = "gemini-flash"
+cost_tier = "B"
+[[provider]]
+name = "openai-mini"
+cost_tier = "B"
+[[provider]]
+name = "perplexity"
+cost_tier = "B"
+[[provider]]
+name = "anthropic"
+cost_tier = "C"
+[[provider]]
+name = "claude"
+cost_tier = "C"
+[[provider]]
+name = "openai"
+cost_tier = "C"
+[[provider]]
+name = "openai-pro"
+cost_tier = "C"
+[[provider]]
+name = "openai-gpt55"
+cost_tier = "C"
+[[provider]]
+name = "gemini"
+cost_tier = "C"
+[[provider]]
+name = "gemini-pro"
+cost_tier = "C"
+[[provider]]
+name = "together-pro"
+cost_tier = "C"
+[[provider]]
+name = "unknown"
+cost_tier = "A"
+
+# ── per-MTok rates (USD input/output) + per-model routing facts ─────────────
+# `routes` names the consumers allowed to select the model:
+#   "knemon"          -> KNEMON_PROVIDERS (the bus's cost-aware router)
+#   "zoder.coder" / "zoder.reviewer" / "zoder.reviewer.backup"
+#   "zeroclaw.default"
+# `knemon_alias`/`knemon_tier` only apply when "knemon" is in routes.
+# `emit_rate = false` keeps a model OUT of the bus LLM_RATES table (host-placement
+# models are priced by their host, not by the bus router).
+# Model key "<provider>/<model>" except the provider wildcard "*".
+
+[[model]]
+key = "anthropic/claude-opus-4-7"
+in = 5.00
+out = 25.00
+[[model]]
+key = "anthropic/claude-opus-4-6"
+in = 5.00
+out = 25.00
+[[model]]
+key = "anthropic/claude-sonnet-4-6"
+in = 3.00
+out = 15.00
+[[model]]
+key = "anthropic/claude-sonnet-4-7"
+in = 3.00
+out = 15.00
+[[model]]
+key = "anthropic/claude-haiku-4-5"
+in = 1.00
+out = 5.00
+[[model]]
+key = "anthropic/*"
+in = 3.00
+out = 15.00
+[[model]]
+key = "openai/gpt-5.5"
+in = 5.00
+out = 30.00
+[[model]]
+key = "openai/gpt-5.5-pro"
+in = 30.00
+out = 180.00
+[[model]]
+key = "openai/gpt-5.4-nano"
+in = 0.20
+out = 1.25
+[[model]]
+key = "openai/o4-mini"
+in = 0.55
+out = 2.20
+[[model]]
+key = "openai/o3"
+in = 2.00
+out = 8.00
+[[model]]
+key = "openai/*"
+in = 5.00
+out = 30.00
+[[model]]
+key = "xai/grok-4.3"
+in = 1.25
+out = 2.50
+[[model]]
+key = "xai/grok-4.1-fast"
+knemon_order = 4
+in = 0.20
+out = 0.50
+knemon_alias = "hive_xai_1"
+knemon_tier = "B"
+routes = ["knemon"]
+[[model]]
+key = "xai/grok-4.20"
+in = 2.00
+out = 6.00
+[[model]]
+key = "xai/*"
+in = 1.25
+out = 2.50
+[[model]]
+key = "groq/llama-3.3-70b-versatile"
+in = 0.59
+out = 0.79
+[[model]]
+key = "groq/llama-3.1-8b-instant"
+in = 0.05
+out = 0.08
+[[model]]
+key = "groq/llama-4-scout-17b"
+in = 0.11
+out = 0.34
+[[model]]
+key = "groq/qwen3-32b"
+in = 0.29
+out = 0.59
+[[model]]
+key = "groq/gpt-oss-120b"
+in = 0.15
+out = 0.60
+endpoint = "https://api.groq.com/openai/v1"
+auth = "bearer"
+routes = ["zeroclaw.default"]
+[[model]]
+key = "groq/gpt-oss-20b"
+knemon_order = 1
+in = 0.075
+out = 0.30
+knemon_alias = "hive_groq_1"
+knemon_tier = "B"
+routes = ["knemon"]
+[[model]]
+key = "groq/*"
+in = 0.29
+out = 0.59
+[[model]]
+key = "ngc-proxy/gpt-5.5"
+in = 0.0
+out = 0.0
+[[model]]
+key = "ngc-proxy/*"
+in = 0.0
+out = 0.0
+[[model]]
+key = "deepseek-direct/deepseek-v4-pro"
+in = 0.435
+out = 0.87
+[[model]]
+key = "deepseek-direct/deepseek-v4-flash"
+in = 0.14
+out = 0.28
+[[model]]
+key = "deepseek-direct/*"
+in = 0.435
+out = 0.87
+[[model]]
+key = "deepseek/*"
+in = 0.435
+out = 0.87
+[[model]]
+key = "minimax/minimax-m3"
+knemon_order = 3
+in = 0.40
+out = 1.20
+knemon_alias = "hive_minimax_1"
+knemon_tier = "B"
+routes = ["knemon"]
+notes = "MiniMax DIRECT (operator 2026-10-15) — never via together"
+[[model]]
+key = "minimax/*"
+in = 0.40
+out = 1.20
+[[model]]
+key = "together/deepseek-v4-pro"
+in = 2.10
+out = 4.40
+notes = "PRICING RECORD ONLY — deepseek is direct-only, so this entry carries no routes"
+[[model]]
+key = "together/kimi-k2.6"
+in = 1.20
+out = 4.40
+[[model]]
+key = "together/glm-3.5-90"
+in = 0.10
+out = 0.15
+[[model]]
+key = "together/qwen2.5-coder-32b"
+in = 0.05
+out = 0.12
+[[model]]
+key = "together/*"
+in = 0.40
+out = 1.20
+[[model]]
+key = "bedrock/amazon.nova-micro-v1:0"
+in = 0.035
+out = 0.14
+knemon_alias = "hive_nova_2"
+knemon_tier = "B"
+knemon_order = 6
+routes = ["knemon"]
+[[model]]
+key = "bedrock/amazon.nova-lite-v1:0"
+knemon_order = 5
+in = 0.06
+out = 0.24
+knemon_alias = "hive_nova_1"
+knemon_tier = "B"
+routes = ["knemon"]
+[[model]]
+key = "bedrock/amazon.nova-pro-v1:0"
+in = 0.80
+out = 3.20
+[[model]]
+key = "bedrock/*"
+in = 0.06
+out = 0.24
+[[model]]
+key = "gemini/gemini-2.5-flash-lite"
+knemon_order = 2
+in = 0.10
+out = 0.40
+knemon_alias = "hive_gemini_1"
+knemon_tier = "B"
+routes = ["knemon"]
+[[model]]
+key = "gemini/gemini-2.5-flash"
+in = 0.30
+out = 2.50
+[[model]]
+key = "gemini/gemini-3.1-pro"
+in = 2.00
+out = 12.00
+[[model]]
+key = "gemini/*"
+in = 1.25
+out = 10.00
+[[model]]
+key = "perplexity/sonar"
+in = 1.00
+out = 1.00
+[[model]]
+key = "perplexity/sonar-pro"
+in = 3.00
+out = 15.00
+[[model]]
+key = "perplexity/*"
+in = 1.00
+out = 1.00
+
+# ── per-host engine placement ───────────────────────────────────────────────
+# Facts only; the generator turns these into TOML fragments.
+#
+# Nemotron (fleet rule): nvidia/nemotron-3-ultra-550b-a55b is the ONLY Nemotron,
+# EIH-only, backup reviewer. It must never carry a "knemon" route.
+
+[[model]]
+key = "local/qwen38"
+emit_rate = false
+in = 0.0
+out = 0.0
+endpoint = "http://tydeus:8006/v1"
+routes = ["zoder.coder"]
+[[model]]
+key = "local/gemma4-31b"
+emit_rate = false
+in = 0.0
+out = 0.0
+endpoint = "http://cerberus:8080/v1"
+routes = ["zoder.reviewer"]
+[[model]]
+key = "nvidia/nemotron-3-ultra-550b-a55b"
+emit_rate = false
+in = 0.0
+out = 0.0
+endpoint = "http://eih:8000/v1"
+routes = ["zoder.reviewer.backup"]
+notes = "EIH-only backup reviewer. Fleet rule: never a knemon/coder candidate."
+
+[host.cerberus]
+zoder_reviewer = "local/gemma4-31b"
+[host.tydeus]
+zoder_coder = "local/qwen38"
+[host.eih]
+zoder_reviewer_backup = "nvidia/nemotron-3-ultra-550b-a55b"
+
+[host.pythia]
+zeroclaw_default = "groq/gpt-oss-120b"
