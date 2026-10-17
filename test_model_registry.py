@@ -251,6 +251,51 @@ class TestInvariants(unittest.TestCase):
         self.assertIsNone(mr._retired_endpoint("http://tydeus:8010/v1/nemotron35"))
         self.assertIsNotNone(mr._retired_endpoint("http://tydeus:8002/v1"))
 
+    def test_host_slot_lacks_nemotron_host_restriction(self):
+        """§3.1 regression lock (operator correction 2026-10-17):
+        ``_validate_host_slot`` must NOT block a Nemotron-shaped entry
+        based on the host/slot pair. Pre-fix it raised
+        'Nemotron is an EIH-only backup reviewer — it may only be
+        mapped to [host.eih] zoder_reviewer_backup'. The new behaviour
+        must rely solely on the route check, with EIH / DeepSeek /
+        retired-endpoint rules unchanged.
+        """
+        src = Path(mr.__file__).read_text()
+        # The old host-restriction block called _is_nemotron() on the host
+        # slot's entry and compared host/slot against NEMOTRON_ALLOWED_HOST /
+        # NEMOTRON_ALLOWED_SLOT. The conditional is gone; only the
+        # fleet-level _is_nemotron(m) checks remain (shaped entries are
+        # accepted on EIH by the EIH placement pass below).
+        self.assertNotRegex(
+            src,
+            r"_is_nemotron\(entry\)",
+            "the Nemotron host-restriction block returned to model_registry",
+        )
+        self.assertNotIn("NEMOTRON_ALLOWED_HOST", src)
+        self.assertNotIn("NEMOTRON_ALLOWED_SLOT", src)
+        # The host pass must still be driven from validate_invariants.
+        self.assertRegex(
+            src,
+            r"_validate_host_slot\(reg, hosts_where, host, slot, key\)",
+            "host-slot validation is no longer wired into validate_invariants",
+        )
+        # EIH, DeepSeek, and retired-endpoint invariants must remain.
+        self.assertRegex(
+            src,
+            r"DeepSeek is direct-only",
+            "the DeepSeek direct-only message disappeared — invariant gone",
+        )
+        self.assertRegex(
+            src,
+            r"a retired endpoint may never be referenced",
+            "the retired-endpoint guard disappeared — invariant gone",
+        )
+        self.assertRegex(
+            src,
+            r"EIH placement policy",
+            "the EIH open-weight/Nemotron-only message disappeared — invariant gone",
+        )
+
     def test_rejects_nemotron_in_eih_coder_slot(self):
         """Nemotron may only be the backup reviewer, even on EIH."""
         with tempfile.TemporaryDirectory() as td:
