@@ -1010,21 +1010,36 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
         return f"DRY_RUN: would cancel {len(target_ids)} jobs of {base_kind}"
-    # Note: terminal-status jobs (failed/cancelled/done) cannot be re-PATCHed
-    # via this endpoint per bus contract. To truly cancel failed jobs use the
-    # admin requeue endpoint to bring them back to queued first, then handle.
-    # For "clear from queue" intent we just record the cancel intent in a
-    # broadcast message.
-    broadcast_doctor_message("doctor.cancel_intent", {
+    # Failed jobs are terminal and cannot be PATCHed, so a cancel removes them
+    # from the queue with the bus purge (failed status only, explicit ids).
+    # The ids stay on record in this triage job's result and the broadcast.
+    code2, resp2 = _http("POST", "/v1/jobs/purge", {
+        "ids": target_ids,
+        "status": "failed",
+        "reason": f"doctor-cancel:{base_kind}",
+    })
+    broadcast_doctor_message("doctor.cancel", {
         "host": AGENT_HOST,
         "base_kind": base_kind,
         "job_ids": target_ids,
         "reason": "doctor-determined-structural-failure",
+        "api": code2,
     })
-    return f"recorded cancel intent for {len(target_ids)} jobs of {base_kind}"
+    removed = (resp2 or {}).get("deleted") if isinstance(resp2, dict) else None
+    return f"cancelled {removed if removed is not None else '?'}/{len(target_ids)} failed jobs of {base_kind} (api={code2}): {', '.join(target_ids)}"
 
 
-DEFAULT_RELEASE_KINDS = ["zeroclaw", "codex", "opencode"]
+# Codex runs only on explicit request, never as a default target.
+DEFAULT_RELEASE_KINDS = ["zeroclaw", "opencode"]
+RELEASABLE_KINDS = frozenset(DEFAULT_RELEASE_KINDS)
+
+# Failures no retry can fix: the submitter has to create the branch or map the
+# repo first. Escalated without an LLM call.
+_UNSCHEDULABLE_RE = re.compile(
+    r"Remote branch \S+ not found|couldn't find remote ref|no_repo_mapping"
+    r"|unknown repo|could not resolve repo",
+    re.IGNORECASE,
+)
 
 
 def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) -> str:
@@ -1037,7 +1052,9 @@ def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) ->
     the doctor pool will re-claim the job and trigger a loop (caught by
     loop detection but burns LLM calls and human attention)."""
     if release_eligible_kinds and isinstance(release_eligible_kinds, list):
-        new_kinds = [k for k in release_eligible_kinds if k and k != "doctor"]
+        # Only real worker kinds: an LLM-supplied job kind or "doctor" would
+        # leave the job queued with nothing able to claim it.
+        new_kinds = [k for k in release_eligible_kinds if k in RELEASABLE_KINDS]
     else:
         new_kinds = []
     # If LLM didn't give us anything usable, broaden to all workers.
@@ -1060,6 +1077,19 @@ def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) ->
     # Step 1 already succeeded so the job IS released; the kind retag just failed.
     return (f"released {job_id[:12]} → queued (eligible_kinds retag failed "
             f"code={code2} resp={str(resp2)[:200]})")
+
+
+def apply_release(job_id: str, is_explicit_triage: bool, base_kind: str,
+                  release_eligible_kinds: list | None) -> tuple[str, bool]:
+    """Carry out a release_to_queue decision. Returns (summary, released).
+
+    On a triage:<kind> wrapper, "release" means re-run the ORIGINAL failed
+    job(s) of that kind; releasing the wrapper itself would leave the failed
+    jobs untouched and park the wrapper in the queue. Only a job the doctor
+    claimed directly is handed back to the regular queue."""
+    if is_explicit_triage:
+        return action_resubmit_jobs(base_kind), False
+    return action_release_to_queue(job_id, release_eligible_kinds), True
 
 
 def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str:
@@ -1280,6 +1310,12 @@ def _match_known_signature(job: dict, base_kind: str,
             except Exception:
                 result = str(result)
         search_text += " " + str(result)[:3000]
+
+    unschedulable = _UNSCHEDULABLE_RE.search(search_text)
+    if unschedulable:
+        return {"action_type": "escalate", "confidence": 1.0,
+                "reason": f"unschedulable ({unschedulable.group(0)}): the submitter must "
+                          "create the branch or map the repo; a retry cannot fix it; no LLM"}
 
     # Transient gateway/session error (ws-400 / ConnectionClosed) — e.g. a worker
     # restart severed the WSS mid-job. Release to queue WITHOUT burning codex-cli.
@@ -1533,13 +1569,17 @@ def process_triage_job(job: dict) -> dict:
                 "signature": known_action.get("signature"),
                 "base_kind": base_kind,
             })
-            # Release the triage job back to queue so the offending host
-            # (now fixed) or any other worker can reclaim it
-            parts.append(action_release_to_queue(
-                job_id, known_action.get("release_eligible_kinds")))
+            # Re-run the failed work now the offending host is fixed (the
+            # original jobs for a triage wrapper, else this job itself).
+            text, _ = apply_release(
+                job_id, is_explicit_triage, base_kind,
+                known_action.get("release_eligible_kinds"))
+            parts.append(text)
         elif a == "release_to_queue":
-            parts.append(action_release_to_queue(
-                job_id, known_action.get("release_eligible_kinds")))
+            text, _ = apply_release(
+                job_id, is_explicit_triage, base_kind,
+                known_action.get("release_eligible_kinds"))
+            parts.append(text)
         elif a == "escalate":
             parts.append("escalated to human")
             broadcast_doctor_message("doctor.escalate.token_mismatch", {
@@ -1557,7 +1597,8 @@ def process_triage_job(job: dict) -> dict:
             "base_kind": base_kind,
             "failed_count_seen": len(failed),
             "auto_detected": True,
-            "released_to_queue": (a in ("dispatch_codex_fix", "release_to_queue")),
+            "released_to_queue": (
+                a in ("dispatch_codex_fix", "release_to_queue") and not is_explicit_triage),
         }
 
     prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
@@ -1595,8 +1636,8 @@ def process_triage_job(job: dict) -> dict:
     if a == "release_to_queue":
         rk = action.get("release_eligible_kinds")
         rk_clean = [k for k in rk if isinstance(k, str) and k] if isinstance(rk, list) else None
-        parts.append(action_release_to_queue(job_id, rk_clean))
-        released = True
+        text, released = apply_release(job_id, is_explicit_triage, base_kind, rk_clean)
+        parts.append(text)
     elif a == "restart_service" and conf >= 0.7:
         parts.append(action_restart_service(
             action.get("target_host"), action.get("service_name")))
