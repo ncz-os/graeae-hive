@@ -24,11 +24,17 @@ Invariants enforced (as code, not comments):
 * DeepSeek — deepseek models are DIRECT-only: they may never carry a route
   through any other provider (``together`` may carry a pricing record for
   deepseek, but no routes).
+* Host placement — every ``[host.<name>]`` slot is validated against the same
+  rules (review §3.1): the slot's model must exist and allow that slot as a
+  route, Nemotron may only sit in EIH's backup-reviewer slot, a DeepSeek model
+  must resolve to the direct provider, and a retired endpoint
+  (TYDEUS ``:8002``/``nemotron35`` or ``:4100``) may never be referenced.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import tomllib
 from dataclasses import dataclass, field
@@ -53,6 +59,16 @@ DEEPSEEK_DIRECT_PROVIDERS = frozenset({"deepseek", "deepseek-direct"})
 KNOWN_ROUTES = frozenset(
     {"knemon", "zoder.coder", "zoder.reviewer", "zoder.reviewer.backup", "zeroclaw.default"}
 )
+DEEPSEEK_DIRECT_ENDPOINT = "https://api.deepseek.com/v1"
+NEMOTRON_ALLOWED_HOST = EIH_HOST
+NEMOTRON_ALLOWED_SLOT = "zoder_reviewer_backup"
+# Retired endpoints: TYDEUS :8002 (the old nemotron35 coder route) and :4100
+# (the legacy EIH gateway). Any host slot still pointing at one is an error.
+RETIRED_ENDPOINT_PORTS = (
+    ("8002", "TYDEUS :8002 (retired nemotron35 coder)"),
+    ("4100", "legacy EIH gateway :4100 (retired)"),
+)
+RETIRED_ENDPOINT_TOKENS = ("nemotron35",)
 
 
 class RegistryError(ValueError):
@@ -213,6 +229,90 @@ def validate_invariants(reg: Registry) -> None:
             raise RegistryError(f"{where}: duplicate knemon_alias {m.knemon_alias!r}")
         orders.add(m.knemon_order)
         aliases.add(m.knemon_alias)
+
+    # ── Host placement: every [host.<name>] slot obeys the same rules ────────
+    for host, assigns in reg.hosts.items():
+        for slot, key in assigns.items():
+            _validate_host_slot(reg, where, host, slot, key)
+
+
+def _is_nemotron(m: ModelEntry) -> bool:
+    return "nemotron" in m.model.lower() or "nemotron" in m.provider.lower()
+
+
+def _slot_route(slot: str) -> str:
+    """Map a ``[host.<name>]`` slot name to the route it selects.
+
+    zoder slots are written ``zoder_<role>`` in TOML (``zoder_reviewer_backup``)
+    and named ``zoder.<role>`` as routes (``zoder.reviewer.backup``).
+    """
+    group, _, role = slot.partition("_")
+    if not group or not role:
+        return slot
+    return f"{group}.{role.replace('_', '.')}"
+
+
+def _retired_endpoint(endpoint: str) -> str | None:
+    """Return the retired-endpoint label if ``endpoint`` points at one."""
+    ep = endpoint.strip().lower()
+    if not ep:
+        return None
+    for token in RETIRED_ENDPOINT_TOKENS:
+        if token in ep:
+            return f"retired endpoint token {token!r}"
+    for port, label in RETIRED_ENDPOINT_PORTS:
+        if re.search(rf":{port}(?!\d)", ep):
+            return label
+    return None
+
+
+def _validate_host_slot(reg: Registry, where: str, host: str, slot: str, key: str) -> None:
+    """Reject a host slot that is unknown, unallowed, or points at a banned route.
+
+    Covers review §3.1: a registry mapping ``[host.tydeus] zoder_coder =
+    'nvidia/nemotron-3-ultra-550b-a55b'`` must fail to load, not emit a TOML.
+    """
+    site = f"{where}: host {host!r} slot {slot!r} -> model {key!r}"
+
+    entry = reg.by_key(key)
+    if entry is None:
+        raise RegistryError(f"{site}: unknown model (not declared in the registry)")
+
+    # (2) Nemotron only ever maps to the EIH backup-reviewer slot — never on
+    # tydeus (or any other local host), and never in a coder/reviewer slot.
+    if _is_nemotron(entry):
+        if host != NEMOTRON_ALLOWED_HOST or slot != NEMOTRON_ALLOWED_SLOT:
+            raise RegistryError(
+                f"{site}: Nemotron is an EIH-only backup reviewer — it may only be "
+                f"mapped to [host.{NEMOTRON_ALLOWED_HOST}] "
+                f"{NEMOTRON_ALLOWED_SLOT}, never {host}.{slot}"
+            )
+
+    # (3) a DeepSeek model in a slot must resolve to the direct provider.
+    if "deepseek" in entry.model.lower():
+        endpoint = entry.endpoint.rstrip("/")
+        if entry.provider not in DEEPSEEK_DIRECT_PROVIDERS or endpoint != DEEPSEEK_DIRECT_ENDPOINT:
+            raise RegistryError(
+                f"{site}: DeepSeek is direct-only — slot model must resolve to "
+                f"provider {sorted(DEEPSEEK_DIRECT_PROVIDERS)} with endpoint "
+                f"{DEEPSEEK_DIRECT_ENDPOINT}, got provider {entry.provider!r} "
+                f"endpoint {entry.endpoint!r}"
+            )
+
+    # (4) a retired endpoint may never be referenced from a host slot.
+    retired = _retired_endpoint(entry.endpoint)
+    if retired:
+        raise RegistryError(f"{site}: references the {retired} ({entry.endpoint!r})")
+
+    # The slot must name one of the model's allowed routes/roles. Checked last
+    # so the fleet rules above own the message when they also apply (a Nemotron,
+    # DeepSeek or retired-endpoint slot is that violation first).
+    route = _slot_route(slot)
+    if route not in entry.routes:
+        raise RegistryError(
+            f"{site}: slot {slot!r} (route {route!r}) is not an allowed route of "
+            f"{key!r}; allowed routes {sorted(entry.routes)}"
+        )
 
 
 # ── emit: bus tables ────────────────────────────────────────────────────────

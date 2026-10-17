@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -210,6 +211,145 @@ class TestInvariants(unittest.TestCase):
             with self.assertRaises(mr.RegistryError) as ctx:
                 mr.load_registry(_write_registry(Path(td), text))
             self.assertIn("Nemotron", str(ctx.exception))
+
+    # ── host.<name>.<slot> placement (review §3.1) ──────────────────────────
+    def test_committed_registry_loads_with_host_slot_validation(self):
+        """Positive: the committed registry satisfies every host-slot rule."""
+        reg = mr.load_registry(REGISTRY)  # raises RegistryError on any violation
+        self.assertEqual(
+            reg.hosts["eih"]["zoder_reviewer_backup"], mr.NEMOTRON_MODEL
+        )
+        for host, assigns in reg.hosts.items():
+            for slot, key in assigns.items():
+                entry = reg.by_key(key)
+                self.assertIn(mr._slot_route(slot), entry.routes, f"{host}.{slot}")
+
+    def test_rejects_nemotron_on_tydeus_coder_slot(self):
+        """§3.1 (2): the review's exact mutation — Nemotron as TYDEUS coder."""
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace(
+                '[host.tydeus]\nzoder_coder = "local/qwen38"',
+                f'[host.tydeus]\nzoder_coder = "{mr.NEMOTRON_MODEL}"',
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            msg = str(ctx.exception)
+            self.assertIn("tydeus", msg)
+            self.assertIn("zoder_coder", msg)
+            self.assertIn(mr.NEMOTRON_MODEL, msg)
+            self.assertIn("Nemotron", msg)
+
+    def test_rejects_nemotron_in_eih_coder_slot(self):
+        """Nemotron may only be the backup reviewer, even on EIH."""
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace(
+                'zoder_reviewer_backup = "nvidia/nemotron-3-ultra-550b-a55b"',
+                'zoder_coder = "nvidia/nemotron-3-ultra-550b-a55b"',
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            self.assertIn("Nemotron", str(ctx.exception))
+
+    def test_rejects_deepseek_through_third_party_slot(self):
+        """§3.1 (3): a slot may not resolve a DeepSeek model off the direct provider."""
+        extra = (
+            '[[model]]\nkey = "together/deepseek-v4-flash"\nin = 0.14\nout = 0.28\n'
+            'routes = ["zoder.coder"]\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace('[host.tydeus]', extra + '[host.tydeus]')
+            text = text.replace(
+                'zoder_coder = "local/qwen38"', 'zoder_coder = "together/deepseek-v4-flash"'
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            msg = str(ctx.exception)
+            self.assertIn("DeepSeek", msg)
+            self.assertIn("direct-only", msg)
+            self.assertIn("together/deepseek-v4-flash", msg)
+
+    def test_rejects_deepseek_slot_pointing_at_siliconflow(self):
+        """A direct-provider key is not enough: the endpoint must be api.deepseek.com."""
+        extra = (
+            '[[model]]\nkey = "deepseek-direct/deepseek-v4-orion"\nin = 0.1\nout = 0.2\n'
+            'endpoint = "https://api.siliconflow.cn/v1"\nroutes = ["zoder.coder"]\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace('[host.tydeus]', extra + '[host.tydeus]')
+            text = text.replace(
+                'zoder_coder = "local/qwen38"',
+                'zoder_coder = "deepseek-direct/deepseek-v4-orion"',
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            msg = str(ctx.exception)
+            self.assertIn("https://api.deepseek.com/v1", msg)
+            self.assertIn("deepseek-direct/deepseek-v4-orion", msg)
+
+    def test_rejects_retired_tydeus_8002_endpoint_from_a_slot(self):
+        """§3.1 (4): the retired TYDEUS :8002 nemotron35 coder endpoint."""
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace(
+                'endpoint = "http://tydeus:8006/v1"',
+                'endpoint = "http://tydeus:8002/v1/nemotron35"',
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            msg = str(ctx.exception)
+            self.assertIn(":8002", msg)
+            self.assertIn("local/qwen38", msg)
+            self.assertIn("tydeus", msg)
+
+    def test_rejects_retired_4100_endpoint_from_a_slot(self):
+        """§3.1 (4): the legacy EIH gateway :4100 may never be a host slot endpoint."""
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace(
+                'endpoint = "http://cerberus:8080/v1"', 'endpoint = "http://eih:4100/v1"'
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            msg = str(ctx.exception)
+            self.assertIn(":4100", msg)
+            self.assertIn("local/gemma4-31b", msg)
+
+    def test_rejects_slot_outside_the_models_allowed_routes(self):
+        """§3.1 (1): the slot must be one of that model's routes/roles."""
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace(
+                'zoder_coder = "local/qwen38"', 'zoder_coder = "local/gemma4-31b"'
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            msg = str(ctx.exception)
+            self.assertIn("local/gemma4-31b", msg)
+            self.assertIn("zoder_coder", msg)
+
+    def test_rejects_slot_referencing_unknown_model(self):
+        """§3.1 (1): the slot's model must exist in the registry."""
+        with tempfile.TemporaryDirectory() as td:
+            text = REGISTRY.read_text().replace(
+                'zoder_coder = "local/qwen38"', 'zoder_coder = "local/does-not-exist"'
+            )
+            self.assertNotEqual(text, REGISTRY.read_text())
+            with self.assertRaises(mr.RegistryError) as ctx:
+                mr.load_registry(_write_registry(Path(td), text))
+            msg = str(ctx.exception)
+            self.assertIn("tydeus", msg)
+            self.assertIn("zoder_coder", msg)
+            self.assertIn("local/does-not-exist", msg)
+
+    def test_slot_route_names_map_to_routes(self):
+        self.assertEqual(mr._slot_route("zoder_coder"), "zoder.coder")
+        self.assertEqual(mr._slot_route("zoder_reviewer"), "zoder.reviewer")
+        self.assertEqual(mr._slot_route("zoder_reviewer_backup"), "zoder.reviewer.backup")
+        self.assertEqual(mr._slot_route("zeroclaw_default"), "zeroclaw.default")
 
     # ── DeepSeek = direct only ──────────────────────────────────────────────
     def test_deepseek_is_direct_only(self):
