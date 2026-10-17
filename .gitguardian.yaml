@@ -1,9 +1,5 @@
-# GitGuardian config — see task: suppress false positives on synthetic test fixtures
-# that intentionally contain credential SHAPES (built at runtime, never real values).
+# GitGuardian config — task 01a1481e-bb57-7201-bd9f-ca5de739c71f: suppress false positives on synthetic test fixtures that intentionally carry credential SHAPES (built at runtime from fragments, never real values); ignored-paths is limited to the test fixture files that hold token shapes.
 version: 2
 secret:
   ignored-paths:
-    # Only this file: it is the single source of deliberately token-shaped,
-    # runtime-assembled fixtures used to exercise hive.core.secrets.
-    # Names are spelled in pieces here so this config cannot itself look like a token.
     - "test_hive_secrets.py"
