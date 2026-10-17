@@ -47,6 +47,7 @@ from hive.bus.domain.jobs import (
     CACHE_TTL_SECONDS,
     CLAIM_LEASE_SECONDS,
     MAX_DECLINE_REQUEUES,
+    NO_REPO_MAPPING_DECLINE_BUDGET,
     STATUS_TRANSITIONS,
     SUBSCRIPTION_PROVIDERS,
     _cache_json,
@@ -729,11 +730,14 @@ async def update_job(job_id: str, req: JobUpdate):
 
     # Skip releases are not failures. DECLINE_REASON_PREFIXES is intentionally
     # narrow unless a future real failure release reason needs dead-letter counting.
+    # ``no_repo_mapping`` is deployment-dependent (worker REPO_MAP vs bus catalog),
+    # so it only counts when the job's repo is genuinely absent from the catalog
+    # (audit BLOCKING-1) -- see is_unresolvable_release.
     decline_reason = None
     dead_lettered = False
     if req.status == "queued" and isinstance(req.result, dict):
         _werr = str(req.result.get("worker_error") or "")
-        if is_unresolvable_release(_werr):
+        if _werr and is_unresolvable_release(_werr):
             decline_reason = _werr
 
     # Storage via the HiveMindRepository ABC on ONE transaction (EPIMONE shape).
@@ -886,9 +890,22 @@ async def update_job(job_id: str, req: JobUpdate):
             )
 
         # Optional real-failure release counting.
+        # (audit BLOCKING-1) ``no_repo_mapping`` is deployment-dependent, so it
+        # counts only when this job's repo is genuinely absent from the bus
+        # catalog; a catalog-present repo means a STALE WORKER, not a dead job.
+        decline_threshold = MAX_DECLINE_REQUEUES
+        if decline_reason is not None:
+            # Classification (not a threshold decision): should this reason be
+            # counted at all? no_repo_mapping on a CATALOG-PRESENT repo is a
+            # stale worker, so it is dropped here and the job simply requeues.
+            if not is_unresolvable_release(decline_reason, job_repo=job_repo):
+                decline_reason = None
+            elif decline_reason == "no_repo_mapping" or decline_reason.startswith("no_repo_mapping:"):
+                # Genuinely absent repo: count, but on a larger budget.
+                decline_threshold = NO_REPO_MAPPING_DECLINE_BUDGET
         if decline_reason is not None and release_to_queue:
             new_decline_count = (decline_count or 0) + 1
-            if new_decline_count >= MAX_DECLINE_REQUEUES:
+            if new_decline_count >= decline_threshold:
                 dl_result = {
                     "dead_letter": True,
                     "decline_count": new_decline_count,
@@ -1064,7 +1081,7 @@ async def update_job(job_id: str, req: JobUpdate):
                     "id": job_id,
                     "claimed_by": req.claimed_by or old_claimed_by,
                     "last_decline_reason": decline_reason,
-                    "decline_threshold": MAX_DECLINE_REQUEUES,
+                    "decline_threshold": decline_threshold,
                 },
             )
         else:
