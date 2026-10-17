@@ -151,6 +151,119 @@ class ClaimedProvenanceTests(unittest.IsolatedAsyncioTestCase):
             # No author could be extracted -> the registration model stands.
             self.assertEqual(got["claimed_model"], "zoder", models)
 
+    async def test_provenance_reaches_the_update_sql(self):
+        """The provenance fields must land in the UPDATE that patch_job_status
+        executes, not just in the in-memory `sets` map."""
+        repo = await self._repo("updatesql.db")
+        job_id = await self._claimed_job(repo, "job-sql")
+        seen: list[dict] = []
+        original = repo.patch_job_status
+
+        async def spy(tx, jid, *, sets, expected_status=None):
+            seen.append(dict(sets))
+            return await original(tx, jid, sets=sets, expected_status=expected_status)
+
+        with (
+            mock.patch.object(repo, "patch_job_status", spy),
+            mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+            mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
+            mock.patch("hive.bus.deps.hive_repo", lambda: repo),
+        ):
+            await hive_jobs_router.update_job(
+                job_id,
+                JobUpdate(
+                    status="running",
+                    claimed_by=CLAIMANT,
+                    claimed_model="claude-opus-4-7",
+                    claimed_provider="anthropic",
+                ),
+            )
+        self.assertTrue(seen, "patch_job_status was never called")
+        self.assertEqual(seen[-1]["claimed_model"], "claude-opus-4-7")
+        self.assertEqual(seen[-1]["claimed_provider"], "anthropic")
+        # And the row really changed on disk.
+        got = await self._get(repo, job_id)
+        self.assertEqual(got["claimed_model"], "claude-opus-4-7")
+
+    async def test_none_is_never_emitted_into_the_update_sql(self):
+        """An absent provenance value must not appear in the UPDATE at all
+        (emitting NULL would clobber the recorded model)."""
+        repo = await self._repo("nonull.db")
+        job_id = await self._claimed_job(repo, "job-nonull", model="kimi-k2.6")
+        seen: list[dict] = []
+        original = repo.patch_job_status
+
+        async def spy(tx, jid, *, sets, expected_status=None):
+            seen.append(dict(sets))
+            return await original(tx, jid, sets=sets, expected_status=expected_status)
+
+        with (
+            mock.patch.object(repo, "patch_job_status", spy),
+            mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
+            mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
+            mock.patch("hive.bus.deps.hive_repo", lambda: repo),
+        ):
+            await hive_jobs_router.update_job(job_id, JobUpdate(status="running", claimed_by=CLAIMANT))
+        for col in ("claimed_model", "claimed_provider", "claimed_runtime", "claimed_cost_tier"):
+            self.assertNotIn(col, seen[-1])
+        got = await self._get(repo, job_id)
+        self.assertEqual(got["claimed_model"], "kimi-k2.6")
+
+    async def test_provenance_columns_exist_after_init_on_a_legacy_db(self):
+        """A pre-provenance SQLite DB is migrated forward by init(): the four
+        claimed_* columns are ALTERed in, existing rows survive, and GET works."""
+        import sqlite3
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        path = Path(td.name) / "legacy.db"
+        con = sqlite3.connect(path)
+        con.executescript(agent_bus.SCHEMA)
+        for col in ("claimed_model", "claimed_provider", "claimed_runtime", "claimed_cost_tier"):
+            con.execute(f"ALTER TABLE jobs DROP COLUMN {col}")
+        con.execute(
+            "INSERT INTO jobs (id, submitter_urn, kind, status, started_at, claimed_by) "
+            "VALUES ('old-job', 'urn:submitter', 'research', 'done', 1.0, 'urn:agent:zeroclaw:x:s1')"
+        )
+        con.commit()
+        con.close()
+
+        repo = SqliteHiveRepository(str(path))
+        await repo.init(agent_bus.SCHEMA)
+        async with repo.connection() as db:
+            async with db.execute("PRAGMA table_info(jobs)") as cur:
+                cols = {r[1] for r in await cur.fetchall()}
+        for col in ("claimed_model", "claimed_provider", "claimed_runtime", "claimed_cost_tier"):
+            self.assertIn(col, cols)
+        got = await self._get(repo, "old-job")
+        self.assertEqual(got["id"], "old-job")
+        self.assertIsNone(got["claimed_model"])
+
+    async def test_oracle_translation_carries_the_provenance_columns(self):
+        """The Oracle backend inherits patch_job_status and rewrites its SQL;
+        the provenance columns must survive translation as bound params."""
+        from hive.persistence.oracle import _translate_sql
+
+        sql = (
+            "UPDATE jobs SET status=?, last_update_at=?, result=?, claimed_model=?, "
+            "claimed_provider=?, claimed_runtime=?, claimed_cost_tier=? WHERE id=? AND status=?"
+        )
+        translated, params = _translate_sql(
+            sql,
+            ["done", 1.0, "{}", "grok-4.3", "xai", "claude-code", "B", "job-1", "running"],
+        )
+        for col in ("claimed_model", "claimed_provider", "claimed_runtime", "claimed_cost_tier"):
+            # present in the SET list and rewritten to an Oracle bind marker,
+            # i.e. the value is BOUND, never inlined into the SQL text.
+            self.assertRegex(translated, rf"{col}=:\d")
+            self.assertNotIn("grok-4.3", translated)
+        self.assertIn("grok-4.3", params)
+        # Oracle's required-column contract must list all four.
+        from hive.persistence.oracle import _ORACLE_REQUIRED_JOB_COLUMNS
+
+        for col in ("CLAIMED_MODEL", "CLAIMED_PROVIDER", "CLAIMED_RUNTIME", "CLAIMED_COST_TIER"):
+            self.assertIn(col, _ORACLE_REQUIRED_JOB_COLUMNS)
+
     async def test_normalize_preserves_models_key_on_done(self):
         """normalize_result_payload must not strip result['models']."""
         from hive.bus.domain.jobs import normalize_result_payload
