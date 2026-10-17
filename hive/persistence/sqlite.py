@@ -780,7 +780,9 @@ class SqliteHiveRepository(HiveMindRepository):
                     if urn_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
                         continue
                     if j_deps_json:
-                        deps = json_list(j_deps_json)
+                        # Distinct ids: COUNT(*) of matching rows never exceeds
+                        # the distinct count, so a repeated id would block forever.
+                        deps = list(dict.fromkeys(json_list(j_deps_json)))
                         if deps:
                             ph = ",".join("?" * len(deps))
                             async with db.execute(
@@ -1125,7 +1127,7 @@ class SqliteHiveRepository(HiveMindRepository):
             return True
         if not isinstance(deps, list) or not deps:
             return True
-        ids = [str(d) for d in deps if d is not None]
+        ids = list(dict.fromkeys(str(d) for d in deps if d is not None))
         if not ids:
             return True
         placeholders = ",".join("?" * len(ids))

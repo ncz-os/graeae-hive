@@ -250,6 +250,28 @@ class DependencyGatingTests(_RepoCase):
             await tx.commit()
         self.assertEqual(rc, 1)
 
+    async def test_repeated_dependency_id_does_not_block_forever(self):
+        repo = await self._repo()
+        urn = await self._agent(repo)
+        await self._insert(repo, "dep", status="done")
+        await self._insert(repo, "dup", deps=["dep", "dep"])
+        now = time.time()
+        async with repo.connection() as tx:
+            self.assertTrue(await repo.dependencies_satisfied(tx, "dup"))
+            rc = await repo.claim_job(
+                tx,
+                job_id="dup",
+                agent_urn=urn,
+                now=now,
+                lease_expires_at=now + 60,
+                runtime="zeroclaw",
+                model="qwen38",
+                provider="local",
+                cost_tier="B",
+            )
+            await tx.commit()
+        self.assertEqual(rc, 1)
+
     async def test_dependencies_satisfied_treats_null_and_empty_as_open(self):
         repo = await self._repo()
         await self._insert(repo, "no-deps")

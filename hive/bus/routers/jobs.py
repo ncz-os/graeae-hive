@@ -1290,7 +1290,7 @@ async def claim_job(job_id: str, by: str):
             raise HTTPException(409, f"job is in retry backoff until {j_retry_backoff_until} (now={now})")
 
         if j_deps_json:
-            deps = json_list(j_deps_json)
+            deps = list(dict.fromkeys(json_list(j_deps_json)))
             if deps:
                 done_ids = await hive_repo().completed_job_ids(tx, ids=list(deps))
                 if len(done_ids) < len(deps):
