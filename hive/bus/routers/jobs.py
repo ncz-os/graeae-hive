@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse, Response
@@ -78,6 +79,27 @@ _JOB_COLUMNS = (
     "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count, "
     "claimed_model, claimed_provider, claimed_runtime, claimed_cost_tier"
 )
+
+
+def _result_model_author(result: Any) -> str | None:
+    """The author model a worker recorded on a completion, or None.
+
+    `result['models']` is worker-supplied and therefore untrusted: it may be
+    absent, a string, a list, or nested one level deeper than expected. Every
+    level is type-checked, so a malformed payload yields None instead of an
+    AttributeError. `normalize_result_payload` preserves the key (it only adds
+    commits/files_changed), so the author survives the done-path rewrite.
+    """
+    if not isinstance(result, dict):
+        return None
+    models = result.get("models")
+    if not isinstance(models, dict):
+        return None
+    author = models.get("author")
+    if not isinstance(author, str):
+        return None
+    author = author.strip()
+    return author or None
 
 
 @router.get("/v1/jobs")
@@ -872,24 +894,29 @@ async def update_job(job_id: str, req: JobUpdate):
 
         # ---- model provenance (2026-10-16) --------------------------------
         # The worker reports the model it ACTUALLY ran (attempt start + lease
-        # renewal). Allowed only for the CURRENT claimant, only while the job
-        # is claimed/running or on the terminal done/failed write, and never
-        # with None (an absent/blank value leaves the column untouched).
+        # renewal, plus the terminal write). Rules:
+        #   * only on a claimed/running or terminal done/failed write, and never
+        #     on a release-to-queued (that path clears the provenance columns);
+        #   * only for the CURRENT claimant -- there must BE a current claimant
+        #     and the caller must present that exact urn. An unclaimed job has
+        #     no claimant, so nobody may stamp provenance onto it;
+        #   * never with None/blank: an absent value leaves the column untouched.
         if not release_to_queue and req.status in {"claimed", "running", "done", "failed"}:
-            prov_fields = {
+            prov_sets = {
                 "claimed_model": req.claimed_model,
                 "claimed_provider": req.claimed_provider,
                 "claimed_runtime": req.claimed_runtime,
                 "claimed_cost_tier": req.claimed_cost_tier,
             }
-            prov_sets = {k: v for k, v in prov_fields.items() if v}
-            if req.status == "done" and isinstance(req.result, dict):
-                models = req.result.get("models")
-                author = models.get("author") if isinstance(models, dict) else None
-                if isinstance(author, str) and author.strip() and "claimed_model" not in prov_sets:
-                    prov_sets["claimed_model"] = author.strip()
+            prov_sets = {col: val.strip() for col, val in prov_sets.items() if isinstance(val, str) and val.strip()}
+            if req.status == "done":
+                author = _result_model_author(req.result)
+                if author and "claimed_model" not in prov_sets:
+                    prov_sets["claimed_model"] = author
             if prov_sets:
-                if not old_claimed_by or req.claimed_by != old_claimed_by:
+                # Positive, strict claimant match (no truthiness shortcuts).
+                is_current_claimant = isinstance(old_claimed_by, str) and old_claimed_by != "" and req.claimed_by == old_claimed_by
+                if not is_current_claimant:
                     raise HTTPException(
                         403,
                         "provenance update requires claimed_by to match the current claimant",

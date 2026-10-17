@@ -106,6 +106,59 @@ class ClaimedProvenanceTests(unittest.IsolatedAsyncioTestCase):
         got = await self._get(repo, job_id)
         self.assertEqual(got["claimed_model"], "zoder")
 
+    async def test_unclaimed_job_cannot_receive_provenance(self):
+        """No current claimant == nobody may stamp provenance, even by
+        self-declaring a claimed_by on a claimed/running status."""
+        from fastapi import HTTPException
+
+        repo = await self._repo("unclaimed.db")
+        now = time.time()
+        async with repo.connection() as db:
+            await db.execute(
+                "INSERT INTO jobs (id, submitter_urn, kind, priority, status, started_at) "
+                "VALUES ('job-open', 'urn:submitter', 'research', 5, 'queued', ?)",
+                (now,),
+            )
+            await db.commit()
+        # queued -> claimed is a claim bypass (409) regardless; assert either
+        # way that no provenance lands on the row.
+        with self.assertRaises(HTTPException) as ctx:
+            await self._patch(
+                repo,
+                "job-open",
+                status="claimed",
+                claimed_by="urn:agent:zeroclaw:typhon:s1",
+                claimed_model="sneaky-model",
+            )
+        self.assertIn(ctx.exception.status_code, (403, 409))
+        async with repo.connection() as db:
+            async with db.execute("SELECT claimed_model FROM jobs WHERE id='job-open'") as cur:
+                self.assertIsNone((await cur.fetchone())[0])
+
+    async def test_malformed_result_models_is_ignored(self):
+        """`result['models']` is worker-supplied; a non-dict must not crash."""
+        repo = await self._repo("malformed.db")
+        for models in ("grok-4.3", ["grok-4.3"], None, 17, {"author": ["not-a-str"]}, {"author": "   "}):
+            job_id = await self._claimed_job(repo, f"job-{abs(hash(repr(models)))}")
+            await self._patch(
+                repo,
+                job_id,
+                status="done",
+                claimed_by=CLAIMANT,
+                result={"exit_code": 0, "models": models},
+            )
+            got = await self._get(repo, job_id)
+            # No author could be extracted -> the registration model stands.
+            self.assertEqual(got["claimed_model"], "zoder", models)
+
+    async def test_normalize_preserves_models_key_on_done(self):
+        """normalize_result_payload must not strip result['models']."""
+        from hive.bus.domain.jobs import normalize_result_payload
+
+        out = normalize_result_payload("done", {"models": {"author": "grok-4.3", "reviewers": []}})
+        self.assertEqual(out["models"]["author"], "grok-4.3")
+        self.assertEqual(out["commits"], [])
+
     async def test_none_does_not_clobber(self):
         repo = await self._repo("none.db")
         job_id = await self._claimed_job(repo)
