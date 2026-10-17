@@ -59,6 +59,9 @@ async function registerAgent(){
 // ── submit form ───────────────────────────────────────────────────────
 function toggleSubmit(){
   _submitOpen=!_submitOpen;
+  // Closing the panel abandons an edit/resubmit: its carry-over must not
+  // leak into the next, unrelated submit.
+  if(!_submitOpen)cancelEdit();
   document.getElementById('submit-body').className=_submitOpen?'open':'';
   document.getElementById('submit-toggle').textContent=_submitOpen?'▲ collapse':'▼ expand';
 }
@@ -90,7 +93,7 @@ function cancelEdit(){
 let _carryover=null;
 function setCarryover(job,opts={}){
   _carryover={
-    parent_job_id:opts.parent_job_id??(job&&job.id||null),
+    parent_job_id:('parent_job_id' in opts)?opts.parent_job_id:(job&&job.id||null),
     required_capabilities:(job&&job.required_capabilities)||null,
     max_retries:(job&&typeof job.max_retries==='number')?job.max_retries:null,
     eligible_hosts:(job&&job.eligible_hosts)||null,
@@ -126,7 +129,8 @@ function setSelectOrAdd(selectEl, value){
 function fillFormForEdit(job){
   _editingJobId=job.id;
   fillFormFromJob(job);
-  setCarryover(job);
+  // An edit replaces the job; it is not a child of it.
+  setCarryover(job,{parent_job_id:null});
   document.getElementById('edit-banner').className='show';
   document.getElementById('submit-title').textContent='Edit Job';
   if(!_submitOpen)toggleSubmit();
@@ -146,7 +150,7 @@ async function submitJob(){
   // create a repo=None job that no worker can map (no_repo_mapping) and
   // dead-letters in ~70s. Warn — but allow the submit.
   const _co=_carryover;
-  const _warnedRepo=!!(_co&&_co.parent_job_id&&_co.source_repo&&repo==='');
+  const _warnedRepo=!!(_co&&_co.source_repo&&repo==='');
   const body={
     submitter_urn:_myUrn,
     kind:document.getElementById('f-kind').value,
@@ -182,7 +186,7 @@ async function submitJob(){
     } else {
       setStatus(`✓ Job ${shortId} queued — watching for agent pickup…`);
     }
-    if(_warnedRepo)setStatus(`⚠ Resubmitted WITHOUT a repo (source job had one) — workers can't map it, it will likely dead-letter. Reopen with repo filled in if that was a mistake.`,true);
+    if(_warnedRepo)setStatus(`⚠ Job ${shortId} queued WITHOUT a repo (source job had one) — workers can't map it, it will likely dead-letter. Reopen with repo filled in if that was a mistake.`,true);
     await refreshAll();
   }catch(e){
     setStatus('Error: '+e.message,true);

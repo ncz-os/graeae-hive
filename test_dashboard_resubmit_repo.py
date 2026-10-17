@@ -135,7 +135,7 @@ class DashboardResubmitRepoTest(unittest.TestCase):
         # detection: carry-over parent whose source job HAD a repo + repo empty
         self.assertRegex(
             self.submit,
-            r"_warnedRepo\s*=\s*!!\(\s*_co\s*&&\s*_co\.parent_job_id\s*&&\s*_co\.source_repo\s*&&\s*repo\s*===\s*''\s*\)",
+            r"_warnedRepo\s*=\s*!!\(\s*_co\s*&&\s*_co\.source_repo\s*&&\s*repo\s*===\s*''\s*\)",
         )
         self.assertRegex(self.js, r"source_repo\s*:\s*\(\s*job\s*&&\s*job\.repo\s*\)\s*\|\|\s*''")
         # and an error-styled warning is rendered
@@ -148,6 +148,12 @@ class DashboardResubmitRepoTest(unittest.TestCase):
         clear_at = self.submit.index("clearForm();")
         self.assertLess(clear_at, self.submit.index("WITHOUT a repo"))
         self.assertLess(clear_at, self.submit.index("queued"))
+
+    def test_edit_is_not_parented_and_closing_drops_carryover(self):
+        self.assertIn("setCarryover(job,{parent_job_id:null})", self.js)
+        self.assertIn("('parent_job_id' in opts)?opts.parent_job_id", self.js)
+        toggle = self.js[self.js.index("function toggleSubmit") : self.js.index("function setStatus")]
+        self.assertIn("if(!_submitOpen)cancelEdit();", toggle)
 
     def test_priority_zero_survives_fill(self):
         self.assertIn("job.priority??50", self.js)
