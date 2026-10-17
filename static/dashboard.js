@@ -662,13 +662,20 @@ async function refreshGPU(){
     const mu = g.mem_used_mib, mt = g.mem_total_mib;
     const memPct = (mu!=null && mt && mt>0) ? (100*mu/mt) : null;
     const memCls = memPct==null?'load-ok':memPct<70?'load-ok':memPct<90?'load-warn':'load-crit';
-    const memCell = (mu!=null && mt!=null) ? `<span class="load-bar" style="width:60px"><span class="load-bar-fill ${memCls}" style="width:${memPct||0}%"></span></span> ${(mu/1024).toFixed(1)}/${(mt/1024).toFixed(1)} GiB` : '-';
+    const memCell = (mu!=null && mt!=null && mt>0) ? `<span class="load-bar" style="width:60px"><span class="load-bar-fill ${memCls}" style="width:${memPct||0}%"></span></span> ${(mu/1024).toFixed(1)}/${(mt/1024).toFixed(1)} GiB` : '-';
     const temp = g.temp_c, tempColor = temp==null?'#8b949e':temp<70?'#7ee787':temp<85?'#9e6a03':'#da3633';
     const tempCell = temp==null ? '-' : `<span style="color:${tempColor}">${temp.toFixed(0)}°C</span>`;
     const power = g.power_w, powerCell = power==null||power===0 ? '-' : `${power.toFixed(0)}W`;
-    const vendorIcon = g.vendor==='nvidia'?'🟢':g.vendor==='amd'?'🔴':'⚪';
+    // Vendor is identity, not health — render it as a neutral text badge.
+    // Red/green dots here made healthy AMD GPUs (HYDRA/ACHILLES) read as failures.
+    const vendor = (g.vendor||'other').toLowerCase();
+    const vendorLabel = vendor==='nvidia'?'NVIDIA':vendor==='amd'?'AMD':esc(g.vendor||'GPU');
+    const vendorBadge = `<span class="gpu-vendor">${vendorLabel}</span>`;
+    // Health dot: green when this GPU reported runtime metrics in the latest
+    // heartbeat (row present with a real util_pct), grey when no runtime data.
+    const healthDot = util!=null ? '<span class="gpu-health-dot gpu-health-ok" title="reporting runtime metrics"></span>' : '<span class="gpu-health-dot gpu-health-none" title="no runtime data"></span>';
     tr.appendChild(td(`<b>${esc(r.host)}</b>`));
-    tr.appendChild(td(`${vendorIcon} <small class="dim">${esc(g.name||g.vendor||'?')}</small>`));
+    tr.appendChild(td(`${healthDot} ${vendorBadge} <small class="dim">${esc(g.name||g.vendor||'?')}</small>`));
     tr.appendChild(td(utilCell));
     tr.appendChild(td(memCell));
     tr.appendChild(td(tempCell));

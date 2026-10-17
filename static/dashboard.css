@@ -159,6 +159,14 @@ small.dim{font-size:.85em}
 .load-bar-fill{display:block;height:100%;border-radius:3px;min-width:1px}
 .load-ok{background:#238636}.load-warn{background:#9e6a03}.load-crit{background:#da3633}
 
+/* GPU panel: vendor badge is identity (neutral color — never red/green by vendor),
+   the health dot carries live status: green = reporting runtime metrics,
+   grey = no runtime data. Red is reserved for real failures elsewhere. */
+.gpu-vendor{display:inline-block;padding:.05em .4em;border:1px solid #30363d;border-radius:3px;background:#21262d;color:#8b949e;font-size:.72em;font-weight:600;line-height:1.2;margin-right:.35em;white-space:nowrap}
+.gpu-health-dot{display:inline-block;width:8px;height:8px;border-radius:50%;vertical-align:middle;margin-right:.3em}
+.gpu-health-ok{background:#7ee787}
+.gpu-health-none{background:#6e7681}
+
 /* responsive */
 @media(max-width:700px){
   .grid{grid-template-columns:1fr}
