@@ -227,3 +227,143 @@ def test_dispatch_codex_fix_never_requires_hard_codex(doctor, monkeypatch):
     assert "hard:codex" not in body["required_capabilities"]
     # the fix runs on a zoder worker, never a codex-runtime worker
     assert body["eligible_kinds"] == ["zeroclaw"]
+
+
+# ───────────────────────── alias-table contract ─────────────────────────
+# Source-fix hardening for the live incident
+# (fix:singularity-shell-about-graphic, eligible_kinds=['zeroclaw']).
+# job_agent_eligible now scopes doctor agents via _doctor_scope_allowed --
+# but the implementation still relies on RUNTIME_KIND_MAP never bridging
+# the doctor kind to an executor runtime. These tests lock that contract.
+import os  # noqa: E402
+
+from hive.bus.domain.eligibility import (  # noqa: E402
+    DOCTOR_KIND,
+    DOCTOR_OPT_IN_EXCLUDE_ALIASES,
+    RUNTIME_KIND_MAP,
+    agent_is_doctor,
+)
+
+
+def test_alias_table_does_not_bridge_doctor_to_executor_kinds():
+    # "doctor" must not appear in any executor's alias set.
+    for runtime in (
+        "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
+        "claude", "claude-code", "claude-cli",
+    ):
+        aliases = RUNTIME_KIND_MAP.get(runtime, set())
+        assert DOCTOR_KIND not in aliases, (
+            f"runtime {runtime!r} aliases {sorted(aliases)!r} must not include "
+            f"{DOCTOR_KIND!r} -- that would re-leak normal worker jobs to the doctor"
+        )
+
+
+def test_doctor_alias_set_does_not_contain_executor_kinds():
+    # Doctor agents must not advertise any executor alias -- even if the
+    # registration payload or runtime field were to drift, the alias set
+    # alone must not match a normal worker job's eligible_kinds.
+    aliases = agent_kind_aliases("doctor", "doctor")
+    assert aliases == {"doctor"}
+    assert not aliases.intersection({"zeroclaw", "codex", "opencode", "claude"})
+
+
+def test_agent_is_doctor_matches_runtime_only():
+    # An agent registered with kind="patch.notes" / runtime="doctor" is still a
+    # doctor and must be scoped. An agent registered with kind="doctor" /
+    # runtime="zoder" is also a doctor.
+    assert agent_is_doctor({"kind": "patch.notes", "runtime": "doctor"}) is True
+    assert agent_is_doctor({"kind": "doctor", "runtime": "zoder"}) is True
+    assert agent_is_doctor({"kind": "zeroclaw", "runtime": "zeroclaw"}) is False
+
+
+def test_doctor_scope_holds_for_non_scope_kind_with_zeroclaw_only():
+    # Sanity: eligible_kinds=["zeroclaw"] is the exact live incident
+    # (fix:singularity-shell-about-graphic) -- locked at the source.
+    job = _job("fix:cover-bug", ["zeroclaw"])
+    ok, reason = job_agent_eligible(job, _agent("doctor"))
+    assert ok is False, reason
+    assert "out of scope" in reason
+
+
+@pytest.mark.parametrize(
+    "eligible_kinds",
+    [
+        ["*"],
+        ["zeroclaw"],
+        ["codex"],
+        ["opencode"],
+        ["claude"],
+    ],
+)
+def test_doctor_rejects_wildcard_and_executor_alias_opt_ins(eligible_kinds):
+    # The reviewer flagged this specifically: a job whose only eligible_kinds
+    # are '*' or executor aliases must NOT match a doctor agent -- the doctor
+    # is a triage brain, not a wildcard worker. The only path for an explicit
+    # opt-in is a literal 'doctor' entry (covered separately in
+    # test_doctor_eligible_when_job_lists_doctor_in_eligible_kinds).
+    job = _job("fix:cover-bug", eligible_kinds)
+    ok, reason = job_agent_eligible(job, _agent("doctor"))
+    assert ok is False, (eligible_kinds, reason)
+    assert "out of scope" in reason
+
+
+def test_doctor_opt_in_via_explicit_doctor_entry_still_works():
+    # Sanity check on the boundary: when eligible_kinds lists 'doctor'
+    # alongside '*' or an executor alias, the literal 'doctor' entry IS the
+    # opt-in path described in the task ("whose eligible_kinds explicitly
+    # lists 'doctor'"). The wildcard / executor entries do not subvert it.
+    for eligible_kinds in (["*", "doctor"], ["zeroclaw", "doctor"]):
+        ok, reason = job_agent_eligible(
+            _job("feat:explicit-opt-in", eligible_kinds), _agent("doctor")
+        )
+        assert ok is True, (eligible_kinds, reason)
+
+
+def test_doctor_opt_in_exclude_aliases_blocks_wildcard_and_executors():
+    # The DOCTOR_OPT_IN_EXCLUDE_ALIASES set is the explicit mechanism that
+    # closes the wildcard/executor-as-opt-in leak. It must contain '*' and
+    # every executor alias. A future edit that drops one of these (e.g. to
+    # support a new executor) must be paired with a deliberate decision to
+    # keep the doctor out of that alias set -- this test forces the choice.
+    assert "*" in DOCTOR_OPT_IN_EXCLUDE_ALIASES
+    for alias in (
+        "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
+        "claude", "claude-code", "claude-cli",
+    ):
+        assert alias in DOCTOR_OPT_IN_EXCLUDE_ALIASES, alias
+
+
+def test_runtime_kind_map_invariant_fires_when_executor_aliases_doctor():
+    # The module-level invariant must fire if RUNTIME_KIND_MAP is edited so
+    # an executor runtime aliases 'doctor'. A violating source edit cannot
+    # even load -- the bus cannot come up with a bridged alias table.
+    import importlib.util
+    import sys
+
+    src_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "hive", "bus", "domain", "eligibility.py",
+    )
+    with open(src_path) as fh:
+        original = fh.read()
+    mutated = original.replace(
+        '"zeroclaw": {"zeroclaw"},',
+        '"zeroclaw": {"zeroclaw", "doctor"},',
+        1,
+    )
+    assert mutated != original, "invariant test failed to inject a violating source"
+    mod_name = "eligibility_invariant_probe"
+    spec = importlib.util.spec_from_loader(mod_name, loader=None)
+    module = importlib.util.module_from_spec(spec)
+    try:
+        exec(compile(mutated, src_path, "exec"), module.__dict__)
+    except RuntimeError as exc:
+        assert "RUNTIME_KIND_MAP invariant violated" in str(exc)
+        assert "zeroclaw" in str(exc)
+    else:
+        pytest.fail(
+            "module-level RUNTIME_KIND_MAP invariant did NOT fire when "
+            "executor runtime 'zeroclaw' aliased 'doctor'"
+        )
+    finally:
+        sys.modules.pop(mod_name, None)

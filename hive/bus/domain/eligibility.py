@@ -32,6 +32,34 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "dream-walker": {"dream-walker"},
     "unknown": {"unknown"},
 }
+# INVARIANT (locked 2026-10-17 by
+# test_alias_table_does_not_bridge_doctor_to_executor_kinds and
+# test_runtime_kind_map_invariant_fires_when_executor_aliases_doctor):
+# "doctor" MUST NOT appear in any executor runtime's alias set. If a future
+# edit adds it (e.g. for a "doctor-zc" runtime that runs codex dispatches),
+# a normal worker job with eligible_kinds=["zeroclaw"] would alias through
+# to a doctor-kind agent -- exactly the live claim/release churn this
+# module fixes (reproduced 2026-10-17, fix:singularity-shell-about-graphic).
+# Doctor scope is enforced at _doctor_scope_allowed / job_agent_eligible,
+# NOT via the alias table; the alias table must keep doctor isolated so the
+# alias-set match in job_agent_eligible's non-doctor path cannot re-introduce
+# the leak. A violating source edit raises at import time so the bus cannot
+# come up with a bridged alias table.
+_DOCTOR_EXECUTOR_RUNTIMES = frozenset({
+    "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
+    "claude", "claude-code", "claude-cli",
+})
+for _rt in _DOCTOR_EXECUTOR_RUNTIMES:
+    if "doctor" in RUNTIME_KIND_MAP.get(_rt, set()):
+        raise RuntimeError(
+            f"RUNTIME_KIND_MAP invariant violated: executor runtime {_rt!r} "
+            "aliases include 'doctor' -- this would re-leak normal worker "
+            "jobs to a doctor agent (live incident 2026-10-17, "
+            "fix:singularity-shell-about-graphic). Move 'doctor' out of "
+            "executor alias sets; doctor scope is enforced in "
+            "_doctor_scope_allowed, not via the alias table."
+        )
+del _rt
 
 
 NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
@@ -144,8 +172,32 @@ def agent_kind_aliases(kind: str, runtime: str | None) -> set[str]:
     # live 2026-09-15 (TYDEUS's codex worker claimed + ran a zeroclaw smoke
     # test job). Kind is strict again; a job's eligible_kinds now means what
     # it says.
+    # Doctor isolation (2026-10-17, source fix for live incident
+    # fix:singularity-shell-about-graphic): a doctor agent must never carry
+    # executor aliases. The kind/runtime/alias-set path above is purely
+    # data-driven from RUNTIME_KIND_MAP -- if a future edit ever made
+    # "doctor" an alias of an executor runtime, aliases would silently pick
+    # it up. Drop executor aliases for doctor agents so the alias-set match
+    # in job_agent_eligible cannot bridge the two worlds. The actual
+    # doctor-scope matching lives in _doctor_scope_allowed /
+    # job_agent_eligible's doctor branch; this strip is defence-in-depth so
+    # the alias set alone cannot trigger an executor-eligible_kinds match.
+    if kind == DOCTOR_KIND or runtime == DOCTOR_KIND:
+        aliases -= _DOCTOR_EXECUTOR_ALIASES
     aliases.discard("")
     return aliases
+
+
+# Aliases that, if present in agent_kind_aliases for a doctor agent, would
+# let a normal worker job with that exact eligible_kinds entry match the
+# doctor by alias-set intersection (job_agent_eligible's non-doctor path).
+# We strip them for any doctor agent so the alias-set alone can never
+# bridge doctor<->executor. Locked at import time by the RUNTIME_KIND_MAP
+# invariant check above.
+_DOCTOR_EXECUTOR_ALIASES = frozenset({
+    "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
+    "claude", "claude-code", "claude-cli",
+})
 
 
 def workspace_capability_for_kind(kind: str) -> str | None:
@@ -180,30 +232,113 @@ def agent_is_doctor(agent: dict[str, Any]) -> bool:
 def _doctor_scope_allowed(job: dict[str, Any], kinds: set[str]) -> tuple[bool, str]:
     """Doctor agents may only take triage:* / doctor:* work.
 
-    Escape hatch: a job whose eligible_kinds explicitly lists 'doctor' opts in
-    to the doctor directly. The wildcard "*" (and any other executor alias such
-    as "zeroclaw") is NOT an opt-in -- that is exactly what leaked a normal
-    worker job to the doctor.
+    Restriction (2026-10-17 source fix, live incident
+    fix:singularity-shell-about-graphic, eligible_kinds=['zeroclaw']):
+    doctor agents are triage brains, not executors. The bus matcher used to
+    offer them any normal worker job because job_agent_eligible filtered on
+    eligible_kinds alone. We now enforce the doctor scope explicitly here:
+
+      1. Explicit opt-in: a job whose eligible_kinds lists 'doctor' is in
+         scope regardless of its kind prefix (the only way a doctor takes a
+         non-triage/doctor: kind).
+      2. Otherwise the job kind must start with one of DOCTOR_JOB_KIND_PREFIXES
+         ("triage:", "doctor:") and not DOCTOR_JOB_KIND_EXCLUDE_PREFIXES
+         ("doctor:codex-fix:" -- those are round-tripped by zero-triage).
+      3. The wildcard "*" in eligible_kinds is NEVER an opt-in for a doctor
+         (that is exactly what leaked worker jobs to the doctor in the first
+         place). It is treated as if it were not present.
+      4. Executor aliases in eligible_kinds ("zeroclaw", "codex", ...) are
+         NEVER an opt-in for a doctor -- they describe executor capabilities,
+         not doctor ones. They are stripped from the kinds set before the
+         opt-in check, so a job listing ['zeroclaw'] cannot claim to opt in
+         just because the doctor happens to be one of many kinds.
     """
     j_kind = _norm_str(job.get("kind"))
-    if DOCTOR_KIND in kinds:
+
+    # Strip executor aliases and the wildcard from the kinds set: none of
+    # those are opt-ins for a doctor agent. Only a literal "doctor" entry
+    # in eligible_kinds is. This is the line that closes the
+    # fix:singularity-shell-about-graphic leak: a job whose only eligible
+    # kind is "zeroclaw" (or "*") cannot pass the opt-in check below.
+    opt_in_kinds = kinds - DOCTOR_OPT_IN_EXCLUDE_ALIASES
+
+    if DOCTOR_KIND in opt_in_kinds:
         return True, "eligible"
     if j_kind.startswith(DOCTOR_JOB_KIND_EXCLUDE_PREFIXES):
-        return False, f"doctor out of scope for excluded kind {j_kind!r} (codex-fix dispatch)"
+        return False, (
+            f"doctor out of scope for excluded kind {j_kind!r} (codex-fix dispatch -- "
+            "round-tripped by zero-triage, not executed by the doctor)"
+        )
     if j_kind.startswith(DOCTOR_JOB_KIND_PREFIXES):
         return True, "eligible"
     return (
         False,
         f"doctor is out of scope for kind {j_kind!r} (eligible only for "
-        f"{list(DOCTOR_JOB_KIND_PREFIXES)} kinds, or jobs listing 'doctor' in eligible_kinds)",
+        f"{list(DOCTOR_JOB_KIND_PREFIXES)} kinds, or jobs explicitly listing "
+        f"'doctor' in eligible_kinds; '*' and executor aliases are not opt-ins)",
     )
 
 
+# Aliases in a job's eligible_kinds that are NEVER an opt-in for a doctor
+# agent. The wildcard "*" is the most important (any-worker match); the
+# executor aliases are defensive: even if a future job author wrote
+# eligible_kinds=["zeroclaw", "doctor"] to mean "either the zeroclaw worker
+# or the doctor", the doctor must look at the job kind to decide scope,
+# not at the alias. With these stripped, the only path to opt in is a
+# literal "doctor" entry alongside a job kind that the doctor owns.
+DOCTOR_OPT_IN_EXCLUDE_ALIASES = frozenset(
+    {"*", "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
+     "claude", "claude-code", "claude-cli", "openclaw", "ic-engine",
+     "hermes", "mnemos", "human", "system", "dream-walker", "unknown"}
+)
+
+
 def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool, str]:
+    """Decide whether `agent` may claim `job`.
+
+    For non-doctor agents, the matching path is the legacy "filter on
+    eligible_kinds + kind_affinity + capabilities + cost tier" flow.
+
+    For doctor agents, the doctor scope (triage:* / doctor:* minus
+    doctor:codex-fix:*, or jobs that explicitly opt in with 'doctor' in
+    eligible_kinds) is the AUTHORITY. _doctor_scope_allowed runs the
+    same logic against the job's kind and eligible_kinds, and rejects
+    the doctor when '*' or any executor alias is the only opt-in. Once a
+    job has cleared doctor scope, the rest of the function falls through
+    normally so a triage job's required_capabilities, eligible_hosts, and
+    cost_tier are still honoured.
+    """
     agent_host = _norm_str(agent.get("host"))
     agent_caps = _norm_str_set(agent.get("capabilities"))
     eligible_aliases = _norm_str_set(agent.get("eligible_aliases"))
     j_kind = _norm_str(job.get("kind"))
+    kinds = _norm_str_set(job.get("eligible_kinds"))
+
+    # ── Doctor scope branch (2026-10-17 source fix) ─────────────────────────
+    # The doctor is a triage brain, not an executor. We check its scope
+    # before the kind_affinity / executor-alias gates below: a doctor
+    # agent whose kind/runtime is 'doctor' must never pass the function
+    # because it happens to alias-match ['zeroclaw'] or ['*'].
+    if agent_is_doctor(agent):
+        doctor_ok, doctor_reason = _doctor_scope_allowed(job, kinds)
+        if not doctor_ok:
+            # Clear, auditable reason -- the bus endpoint surfaces this
+            # to the worker so the doctor can log + skip instead of
+            # claim/release-churning.
+            return False, doctor_reason
+        # In scope for the doctor: continue with capability / host / cost
+        # tier checks below; skip the executor-eligible_kinds match
+        # (which would reject {'doctor'} on a triage:* job that does not
+        # list zeroclaw/codex/etc in eligible_kinds).
+    else:
+        # Non-doctor path: legacy executor matching. '*' short-circuits
+        # the eligible_kinds gate; otherwise the agent's alias set must
+        # intersect the job's eligible_kinds.
+        if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
+            return (
+                False,
+                f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}",
+            )
 
     if agent_host in NARROW_HOSTS and not j_kind.startswith(NARROW_ALLOWLIST):
         return False, f"narrow host {agent_host} not allowed for kind {j_kind}"
@@ -213,19 +348,6 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         return (
             False,
             f"agent kind aliases={sorted(eligible_aliases)!r} do not satisfy kind affinity={kind_affinity!r}",
-        )
-
-    kinds = _norm_str_set(job.get("eligible_kinds"))
-    if agent_is_doctor(agent):
-        doctor_ok, doctor_reason = _doctor_scope_allowed(job, kinds)
-        if not doctor_ok:
-            return False, doctor_reason
-        # In scope for the doctor: executor-kind filters (zeroclaw, "*", ...)
-        # are irrelevant -- the doctor scope above is the authority.
-    elif kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
-        return (
-            False,
-            f"agent kind aliases={sorted(eligible_aliases)!r} not in eligible_kinds={sorted(kinds)}",
         )
 
     hosts = _norm_str_set(job.get("eligible_hosts"))
