@@ -69,7 +69,7 @@ from hive.bus.domain.jobs import (
 from hive.bus.domain.workspace import resolve_workspace_shadow
 from hive.bus.schemas import JobCreate, JobUpdate
 from hive.core.models import COST_TIERS
-from hive.persistence.sqlite import SqlExpr
+from hive.persistence.sqlite import DependencyNotReady, SqlExpr
 
 router = APIRouter()
 
@@ -78,7 +78,10 @@ _JOB_COLUMNS = (
     "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
     "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count, "
     "claimed_at, claim_lease_expires_at, last_update_at, claimed_model, claimed_provider, "
-    "claimed_runtime, claimed_cost_tier"
+    "claimed_runtime, claimed_cost_tier, "
+    # Fault 2026-10-17: JobCreate accepted these and the row carried them, but
+    # GET /v1/jobs/{id} never selected/returned them.
+    "preferred_providers, preferred_models, depends_on, project, max_cost_tier, mnemos_refs"
 )
 
 
@@ -182,6 +185,12 @@ async def get_job(job_id: str):
         "claimed_provider": r[25],
         "claimed_runtime": r[26],
         "claimed_cost_tier": r[27],
+        "preferred_providers": json.loads(r[28]) if r[28] else None,
+        "preferred_models": json.loads(r[29]) if r[29] else None,
+        "depends_on": json.loads(r[30]) if r[30] else None,
+        "project": r[31],
+        "max_cost_tier": r[32],
+        "mnemos_refs": json.loads(r[33]) if r[33] else None,
     }
 
 
@@ -567,9 +576,7 @@ async def dequeue_next_job(agent_urn: str):
                         },
                     )
 
-            candidates = await hive_repo().queued_candidates(
-                tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW
-            )
+            candidates = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW)
             # Role-aware ordering (hive.scheduler is the single source of truth).
             worker_profile = sched.worker_profile_from_metadata(
                 urn=agent_urn,
@@ -647,17 +654,22 @@ async def dequeue_next_job(agent_urn: str):
                 eligible, _reason = job_agent_eligible(job, agent)
                 if not eligible:
                     continue
-                rc = await hive_repo().claim_job(
-                    tx,
-                    job_id=j_id,
-                    agent_urn=agent_urn,
-                    now=now,
-                    lease_expires_at=now + CLAIM_LEASE_SECONDS,
-                    runtime=a_runtime,
-                    model=_claim_model,
-                    provider=_claim_provider,
-                    cost_tier=a_tier,
-                )
+                try:
+                    rc = await hive_repo().claim_job(
+                        tx,
+                        job_id=j_id,
+                        agent_urn=agent_urn,
+                        now=now,
+                        lease_expires_at=now + CLAIM_LEASE_SECONDS,
+                        runtime=a_runtime,
+                        model=_claim_model,
+                        provider=_claim_provider,
+                        cost_tier=a_tier,
+                    )
+                except DependencyNotReady:
+                    # The DAG gate re-checked inside the claim transaction: the
+                    # deps changed after the pre-scan, so skip this candidate.
+                    continue
                 if rc == 0:
                     continue
                 claimed = {
@@ -921,7 +933,9 @@ async def update_job(job_id: str, req: JobUpdate):
                     prov_sets["claimed_model"] = author
             if prov_sets:
                 # Positive, strict claimant match (no truthiness shortcuts).
-                is_current_claimant = isinstance(old_claimed_by, str) and old_claimed_by != "" and req.claimed_by == old_claimed_by
+                is_current_claimant = (
+                    isinstance(old_claimed_by, str) and old_claimed_by != "" and req.claimed_by == old_claimed_by
+                )
                 if not is_current_claimant:
                     raise HTTPException(
                         403,
@@ -953,9 +967,7 @@ async def update_job(job_id: str, req: JobUpdate):
 
         # Thrash fix: compare-and-set on the observed status.
         if await hive_repo().patch_job_status(tx, job_id, sets=sets, expected_status=old_status) == 0:
-            raise HTTPException(
-                409, f"job {job_id} status changed concurrently (expected {old_status!r}); retry"
-            )
+            raise HTTPException(409, f"job {job_id} status changed concurrently (expected {old_status!r}); retry")
 
         # Optional real-failure release counting.
         # (audit BLOCKING-1) ``no_repo_mapping`` is deployment-dependent, so it
@@ -1243,9 +1255,7 @@ async def claim_job(job_id: str, by: str):
             _agent_load,
         ) = agent_row
         if agent_status not in ACTIVE_AGENT_STATUSES:
-            raise HTTPException(
-                409, f"claim failed: agent status is {agent_status!r}, not online/idle: {by}"
-            )
+            raise HTTPException(409, f"claim failed: agent status is {agent_status!r}, not online/idle: {by}")
         agent_caps = set(json.loads(caps_json)) if caps_json else set()
         eligible_aliases = agent_kind_aliases(agent_kind, a_runtime)
         a_tier = (a_tier or "C").upper()
@@ -1280,13 +1290,11 @@ async def claim_job(job_id: str, by: str):
             raise HTTPException(409, f"job is in retry backoff until {j_retry_backoff_until} (now={now})")
 
         if j_deps_json:
-            deps = json_list(j_deps_json)
+            deps = list(dict.fromkeys(json_list(j_deps_json)))
             if deps:
                 done_ids = await hive_repo().completed_job_ids(tx, ids=list(deps))
                 if len(done_ids) < len(deps):
-                    raise HTTPException(
-                        409, f"job has unsatisfied DAG dependencies ({len(done_ids)}/{len(deps)} done)"
-                    )
+                    raise HTTPException(409, f"job has unsatisfied DAG dependencies ({len(done_ids)}/{len(deps)} done)")
 
         agent = {
             "urn": by,
@@ -1314,21 +1322,26 @@ async def claim_job(job_id: str, by: str):
         eligible, reason = job_agent_eligible(job, agent)
         if not eligible:
             status = (
-                422 if reason.startswith("job max_cost_tier") else (429 if reason.startswith("subscription agent throttled") else 403)
+                422
+                if reason.startswith("job max_cost_tier")
+                else (429 if reason.startswith("subscription agent throttled") else 403)
             )
             raise HTTPException(status, reason)
 
-        rc = await hive_repo().claim_job(
-            tx,
-            job_id=job_id,
-            agent_urn=by,
-            now=now,
-            lease_expires_at=now + CLAIM_LEASE_SECONDS,
-            runtime=a_runtime,
-            model=a_model,
-            provider=a_provider,
-            cost_tier=a_tier,
-        )
+        try:
+            rc = await hive_repo().claim_job(
+                tx,
+                job_id=job_id,
+                agent_urn=by,
+                now=now,
+                lease_expires_at=now + CLAIM_LEASE_SECONDS,
+                runtime=a_runtime,
+                model=a_model,
+                provider=a_provider,
+                cost_tier=a_tier,
+            )
+        except DependencyNotReady as exc:
+            raise HTTPException(409, str(exc)) from exc
         await tx.commit()
         if rc == 0:
             raise HTTPException(409, "job already claimed or not available (race)")

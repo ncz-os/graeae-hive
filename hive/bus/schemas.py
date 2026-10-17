@@ -25,16 +25,12 @@ class AgentRegister(BaseModel):
         pattern=r"^[a-z][a-z0-9-]{0,31}$",
         description="URN routing segment — defaults to runtime",
     )
-    autonomy_level: str = Field(
-        "unknown", description="autonomous / confirm-risky / interactive / unknown"
-    )
+    autonomy_level: str = Field("unknown", description="autonomous / confirm-risky / interactive / unknown")
     auth_method: str = Field(
         "unknown",
         description="subscription (Max plan), api (pay-per-token), free, unknown",
     )
-    plan_cap_usd: float | None = (
-        None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
-    )
+    plan_cap_usd: float | None = None  # monthly cap; defaults from DEFAULT_PLAN_CAPS by auth_method
     pid: int | None = None
     capabilities: list[str] | None = None
     version: str | None = None
@@ -71,9 +67,7 @@ class JobCreate(BaseModel):
     deadline: float | None = None  # unix ts, optional SLA
     required_capabilities: list[str] | None = None  # worker must have ALL of these
     eligible_kinds: list[str] | None = None  # restrict to agent kinds; null = any
-    eligible_hosts: list[str] | None = (
-        None  # restrict to agent hosts (e.g. ["cixmini"]); null = any
-    )
+    eligible_hosts: list[str] | None = None  # restrict to agent hosts (e.g. ["cixmini"]); null = any
     target_workspace: str | None = (
         None  # GRAEAE permanent-fix: bus-side first-class workspace (replaces worker KIND_WORKSPACE_MAP guessing)
     )
@@ -84,21 +78,13 @@ class JobCreate(BaseModel):
     max_retries: int = 2  # auto-resubmit after worker reports failed (up to N times)
     # COST DISCIPLINE (per CLAUDE.md llm-usage-policy):
     max_cost_tier: str = "B"  # adaptive tier cap: A=local/NGC first (free), B=Groq/xAI overflow (paid), C=reserve. Default B=Tier A preferred, Tier B fallback when Tier A overloaded.
-    preferred_providers: list[str] | None = (
-        None  # ranked preference (first match wins among tier-eligible)
-    )
+    preferred_providers: list[str] | None = None  # ranked preference (first match wins among tier-eligible)
     preferred_models: list[str] | None = None  # ranked model preference
     # MNEMOS provenance:
-    mnemos_refs: list[str] | None = (
-        None  # mem_XXX ids — context/handoffs/related work the worker should consult
-    )
+    mnemos_refs: list[str] | None = None  # mem_XXX ids — context/handoffs/related work the worker should consult
     # DAG support:
-    depends_on: list[str] | None = (
-        None  # job ids that must be status='done' before this job is dequeueable
-    )
-    idempotency_key: str | None = (
-        None  # forced-rerun escape: a unique value is never coalesced
-    )
+    depends_on: list[str] | None = None  # job ids that must be status='done' before this job is dequeueable
+    idempotency_key: str | None = None  # forced-rerun escape: a unique value is never coalesced
     # PR-fix routing (operator 2026-06-17): forge + repo + branch/PR to check out.
     site: str | None = None  # git_sites.json key (github/gitlab-ncz/codeberg/internal)
     repo: str | None = None  # owner/name path on that site
@@ -106,17 +92,64 @@ class JobCreate(BaseModel):
     pr_number: int | None = None
 
 
+class JobOut(BaseModel):
+    """The job response model (GET /v1/jobs, GET /v1/jobs/{id}).
+
+    PREFERRED_* / DEPENDS_ON ROUND-TRIP FIX (fault 2026-10-17): JobCreate
+    accepted ``preferred_models``/``preferred_providers``/``depends_on`` and the
+    repository persisted them, but the read serializers never returned them —
+    submitters' model preferences looked silently ignored and dependency
+    ordering could not be verified from the API. They are DECLARED here (not
+    just added to a dict) so a future serializer change that drops a field
+    fails a test instead of silently regressing.
+
+    Optional with a ``None`` default: rows written before this fix carry NULL,
+    and ``preferred_*``/``depends_on`` are stored/returned as JSON arrays.
+    """
+
+    id: str
+    submitter_urn: str
+    parent_job_id: str | None = None
+    kind: str
+    description: str | None = None
+    priority: int = 0
+    status: str
+    claimed_by: str | None = None
+    started_at: float | None = None
+    ended_at: float | None = None
+    result: dict | None = None
+    estimated_cost_usd: float | None = None
+    required_capabilities: list[str] | None = None
+    eligible_kinds: list[str] | None = None
+    eligible_hosts: list[str] | None = None
+    project: str | None = None
+    max_cost_tier: str | None = None
+    preferred_providers: list[str] | None = None
+    preferred_models: list[str] | None = None
+    depends_on: list[str] | None = None
+    mnemos_refs: list[str] | None = None
+    site: str | None = None
+    repo: str | None = None
+    head_branch: str | None = None
+    pr_number: int | None = None
+    max_retries: int | None = None
+    retry_count: int | None = None
+    claimed_at: float | None = None
+    claim_lease_expires_at: float | None = None
+    last_update_at: float | None = None
+    claimed_model: str | None = None
+    claimed_provider: str | None = None
+    claimed_runtime: str | None = None
+    claimed_cost_tier: str | None = None
+
+
 class JobUpdate(BaseModel):
     status: str
     result: dict | None = None
     claimed_by: str | None = None
-    tokens_in: int | None = (
-        None  # workers SHOULD report token usage on done/failed for cost audit
-    )
+    tokens_in: int | None = None  # workers SHOULD report token usage on done/failed for cost audit
     tokens_out: int | None = None
-    result_mnemos_id: str | None = (
-        None  # mem_XXX id where worker stored the outcome — closes provenance loop
-    )
+    result_mnemos_id: str | None = None  # mem_XXX id where worker stored the outcome — closes provenance loop
     # Routing re-assignment (queued/offered jobs only — use status=queued to re-route)
     eligible_kinds: list[str] | None = None
     eligible_hosts: list[str] | None = None

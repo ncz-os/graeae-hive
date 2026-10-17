@@ -29,9 +29,18 @@ class SqlExpr:
     sql: str
 
 
+class DependencyNotReady(RuntimeError):
+    """Raised when a claim is attempted on a job whose ``depends_on`` are not
+    all ``done``. Raised inside the caller's transaction so the claim path can
+    skip the candidate (batch dequeue) or answer 409 (targeted claim)."""
+
+    def __init__(self, job_id: str) -> None:
+        super().__init__(f"job has unsatisfied DAG dependencies: {job_id}")
+        self.job_id = job_id
+
+
 NARROW_HOSTS = {"cixmini", "bigpi", "clawpi", "zeropi"}
 NARROW_ALLOWLIST = ("cixmini-os:", "ncz-os-", "fleet-infra:")
-
 
 
 DDL = """
@@ -308,7 +317,9 @@ class SqliteHiveRepository(HiveMindRepository):
                     "plan_period_used_usd REAL DEFAULT 0, "
                     "subscription_pools TEXT)"
                 )
-                await conn.execute(f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration")
+                await conn.execute(
+                    f"INSERT INTO agents ({col_list}) SELECT {col_list} FROM agents__pre_stale_migration"
+                )
                 await conn.execute("DROP TABLE agents__pre_stale_migration")
 
             async def _ensure_jobs_status_allows_dead_letter(conn) -> None:
@@ -336,7 +347,9 @@ class SqliteHiveRepository(HiveMindRepository):
                     new_cols = {r[1] for r in await cur.fetchall()}
                 common = [c for c in old_cols if c in new_cols]
                 col_list = ", ".join(common)
-                await conn.execute(f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration")
+                await conn.execute(
+                    f"INSERT INTO jobs ({col_list}) SELECT {col_list} FROM jobs__pre_deadletter_migration"
+                )
                 await conn.execute("DROP TABLE jobs__pre_deadletter_migration")
 
             live_columns = (
@@ -739,7 +752,7 @@ class SqliteHiveRepository(HiveMindRepository):
             async with db.execute(
                 "SELECT id, kind, description, priority, deadline, required_capabilities, eligible_kinds, "
                 "eligible_hosts, submitter_urn, parent_job_id, started_at, max_cost_tier, preferred_providers, "
-                "preferred_models, mnemos_refs, depends_on FROM jobs WHERE status='queued' "
+                "preferred_models, mnemos_refs, depends_on, retry_count FROM jobs WHERE status='queued' "
                 "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
                 "ORDER BY priority DESC, started_at ASC",
                 (now,),
@@ -762,20 +775,14 @@ class SqliteHiveRepository(HiveMindRepository):
                         j_pref_models,
                         j_mnemos_refs,
                         j_deps_json,
+                        j_retry_count,
                     ) = r
                     if urn_host in NARROW_HOSTS and not (j_kind or "").startswith(NARROW_ALLOWLIST):
                         continue
-                    if j_deps_json:
-                        deps = json_list(j_deps_json)
-                        if deps:
-                            ph = ",".join("?" * len(deps))
-                            async with db.execute(
-                                f"SELECT COUNT(*) FROM jobs WHERE id IN ({ph}) AND status='done'",
-                                tuple(deps),
-                            ) as dc:
-                                done_count = (await dc.fetchone())[0]
-                            if done_count < len(deps):
-                                continue
+                    # Same fail-closed gate as claim_job: distinct ids, and
+                    # unreadable depends_on never skips its prerequisites.
+                    if j_deps_json and not await self._deps_all_done(db, j_deps_json):
+                        continue
                     if _j_kinds_json:
                         kinds = set(json_list(_j_kinds_json))
                         if kinds and "*" not in kinds and not kinds.intersection(eligible_aliases):
@@ -838,6 +845,14 @@ class SqliteHiveRepository(HiveMindRepository):
                         "claimed_at": now,
                         "queued_at": j_started,
                         "mnemos_refs": json.loads(j_mnemos_refs) if j_mnemos_refs else [],
+                        # Fallback claim path: surface the routed prefs + the
+                        # CURRENT attempt so a worker honours model preference
+                        # and climbs an escalation rung the same way it does
+                        # on POST /v1/jobs/next.
+                        "preferred_providers": json.loads(j_pref_providers) if j_pref_providers else [],
+                        "preferred_models": json.loads(j_pref_models) if j_pref_models else [],
+                        "depends_on": json.loads(j_deps_json) if j_deps_json else [],
+                        "retry_count": int(j_retry_count or 0),
                         "claimed_resources": {
                             "runtime": a_runtime,
                             "model": a_model,
@@ -902,6 +917,10 @@ class SqliteHiveRepository(HiveMindRepository):
         Filters: status, agent_urn, parent_job_id, since, limit, include_result.
         Returns (total_count, rows). Sorting: terminal statuses by ended/started
         DESC; otherwise recency-first with priority as tiebreak.
+
+        ``preferred_providers``/``preferred_models``/``depends_on`` are part of
+        the row (fault 2026-10-17: JobCreate accepted them and the row stored
+        them, but the response dropped them).
         """
         status = filters.get("status")
         agent_urn = filters.get("agent_urn")
@@ -915,7 +934,8 @@ class SqliteHiveRepository(HiveMindRepository):
             "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, "
             "pr_number, max_retries, retry_count, claimed_at, claim_lease_expires_at, "
             "last_update_at, claimed_model, claimed_provider, claimed_runtime, "
-            "claimed_cost_tier FROM jobs WHERE 1=1"
+            "claimed_cost_tier, preferred_providers, preferred_models, depends_on, "
+            "project, max_cost_tier, mnemos_refs FROM jobs WHERE 1=1"
         )
         cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
         args: list[Any] = []
@@ -945,6 +965,10 @@ class SqliteHiveRepository(HiveMindRepository):
             col_sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
         else:
             col_sql += " ORDER BY COALESCE(ended_at, started_at) DESC, priority DESC LIMIT ?"
+        # The status filter is bound exactly once, in the WHERE clause above.
+        # (A previous revision appended it a second time after the ORDER BY and
+        # then string-injected `status=?` into WHERE, leaving three
+        # placeholders for two args — "Incorrect number of bindings supplied".)
         args.append(limit)
         rows: list[dict[str, Any]] = []
         db = tx
@@ -982,6 +1006,12 @@ class SqliteHiveRepository(HiveMindRepository):
                     "claimed_provider": r[25],
                     "claimed_runtime": r[26],
                     "claimed_cost_tier": r[27],
+                    "preferred_providers": json.loads(r[28]) if r[28] else None,
+                    "preferred_models": json.loads(r[29]) if r[29] else None,
+                    "depends_on": json.loads(r[30]) if r[30] else None,
+                    "project": r[31],
+                    "max_cost_tier": r[32],
+                    "mnemos_refs": json.loads(r[33]) if r[33] else None,
                 }
                 if not include_result:
                     job.pop("result", None)
@@ -1067,6 +1097,51 @@ class SqliteHiveRepository(HiveMindRepository):
         ) as cur:
             return {row[0] async for row in cur}
 
+    async def dependencies_satisfied(self, tx: Transaction, job_id: str) -> bool:
+        """True when EVERY ``depends_on`` job of ``job_id`` is status='done'.
+
+        A missing job, a non-JSON/empty value, or any non-array JSON counts as
+        satisfied (only a real, non-empty list of ids can block). The read is
+        plain SQL (no dialect-specific JSON functions) so sqlite, Oracle and
+        Db2 all evaluate it identically.
+        """
+        db = tx
+        async with db.execute("SELECT depends_on FROM jobs WHERE id=?", (job_id,)) as cur:
+            row = await cur.fetchone()
+        return await self._deps_all_done(db, row[0] if row else None)
+
+    @staticmethod
+    async def _deps_all_done(db: Any, depends_on: Any) -> bool:
+        # Fail closed: unreadable or non-array depends_on must never let a
+        # job skip its prerequisites. Absent / JSON null / [] means no deps.
+        try:
+            deps = json.loads(depends_on) if depends_on else []
+        except (TypeError, ValueError):
+            return False
+        if deps is None:
+            return True
+        if not isinstance(deps, list):
+            return False
+        if not deps:
+            return True
+        ids = list(dict.fromkeys(str(d) for d in deps if d is not None))
+        if not ids:
+            return True
+        placeholders = ",".join("?" * len(ids))
+        async with db.execute(
+            f"SELECT COUNT(*) FROM jobs WHERE id IN ({placeholders}) AND status='done'",
+            tuple(ids),
+        ) as cur:
+            done = (await cur.fetchone())[0]
+        return int(done or 0) >= len(ids)
+
+    async def _require_dependencies_done(self, db: Any, job_id: str) -> None:
+        """Raise ``DependencyNotReady`` unless the job's DAG prerequisites are done."""
+        async with db.execute("SELECT depends_on FROM jobs WHERE id=?", (job_id,)) as cur:
+            row = await cur.fetchone()
+        if not await self._deps_all_done(db, row[0] if row else None):
+            raise DependencyNotReady(job_id)
+
     async def claim_job(
         self,
         tx: Transaction,
@@ -1084,8 +1159,16 @@ class SqliteHiveRepository(HiveMindRepository):
 
         The compare-and-set predicate is what makes it race-safe (rowcount 0 =
         lost the race / not claimable). No commit — the caller owns the tx.
+
+        DAG GATE (fault 2026-10-17): the SELECT in the caller and the UPDATE
+        here are separate statements. The gate is evaluated INSIDE this
+        transaction, immediately before the compare-and-set — so a job whose
+        ``depends_on`` rows are not all ``done`` is never handed out, even if
+        the caller's pre-read saw a different state. A NULL/empty ``depends_on``
+        or one that is not a JSON array counts as satisfied.
         """
         db = tx
+        await self._require_dependencies_done(db, job_id)
         cur = await db.execute(
             "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
             "claimed_runtime=?, claimed_model=?, claimed_provider=?, claimed_cost_tier=?, "
@@ -1198,8 +1281,7 @@ class SqliteHiveRepository(HiveMindRepository):
         """The auto-retry pre-read, row-locked per this backend's dialect."""
         db = tx
         async with db.execute(
-            "SELECT status, kind, max_retries, retry_count, result FROM jobs WHERE id=?"
-            + self._retry_lock_clause,
+            "SELECT status, kind, max_retries, retry_count, result FROM jobs WHERE id=?" + self._retry_lock_clause,
             (job_id,),
         ) as cur:
             return await cur.fetchone()
@@ -1207,9 +1289,7 @@ class SqliteHiveRepository(HiveMindRepository):
     async def job_release_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
         """The zcgate release pre-read (result/status)."""
         db = tx
-        async with db.execute(
-            "SELECT result, status FROM jobs WHERE id=?", (job_id,)
-        ) as cur:
+        async with db.execute("SELECT result, status FROM jobs WHERE id=?", (job_id,)) as cur:
             return await cur.fetchone()
 
     async def active_orchestrator_urn(self, tx: Transaction) -> str | None:
@@ -1266,9 +1346,7 @@ class SqliteHiveRepository(HiveMindRepository):
     async def cache_stats(self, tx: Transaction, *, top_n: int) -> dict[str, Any]:
         """Result-cache hit-rate + cost savings (GET /v1/stats/cache)."""
         db = tx
-        async with db.execute(
-            "SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache"
-        ) as cur:
+        async with db.execute("SELECT COUNT(*), SUM(hit_count), ROUND(SUM(cost_saved_usd),4) FROM hive_cache") as cur:
             r = await cur.fetchone()
         totals = {
             "cached_jobs": r[0] or 0,
@@ -1317,9 +1395,7 @@ class SqliteHiveRepository(HiveMindRepository):
             "tokens_out": (r[3] or 0) if r else 0,
         }
 
-    async def cost_stats_rows(
-        self, tx: Transaction, *, group_by: str, cutoff: float
-    ) -> list[dict[str, Any]]:
+    async def cost_stats_rows(self, tx: Transaction, *, group_by: str, cutoff: float) -> list[dict[str, Any]]:
         """Aggregated cost stats (GET /v1/stats/costs)."""
         db = tx
         if group_by == "day":
@@ -1688,13 +1764,10 @@ class SqliteHiveRepository(HiveMindRepository):
         ) as cur:
             return [tuple(r) async for r in cur]
 
-    async def mark_schedule_fired(
-        self, tx: Transaction, *, sched_id: str, now: float, next_at: float
-    ) -> None:
+    async def mark_schedule_fired(self, tx: Transaction, *, sched_id: str, now: float, next_at: float) -> None:
         db = tx
         await db.execute(
-            "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, "
-            "fire_count=fire_count+1 WHERE id=?",
+            "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, fire_count=fire_count+1 WHERE id=?",
             (now, next_at, sched_id),
         )
 
@@ -1808,9 +1881,7 @@ class SqliteHiveRepository(HiveMindRepository):
             "INSERT INTO capacity_usage (dedup_key, service, tokens, cost_usd, ts) VALUES (?, ?, ?, ?, ?)",
             (dedup_key, service, int(tokens), float(cost_usd), float(now)),
         )
-        async with db.execute(
-            "SELECT 1 FROM capacity_ledger WHERE service=?", (service,)
-        ) as cur:
+        async with db.execute("SELECT 1 FROM capacity_ledger WHERE service=?", (service,)) as cur:
             exists = await cur.fetchone()
         if exists:
             await db.execute(
