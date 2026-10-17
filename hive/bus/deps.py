@@ -161,6 +161,16 @@ VALID_JOB_STATUSES = {
 }
 TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 
+#: Statuses that still have a LIVE worker attached — the only ones the delete
+#: cascade must refuse without ``force``/``include_active``. This is
+#: ACTIVE_JOB_STATUSES minus ``needs-review``: a needs-review job is a
+#: QUARANTINE state (its worker has already stopped, the completion was
+#: rejected for missing evidence), so no worker can be orphaned by deleting it.
+#: It stays out of TERMINAL_JOB_STATUSES on purpose — it is still PROMOTABLE
+#: (needs-review -> done/failed/cancelled) and a human-attention queue, not
+#: finished work.
+IN_FLIGHT_JOB_STATUSES = ("queued", "offered", "claimed", "running")
+
 
 async def require_mutation_actor(
     x_hive_actor: str | None = Header(default=None, alias="X-Hive-Actor"),
@@ -195,10 +205,10 @@ async def _cascade_delete_jobs(db, job_ids: list[str], *, allow_active: bool = F
     if allow_active:
         await db.executemany("DELETE FROM jobs WHERE id=?", rows)
     else:
-        active_ph = ",".join("?" for _ in ACTIVE_JOB_STATUSES)
+        active_ph = ",".join("?" for _ in IN_FLIGHT_JOB_STATUSES)
         await db.executemany(
             f"DELETE FROM jobs WHERE id=? AND status NOT IN ({active_ph})",
-            [(jid, *ACTIVE_JOB_STATUSES) for jid in job_ids],
+            [(jid, *IN_FLIGHT_JOB_STATUSES) for jid in job_ids],
         )
     survivors: set[str] = set()
     for jid in job_ids:

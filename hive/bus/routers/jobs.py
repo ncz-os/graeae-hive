@@ -855,7 +855,9 @@ async def update_job(job_id: str, req: JobUpdate):
             sets["retry_backoff_until"] = now + _bo
         if req.status in {"claimed", "running"}:
             sets["claim_lease_expires_at"] = now + CLAIM_LEASE_SECONDS
-        if req.status in TERMINAL_JOB_STATUSES or req.status == "queued":
+        if req.status in TERMINAL_JOB_STATUSES or req.status in {"queued", "needs-review"}:
+            # needs-review is a quarantine stop: the worker is done, so its lease
+            # must not stay live (a stale lease makes the job look claimed).
             sets["claim_lease_expires_at"] = None
         if result_mnemos_was_set:
             sets["result_mnemos_id"] = req.result_mnemos_id
