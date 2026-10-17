@@ -142,6 +142,24 @@ DLQ_MAX_PER_CYCLE = int(os.environ.get("DLQ_MAX_PER_CYCLE", "20"))
 # Once a dead-letter job has a logged decision, don't re-decide it every cycle.
 _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
+# Owner-protected dead-letter jobs (2026-10-17): another orchestrator asked that
+# its jobs be reported, not remediated. A dead-letter job whose kind starts with
+# one of these prefixes, or whose project is listed, is logged and left alone
+# (no purge, requeue or reclassify). Comma-separated env lists.
+DLQ_PROTECT_KIND_PREFIXES = tuple(
+    p.strip() for p in os.environ.get("DLQ_PROTECT_KIND_PREFIXES", "").split(",") if p.strip()
+)
+DLQ_PROTECT_PROJECTS = frozenset(
+    p.strip() for p in os.environ.get("DLQ_PROTECT_PROJECTS", "").split(",") if p.strip()
+)
+
+
+def dlq_protected(job: dict) -> bool:
+    """Whether a dead-letter job belongs to an owner who handles it themselves."""
+    kind = str(job.get("kind") or "")
+    if DLQ_PROTECT_KIND_PREFIXES and kind.startswith(DLQ_PROTECT_KIND_PREFIXES):
+        return True
+    return str(job.get("project") or "") in DLQ_PROTECT_PROJECTS
 # Job-level "permanently unschedulable" decline reasons -> remove. Mirrors
 # hive.bus.domain.jobs.DECLINE_REASON_PREFIXES (kept literal: this module is
 # stdlib-only so it can run in the container without the hive package).
@@ -1486,6 +1504,12 @@ def handle_dead_letter_queue() -> dict:
         jid = job.get("id", "")
         if not jid or jid in _dlq_seen:
             summary["skipped_seen"] += 1
+            continue
+        if dlq_protected(job):
+            _dlq_seen[jid] = now
+            summary["protected"] = summary.get("protected", 0) + 1
+            log.info("dlq %s kind=%s project=%s -> left for its owner (protected)",
+                     jid[:12], job.get("kind", "?"), job.get("project") or "-")
             continue
         if acted >= DLQ_MAX_PER_CYCLE:
             break
