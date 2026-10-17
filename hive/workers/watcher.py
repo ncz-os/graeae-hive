@@ -79,6 +79,30 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict |
 _IS_MACOS = platform.system() == "Darwin"
 
 
+def _rocm_bin_dirs() -> list[str]:
+    """ROCm installs outside the systemd PATH (/opt/rocm-<ver>/bin). Glob them."""
+    dirs = ["/opt/rocm/bin"]
+    try:
+        import glob as _glob
+
+        dirs += sorted(_glob.glob("/opt/rocm-*/bin"))
+    except Exception:
+        pass
+    return dirs
+
+
+def _find_bin(name: str, extra_dirs: list[str] | None = None) -> str | None:
+    """Locate a tool on PATH or in the given extra dirs (e.g. ROCm's /opt/rocm*/bin)."""
+    p = shutil.which(name)
+    if p:
+        return p
+    for d in extra_dirs or []:
+        cand = os.path.join(d, name)
+        if os.path.exists(cand):
+            return cand
+    return None
+
+
 def static_specs() -> dict:
     """One-shot specs gathered at startup."""
     out = {
@@ -158,21 +182,32 @@ def static_specs() -> dict:
         except Exception:
             pass
     # NVIDIA
-    if shutil.which("nvidia-smi"):
+    _nvsmi = _find_bin("nvidia-smi", ["/usr/bin", "/usr/local/bin", "/usr/sbin"])
+    if _nvsmi:
         try:
-            r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total,driver_version",
+            r = subprocess.run([_nvsmi, "--query-gpu=name,memory.total,driver_version",
                                 "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=5)
             for line in r.stdout.strip().splitlines():
                 parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= 2:
-                    gpus.append({"vendor": "nvidia", "name": parts[0], "vram_mib": int(parts[1]),
+                if len(parts) < 2:
+                    continue
+                name = parts[0]
+                # a probe/unavailable GPU reports [N/A]/N/A — keep the row but
+                # don't fail the loop (int("[N/A]") must not abort the others).
+                try:
+                    vram = int(parts[1])
+                except (TypeError, ValueError):
+                    vram = None
+                if name and name not in ("[N/A]", "N/A"):
+                    gpus.append({"vendor": "nvidia", "name": name, "vram_mib": vram,
                                  "driver": parts[2] if len(parts) > 2 else ""})
         except Exception:
             pass
-    # AMD
-    if shutil.which("rocm-smi"):
+    # AMD/ROCm — the binary is usually at /opt/rocm*/bin, NOT on the systemd PATH
+    _rocsmi = _find_bin("rocm-smi", _rocm_bin_dirs())
+    if _rocsmi:
         try:
-            r = subprocess.run(["rocm-smi", "--showproductname", "--json"], capture_output=True, text=True, timeout=5)
+            r = subprocess.run([_rocsmi, "--showproductname", "--json"], capture_output=True, text=True, timeout=5)
             data = json.loads(r.stdout) if r.stdout.strip() else {}
             for k, v in data.items():
                 if isinstance(v, dict) and ("Card SKU" in v or "GPU ID" in v):
@@ -376,12 +411,16 @@ def dynamic_load() -> dict:
             pass
     # Runtime GPU metrics (added 2026-05-26 for dashboard GPU status panel).
     # nvidia-smi → name, util%, mem MiB, temp C; same shape for rocm-smi (AMD).
+    # Use _find_bin (PATH *and* /opt/rocm*/bin, /usr/sbin) — the live metrics were
+    # blank on hosts whose tools are off-PATH (ACHILLES' rocm-smi), so the GPU
+    # chart showed nothing even though the static specs listed the GPU.
     try:
         gpus_rt = []
-        if shutil.which("nvidia-smi"):
+        _nvsmi_rt = _find_bin("nvidia-smi", ["/usr/bin", "/usr/local/bin", "/usr/sbin"])
+        if _nvsmi_rt:
             try:
                 r = subprocess.run(
-                    ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
+                    [_nvsmi_rt, "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw",
                      "--format=csv,noheader,nounits"],
                     capture_output=True, text=True, timeout=5,
                 )
@@ -400,9 +439,10 @@ def dynamic_load() -> dict:
                             })
             except Exception:
                 pass
-        if shutil.which("rocm-smi"):
+        _rocsmi_rt = _find_bin("rocm-smi", _rocm_bin_dirs())
+        if _rocsmi_rt:
             try:
-                r = subprocess.run(["rocm-smi", "--showproductname", "--showuse", "--showmemuse",
+                r = subprocess.run([_rocsmi_rt, "--showproductname", "--showuse", "--showmemuse",
                                     "--showtemp", "--showpower", "--json"],
                                    capture_output=True, text=True, timeout=5)
                 data = json.loads(r.stdout) if r.stdout.strip() else {}

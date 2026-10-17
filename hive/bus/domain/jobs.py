@@ -97,25 +97,89 @@ def stable_worker_id(urn: str) -> str:
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
 MAX_DECLINE_REQUEUES = 3
+# Reasons emitted by a worker's release path that are JOB-LEVEL unschedulable: a
+# property of the job alone (its id, its head_branch), so no worker on any host
+# can ever run it and requeueing only loops. These count toward the decline
+# dead-letter threshold.
+JOB_LEVEL_DECLINE_REASONS: tuple[str, ...] = (
+    "malformed_job_id",
+    "invalid_head_branch",
+)
+
+# Extra operator-visible credits granted to the DEPLOYMENT-DEPENDENT release
+# reason ``no_repo_mapping`` (see is_unresolvable_release).
+NO_REPO_MAPPING_DECLINE_BUDGET = 20
+
+# The workspace reasons in DECLINE_REASON_PREFIXES that take a ``:<detail>``
+# suffix on the wire (e.g. "no_workspace_for_kind:read-only").
+WORKSPACE_DECLINE_REASONS: tuple[str, ...] = (
+    "no_workspace_for_kind",
+    "no_workspace_for_repo",
+)
+
 DECLINE_REASON_PREFIXES: tuple[str, ...] = (
     "no_workspace_for_kind",
     "no_workspace_for_repo",
-    # Worker-side JOB-LEVEL unschedulable reasons (hive_worker.py release_job):
-    # no worker can ever run these jobs, so without counting them the reclaim loop
-    # requeues forever (observed live 2026-10-16: a job with worker_error
-    # no_repo_mapping climbed to retry_count=5 with no dead-letter). Count them so
-    # the thrash guard terminates the loop.
-    "no_repo_mapping",
-    "malformed_job_id",
-    "invalid_head_branch",
+    # Worker-side JOB-LEVEL unschedulable reasons (hive_worker.py release_job).
+    # Count them so the thrash guard terminates a loop no host can break.
+    *JOB_LEVEL_DECLINE_REASONS,
 )  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
+# NOTE: "no_repo_mapping" is deliberately NOT in the tuple above (audit
+# BLOCKING-1, 2026-10-16). It is a WORKER-DEPLOYMENT condition -- the deployed
+# worker's REPO_MAP holds 16 repos while the bus catalog holds 123, so the reason
+# says "this worker file is stale", not "this job can never run". Counting it at
+# the normal threshold killed legitimate jobs in ~70s. It is counted only when
+# the job's repo is GENUINELY absent from the catalog: see is_unresolvable_release.
 
 
-def is_unresolvable_release(reason: str) -> bool:
-    """True if ``reason`` is a job-level unschedulable release that should count
-    toward the dead-letter threshold (exact match or ``reason:<detail>`` form)."""
+def is_unresolvable_release(reason: str, *, job_repo: str | None = None) -> bool:
+    """True if ``reason`` should COUNT toward the decline dead-letter threshold.
+
+    Job-level reasons (`DECLINE_REASON_PREFIXES` -- ``malformed_job_id``,
+    ``invalid_head_branch``, the workspace reasons) count unconditionally: no
+    host can ever run such a job.
+
+    ``no_repo_mapping`` is deployment-dependent (the worker's REPO_MAP vs the
+    bus catalog), so it counts only when the job's repo is genuinely absent
+    from the in-process catalog (`repo_in_catalog`, no HTTP). For a
+    catalog-present repo the WORKER is stale (deploy drift) and the job must be
+    requeued/routed, not dead-lettered (audit BLOCKING-1). A genuinely absent
+    repo is counted on the larger `NO_REPO_MAPPING_DECLINE_BUDGET`; the caller
+    owns that threshold comparison.
+    """
     r = reason or ""
-    return r in DECLINE_REASON_PREFIXES or any(r.startswith(p + ":") for p in DECLINE_REASON_PREFIXES)
+    if r in JOB_LEVEL_DECLINE_REASONS or any(r.startswith(p + ":") for p in JOB_LEVEL_DECLINE_REASONS):
+        return True
+    if any(r == p or r.startswith(p + ":") for p in WORKSPACE_DECLINE_REASONS):
+        return True
+    if r == "no_repo_mapping" or r.startswith("no_repo_mapping:"):
+        return not repo_in_catalog(job_repo)
+    return False
+
+
+def repo_in_catalog(job_repo: str | None) -> bool:
+    """Whether ``job_repo`` is a known repo in the BUS catalog.
+
+    Uses the in-process catalog (`hive.repos`, loaded from ``data/repos.json``)
+    -- never an HTTP call on the job release hot path. A job with no repo can
+    never be resolved by a worker, so it is NOT "catalog-present": it takes the
+    genuine no_repo_mapping path. An unreadable/missing catalog fails OPEN
+    (returns True, i.e. "might be present"): failing closed would dead-letter a
+    repo we simply could not look up, which is the BLOCKING-1 failure mode.
+    """
+    repo = (job_repo or "").strip()
+    if not repo:
+        return False
+    try:
+        from hive import repos as _repo_catalog
+
+        # EXACT match only (audit BLOCKING-1 follow-up): the fuzzy ranker made a
+        # genuinely-absent repo whose name is a prefix/substring of a catalog id
+        # ("raeae-hive" vs "graeae-hive") look catalog-present, so no_repo_mapping
+        # was never counted and the job requeued forever.
+        return _repo_catalog.find_exact(repo) is not None
+    except Exception:  # noqa: BLE001 - catalog unavailable: do not kill the job
+        return True
 
 
 STATUS_TRANSITIONS: dict[str, set[str]] = {
@@ -151,6 +215,34 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
 
 
+def is_readonly_kind(job_kind: str) -> bool:
+    """Whether ``job_kind`` names a read-only kind, at a TOKEN BOUNDARY.
+
+    ``ADMISSION_NONCOMMIT_PREFIXES`` mixes delimited entries (``docs:``,
+    ``track:``, ``ops:``, ``diag:``, ``ping:``) with bare ones (``review``,
+    ``analysis``, ``investigation``, ``triage``, ``design``, ``research``,
+    ``architecture``, ...). At admission a bare prefix is a "kind family starts
+    with this word" shorthand, but for the commit-evidence gate it must not
+    swallow an unrelated code kind (audit BLOCKING-2, 2026-10-16): a plain
+    ``startswith`` made ``analysis-pipeline-fix``, ``reviewer-migration`` and
+    ``design-system-update`` exempt even with a repo set.
+
+    A kind is read-only only when it EQUALS a bare prefix or starts with
+    ``<prefix>:``. Any other character after the prefix (``e`` in ``reviewer``,
+    ``-`` in ``analysis-pipeline``) means NOT read-only. Delimited prefixes are
+    unchanged: ``docs:x`` exempt, ``docs`` itself exempt (equals the prefix
+    minus its ``:``).
+    """
+    k = str(job_kind or "")
+    for p in ADMISSION_NONCOMMIT_PREFIXES:
+        if p.endswith(":"):
+            if k == p or k.startswith(p):
+                return True
+        elif k == p or k.startswith(p + ":"):
+            return True
+    return False
+
+
 def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
     """Whether a ``done`` job must carry commit evidence.
 
@@ -159,9 +251,12 @@ def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
     under review) must NOT be held to the commit-evidence gate. Regression
     2026-10-16: ``review:...`` with ``repo`` set went ``needs-review`` with
     ``completion_evidence_missing`` despite a clean verified run.
+
+    The exemption is matched at a token boundary only — see
+    :func:`is_readonly_kind` (audit BLOCKING-2).
     """
     k = str(job_kind or "")
-    if any(k.startswith(p) for p in ADMISSION_NONCOMMIT_PREFIXES):
+    if is_readonly_kind(k):
         return False
     return (
         bool(job_repo)

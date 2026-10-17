@@ -173,6 +173,31 @@ def get_repo(repo_id: str, *, host: str | None = None) -> dict[str, Any] | None:
     return to_dict(entry, host=host) if entry else None
 
 
+def find_exact(repo_id: str) -> dict[str, Any] | None:
+    """EXACT catalog lookup: id, then case-insensitive id/display_name/alias.
+
+    Deliberately NOT :func:`resolve`. ``resolve`` is a fuzzy prefix/substring
+    ranker, so a query like ``"hive"`` matches the catalog entry ``graeae-hive``
+    by SUBSTRING -- callers that need "is this repo genuinely in the catalog"
+    (e.g. the decline classifier) would wrongly treat an absent repo as
+    present. This helper only ever returns rank-0 matches.
+    """
+    key = (repo_id or "").strip()
+    if not key:
+        return None
+    catalog = load_catalog()
+    entry = catalog.get(key)
+    if entry is not None:
+        return entry
+    lowered = key.lower()
+    for candidate in catalog.values():
+        names = {candidate["id"].lower(), (candidate.get("display_name") or "").lower()}
+        names |= {a.lower() for a in (candidate.get("aliases") or [])}
+        if lowered in names:
+            return candidate
+    return None
+
+
 def resolve(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
     """Ranked fuzzy match over id / display_name / aliases (exact > prefix > substring).
 
