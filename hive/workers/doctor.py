@@ -150,28 +150,42 @@ DOCTOR_FALLBACK_MODELS: list[str] = [
 ]
 
 
-def _fallback_rungs(phase_base: str) -> list[tuple[str, str]]:
+def _phase_model(phase: str) -> str:
+    """The model id the operator configured for this phase.
+
+    DOCTOR_<PHASE>_MODEL, falling back to the doctor-wide open-weight model for
+    an unknown phase. A Codex/GPT alias can never be returned (Codex never runs
+    unattended — operator rule 2026-10-10), and neither can an empty value."""
+    alias = (_PHASE_MODELS.get(phase) or "").strip()
+    if not alias or _is_codex_alias(alias):
+        return DOCTOR_OPENWEIGHT_MODEL
+    return alias
+
+
+def _fallback_rungs(phase_base: str, phase_model: str | None = None) -> list[tuple[str, str]]:
     """(base_url, model_id) rungs to try after the phase base.
 
     One rung per DOCTOR_FALLBACK_BASE_URLS entry, excluding the phase base
-    itself. A missing parallel model id falls back to the phase model (an
-    operator who only overrides DOCTOR_FALLBACK_BASE_URLS still gets a
-    coherent request). Duplicate bases are collapsed.
-    """
-    phase_model = _PHASE_MODELS.get("triage", DOCTOR_TRIAGE_MODEL)
+    itself. DOCTOR_FALLBACK_MODELS is the parallel model list; the two lists may
+    differ in length in either direction:
+      - more bases than models  -> the trailing bases reuse ``phase_model``
+        (never an index into a shorter list),
+      - more models than bases  -> the extra models are unused.
+    Duplicate bases are collapsed. Nothing here can raise IndexError."""
+    default_model = (phase_model or "").strip() or DOCTOR_OPENWEIGHT_MODEL
     rungs: list[tuple[str, str]] = []
     seen = {phase_base.rstrip("/")}
-    for idx, base in enumerate(DOCTOR_FALLBACK_BASE_URLS):
-        base = base.rstrip("/")
+    for idx, raw_base in enumerate(DOCTOR_FALLBACK_BASE_URLS):
+        base = (raw_base or "").strip().rstrip("/")
         if not base or base in seen:
             continue
         seen.add(base)
         model = (
-            DOCTOR_FALLBACK_MODELS[idx]
+            (DOCTOR_FALLBACK_MODELS[idx] or "").strip()
             if idx < len(DOCTOR_FALLBACK_MODELS)
-            else phase_model
+            else ""
         )
-        rungs.append((base, model or phase_model))
+        rungs.append((base, model or default_model))
     return rungs
 
 
@@ -764,19 +778,19 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
             )
         model_alias = DOCTOR_OPENWEIGHT_MODEL
 
-    phase_model = _PHASE_MODELS.get("review", DOCTOR_OPENWEIGHT_MODEL)
-    if phase_model in _CODEX_ALIASES or not phase_model:
-        phase_model = DOCTOR_OPENWEIGHT_MODEL
+    phase_model = _phase_model(phase)
     phase_base = _PHASE_BASE_URLS.get(phase, DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 
     # Try the phase base first, then the local failover rungs.
     chain: list[tuple[str, str]] = [(phase_base, phase_model)]
-    chain.extend(_fallback_rungs(phase_base))
+    chain.extend(_fallback_rungs(phase_base, phase_model))
 
     last_base, last_reason = phase_base, ""
     for idx, (base, model) in enumerate(chain):
+        # Pass the model ONLY as the keyword: _invoke_openweight's second
+        # positional parameter is the alias label, not the model id.
         ok, text = _invoke_openweight(
-            prompt, model, base_url=base, model=model
+            prompt, model_alias, base_url=base, model=model
         )
         if ok and text.strip():
             if idx == 0:

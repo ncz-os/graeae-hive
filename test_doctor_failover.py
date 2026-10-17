@@ -245,3 +245,121 @@ def test_codex_alias_still_uses_the_failover_chain(doctor, monkeypatch):
     ok, _ = doctor.invoke_doctor_agent("diagnose", phase="triage")
     assert ok
     assert rec.bases == [HYDRA, ACHILLES]
+
+
+# ─────────────── per-phase model selection (regression, 2026-10-17) ───────────────
+# The first implementation looked the phase model up under the literal key
+# "review", so a triage call was sent with the REVIEW model and every failover
+# rung reused it. These tests pin the model actually sent on the wire.
+def _wire_models(rec):
+    return [json.loads(c["body"])["model"] for c in rec.calls]
+
+
+def test_triage_uses_the_triage_model_not_the_review_model(doctor, monkeypatch):
+    monkeypatch.setitem(doctor._PHASE_MODELS, "triage", "gemma4-e2b")
+    monkeypatch.setitem(doctor._PHASE_MODELS, "review", "review-only-model")
+    rec = _install(doctor, monkeypatch, {HYDRA: '{"action_type":"no_action"}'})
+    ok, _ = doctor.invoke_doctor_agent("diagnose", phase="triage")
+    assert ok
+    assert _wire_models(rec) == ["gemma4-e2b"]
+
+
+def test_review_uses_the_review_model(doctor, monkeypatch):
+    monkeypatch.setitem(doctor._PHASE_MODELS, "review", "review-only-model")
+    rec = _install(doctor, monkeypatch, {ACHILLES: '{"action_type":"no_action"}'})
+    ok, _ = doctor.invoke_doctor_agent("verify", phase="review")
+    assert ok
+    assert _wire_models(rec) == ["review-only-model"]
+
+
+def test_fix_phase_uses_the_fix_model(doctor, monkeypatch):
+    monkeypatch.setenv("DOCTOR_FIX_MODEL", "gemma4-e2b")
+    monkeypatch.setenv("DOCTOR_FIX_BASE_URL", ACHILLES)
+    from hive.workers import doctor as _doctor
+
+    d = importlib.reload(_doctor)
+    rec = _install(d, monkeypatch, {ACHILLES: '{"action_type":"no_action"}'})
+    ok, _ = d.invoke_doctor_agent("apply", phase="fix")
+    assert ok
+    assert _wire_models(rec) == ["gemma4-e2b"]
+
+
+def test_unknown_phase_falls_back_to_the_doctor_wide_model(doctor, monkeypatch):
+    rec = _install(doctor, monkeypatch, {CERBERUS: '{"action_type":"no_action"}'})
+    ok, _ = doctor.invoke_doctor_agent("diagnose", phase="nonesuch")
+    assert ok
+    # unknown phase -> DOCTOR_OPENWEIGHT_BASE_URL + DOCTOR_OPENWEIGHT_MODEL
+    assert _wire_models(rec) == [doctor.DOCTOR_OPENWEIGHT_MODEL]
+
+
+def test_failover_rungs_carry_the_phase_model_when_models_list_is_short(doctor, monkeypatch):
+    monkeypatch.setitem(doctor._PHASE_MODELS, "triage", "triage-model")
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_BASE_URLS", [HYDRA, ACHILLES, CERBERUS])
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_MODELS", ["achilles-model"])
+    rec = _install(doctor, monkeypatch, {})
+    doctor.invoke_doctor_agent("diagnose", phase="triage")
+    # The chain is the phase base plus one rung per non-duplicate base, in
+    # list order: HYDRA (phase base), then ACHILLES and CERBERUS. Models are
+    # indexed against DOCTOR_FALLBACK_BASE_URLS, so ACHILLES (idx 1) and
+    # CERBERUS (idx 2) have no parallel entry and reuse the TRIAGE model —
+    # no IndexError, no silent "review" model.
+    assert rec.bases == [HYDRA, ACHILLES, CERBERUS]
+    assert _wire_models(rec) == ["triage-model", "triage-model", "triage-model"]
+
+
+def test_models_list_longer_than_bases_is_harmless(doctor, monkeypatch):
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_BASE_URLS", [HYDRA, ACHILLES])
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_MODELS", ["m-a", "m-b", "m-c", "m-d"])
+    rungs = doctor._fallback_rungs(HYDRA, "phase-model")
+    assert rungs == [(ACHILLES, "m-b")]
+
+
+def test_empty_models_list_never_raises_and_uses_phase_model(doctor, monkeypatch):
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_BASE_URLS", [HYDRA, ACHILLES, CERBERUS])
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_MODELS", [])
+    rungs = doctor._fallback_rungs(HYDRA, "phase-model")
+    assert rungs == [(ACHILLES, "phase-model"), (CERBERUS, "phase-model")]
+
+
+def test_blank_rung_model_falls_back_to_phase_model(doctor, monkeypatch):
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_BASE_URLS", [HYDRA, ACHILLES])
+    monkeypatch.setattr(doctor, "DOCTOR_FALLBACK_MODELS", ["   ", ""])
+    assert doctor._fallback_rungs(HYDRA, "phase-model") == [(ACHILLES, "phase-model")]
+
+
+def test_fallback_bases_may_be_longer_or_shorter_than_models_via_env(monkeypatch):
+    monkeypatch.setenv("DOCTOR_TRIAGE_MODEL", "gemma4-e2b")
+    monkeypatch.setenv(
+        "DOCTOR_FALLBACK_BASE_URLS", f"{HYDRA},{ACHILLES},{CERBERUS}"
+    )
+    monkeypatch.setenv("DOCTOR_FALLBACK_MODELS", "gemma4-e2b")
+    from hive.workers import doctor as _doctor
+
+    d = importlib.reload(_doctor)
+    assert d._fallback_rungs(HYDRA, "gemma4-e2b") == [
+        (ACHILLES, "gemma4-e2b"),
+        (CERBERUS, "gemma4-e2b"),
+    ]
+
+
+def test_phase_model_never_returns_a_codex_alias_or_empty(doctor, monkeypatch):
+    monkeypatch.setitem(doctor._PHASE_MODELS, "triage", "gpt-5.6-luna")
+    assert doctor._phase_model("triage") == doctor.DOCTOR_OPENWEIGHT_MODEL
+    monkeypatch.setitem(doctor._PHASE_MODELS, "triage", "   ")
+    assert doctor._phase_model("triage") == doctor.DOCTOR_OPENWEIGHT_MODEL
+    assert doctor._phase_model("nonesuch") == doctor.DOCTOR_OPENWEIGHT_MODEL
+
+
+def test_invoke_openweight_gets_model_only_as_keyword(doctor, monkeypatch):
+    """The 2nd positional param is an alias label; a duplicate model= kwarg
+    would be a TypeError at call time."""
+    seen = []
+
+    def fake_invoke(prompt, model_alias, *, base_url=None, model=None):
+        seen.append({"alias": model_alias, "base": base_url, "model": model})
+        return True, '{"action_type":"no_action"}'
+
+    monkeypatch.setattr(doctor, "_invoke_openweight", fake_invoke)
+    ok, _ = doctor.invoke_doctor_agent("diagnose", phase="triage")
+    assert ok
+    assert seen == [{"alias": "gemma4-e2b", "base": HYDRA, "model": "gemma4-e2b"}]
