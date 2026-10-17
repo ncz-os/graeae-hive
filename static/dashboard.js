@@ -67,18 +67,49 @@ function setStatus(msg,isErr=false){
   el.textContent=msg;el.className=isErr?'err':'';
 }
 function clearForm(){
-  ['f-desc','f-project'].forEach(id=>document.getElementById(id).value='');
+  ['f-desc','f-project','f-repo','f-head-branch'].forEach(id=>document.getElementById(id).value='');
   document.getElementById('f-priority').value=50;
   document.getElementById('f-kind').value='investigation';
   document.getElementById('f-tier').value='B';
   document.getElementById('f-eligible').value='';
+  clearCarryover();
   cancelEdit();
   setStatus('');
 }
 function cancelEdit(){
   _editingJobId=null;
+  clearCarryover();
   document.getElementById('edit-banner').className='';
   document.getElementById('submit-title').textContent='New Job';
+}
+// ── hidden carry-over state for resubmits ─────────────────────────────
+// Fields that are not shown as editable inputs (required_capabilities,
+// max_retries, eligible_hosts) plus the original job id, so a resubmit can
+// preserve the source job's routing. Plain form inputs (repo, head_branch)
+// are read directly from #f-repo / #f-head-branch at submit time.
+let _carryover=null;
+function setCarryover(job,opts={}){
+  _carryover={
+    parent_job_id:opts.parent_job_id??(job&&job.id||null),
+    required_capabilities:(job&&job.required_capabilities)||null,
+    max_retries:(job&&typeof job.max_retries==='number')?job.max_retries:null,
+    eligible_hosts:(job&&job.eligible_hosts)||null,
+    site:(job&&job.site)||null,
+    pr_number:(job&&typeof job.pr_number==='number')?job.pr_number:null,
+  };
+}
+function clearCarryover(){
+  _carryover=null;
+}
+function fillFormFromJob(job){
+  document.getElementById('f-desc').value=job.description||'';
+  document.getElementById('f-priority').value=job.priority||50;
+  document.getElementById('f-project').value=job.project||'';
+  setSelectOrAdd(document.getElementById('f-kind'),job.kind||'investigation');
+  document.getElementById('f-tier').value=(job.max_cost_tier||'B').toUpperCase();
+  document.getElementById('f-eligible').value=(job.eligible_kinds||[]).join(', ');
+  document.getElementById('f-repo').value=job.repo||'';
+  document.getElementById('f-head-branch').value=job.head_branch||'';
 }
 function setSelectOrAdd(selectEl, value){
   if(!value)return;
@@ -93,13 +124,8 @@ function setSelectOrAdd(selectEl, value){
 }
 function fillFormForEdit(job){
   _editingJobId=job.id;
-  document.getElementById('f-desc').value=job.description||'';
-  document.getElementById('f-priority').value=job.priority||50;
-  document.getElementById('f-project').value=job.project||'';
-  setSelectOrAdd(document.getElementById('f-kind'),job.kind||'investigation');
-  document.getElementById('f-tier').value=(job.max_cost_tier||'B').toUpperCase();
-  const ek=(job.eligible_kinds||[]);
-  document.getElementById('f-eligible').value=ek.join(', ');
+  fillFormFromJob(job);
+  setCarryover(job);
   document.getElementById('edit-banner').className='show';
   document.getElementById('submit-title').textContent='Edit Job';
   if(!_submitOpen)toggleSubmit();
@@ -113,6 +139,13 @@ async function submitJob(){
   if(!desc){setStatus('Description required',true);return;}
   const eligible=document.getElementById('f-eligible').value
     .split(',').map(s=>s.trim()).filter(Boolean);
+  const repo=document.getElementById('f-repo').value.trim();
+  const headBranch=document.getElementById('f-head-branch').value.trim();
+  // Resubmitting a job that had a repo, with the repo left blank, would
+  // create a repo=None job that no worker can map (no_repo_mapping) and
+  // dead-letters in ~70s. Warn — but allow the submit.
+  const _co=_carryover;
+  const _warnedRepo=_co&&_co.parent_job_id&&repo==='';
   const body={
     submitter_urn:_myUrn,
     kind:document.getElementById('f-kind').value,
@@ -121,6 +154,14 @@ async function submitJob(){
     max_cost_tier:document.getElementById('f-tier').value,
     eligible_kinds:eligible.length?eligible:undefined,
     project:document.getElementById('f-project').value.trim()||undefined,
+    site:_co&&_co.site||undefined,
+    repo:repo||undefined,
+    head_branch:headBranch||undefined,
+    pr_number:_co&&_co.pr_number||undefined,
+    parent_job_id:_co&&_co.parent_job_id||undefined,
+    required_capabilities:_co&&_co.required_capabilities||undefined,
+    max_retries:_co&&typeof _co.max_retries==='number'?_co.max_retries:undefined,
+    eligible_hosts:_co&&_co.eligible_hosts||undefined,
   };
   const btn=document.getElementById('submit-btn');
   btn.disabled=true;
@@ -138,6 +179,7 @@ async function submitJob(){
     } else {
       setStatus(`✓ Job ${shortId} queued — watching for agent pickup…`);
     }
+    if(_warnedRepo)setStatus(`⚠ Resubmitted WITHOUT a repo (source job had one) — workers can't map it, it will likely dead-letter. Reopen with repo filled in if that was a mistake.`,true);
     clearForm();
     await refreshAll();
   }catch(e){
@@ -555,12 +597,8 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
   if(!j)return;
   // Pre-fill form but don't cancel the failed job on submit (it's already done)
   _editingJobId=null;
-  document.getElementById('f-desc').value=j.description||'';
-  document.getElementById('f-priority').value=j.priority||50;
-  document.getElementById('f-project').value=j.project||'';
-  setSelectOrAdd(document.getElementById('f-kind'),j.kind||'investigation');
-  document.getElementById('f-tier').value=(j.max_cost_tier||'B').toUpperCase();
-  document.getElementById('f-eligible').value=(j.eligible_kinds||[]).join(', ');
+  fillFormFromJob(j);
+  setCarryover(j,{parent_job_id:j.id}); // new job is a child of the failed one
   document.getElementById('edit-banner').className='';
   document.getElementById('submit-title').textContent='Resubmit Job';
   if(!_submitOpen)toggleSubmit();
@@ -575,23 +613,27 @@ async function triageAndResubmit(id){
   const reason=r.failure_reason||r.stderr||r.error||r.summary||'(no failure detail)';
   const triageDesc=`Triage this failed Hive job and recommend a corrected resubmit.\n\nFailed kind: ${j.kind}\nPriority: ${j.priority}\nEligible: ${(j.eligible_kinds||[]).join(', ')}\n\nOriginal description:\n${j.description||''}\n\nFailure output:\n${String(reason).slice(0,800)}`;
   try{
+    // Operator rule: Codex runs only on explicit request — never a default
+    // target. Triage is read-only (exempt from the commit gate), so it routes
+    // to the zeroclaw workers via the flash route; the old default of the two
+    // non-fleet kinds dead-lettered every triage job (2026-10-17).
     const tr=await api('POST','/v1/jobs',{
       submitter_urn:_myUrn,
-      kind:'triage',
+      kind:'triage:'+(j.kind||'investigation'),
       description:triageDesc,
       priority:Math.min((j.priority||50)+10,100),
-      eligible_kinds:['codex','claude'],
+      eligible_kinds:['zeroclaw'],
+      required_capabilities:['route:flash'],
+      repo:j.repo||undefined,
+      head_branch:j.head_branch||undefined,
+      parent_job_id:j.id,
       project:j.project||undefined,
     });
     setStatus(`✓ Triage job ${tr.id.slice(0,8)} queued — review form below then submit corrected job`);
     // Pre-fill form for the corrected resubmit
     _editingJobId=null;
-    document.getElementById('f-desc').value=j.description||'';
-    document.getElementById('f-priority').value=j.priority||50;
-    document.getElementById('f-project').value=j.project||'';
-    setSelectOrAdd(document.getElementById('f-kind'),j.kind||'investigation');
-    document.getElementById('f-tier').value=(j.max_cost_tier||'B').toUpperCase();
-    document.getElementById('f-eligible').value=(j.eligible_kinds||[]).join(', ');
+    fillFormFromJob(j);
+    setCarryover(j,{parent_job_id:j.id});
     document.getElementById('edit-banner').className='';
     document.getElementById('submit-title').textContent='Corrected Resubmit (after triage)';
     if(!_submitOpen)toggleSubmit();

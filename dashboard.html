@@ -60,9 +60,19 @@
         </select>
       </div>
     </div>
-    <div class="form-row">
-      <label>Eligible kinds (comma-separated, blank = any)</label>
-      <input type="text" id="f-eligible" placeholder="opencode, codex, zeroclaw">
+    <div class="form-row-3">
+      <div class="form-row" style="margin:0">
+        <label>Repo (optional)</label>
+        <input type="text" id="f-repo" placeholder="owner/name, e.g. graeae/hive">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label>Head branch (optional)</label>
+        <input type="text" id="f-head-branch" placeholder="branch / PR head to check out">
+      </div>
+      <div class="form-row" style="margin:0">
+        <label>Eligible kinds (comma-separated, blank = any)</label>
+        <input type="text" id="f-eligible" placeholder="opencode, codex, zeroclaw">
+      </div>
     </div>
     <div class="form-row">
       <label>Project tag (optional)</label>
