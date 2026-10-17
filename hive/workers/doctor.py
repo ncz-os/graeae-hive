@@ -426,10 +426,19 @@ def register() -> str:
     sys.exit(1)
 
 
+# Codes that mean "the bus does not know this URN (any more) — re-register".
+# 404 is the historic answer; the bus now returns 409 for an unknown agent URN
+# (so workers self-heal, 2026-10-16). Both are self-heal signals, not errors.
+REREGISTER_CODES = (404, 409)
+
+
 def heartbeat():
     code, _ = _http("POST", "/v1/agents/heartbeat", {"urn": _urn, "status": "online"})
-    if code == 404:
-        log.warning("heartbeat 404 — re-registering")
+    if code in REREGISTER_CODES:
+        # Without this a ghost doctor (URN reaped after a stall, or bus restored)
+        # gets a 409 on every heartbeat and spins forever: BLOCKING-3 in
+        # docs/audit-3-fixes-20261016.md. 404 stays handled for older buses.
+        log.warning("heartbeat %s (agent not registered) — re-registering", code)
         register()
 
 
@@ -490,7 +499,13 @@ def claim_next_job() -> dict | None:
             release_out_of_scope_job(job)
             return None
         return job
-    if code not in (0, 204, 404):
+    if code in REREGISTER_CODES:
+        # Expected re-register signal (unknown URN / not online-idle), not an
+        # error: the heartbeat loop heals it. Logging here warned every poll
+        # (ADVISORY-2 in docs/audit-3-fixes-20261016.md).
+        log.debug("claim_next %s — awaiting re-register", code)
+        return None
+    if code != 0:
         log.warning("claim_next %s: %s", code, str(resp)[:200])
     return None
 
