@@ -239,11 +239,11 @@ def _doctor_scope_allowed(job: dict[str, Any], kinds: set[str]) -> tuple[bool, s
     eligible_kinds alone. We now enforce the doctor scope explicitly here:
 
       1. Explicit opt-in: a job whose eligible_kinds lists 'doctor' is in
-         scope regardless of its kind prefix (the only way a doctor takes a
-         non-triage/doctor: kind).
+         scope regardless of its kind prefix -- UNLESS the kind is on
+         DOCTOR_JOB_KIND_EXCLUDE_PREFIXES, which is always excluded even
+         with an explicit opt-in (see rule 5 below).
       2. Otherwise the job kind must start with one of DOCTOR_JOB_KIND_PREFIXES
-         ("triage:", "doctor:") and not DOCTOR_JOB_KIND_EXCLUDE_PREFIXES
-         ("doctor:codex-fix:" -- those are round-tripped by zero-triage).
+         ("triage:", "doctor:").
       3. The wildcard "*" in eligible_kinds is NEVER an opt-in for a doctor
          (that is exactly what leaked worker jobs to the doctor in the first
          place). It is treated as if it were not present.
@@ -252,8 +252,32 @@ def _doctor_scope_allowed(job: dict[str, Any], kinds: set[str]) -> tuple[bool, s
          not doctor ones. They are stripped from the kinds set before the
          opt-in check, so a job listing ['zeroclaw'] cannot claim to opt in
          just because the doctor happens to be one of many kinds.
+      5. DOCTOR_JOB_KIND_EXCLUDE_PREFIXES ("doctor:codex-fix:") is ALWAYS
+         excluded -- even with an explicit 'doctor' opt-in. Those dispatches
+         are submitted by the doctor itself (action_dispatch_codex_fix,
+         eligible_kinds=['zeroclaw']) and round-tripped by zero-triage
+         (zeroclaw_doctor.py consumes them via /v1/jobs/next); the doctor
+         dispatches them but never executes one. The exclude check therefore
+         runs BEFORE the opt-in check, so a 'doctor:codex-fix:*' job with
+         eligible_kinds=['doctor'] is rejected, not opted in.
     """
     j_kind = _norm_str(job.get("kind"))
+
+    # The exclude check ALWAYS runs -- before the opt-in check -- so a job
+    # whose kind is 'doctor:codex-fix:*' (a doctor-dispatched codex-fix job)
+    # cannot be claimed by the doctor regardless of whether eligible_kinds
+    # lists 'doctor'. Those jobs are submitted with eligible_kinds=['zeroclaw']
+    # and consumed by the zeroclaw worker via the zero-triage round trip;
+    # the doctor dispatching them is the only legitimate path and it goes
+    # straight to the worker -- the doctor never executes one itself.
+    if j_kind.startswith(DOCTOR_JOB_KIND_EXCLUDE_PREFIXES):
+        return (
+            False,
+            f"doctor out of scope for excluded kind {j_kind!r} (codex-fix "
+            "dispatch -- round-tripped by zero-triage, not executed by the "
+            "doctor; the exclude applies even with an explicit 'doctor' "
+            "opt-in in eligible_kinds)",
+        )
 
     # Strip executor aliases and the wildcard from the kinds set: none of
     # those are opt-ins for a doctor agent. Only a literal "doctor" entry
@@ -264,11 +288,6 @@ def _doctor_scope_allowed(job: dict[str, Any], kinds: set[str]) -> tuple[bool, s
 
     if DOCTOR_KIND in opt_in_kinds:
         return True, "eligible"
-    if j_kind.startswith(DOCTOR_JOB_KIND_EXCLUDE_PREFIXES):
-        return False, (
-            f"doctor out of scope for excluded kind {j_kind!r} (codex-fix dispatch -- "
-            "round-tripped by zero-triage, not executed by the doctor)"
-        )
     if j_kind.startswith(DOCTOR_JOB_KIND_PREFIXES):
         return True, "eligible"
     return (

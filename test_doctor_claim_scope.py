@@ -152,6 +152,20 @@ def test_doctor_ineligible_for_its_own_codex_fix_dispatch():
     assert "codex-fix" in reason
 
 
+def test_doctor_ineligible_for_codex_fix_dispatch_even_with_explicit_doctor_opt_in():
+    # The 'doctor:codex-fix:' exclude ALWAYS applies -- even when a job
+    # explicitly lists 'doctor' in eligible_kinds. Those dispatches are
+    # round-tripped by zero-triage (zeroclaw_doctor.py consumes them via
+    # eligible_kinds=['zeroclaw']), never executed by the doctor itself.
+    # The exclude check runs BEFORE the opt-in check so this is rejected
+    # even though 'doctor' is a literal opt-in.
+    ok, reason = job_agent_eligible(
+        _job("doctor:codex-fix:1729000000", ["doctor"]), _agent("doctor")
+    )
+    assert ok is False, reason
+    assert "codex-fix" in reason
+
+
 def test_doctor_eligible_when_job_lists_doctor_in_eligible_kinds():
     ok, reason = job_agent_eligible(_job("feat:whatever", ["doctor"]), _agent("doctor"))
     assert ok is True, reason
