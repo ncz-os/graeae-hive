@@ -296,10 +296,23 @@ class TestInvariants(unittest.TestCase):
             )
 
     def test_accepts_nemotron35_served_name_as_an_endpoint(self):
-        """'nemotron35' is a live served name on TYDEUS :8010, not a retired token."""
-        self.assertNotIn("nemotron35", mr.RETIRED_ENDPOINT_TOKENS)
+        """'nemotron35' is a live served name on TYDEUS :8010, not retired.
+
+        Operator correction 2026-10-17: the only token ever in the retired
+        table was 'nemotron35' (TYDEUS vLLM :8010 backup under test), and
+        that entry has been retired. ``_retired_endpoint`` therefore walks
+        ``RETIRED_ENDPOINT_PORTS`` only -- a /nemotron35 endpoint is not
+        retired by the only remaining rule (the port is :8010, not :8002
+        or :4100). The retired-port negatives (:8002 and :4100) keep
+        firing for the legacy endpoints.
+        """
+        self.assertFalse(hasattr(mr, "RETIRED_ENDPOINT_TOKENS"))
         self.assertIsNone(mr._retired_endpoint("http://tydeus:8010/v1/nemotron35"))
         self.assertIsNotNone(mr._retired_endpoint("http://tydeus:8002/v1"))
+        # legacy EIH gateway stays retired too
+        self.assertIsNotNone(mr._retired_endpoint("http://eih:4100/v1"))
+        # and the served name appears nowhere as a path-style token
+        self.assertNotIn("nemotron35", str(mr.RETIRED_ENDPOINT_PORTS).lower())
 
     def test_host_slot_lacks_nemotron_host_restriction(self):
         """§3.1 regression lock (operator correction 2026-10-17):

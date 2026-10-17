@@ -89,17 +89,18 @@ KNOWN_ROUTES = frozenset(
     {"knemon", "zoder.coder", "zoder.reviewer", "zoder.reviewer.backup", "zeroclaw.default"}
 )
 DEEPSEEK_DIRECT_ENDPOINT = "https://api.deepseek.com/v1"
-# Retired endpoints: TYDEUS :8002 (the old coder route) and :4100 (the legacy
-# EIH gateway). Any host slot still pointing at one is an error. (The TYDEUS
-# served name "nemotron35" on vLLM :8010 is NOT retired — see the Nemotron
-# note above.) No retired endpoint tokens remain: the only tokens ever
-# registered were retired with the Nemotron host/slot rule (operator
-# correction 2026-10-17).
+# Retired endpoints: TYDEUS :8002 (the old coder route) and :4100 (the
+# legacy EIH gateway). Any host slot still pointing at one is an error.
+# (The TYDEUS served name "nemotron35" on vLLM :8010 is NOT retired — it
+# is a live Nemotron backup-under-test endpoint; see the Nemotron note
+# above.) Operator correction 2026-10-17 retired the only ever-registered
+# path-style tokens along with the Nemotron host/slot rule, so the old
+# RETIRED_ENDPOINT_TOKENS constant is gone; matching retired-endpoint
+# substrings now live in RETIRED_ENDPOINT_PORTS only.
 RETIRED_ENDPOINT_PORTS = (
     ("8002", "TYDEUS :8002 (retired coder route)"),
     ("4100", "legacy EIH gateway :4100 (retired)"),
 )
-RETIRED_ENDPOINT_TOKENS: tuple[str, ...] = ()
 
 
 class RegistryError(ValueError):
@@ -338,13 +339,19 @@ def _slot_route(slot: str) -> str:
 
 
 def _retired_endpoint(endpoint: str) -> str | None:
-    """Return the retired-endpoint label if ``endpoint`` points at one."""
+    """Return the retired-endpoint label if ``endpoint`` points at one.
+
+    The retired-port table is the single source of truth: every endpoint
+    that was ever retired carried a forbidden port (:8002 / :4100). The
+    retired-token table was retired alongside the Nemotron host/slot
+    rule (operator correction 2026-10-17) because the only token ever
+    registered was 'nemotron35' on TYDEUS vLLM :8010, which is a live
+    served name, not a retired path. ``_retired_endpoint`` therefore
+    scans only ``RETIRED_ENDPOINT_PORTS``.
+    """
     ep = endpoint.strip().lower()
     if not ep:
         return None
-    for token in RETIRED_ENDPOINT_TOKENS:
-        if token in ep:
-            return f"retired endpoint token {token!r}"
     for port, label in RETIRED_ENDPOINT_PORTS:
         if re.search(rf":{port}(?!\d)", ep):
             return label
