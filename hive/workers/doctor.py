@@ -1375,6 +1375,10 @@ def scan_for_failure_clusters() -> list[dict]:
         bk = _base_kind(j.get("kind", ""))
         if not bk or bk.startswith("triage:") or bk.startswith("doctor:"):
             continue
+        # Owners who handle their own failures (DLQ_PROTECT_*) are left alone
+        # here too, not only in the dead-letter sweep.
+        if dlq_protected(j):
+            continue
         counts.setdefault(bk, []).append(j)
     clusters = []
     now = time.time()
