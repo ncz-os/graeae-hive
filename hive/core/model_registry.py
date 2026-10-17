@@ -18,9 +18,9 @@ CLI::
 
 Invariants enforced (as code, not comments):
 
-* Nemotron — ``nvidia/nemotron-3-ultra-550b-a55b`` is the only Nemotron served
-  through NVIDIA EIH, and is a backup REVIEWER. It may never be a knemon (bus
-  router) candidate or a coder route.
+* Nemotron — ``nvidia/nemotron-3-ultra-550b-a55b`` is the one Nemotron this
+  registry knows, served through NVIDIA EIH as a backup REVIEWER. It may
+  never be a knemon (bus router) candidate or a coder route.
 * Nemotron placement is NOT EIH-exclusive (operator correction 2026-10-17):
   a Nemotron model may sit in ANY ``[host.<name>]`` slot whose routes it
   allows, on ANY host — TYDEUS serves a Nemotron backup model under test

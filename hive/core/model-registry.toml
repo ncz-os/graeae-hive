@@ -316,10 +316,12 @@ out = 1.00
 # ── per-host engine placement ───────────────────────────────────────────────
 # Facts only; the generator turns these into TOML fragments.
 #
-# Nemotron: nvidia/nemotron-3-ultra-550b-a55b is the only Nemotron routed
-# through EIH and is a backup reviewer. It must never carry a "knemon" route.
+# Nemotron: nvidia/nemotron-3-ultra-550b-a55b is the Nemotron this registry
+# knows, routed through EIH as a backup reviewer. It must never carry a
+# "knemon" route.
 # Placement is NOT EIH-only: a Nemotron model may be mapped into any host slot
-# whose route it allows (operator correction 2026-10-17).
+# whose route it allows (operator correction 2026-10-17). TYDEUS serves a
+# Nemotron backup model under test (served name 'nemotron35', vLLM :8010).
 
 [[model]]
 key = "local/qwen38"
