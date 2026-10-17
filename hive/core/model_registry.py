@@ -54,7 +54,9 @@ GENERATED_DIR = HERE / "generated"
 BUS_BEGIN = "# --- BEGIN GENERATED (hive.core.model_registry) ---"
 BUS_END = "# --- END GENERATED (hive.core.model_registry) ---"
 
-# The one legal Nemotron, and the only EIH endpoint prefix it may use.
+# The one legal Nemotron in the registry (operator correction 2026-10-17: it
+# alone ships on the EIH endpoint prefix; a Nemotron model may also map to a
+# non-EIH host slot — see the placement rules below).
 NEMOTRON_MODEL = "nvidia/nemotron-3-ultra-550b-a55b"
 EIH_HOST = "eih"
 

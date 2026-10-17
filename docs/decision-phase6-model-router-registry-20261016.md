@@ -60,7 +60,9 @@ endpoint facts and placement facts do not mix.
   - `main()` CLI: `--check` / `--write`
 - **Drift test:** `test_model_registry.py` regenerates the committed bus tables and
   asserts byte-equality; asserts every `routes` entry resolves to a real consumer;
-  asserts no Nemotron is routed outside the EIH reviewer rule.
+  asserts the Nemotron / EIH invariants (placement NOT EIH-exclusive, the shipped
+  Nemotron is the EIH backup reviewer and never a knemon/coder candidate),
+  DeepSeek is direct-only, and retired endpoints (:8002 / :4100) are rejected.
 
 ## Non-goals / guardrails
 
@@ -68,9 +70,15 @@ endpoint facts and placement facts do not mix.
   a registry that encodes today's values; it must not change routing. Any routing
   change is a separate reviewed commit.
 - **No runtime dependency.** The bus never reads FleetOps at runtime.
-- **EIH / Nemotron rule** stays: `nvidia/nemotron-3-ultra-550b-a55b` is the only
-  Nemotron, EIH-only, backup reviewer. The generator must encode this as an
-  invariant, not a comment.
+- **Nemotron / EIH rule** (operator correction 2026-10-17):
+  `nvidia/nemotron-3-ultra-550b-a55b` is the only Nemotron routed through EIH and
+  is a backup reviewer; it must never carry a "knemon" route. Placement is NOT
+  EIH-exclusive — a Nemotron model may sit in ANY `[host.<name>]` slot whose
+  route it allows, on ANY host (TYDEUS serves a Nemotron backup model under test
+  as `nemotron35` on vLLM :8010, zoder provider `custom.nemotron`). The EIH
+  placement rule still forbids closed frontier models on EIH and keeps DeepSeek
+  direct-only. The generator must encode all of this as an invariant, not a
+  comment.
 - **DeepSeek direct-only**, key resolution via the JSON registry (no env var).
 
 ## Why not implemented in this pass
@@ -93,5 +101,5 @@ session starts from a fixed target instead of re-deriving it.
 ## Refs
 
 - `docs/refactor-plan-20261015.md` (Phase 6)
-- CLAUDE.md fleet/provider rules (DeepSeek window, Nemotron=EIH-only, zoder routes)
+- CLAUDE.md fleet/provider rules (DeepSeek window, Nemotron placement, zoder routes)
 - `hive/core/models.py`, `hive/bus/routers/knemon.py`
