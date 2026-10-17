@@ -38,7 +38,7 @@ class FixtureShapeTests(unittest.TestCase):
     """Guard the fixtures themselves: they must stay shape-valid but fake."""
 
     def test_glpat_fixture_satisfies_detector_body_length(self):
-        # body after "glpat-" must be >= 18 chars of [0-9A-Za-z_-]
+        # body after the "glpat" + "-" prefix must be >= 18 chars of [0-9A-Za-z_-]
         self.assertGreaterEqual(len(FAKE_GLPAT.split("-", 1)[1]), 18)
         self.assertIn("FAKE", FAKE_GLPAT)
 

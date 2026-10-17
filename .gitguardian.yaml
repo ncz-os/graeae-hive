@@ -4,6 +4,6 @@ version: 2
 secret:
   ignored-paths:
     # Only this file: it is the single source of deliberately token-shaped,
-    # runtime-assembled fixtures (glpat / gho_ / github_pat_ / sk- / AKIA /
-    # sshpass -p / basic-auth URI) used to exercise hive.core.secrets.
+    # runtime-assembled fixtures used to exercise hive.core.secrets.
+    # Names are spelled in pieces here so this config cannot itself look like a token.
     - "test_hive_secrets.py"
