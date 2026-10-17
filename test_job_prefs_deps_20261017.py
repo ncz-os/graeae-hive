@@ -272,6 +272,19 @@ class DependencyGatingTests(_RepoCase):
             await tx.commit()
         self.assertEqual(rc, 1)
 
+    async def test_malformed_dependencies_fail_closed(self):
+        repo = await self._repo()
+        rows = (("bad-json", "{not json"), ("not-list", '{"a": 1}'))
+        for job_id, _raw in rows:
+            await self._insert(repo, job_id)
+        async with repo.connection() as db:
+            for job_id, raw in rows:
+                await db.execute("UPDATE jobs SET depends_on=? WHERE id=?", (raw, job_id))
+            await db.commit()
+        async with repo.connection() as tx:
+            self.assertFalse(await repo.dependencies_satisfied(tx, "bad-json"))
+            self.assertFalse(await repo.dependencies_satisfied(tx, "not-list"))
+
     async def test_dependencies_satisfied_treats_null_and_empty_as_open(self):
         repo = await self._repo()
         await self._insert(repo, "no-deps")

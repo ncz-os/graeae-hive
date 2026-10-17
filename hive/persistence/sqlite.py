@@ -1121,11 +1121,17 @@ class SqliteHiveRepository(HiveMindRepository):
 
     @staticmethod
     async def _deps_all_done(db: Any, depends_on: Any) -> bool:
+        # Fail closed: unreadable or non-array depends_on must never let a
+        # job skip its prerequisites. Absent / JSON null / [] means no deps.
         try:
             deps = json.loads(depends_on) if depends_on else []
         except (TypeError, ValueError):
+            return False
+        if deps is None:
             return True
-        if not isinstance(deps, list) or not deps:
+        if not isinstance(deps, list):
+            return False
+        if not deps:
             return True
         ids = list(dict.fromkeys(str(d) for d in deps if d is not None))
         if not ids:
