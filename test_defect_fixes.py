@@ -1308,7 +1308,7 @@ class SchedulerDequeueTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(claimed["id"], ("job-aa", "job-bb"))
 
     async def test_dequeue_local_eih_routes_share_pool_with_general_workers(self):
-        """Local (local-llamacpp) and EIH (ngc-proxy) jobs are general-pool
+        """Local (local-llamacpp) and EIH (NVIDIA EIH, integrate.api.nvidia.com)
         work — they do NOT consume a MiniMax-M3 lease and a general worker
         (grok-4.3 / xai) is free to claim them even when 5 MiniMax leases
         are active elsewhere in the fleet. Only MiniMax-route workers
