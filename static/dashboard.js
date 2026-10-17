@@ -257,16 +257,15 @@ async function refreshAgents(){
 }
 
 async function refreshJobs(){
-  const [q,offered,claimed]=await Promise.all([
+  const [q,offered]=await Promise.all([
     api('GET','/v1/jobs?status=queued&limit=250'),
     api('GET','/v1/jobs?status=offered&limit=25').catch(()=>({jobs:[]})),
-    api('GET','/v1/jobs?status=claimed&limit=250').catch(()=>({jobs:[]})),
   ]);
-  const all=[...(q.jobs||[]),...(offered.jobs||[]),...(claimed.jobs||[])].sort((a,b)=>b.priority-a.priority);
+  const all=[...(q.jobs||[]),...(offered.jobs||[])].sort((a,b)=>b.priority-a.priority);
   if(unchanged('jobs',all))return;
   const cnt=all.length;
   document.getElementById('queue-cnt').textContent=`(${cnt})`;
-  document.getElementById('meta-queue').textContent=cnt?cnt+' active':'queue clear';
+  document.getElementById('meta-queue').textContent=cnt?cnt+' queued':'queue clear';
   const tb=document.querySelector('#jobs-tbl tbody');tb.innerHTML='';
   for(const j of all){
     const r=tb.insertRow();
@@ -476,14 +475,15 @@ async function refreshDoctor(){
 
 async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFailed) */ }
   async function refreshFailed(){
-    // UNIFIED TRIAGE QUEUE (operator 2026-06-04): one queue, all non-done/non-cancelled
-    // statuses, color-coded + priority. Replaces the separate Failed + Doctor panels.
-    const sts=['dead-letter','failed','running','claimed','offered','queued'];
+    // TRIAGE QUEUE (2026-10-17): only jobs that need attention. Healthy in-flight
+    // work lives in the Jobs (queued/offered) + Workers (claimed/running) panels;
+    // it must NOT appear here as a triage entry.
+    const sts=['dead-letter','failed','needs-review'];
     const res=await Promise.all(sts.map(st=>api('GET',`/v1/jobs?status=${st}&limit=${st==='queued'?300:100}`).catch(()=>({jobs:[]}))));
     let jobs=[];
     sts.forEach((st,i)=>{(res[i].jobs||[]).forEach(j=>{if(!j.status)j.status=st;jobs.push(j);});});
     _failedJobs=Object.fromEntries(jobs.map(j=>[j.id,j]));
-    const order={'dead-letter':0,failed:1,running:2,claimed:3,offered:4,queued:5};
+    const order={'dead-letter':0,failed:1,'needs-review':2};
     jobs.sort((a,b)=>{const ao=order[a.status]??9,bo=order[b.status]??9;if(ao!==bo)return ao-bo;return (b.priority||0)-(a.priority||0);});
     if(unchanged('failed',jobs))return;
     const cntEl=document.getElementById('failed-cnt');
@@ -491,7 +491,7 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
     const el=document.getElementById('failed-list');
     if(!el)return;
     el.innerHTML='';
-    if(!jobs.length){ el.innerHTML='<div class="failed-panel-empty">Queue empty — nothing in flight ✓</div>'; return; }
+    if(!jobs.length){ el.innerHTML='<div class="failed-panel-empty">Nothing needs triage ✓</div>'; return; }
     for(const j of jobs.slice(0,150)){
       const r=j.result||{};
       const reason=r.failure_reason||r.stderr||r.error||r.note||r.worker_error||r.summary||'';
@@ -500,7 +500,7 @@ async function refreshDoctor(){ /* merged into unified Triage Queue (refreshFail
       card.onclick=()=>showJobModal(j);
       const jid=j.id, prio=j.priority||0;
       const pcls=prio>=80?'pri-hi':(prio>=40?'pri-mid':'pri-lo');
-      const isTerminal=(j.status==='failed'||j.status==='dead-letter');
+      const isTerminal=(j.status==='failed'||j.status==='dead-letter'||j.status==='needs-review');
       const acts=isTerminal?`<div class="fc-acts" onclick="event.stopPropagation()">
           <button class="btn btn-ghost btn-sm" onclick="resubmitFailed('${jid}')">🔁 Resubmit</button>
           <button class="btn btn-primary btn-sm" onclick="triageAndResubmit('${jid}')">🔍 Triage &amp; Resubmit</button>
