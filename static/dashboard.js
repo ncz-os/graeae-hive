@@ -352,7 +352,7 @@ async function refreshRunning(){
     const card=document.createElement('div');
     card.className='worker-card'+(h.busy?'':' idle');
     if(h.busy){ const j0=h.jobs[0]; card.onclick=()=>showJobModal(j0); }
-    const jobKinds=h.jobs.map(j=>`${esc(j.kind||'?')} <span class="dim">[${esc(j.claimed_model||'model?')}]</span>`).join(', ');
+    const jobKinds=h.jobs.map(j=>`${esc(j.kind||'?')} <span class="dim">[${esc(claimedModelLabel(j))}]</span>`).join(', ');
     card.innerHTML=`
       <div class="wc-agent"><span class="wc-dot"></span>
         <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}</div>
@@ -363,6 +363,30 @@ async function refreshRunning(){
   }
 }
 
+
+// Models that actually did a job: result.models (worker provenance) when present,
+// else the author_model/reviewer_model entries of the zoder loop record in
+// result.tail. Ordered + de-duplicated, so an escalated job reads
+// "deepseek-flash → MiniMax-M3".
+function jobModels(j){
+  const r=(j&&j.result)||{};
+  const m=r.models;
+  if(m&&(m.author||m.reviewers)){
+    return {author:String(m.author||''),reviewers:[].concat(m.reviewers||[]).map(String)};
+  }
+  const t=String(r.tail||'');
+  const uniq=a=>[...new Set(a)];
+  const au=uniq([...t.matchAll(/"author_model":\s*"([^"]+)"/g)].map(x=>x[1]));
+  const rv=uniq([...t.matchAll(/"reviewer_model":\s*"([^"]+)"/g)].map(x=>x[1]));
+  if(!au.length&&!rv.length)return null;
+  return {author:au.join(' → '),reviewers:rv};
+}
+// A worker that registered as plain "zoder" reports the harness, not a model.
+function claimedModelLabel(j){
+  const cm=String(j.claimed_model||'');
+  if(!cm||cm==='zoder')return 'zoder · model unreported';
+  return cm;
+}
 
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
@@ -391,7 +415,7 @@ async function refreshResults(){
       preview=parts.length?parts.join('  ·  '):'(build, no detail)';
     }
     if(!preview)preview='(no text result)';
-    const _at=(r.alias_tried&&r.alias_tried.length)?r.alias_tried[r.alias_tried.length-1]:'';const prov=_at||r.gateway_provider_reported||r.gateway_model||r.agent_alias||'';
+    const _at=(r.alias_tried&&r.alias_tried.length)?r.alias_tried[r.alias_tried.length-1]:'';const prov=_at||r.gateway_provider_reported||r.gateway_model||r.agent_alias||'';const mdl=jobModels(j);
     const isCodex=/codex/i.test(j.kind||'')||/codex/i.test(prov)||/codex/i.test(r.via||'')||/codex/i.test(r.gateway_provider||'')||r.runtime==='codex';
     let agentType=r.runtime||String(j.kind||'').split(':')[0]||'agent';
     const wkHost=(String(j.claimed_by||'').match(/:zeroclaw:([^:]+):/)||[])[1]||(String(j.claimed_by||'').split(':')[3])||'';
@@ -415,7 +439,7 @@ async function refreshResults(){
         <span class="rc-agent${isCodex?' codex':''}" title="agent type">${esc(agentType)}</span>
         ${wkHost?`<span class="rc-host" title="host that ran the job">\ud83d\udda5\ufe0f ${esc(wkHost)}</span>`:''}
         <span class="${badgeCls(j.status)}">${esc(j.status)}</span>
-        ${prov?`<span class="rc-model" title="model/provider that did this job">${esc(prov)}</span>`:''}
+        ${mdl?`<span class="rc-model" title="author model → reviewer model (from the zoder loop record)">✍ ${esc(mdl.author||'?')}${mdl.reviewers.length?' · 🔍 '+esc(mdl.reviewers.join(', ')):''}</span>`:(prov?`<span class="rc-model" title="model/provider that did this job">${esc(prov)}</span>`:'')}
         <span class="rc-id">${esc(j.id.slice(0,10))}</span>
         <span class="dim" style="font-size:.75em;margin-left:auto">${relTime(j.ended_at)}</span>
       </div>
