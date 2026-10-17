@@ -20,8 +20,10 @@ from hive.core import secrets
 # source that has the prefix split across a + and the body broken by "+".
 FAKE_GLPAT = "glpat" + "-" + "FAKE" + "x" * 16  # 18+ chars after the dash
 FAKE_GITHUB_PAT = "github" + "_pat_" + "11" + ("FAKE" + "0" * 12) + "_" + "x" * 6
-FAKE_GITHUB_TOKEN = "gho" + "_" + "x" * 36
-FAKE_GHP_TOKEN = "gh" + "p_" + "x" * 36  # ghp_ form (also covered by gh[pousr]_)
+FAKE_GITHUB_TOKEN = "gho" + "_" + "FAKE" + "x" * 32
+FAKE_GHP_TOKEN = "gh" + "p_" + "FAKE" + "x" * 32  # ghp_ form (also covered by gh[pousr]_)
+FAKE_GHR_TOKEN = "gh" + "r_" + "FAKE" + "x" * 32  # ghr_ form (refresh token, covered by gh[pousr]_)
+FAKE_GHS_TOKEN = "gh" + "s_" + "FAKE" + "x" * 32  # ghs_ form (server token, covered by gh[pousr]_)
 FAKE_XAI_KEY = "xai" + "-" + "FAKE" + "x" * 20  # 20+ chars of [0-9A-Za-z]
 FAKE_OPENAI_KEY = "sk" + "-" + "proj" + "-" + "FAKE" + "x" * 20
 FAKE_AWS_AKIA = "AKIA" + "EXAMPLE" + "0" * 9  # AKIA + 16 uppercase/digits
@@ -42,6 +44,12 @@ FAKE_SSHPASS_PW = "not" + "-a" + "-real" + "-password"
 FAKE_PW_KV_PW = "not" + "-a" + "-real" + "-password"
 FAKE_BASIC_AUTH = "https://" + "user" + ":" + "s3cr3t" + "@" + "gitlab.com/x.git"
 
+# Distinct fixture SHAPES that the detector must recognise. The dict keys are
+# the detector's reported `kind` (each is verified as a substring of the scan
+# results), and each entry maps to a runtime-fragmented string that does NOT
+# appear as a complete literal in source. The variants per detector kind
+# (ghr_, ghs_, ghp_, gho_ all collapse to "github_token") are exercised in a
+# separate test method below so the dict stays one-key-per-detector-kind.
 _SAMPLES = {
     "github_pat": "token " + FAKE_GITHUB_PAT,
     "github_token": FAKE_GITHUB_TOKEN,
@@ -69,6 +77,20 @@ class FixtureShapeTests(unittest.TestCase):
         self.assertEqual(len(FAKE_AWS_AKIA), 20)
         self.assertTrue(FAKE_AWS_AKIA.startswith("AKIA"))
         self.assertIn("EXAMPLE", FAKE_AWS_AKIA)
+
+    def test_ghr_fixture_is_fake_shaped(self):
+        # body after the "ghr" + "_" prefix must be >= 30 chars of [0-9A-Za-z]
+        prefix, body = FAKE_GHR_TOKEN.split("_", 1)
+        self.assertEqual(prefix, "ghr")
+        self.assertGreaterEqual(len(body), 30)
+        self.assertIn("FAKE", FAKE_GHR_TOKEN)
+
+    def test_ghs_fixture_is_fake_shaped(self):
+        # body after the "ghs" + "_" prefix must be >= 30 chars of [0-9A-Za-z]
+        prefix, body = FAKE_GHS_TOKEN.split("_", 1)
+        self.assertEqual(prefix, "ghs")
+        self.assertGreaterEqual(len(body), 30)
+        self.assertIn("FAKE", FAKE_GHS_TOKEN)
 
     def test_xai_fixture_is_fake_shaped(self):
         # body after the "xai" + "-" prefix must be >= 20 chars of [0-9A-Za-z]
@@ -140,6 +162,8 @@ class SourceHygieneTests(unittest.TestCase):
             "FAKE_GITHUB_PAT",
             "FAKE_GITHUB_TOKEN",
             "FAKE_GHP_TOKEN",
+            "FAKE_GHR_TOKEN",
+            "FAKE_GHS_TOKEN",
             "FAKE_XAI_KEY",
             "FAKE_OPENAI_KEY",
             "FAKE_AWS_AKIA",
@@ -160,6 +184,15 @@ class ScanTests(unittest.TestCase):
             with self.subTest(kind=kind):
                 kinds = {f.kind for f in secrets.scan(text)}
                 self.assertIn(kind, kinds, f"{kind} not detected in {text!r}")
+
+    def test_detects_every_github_token_variant(self):
+        # The detector collapses the gh[pousr]_ union into a single finding
+        # kind ("github_token"). Exercise each prefix variant independently so
+        # a future that narrows the union would still get caught.
+        for fixture in (FAKE_GITHUB_TOKEN, FAKE_GHP_TOKEN, FAKE_GHR_TOKEN, FAKE_GHS_TOKEN):
+            with self.subTest(fixture=fixture[:4]):
+                kinds = {f.kind for f in secrets.scan(fixture)}
+                self.assertIn("github_token", kinds)
 
     def test_plain_prose_is_clean(self):
         text = "the quick brown fox jumps over the lazy dog; status=online host=pythia"

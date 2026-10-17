@@ -1,4 +1,4 @@
-# GitGuardian config — task 01a1481e-bb57-7201-bd9f-ca5de739c71f: suppress false positives on synthetic test fixtures that intentionally carry credential SHAPES (built at runtime from fragments, never real values); ignored-paths is limited to the test fixture files that hold token shapes.
+# GitGuardian config — task 01a1481e-bb57-7201-bd9f-ca5de739c71f: ignored-paths is limited to test fixture files that intentionally carry credential SHAPES (fragmented at runtime from string literals so no complete token literal exists in source; see test_hive_secrets.py for the FAKE_* fixtures and SourceHygieneTests.FORBIDDEN guard). Hive production code never earns an entry here -- a regression that re-introduces a literal token into a non-test file must fail the scanner.
 version: 2
 secret:
   ignored-paths:
