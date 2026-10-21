@@ -40,6 +40,13 @@ _ORACLE_JOB_ADDITIONS = {
     "CLAIM_LEASE_EXPIRES_AT": "claim_lease_expires_at NUMBER",
     "DECLINE_COUNT": "decline_count NUMBER(5) DEFAULT 0 NOT NULL",
     "DEDUP_HASH": "dedup_hash VARCHAR2(64)",
+    # base_branch (2026-10-21): optional upstream branch head_branch forks off;
+    # worker clones base_branch when head_branch doesn't exist upstream. The
+    # migration loop above is "ADD only if missing" (ADD COLUMN is itself
+    # idempotent-safe via the missing-column gate in _job_columns), so this
+    # addition is safe on BOTH a fresh HIVE_JOBS install and a legacy live
+    # HIVE_JOBS table pre-dating the column.
+    "BASE_BRANCH": "base_branch VARCHAR2(255)",
 }
 _ORACLE_REQUIRED_JOB_COLUMNS = {
     "ID",

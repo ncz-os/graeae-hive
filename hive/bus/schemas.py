@@ -89,6 +89,15 @@ class JobCreate(BaseModel):
     site: str | None = None  # git_sites.json key (github/gitlab-ncz/codeberg/internal)
     repo: str | None = None  # owner/name path on that site
     head_branch: str | None = None  # branch / PR head to check out
+    # base_branch (PR-fix-extension 2026-10-21): optional upstream branch the
+    # worker CLONES when `head_branch` doesn't exist upstream. The worker
+    # creates `head_branch` locally off `base_branch`, mirroring how
+    # deploy/hive-canonical-20261003 agent_bus.py carries the same key — see
+    # `hive_worker.py`'s `job.get("base_branch")` reader on 4d4fc85. Optional
+    # and nullable: existing callers that omit it stay backward-compatible;
+    # the live HIVE_JOBS row carries NULL on pre-existing rows (the migration
+    # only adds the column, never back-fills).
+    base_branch: str | None = None
     pr_number: int | None = None
 
 
@@ -131,6 +140,7 @@ class JobOut(BaseModel):
     site: str | None = None
     repo: str | None = None
     head_branch: str | None = None
+    base_branch: str | None = None
     pr_number: int | None = None
     max_retries: int | None = None
     retry_count: int | None = None

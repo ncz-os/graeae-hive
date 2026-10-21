@@ -93,17 +93,20 @@ def stable_worker_id(urn: str) -> str:
         return urn.rsplit(":", 1)[0]
     return urn
 
+
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
 MAX_DECLINE_REQUEUES = 3
 # Reasons emitted by a worker's release path that are JOB-LEVEL unschedulable: a
-# property of the job alone (its id, its head_branch), so no worker on any host
-# can ever run it and requeueing only loops. These count toward the decline
-# dead-letter threshold.
+# property of the job alone (its id, its head_branch — or its base_branch, which
+# the worker must also clone in order to create head_branch locally), so no
+# worker on any host can ever run it and requeueing only loops. These count
+# toward the decline dead-letter threshold.
 JOB_LEVEL_DECLINE_REASONS: tuple[str, ...] = (
     "malformed_job_id",
     "invalid_head_branch",
+    "invalid_base_branch",
 )
 
 # Extra operator-visible credits granted to the DEPLOYMENT-DEPENDENT release

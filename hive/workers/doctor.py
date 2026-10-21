@@ -253,6 +253,8 @@ DLQ_UNSCHEDULABLE_PREFIXES = (
     "no_repo_mapping",
     "malformed_job_id",
     "invalid_head_branch",
+    "invalid_base_branch",
+    "branch_not_found",
 )
 # Transient / infra failure signatures -> safe to fix & resubmit.
 DLQ_TRANSIENT_RE = re.compile(

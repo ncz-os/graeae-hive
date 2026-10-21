@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   site TEXT,                                    -- git_sites.json key (github/gitlab-ncz/codeberg/internal)
   repo TEXT,                                    -- owner/name path on that site
   head_branch TEXT,                             -- branch / PR head to check out
+  base_branch TEXT,                             -- optional upstream branch head_branch forks off (worker clones base_branch then creates head_branch locally if head_branch doesn't exist upstream)
   pr_number INTEGER,                            -- PR/MR number (forge-specific ref scheme)
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review')),
@@ -394,6 +395,11 @@ class SqliteHiveRepository(HiveMindRepository):
                 ("jobs", "site", "site TEXT"),
                 ("jobs", "repo", "repo TEXT"),
                 ("jobs", "head_branch", "head_branch TEXT"),
+                # base_branch (2026-10-21): optional upstream branch head_branch forks off.
+                # Live HIVE_JOBS rows created before this migration have no value here;
+                # hive_worker.py on 4d4fc85 already reads job.get("base_branch") so the
+                # optional/nullable contract is the one it expects.
+                ("jobs", "base_branch", "base_branch TEXT"),
                 ("jobs", "pr_number", "pr_number INTEGER"),
             )
             # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
@@ -657,10 +663,10 @@ class SqliteHiveRepository(HiveMindRepository):
         await db.execute(
             "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
             "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, "
-            "preferred_models, mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, pr_number, "
+            "preferred_models, mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, base_branch, pr_number, "
             "status, started_at, ended_at, result, claimed_provider, claimed_model, claimed_cost_tier, "
             "estimated_cost_usd, result_mnemos_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 fields["id"],
                 fields["submitter_urn"],
@@ -683,6 +689,7 @@ class SqliteHiveRepository(HiveMindRepository):
                 fields.get("site"),
                 fields.get("repo"),
                 fields.get("head_branch"),
+                fields.get("base_branch"),
                 fields.get("pr_number"),
                 fields.get("status", "queued"),
                 fields["started_at"],
@@ -932,7 +939,7 @@ class SqliteHiveRepository(HiveMindRepository):
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
             "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, "
-            "pr_number, max_retries, retry_count, claimed_at, claim_lease_expires_at, "
+            "base_branch, pr_number, max_retries, retry_count, claimed_at, claim_lease_expires_at, "
             "last_update_at, claimed_model, claimed_provider, claimed_runtime, "
             "claimed_cost_tier, preferred_providers, preferred_models, depends_on, "
             "project, max_cost_tier, mnemos_refs FROM jobs WHERE 1=1"
@@ -996,22 +1003,23 @@ class SqliteHiveRepository(HiveMindRepository):
                     "site": r[15],
                     "repo": r[16],
                     "head_branch": r[17],
-                    "pr_number": r[18],
-                    "max_retries": r[19],
-                    "retry_count": r[20],
-                    "claimed_at": r[21],
-                    "claim_lease_expires_at": r[22],
-                    "last_update_at": r[23],
-                    "claimed_model": r[24],
-                    "claimed_provider": r[25],
-                    "claimed_runtime": r[26],
-                    "claimed_cost_tier": r[27],
-                    "preferred_providers": json.loads(r[28]) if r[28] else None,
-                    "preferred_models": json.loads(r[29]) if r[29] else None,
-                    "depends_on": json.loads(r[30]) if r[30] else None,
-                    "project": r[31],
-                    "max_cost_tier": r[32],
-                    "mnemos_refs": json.loads(r[33]) if r[33] else None,
+                    "base_branch": r[18],
+                    "pr_number": r[19],
+                    "max_retries": r[20],
+                    "retry_count": r[21],
+                    "claimed_at": r[22],
+                    "claim_lease_expires_at": r[23],
+                    "last_update_at": r[24],
+                    "claimed_model": r[25],
+                    "claimed_provider": r[26],
+                    "claimed_runtime": r[27],
+                    "claimed_cost_tier": r[28],
+                    "preferred_providers": json.loads(r[29]) if r[29] else None,
+                    "preferred_models": json.loads(r[30]) if r[30] else None,
+                    "depends_on": json.loads(r[31]) if r[31] else None,
+                    "project": r[32],
+                    "max_cost_tier": r[33],
+                    "mnemos_refs": json.loads(r[34]) if r[34] else None,
                 }
                 if not include_result:
                     job.pop("result", None)
@@ -1077,7 +1085,7 @@ class SqliteHiveRepository(HiveMindRepository):
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
             "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
             "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at, "
-            "site, repo, head_branch, pr_number "
+            "site, repo, head_branch, base_branch, pr_number "
             "FROM jobs WHERE (status='queued' OR (status='offered' AND claimed_by=?)) "
             "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
             "ORDER BY priority DESC, started_at ASC LIMIT ?",

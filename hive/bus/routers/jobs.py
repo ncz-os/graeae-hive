@@ -76,7 +76,7 @@ router = APIRouter()
 _JOB_COLUMNS = (
     "id, submitter_urn, parent_job_id, kind, description, priority, status, "
     "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count, "
+    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, base_branch, pr_number, max_retries, retry_count, "
     "claimed_at, claim_lease_expires_at, last_update_at, claimed_model, claimed_provider, "
     "claimed_runtime, claimed_cost_tier, "
     # Fault 2026-10-17: JobCreate accepted these and the row carried them, but
@@ -175,22 +175,23 @@ async def get_job(job_id: str):
         "site": r[15],
         "repo": r[16],
         "head_branch": r[17],
-        "pr_number": r[18],
-        "max_retries": r[19],
-        "retry_count": r[20],
-        "claimed_at": r[21],
-        "claim_lease_expires_at": r[22],
-        "last_update_at": r[23],
-        "claimed_model": r[24],
-        "claimed_provider": r[25],
-        "claimed_runtime": r[26],
-        "claimed_cost_tier": r[27],
-        "preferred_providers": json.loads(r[28]) if r[28] else None,
-        "preferred_models": json.loads(r[29]) if r[29] else None,
-        "depends_on": json.loads(r[30]) if r[30] else None,
-        "project": r[31],
-        "max_cost_tier": r[32],
-        "mnemos_refs": json.loads(r[33]) if r[33] else None,
+        "base_branch": r[18],
+        "pr_number": r[19],
+        "max_retries": r[20],
+        "retry_count": r[21],
+        "claimed_at": r[22],
+        "claim_lease_expires_at": r[23],
+        "last_update_at": r[24],
+        "claimed_model": r[25],
+        "claimed_provider": r[26],
+        "claimed_runtime": r[27],
+        "claimed_cost_tier": r[28],
+        "preferred_providers": json.loads(r[29]) if r[29] else None,
+        "preferred_models": json.loads(r[30]) if r[30] else None,
+        "depends_on": json.loads(r[31]) if r[31] else None,
+        "project": r[32],
+        "max_cost_tier": r[33],
+        "mnemos_refs": json.loads(r[34]) if r[34] else None,
     }
 
 
@@ -220,7 +221,7 @@ async def zcgate_get_preview(job_id: str):
     async with (
         connect_db() as db,
         db.execute(
-            "SELECT result, status, repo, head_branch, pr_number FROM jobs WHERE id=?",
+            "SELECT result, status, repo, head_branch, base_branch, pr_number FROM jobs WHERE id=?",
             (job_id,),
         ) as cur,
     ):
@@ -236,7 +237,8 @@ async def zcgate_get_preview(job_id: str):
         "status": r[1],
         "repo": r[2],
         "head_branch": r[3],
-        "pr_number": r[4],
+        "base_branch": r[4],
+        "pr_number": r[5],
         "preview": preview,
     }
 
@@ -372,6 +374,7 @@ async def create_job(req: JobCreate):
         site=req.site,
         repo=req.repo,
         head_branch=req.head_branch,
+        base_branch=req.base_branch,
         pr_number=(int(req.pr_number) if req.pr_number is not None else None),
         started_at=now,
     )
@@ -635,6 +638,7 @@ async def dequeue_next_job(agent_urn: str):
                     j_site,
                     j_repo,
                     j_head_branch,
+                    j_base_branch,
                     j_pr_number,
                 ) = r
                 deps = json_list(j_deps_json)
@@ -691,6 +695,7 @@ async def dequeue_next_job(agent_urn: str):
                     "site": j_site,
                     "repo": j_repo,
                     "head_branch": j_head_branch,
+                    "base_branch": j_base_branch,
                     "pr_number": j_pr_number,
                     "status": "claimed",
                     "claimed_by": agent_urn,
