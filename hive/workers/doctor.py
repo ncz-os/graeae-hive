@@ -2137,8 +2137,19 @@ def handle_dead_letter_queue() -> dict:
         outcome = remediate_dead_letter(job, decision, reason)
         summary[decision] = summary.get(decision, 0) + 1
         acted += 1
-        # Recorded AFTER the work, which is the whole ordering.
-        dlq_record_decision(jid, at=now)
+        # Recorded AFTER the work, which is the whole ordering — and NOT recorded when
+        # the work was REFUSED for want of an approval. A refusal is not a decision:
+        # the doctor wanted to act and was not allowed to, and the operator's
+        # approval is a future event, so recording it would hide the job from every
+        # later cycle for the whole seen window and the operator would approve
+        # something that never came back round.
+        #
+        # A `DLQ_DRY_RUN` IS a decision — the doctor classified the job and chose an
+        # action; DLQ_APPLY=0 is the configured behaviour, not a refusal — so it is
+        # recorded, which is what stops every cycle re-deciding the same dead-letter
+        # jobs when the apply switch is off.
+        if not outcome.startswith("REFUSED:"):
+            dlq_record_decision(jid, at=now)
         log.info("dlq %s kind=%s -> %s (%s): %s", jid[:12], job.get("kind", "?"), decision, reason, outcome)
         broadcast_doctor_message(
             "doctor.dlq",

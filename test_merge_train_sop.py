@@ -670,3 +670,60 @@ def test_a_failed_git_count_is_not_a_clean_done(repo, monkeypatch):
     assert all(report.bucket != mt.BUCKET_DONE for report in outcome.reports), [
         (r.branch, r.bucket) for r in outcome.reports
     ]
+
+
+def test_every_measured_branch_gets_a_record(repo):
+    """`merge_train.decide` is called once per record, so a caller with only
+    `to_record()` decides the first branch and silently drops the rest."""
+    outcome = mt.measure_repo(repo["bare"])
+    assert len(outcome.reports) >= 4, [r.branch for r in outcome.reports]
+    records = outcome.to_records()
+    assert len(records) == len(outcome.reports)
+    assert {record["branch"] for record in records} == {r.branch for r in outcome.reports}
+    # `to_record()` is the one-branch shortcut and agrees with the first record.
+    assert records[0] == outcome.to_record()
+
+
+def test_an_unreadable_repository_is_not_reported_as_having_no_branches(repo, monkeypatch):
+    """`for-each-ref` returning nothing read as "no branch matched the pattern" —
+    a clean statement about a repository nothing could look at."""
+    real = mt._sh
+    monkeypatch.setattr(
+        mt,
+        "_sh",
+        lambda a, **k: (
+            subprocess.CompletedProcess(a, 128, "", "fatal: not a git repository\n")
+            if a[:2] == ["git", "for-each-ref"]
+            else real(a, **k)
+        ),
+    )
+    outcome = mt.measure_repo(repo["bare"])
+    assert outcome.failed, outcome.failures
+    assert any("for-each-ref" in failure for failure in outcome.failures), outcome.failures
+    assert not any("no branch matched" in failure for failure in outcome.failures), outcome.failures
+
+
+def test_a_failing_merge_base_is_not_reported_as_no_merge_base(repo, monkeypatch):
+    """git exits 1 for "no merge base" and 128 for "fatal: bad object", and `_git`
+    returns "" for both — two different jobs with different owners."""
+    real = mt._sh
+    monkeypatch.setattr(
+        mt,
+        "_sh",
+        lambda a, **k: (
+            subprocess.CompletedProcess(a, 128, "", "fatal: bad object\n")
+            if a[:2] == ["git", "merge-base"]
+            else real(a, **k)
+        ),
+    )
+    with pytest.raises(mt.MeasurementError):
+        mt.classify(repo["bare"], "main", "hive/ff")
+
+    outcome = mt.measure_repo(repo["bare"])
+    assert any("merge-base" in failure for failure in outcome.failures), outcome.failures
+    # The claim is the FAILURE, not the placeholder bucket: an unmeasurable branch is
+    # filed under the one bucket that escalates, and the repository is refused by the
+    # writer outright.
+    assert outcome.failed
+    lines = mt.fast_forward_candidates([outcome], dry_run=False)
+    assert any("SKIPPED" in line for line in lines), lines

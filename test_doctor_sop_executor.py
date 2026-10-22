@@ -775,9 +775,11 @@ def test_a_protected_job_is_recorded_as_decided_without_being_remediated(monkeyp
     assert doctor.dlq_decided("dead-p"), "reported every cycle, never re-decided"
 
 
-def test_a_refusal_from_the_approval_gate_still_counts_as_a_decision(monkeypatch, doctor_state):
-    """The doctor DID decide — not to act — so the job is recorded. What must never
-    be recorded is a job the doctor never reached."""
+def test_a_refusal_from_the_approval_gate_is_not_recorded_as_decided(monkeypatch, doctor_state):
+    """The doctor wanted to act and was not allowed to. That is not a decision: the
+    operator's approval is a future event, so recording it would hide the job from
+    every later cycle for the whole seen window — and the operator would approve
+    something that never comes back round."""
     monkeypatch.setattr(
         doctor,
         "fetch_dead_letter_jobs",
@@ -794,7 +796,32 @@ def test_a_refusal_from_the_approval_gate_still_counts_as_a_decision(monkeypatch
     summary = doctor.handle_dead_letter_queue()
     assert summary["remove"] == 1, summary
     assert calls == [], "a refusal must not reach the bus"
-    assert doctor.dlq_decided("dead-r")
+    assert not doctor.dlq_decided("dead-r"), "a refusal is not a decision"
+
+    # Once the approval exists, the next cycle reaches the bus and records.
+    digest = doctor_gates.action_digest("dlq_remove", job_ids=["dead-r"])
+    doctor.APPROVALS.record_approval("dlq_remove", digest)
+    calls.clear()
+    doctor.handle_dead_letter_queue()
+    assert len(calls) == 1, calls
+    assert doctor.dlq_decided("dead-r"), "and the acted decision IS recorded"
+
+
+def test_a_dry_run_is_a_decision_and_is_recorded(monkeypatch, doctor_state):
+    """DLQ_APPLY=0 is the configured behaviour, not a refusal — recording it is what
+    stops every cycle re-deciding the same dead-letter jobs."""
+    monkeypatch.setattr(
+        doctor,
+        "fetch_dead_letter_jobs",
+        lambda: [{"id": "dead-d", "kind": "zeroclaw", "result": {"error": "timeout"}}],
+    )
+    monkeypatch.setattr(doctor, "DLQ_APPLY", False)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    summary = doctor.handle_dead_letter_queue()
+    assert summary["resubmit"] == 1, summary
+    assert doctor.dlq_decided("dead-d")
+    again = doctor.handle_dead_letter_queue()
+    assert again["skipped_seen"] == 1, again
 
 
 def test_a_revoked_approval_does_not_come_back_from_the_journal(gate, tmp_path):

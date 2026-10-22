@@ -151,6 +151,23 @@ def _count(repo: str, spec: str) -> int:
     return int(text)
 
 
+def _merge_base(repo: str, base: str, branch: str) -> str | None:
+    """The merge base, or ``None`` when the two genuinely share no history.
+
+    git exits 1 for "no merge base" and 128 for "fatal: bad object", and `_git`
+    returns "" for both. Reporting the second as the first tells the operator a
+    branch has no common ancestor when in fact the repository could not be read —
+    two different jobs with different owners. The exit code is what separates them.
+    """
+    result = _sh(["git", "merge-base", base, branch], cwd=repo)
+    if result.returncode == 1:
+        return None
+    if result.returncode != 0:
+        raise MeasurementError(f"merge-base {base} {branch}: {result.stderr.strip()[:120] or 'failed'}")
+    text = result.stdout.strip()
+    return text or None
+
+
 def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     """The bucket for one branch, measured against `base`.
 
@@ -164,8 +181,8 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     caller has to be able to tell them apart.
     """
     stats = BranchStats()
-    merge_base = _git("merge-base", base, branch, cwd=repo)
-    if not merge_base:
+    merge_base = _merge_base(repo, base, branch)
+    if merge_base is None:
         return BUCKET_NO_BASE, stats
     stats.ahead = _count(repo, f"{base}..{branch}")
     if stats.ahead == 0:
@@ -206,7 +223,16 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
 
 
 def candidate_branches(repo: str, base: str) -> list[str]:
-    listing = _git("for-each-ref", "--format=%(refname:short)", "refs/heads/", cwd=repo)
+    """The branches worth looking at.
+
+    Raises [`MeasurementError`] if the listing failed. An unreadable repository
+    produced no branch names, which read as "no branch matched the pattern" — a
+    clean statement about a repository nothing was able to look at.
+    """
+    result = _sh(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads/"], cwd=repo)
+    if result.returncode != 0:
+        raise MeasurementError(f"for-each-ref refs/heads: {result.stderr.strip()[:120] or 'failed'}")
+    listing = result.stdout
     return [branch for branch in listing.split() if branch != base and BRANCH_PATTERN.search(branch)]
 
 
@@ -278,12 +304,23 @@ class RepoOutcome:
     def failed(self) -> bool:
         return bool(self.failures)
 
-    def to_record(self) -> dict:
-        """The `record` payload for one repository, failures and all.
+    def to_records(self) -> list[dict]:
+        """One `record` payload per measured branch, in measurement order.
 
-        A repository that failed still produces a record: `failures` is what the
-        SOP escalates on, and an empty record would lose the reason — which is the
-        `run failed` this replaces.
+        This is the whole set. `merge_train.decide` is called once per record, so a
+        repository with four candidates is decided four times — and a caller that
+        only had `to_record()` would decide the first branch and silently drop the
+        other three.
+        """
+        return [report.to_record() for report in self.reports]
+
+    def to_record(self) -> dict:
+        """The `record` payload for the FIRST measured branch, failures and all.
+
+        A shortcut for the common one-candidate repository, and the payload for a
+        repository that failed: `failures` is what the SOP escalates on, and an empty
+        record would lose the reason — which is the `run failed` this replaces.
+        Use [`RepoOutcome.to_records`] to decide every branch.
         """
         if not self.reports:
             return {
@@ -518,6 +555,11 @@ def measure_repo(repo: str, pattern_checked: bool = True) -> RepoOutcome:
             bucket, stats, sha = BUCKET_NO_BASE, BranchStats(), ""
             failures.append(f"{name}/{branch}: git timed out")
         except Exception as error:  # noqa: BLE001 - one bad branch is not a bad cycle
+            # The bucket is a PLACEHOLDER for a branch nothing could measure, and
+            # `failures` is the real claim: the SOP escalates on a non-empty
+            # `failures`, and `fast_forward_candidates` refuses a repository that has
+            # any. `no_base` is the placeholder because it is the one bucket that
+            # escalates, so an unmeasurable branch can never be written to.
             bucket, stats, sha = BUCKET_NO_BASE, BranchStats(), ""
             failures.append(f"{name}/{branch}: {type(error).__name__}: {error}")
         if sha == "":
