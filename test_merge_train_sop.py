@@ -841,3 +841,37 @@ def test_a_repository_level_failure_reaches_the_record(tmp_path):
     record = outcome.to_record()
     assert record["failures"] == outcome.failures, record
     assert "no branch matched" in record["failures"][0]
+
+
+def test_a_failed_repository_still_appears_in_the_json_output(tmp_path, capsys, monkeypatch):
+    """Its failures are the whole reason it is in the output; an empty list would
+    mean the record the SOP escalates on never exists."""
+    monkeypatch.setattr(mt, "discover_repos", lambda *a, **k: [str(tmp_path / "not-a-repo.git")])
+    monkeypatch.setattr(mt, "record_cycle_end", lambda *a, **k: False)
+    assert mt.main(["--json"]) == 1
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert len(lines) == 1, lines
+    record = json.loads(lines[0])
+    assert record["failures"], record
+    assert "not a directory" in record["failures"][0], record
+
+
+def test_only_a_bucket_that_wants_a_write_asks_outward(repo, monkeypatch):
+    """A `done` branch needs nothing outward, and a request for it would put a
+    phantom action in front of the operator's approval queue."""
+    monkeypatch.setattr(mt, "ALLOW_PUBLIC_FORGE", True)
+    outward: list[dict] = []
+    outcomes = mt.run_cycle(repos=[repo["bare"]], outward_reports=outward)
+    measured = {report.branch: report.bucket for report in outcomes[0].reports}
+    for request in outward:
+        branch = next(
+            (report for report in outcomes[0].reports if report.repo in request["text"]),
+            None,
+        )
+        assert branch is not None
+        assert branch.bucket in mt.OUTWARD_CANDIDATE_BUCKETS, branch
+    # Nothing that is `done` or `no_base` is ever in the bucket set the engine asks
+    # from, whatever the target says.
+    assert mt.BUCKET_DONE not in mt.OUTWARD_CANDIDATE_BUCKETS
+    assert mt.BUCKET_NO_BASE not in mt.OUTWARD_CANDIDATE_BUCKETS
+    assert measured, measured

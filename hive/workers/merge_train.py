@@ -109,6 +109,13 @@ class MeasurementError(RuntimeError):
     """
 
 
+#: The buckets that would ask for an outward write. `done` and `no_base` need
+#: nothing outward: one has nothing to merge and the other has nothing to compute
+#: against. Mirrors the decision's own rule, so the engine cannot ask for something
+#: `merge_train.decide` would hold.
+OUTWARD_CANDIDATE_BUCKETS = frozenset({BUCKET_FAST_FORWARD, BUCKET_CHERRY, BUCKET_DIVERGENT, BUCKET_CONFLICT})
+
+
 @dataclass
 class BranchStats:
     ahead: int = 0
@@ -691,6 +698,12 @@ def run_cycle(
         outcomes.append(outcome)
         if outward_reports is not None:
             for report in outcome.reports:
+                # Only a bucket that would actually WANT a write asks for one. A
+                # `done` branch or an orphan needs nothing outward, and emitting a
+                # request for it would put a phantom action in front of the
+                # operator's approval queue — the decision refuses these too.
+                if report.bucket not in OUTWARD_CANDIDATE_BUCKETS:
+                    continue
                 request = route_outward(report)
                 if request is not None:
                     outward_reports.append(request)
@@ -785,7 +798,13 @@ def main(argv: list[str] | None = None) -> int:
             # One line per MEASURED BRANCH: `merge_train.decide` is called once per
             # record, so one line per repository would drop every candidate but the
             # first — silently, because the output still looked well-formed.
-            for record in outcome.to_records():
+            records = outcome.to_records()
+            if not records:
+                # A repository that produced NO branch record still has to appear:
+                # its failures are the whole reason it is in the output, and an empty
+                # list would mean the record the SOP escalates on never exists.
+                records = [outcome.to_record()]
+            for record in records:
                 print(json.dumps(record, sort_keys=True))
         else:
             print(" ", outcome.summary())
