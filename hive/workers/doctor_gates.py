@@ -230,7 +230,7 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
     spec = PURGE_INTENTS[intent]
     removed_key = spec["removed_key"]
     if not isinstance(response, dict):
-        return {"removed": 0, "skipped": list(requested), "partial": bool(requested)}
+        return {"removed": 0, "skipped": list(requested), "partial": bool(requested), "attributed": True}
     if intent == "cancel_failed":
         removed = response.get(removed_key)
         removed_ids = _as_id_list(response.get("matched_ids"))
@@ -249,7 +249,17 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
             # false-negative direction of the bug this function exists to close.
             shortfall = max(0, len(requested) - removed)
             skipped = requested[len(requested) - shortfall :] if shortfall else []
-        return {"removed": removed, "skipped": skipped, "partial": bool(skipped)}
+            return {
+                "removed": removed,
+                "skipped": skipped,
+                "partial": bool(skipped),
+                # The route confirmed a COUNT and named no ids, so which ids it
+                # kept is not knowable from the response. `skipped` is therefore
+                # attributed, not observed, and this flag is how a caller knows
+                # not to print it as if it were observed.
+                "attributed": True,
+            }
+        return {"removed": removed, "skipped": skipped, "partial": bool(skipped), "attributed": False}
     removed = response.get(removed_key)
     # `ok` is a list today. If a future bus returned a bare count instead, that
     # count is still what it CONFIRMED, so it is honoured rather than read as
@@ -275,6 +285,7 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
         "not_found": not_found,
         "untouched": untouched,
         "partial": bool(untouched),
+        "attributed": not removed_ids and bool(requested),
     }
 
 

@@ -1227,7 +1227,16 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
         f"failed jobs of {base_kind} (api={code2}): {', '.join(purge_ids)}"
     )
     if outcome["partial"]:
-        summary += f"; PARTIAL: {len(outcome.get('skipped', []))} job(s) not deleted"
+        how_many = len(outcome.get("skipped", []))
+        # `attributed` means the bus confirmed a COUNT and named no ids, so the ids
+        # are not knowable; print the count and say so rather than list jobs the
+        # response never identified.
+        detail = (
+            f"{how_many} job(s) not deleted (the bus named no ids, so which is not reported)"
+            if outcome.get("attributed")
+            else f"{how_many} job(s) not deleted: {', '.join(outcome.get('skipped', []))}"
+        )
+        summary += f"; PARTIAL: {detail}"
     if code2 != 200:
         summary += f"; api did not confirm the purge (status={code2})"
     return summary

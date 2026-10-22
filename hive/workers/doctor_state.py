@@ -67,6 +67,13 @@ log = logging.getLogger("doctor.state")
 DEFAULT_NAMESPACE = "doctor.state"
 DEFAULT_REFRESH_SECS = 30.0
 
+#: The window a key with no entry in [`COUNTER_TTLS`] is pruned at. A day, chosen
+#: because it is long enough that a limit keeps its meaning across a weekend and
+#: short enough that an unlisted key cannot grow the cache without bound. The
+#: alternative — infinity for an unrecognised prefix — makes a typo'd key prefix a
+#: silent memory leak.
+DEFAULT_TTL_SECS = 86_400.0
+
 # Every key the doctor reads, with its default TTL. Listing them here is what
 # makes "which safety limits are durable" a question with an answer rather than a
 # grep, and the expiry is the limit's own window: an entry older than its window
@@ -418,7 +425,13 @@ class DurableStateStore:
 
     def _write_locked(self, key: str, record: dict, ttl: float) -> None:
         self._cache[key] = record
-        self._cache = {k: v for k, v in self._cache.items() if self._is_live(v, self._ttl_for(k))}
+        # Prune with the LONGER of this write's window and the key's canonical one.
+        # Pruning with `ttl` alone means a caller passing a short window silently
+        # truncates the history a caller with the canonical window depends on — the
+        # second loop detector to touch `loop:<job>` with a shorter window would
+        # erase the first one's evidence. Pruning never shortens.
+        prune_ttl = max(self._ttl_for(key), ttl)
+        self._cache = {k: v for k, v in self._cache.items() if self._is_live(v, _prune_ttl_of(k, prune_ttl))}
         self._persist_locked()
 
     def _ttl_for(self, key: str) -> float:
@@ -428,9 +441,9 @@ class DurableStateStore:
         if prefix in COUNTER_TTLS:
             return COUNTER_TTLS[prefix]
         # `max()` over an empty table raises, and this runs inside the write path,
-        # so an unconfigured table degrades to "does not expire" rather than to a
-        # crash on the first write.
-        return max(COUNTER_TTLS.values(), default=0.0) or float("inf")
+        # so an unconfigured table degrades to the named default rather than to a
+        # crash on the first write — and never to infinity.
+        return max(COUNTER_TTLS.values(), default=DEFAULT_TTL_SECS)
 
     def _persist_locked(self) -> None:
         try:
@@ -440,6 +453,11 @@ class DurableStateStore:
         except Exception as error:  # noqa: BLE001 - see _ensure_loaded
             self.persist_ok = False
             log.warning("state save failed (%s); the in-process limits still hold", error)
+
+
+def _prune_ttl_of(key: str, floor: float) -> float:
+    """The window to prune ``key`` at, never below ``floor``."""
+    return max(floor, COUNTER_TTLS.get(key.split(":", 1)[0], DEFAULT_TTL_SECS))
 
 
 def state_store_from_env(env: dict | None = None, time_fn=_now) -> DurableStateStore:

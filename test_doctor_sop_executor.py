@@ -682,3 +682,50 @@ def test_an_empty_counter_table_does_not_crash_the_write_path(store, monkeypatch
     # No prefix matches and the table is empty: the record must still be written.
     state.mark("unlisted-prefix", ttl=60.0, at=clock["now"])
     assert state.last_mark("unlisted-prefix") == clock["now"]
+
+
+def test_a_short_window_write_cannot_truncate_a_keys_canonical_history(store):
+    """A second caller touching the same key with a shorter window must not erase
+    the first caller's evidence: pruning never shortens."""
+    state, clock = store
+    for _ in range(3):
+        state.touch("loop:j", ttl=COUNTER_TTLS["loop"], at=clock["now"])
+    assert len(state.timestamps("loop:j", ttl=COUNTER_TTLS["loop"])) == 3
+    # A short-window write: the record must still carry the three.
+    state.touch("loop:j", ttl=5.0, at=clock["now"])
+    assert len(state.timestamps("loop:j", ttl=COUNTER_TTLS["loop"])) == 4
+
+
+def test_an_unlisted_key_prefix_is_pruned_rather_than_growing_forever(store):
+    """Infinity for an unrecognised prefix makes a typo'd prefix a silent leak.
+
+    Two different windows are in play and the test names both: `COUNTER_TTLS` (and
+    its default) governs how long a record SURVIVES a pruning write, while
+    `seen`/`timestamps` apply the caller's own window at read time. The bounded
+    one is the pruning window, so that is what is asserted here.
+    """
+    import hive.workers.doctor_state as state_module
+
+    state, clock = store
+    state.mark("typo-prefx:j", ttl=60.0, at=clock["now"])
+    assert state.last_mark("typo-prefx:j") == clock["now"]
+
+    assert state_module._prune_ttl_of("typo-prefx:j", 1.0) == state_module.DEFAULT_TTL_SECS
+    assert state_module._prune_ttl_of("loop:j", 9999.0) == 9999.0, "pruning never shortens"
+
+    # Inside the default window a write keeps it; past it, the next write prunes it.
+    state.mark("loop:other", ttl=10.0, at=clock["now"])
+    assert state.last_mark("typo-prefx:j") == clock["now"]
+    clock["now"] += state_module.DEFAULT_TTL_SECS + 1
+    state.mark("loop:other", ttl=10.0, at=clock["now"])
+    assert state.last_mark("typo-prefx:j") is None, "an unlisted prefix must still be pruned"
+
+
+def test_an_attributed_skip_is_flagged_as_attributed_and_not_printed_as_observed():
+    """The bus confirmed a count and named no ids, so which ids it kept is not
+    knowable — and the doctor's summary must say so rather than list them."""
+    outcome = doctor_gates.purge_result("cancel_failed", {"deleted": 1}, ["a", "b", "c"])
+    assert outcome["attributed"] is True
+    assert outcome["partial"] is True
+    exact = doctor_gates.purge_result("cancel_failed", {"deleted": 1, "matched_ids": ["a"]}, ["a", "b"])
+    assert exact["attributed"] is False
