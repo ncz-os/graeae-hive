@@ -949,9 +949,7 @@ def test_a_password_auth_restart_is_refused_when_the_password_is_absent(monkeypa
     # And through the executor, with the gate satisfied so nothing else refuses.
     monkeypatch.setenv("CIXMINI_SSH_PASSWORD", "")
     monkeypatch.setattr(doctor, "DRY_RUN", False)
-    digest = doctor_gates.action_digest(
-        "restart_service", host="cixmini", service="zeroclaw-doctor.service"
-    )
+    digest = doctor_gates.action_digest("restart_service", host="cixmini", service="zeroclaw-doctor.service")
     doctor.APPROVALS.record_approval("restart_service", digest)
 
     def boom(*args, **kwargs):
@@ -970,3 +968,37 @@ def test_each_cancel_test_starts_with_no_approval(tmp_path):
 
     assert isinstance(doctor.STATE.backend, MemoryBackend), type(doctor.STATE.backend)
     assert doctor.STATE.keys("") == [], doctor.STATE.keys("")
+
+
+def test_a_failed_first_load_cannot_overwrite_the_durable_records(tmp_path):
+    """A cache that has never been loaded holds only this process's writes, so
+    persisting it over a backend that was merely unreachable would delete every
+    record the previous process left. Nothing is written until a load succeeds."""
+    path = str(tmp_path / "s.json")
+    clock = {"now": 4_000_000.0}
+    good = DurableStateStore(FileBackend(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    good.mark("cooldown:zeroclaw", ttl=3600.0, at=clock["now"])
+    good.mark("dlq:dead-1", ttl=21600.0, at=clock["now"])
+
+    class Unreachable(FileBackend):
+        def load(self, namespace):
+            raise OSError("bus is down")
+
+    fresh = DurableStateStore(Unreachable(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    fresh.touch("loop:j", ttl=1800.0, at=clock["now"])
+    assert fresh.persist_ok is False, "an unloaded store must not claim it wrote"
+    assert len(fresh.timestamps("loop:j", ttl=1800.0)) == 1, "the in-process limit still holds"
+
+    # The durable records are untouched.
+    reread = DurableStateStore(FileBackend(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    assert reread.seen("cooldown:zeroclaw", ttl=3600.0)
+    assert reread.seen("dlq:dead-1", ttl=21600.0)
+    assert not reread.seen("loop:j", ttl=1800.0), "the unwritten record is absent, as it should be"
+
+    # And once the backend answers, writing resumes.
+    healed = DurableStateStore(FileBackend(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    healed.touch("loop:j", ttl=1800.0, at=clock["now"])
+    assert healed.persist_ok is True
+    again = DurableStateStore(FileBackend(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    assert again.seen("cooldown:zeroclaw", ttl=3600.0), "the existing records survived"
+    assert again.seen("loop:j", ttl=1800.0), "and the new one landed"

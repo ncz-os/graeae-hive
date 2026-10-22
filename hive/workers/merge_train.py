@@ -271,6 +271,17 @@ def candidate_branches(repo: str, base: str) -> list[str]:
     return [branch for branch in listing.split() if branch != base and BRANCH_PATTERN.search(branch)]
 
 
+def target_remote() -> str:
+    """The remote this engine writes to, as configured.
+
+    `MERGE_TRAIN_REMOTE` defaults to ARGONAS. It is RECORDED on every report rather
+    than assumed, because `route_outward` has to know where a write would land to
+    decide whether the write is outward at all — and a report that always said
+    "argonas" made that question unanswerable.
+    """
+    return CANONICAL_REMOTE
+
+
 def _bare(name: str) -> str:
     """A repository name without its `.git` suffix, lowercased."""
     lowered = name.strip().lower()
@@ -455,13 +466,26 @@ def outward_request(report: BranchReport, kind: str, target: str) -> dict:
 
 
 def route_outward(report: BranchReport) -> dict | None:
-    """What the SOP is asked to send outward, or `None` when the path is off.
+    """What the SOP is asked to send outward, or ``None`` when there is nothing to ask.
 
-    OFF by default. The opt-in does not authorise a push — this function cannot
-    push at all — it only decides whether the engine *asks*. Asking is what puts
-    the action in front of an operator instead of in front of a forge.
+    `None` when the opt-in is off (the default), when the target is the canonical
+    ARGONAS remote — which is not outward and needs no request — or when the branch
+    is not a bucket that would want a write at all.
+
+    The opt-in does not authorise a push; this function cannot push. It only decides
+    whether the engine *asks*, which is what puts the action in front of an operator
+    instead of in front of a forge.
     """
     if not ALLOW_PUBLIC_FORGE:
+        return None
+    if report.target == CANONICAL_REMOTE and not report.opens_mr:
+        # Naming ARGONAS in an `outward_send` request would ask an operator to
+        # approve writing to the fleet's own canonical remote, which is the one write
+        # this engine does not need approval for. A MERGE REQUEST on ARGONAS is a
+        # different action from pushing to it, and the decision routes that outward
+        # whatever the target — so it is the one case where ARGONAS is asked for.
+        return None
+    if report.bucket not in OUTWARD_CANDIDATE_BUCKETS:
         return None
     target = report.target
     host = target.split("://")[-1].split("/")[0] or target
@@ -660,7 +684,10 @@ def measure_repo(repo: str, pattern_checked: bool = True) -> RepoOutcome:
                 repo=name,
                 branch=branch,
                 bucket=bucket,
-                target=CANONICAL_REMOTE,
+                # The remote this repo's branch would be written to, as configured.
+                # Hardcoding the canonical name made every outward request name
+                # ARGONAS — the one write that needs no approval.
+                target=target_remote(),
                 base=base,
                 sha=sha,
                 ahead=stats.ahead,
@@ -696,7 +723,11 @@ def run_cycle(
             outcome = RepoOutcome(repo=name, path=repo, failures=[f"{name}: {type(error).__name__}: {error}"])
             log.warning("merge-train %s failed: %s", name, error)
         outcomes.append(outcome)
-        if outward_reports is not None:
+        if outward_reports is not None and not outcome.failed:
+            # A repository whose measurement failed enqueues nothing: the reasons
+            # are already in its record and its outcome is an escalation, and a
+            # request built from a measurement that did not happen is a request for
+            # an action nobody can describe.
             for report in outcome.reports:
                 # Only a bucket that would actually WANT a write asks for one. A
                 # `done` branch or an orphan needs nothing outward, and emitting a

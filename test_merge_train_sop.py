@@ -875,3 +875,28 @@ def test_only_a_bucket_that_wants_a_write_asks_outward(repo, monkeypatch):
     assert mt.BUCKET_DONE not in mt.OUTWARD_CANDIDATE_BUCKETS
     assert mt.BUCKET_NO_BASE not in mt.OUTWARD_CANDIDATE_BUCKETS
     assert measured, measured
+
+
+def test_an_outward_request_never_names_the_canonical_remote(repo, monkeypatch):
+    """Every report's target is ARGONAS by default, and naming ARGONAS in an
+    `outward_send` request would ask an operator to approve the one write that needs
+    no approval."""
+    monkeypatch.setattr(mt, "ALLOW_PUBLIC_FORGE", True)
+    outward: list[dict] = []
+    mt.run_cycle(repos=[repo["bare"]], outward_reports=outward)
+    assert outward == [], outward
+
+    # A genuinely outward target does produce a request.
+    report = mt.BranchReport(repo="proj", branch="hive/x", bucket=mt.BUCKET_DIVERGENT, target="gitlab.com")
+    request = mt.route_outward(report)
+    assert request is not None
+    assert request["target"] == "gitlab.com"
+
+
+def test_a_failed_repository_enqueues_no_outward_request(tmp_path, monkeypatch):
+    """A request built from a measurement that did not happen is a request for an
+    action nobody can describe."""
+    monkeypatch.setattr(mt, "ALLOW_PUBLIC_FORGE", True)
+    outward: list[dict] = []
+    mt.run_cycle(repos=[str(tmp_path / "not-a-repo.git")], outward_reports=outward)
+    assert outward == [], outward

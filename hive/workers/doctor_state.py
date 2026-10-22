@@ -293,6 +293,12 @@ class DurableStateStore:
         # across a restart, and a caller whose limit is a safety boundary (the SSH
         # rate limiter) can fail closed on this rather than assume the write landed.
         self.persist_ok = True
+        #: False until a load has actually SUCCEEDED. A cache that has never been
+        #: loaded holds only what this process wrote, so persisting it over a
+        #: durable backend that was merely unreachable would delete every record the
+        #: previous process left — the load failed, so nobody knows what those
+        #: records were, and overwriting them is the one thing that must not happen.
+        self._loaded_ok = False
 
     # ── the store surface the doctor uses ──────────────────────────────
 
@@ -335,9 +341,19 @@ class DurableStateStore:
         return now
 
     def last_mark(self, key: str) -> float | None:
+        """When this key was last recorded.
+
+        The newest of `at` and every entry in `timestamps`, not `at` alone. `mark`
+        writes `at` and `touch` writes `timestamps`, so a `seen()` on a key some
+        caller reached with `touch` read `None` and reported the limit as absent —
+        which is the same shape as "never happened".
+        """
         record = self._get(key, ttl=None)
-        value = record.get("at")
-        return float(value) if isinstance(value, (int, float)) else None
+        candidates = [float(stamp) for stamp in record.get("timestamps", []) if isinstance(stamp, (int, float))]
+        at = record.get("at")
+        if isinstance(at, (int, float)):
+            candidates.append(float(at))
+        return max(candidates) if candidates else None
 
     def seen(self, key: str, ttl: float) -> bool:
         """Whether ``key`` was marked inside ``ttl``.
@@ -381,9 +397,7 @@ class DurableStateStore:
         self._ensure_loaded()
         with self._lock:
             self._cache[key] = {"tombstone": True, "at": self._time()}
-            self._cache = {
-                k: v for k, v in self._cache.items() if self._is_live(v, _prune_ttl_of(k, 0.0))
-            }
+            self._cache = {k: v for k, v in self._cache.items() if self._is_live(v, _prune_ttl_of(k, 0.0))}
             self._persist_locked()
 
     def refresh(self) -> None:
@@ -401,9 +415,11 @@ class DurableStateStore:
                 return
             try:
                 loaded = self.backend.load(self.namespace)
+                self._loaded_ok = True
             except Exception as error:  # noqa: BLE001 - a backend must never stop the doctor
                 log.warning("state load failed (%s); serving from cache", error)
                 loaded = {}
+                self._loaded_ok = False
             if getattr(self.backend, "truncated", False):
                 # A bounded read of a longer journal would drop the oldest records,
                 # and the oldest records are the ones a window is made of. Treat it
@@ -422,6 +438,11 @@ class DurableStateStore:
                 self._cache = loaded
             elif self._cache:
                 log.warning("state load returned nothing; keeping %d cached records", len(self._cache))
+            if not self._loaded_ok:
+                # Leave `_loaded_at` unset so the NEXT read retries the backend. A
+                # failed load marked as fresh would be skipped for the whole refresh
+                # window, and the cache it serves is not known to be complete.
+                return
             self._loaded_at = now
             if self.backend.name == "memory" and not self._warned_memory:
                 self._warned_memory = True
@@ -487,6 +508,19 @@ class DurableStateStore:
         return max(COUNTER_TTLS.values(), default=DEFAULT_TTL_SECS)
 
     def _persist_locked(self) -> None:
+        if not self._loaded_ok and self.backend.name != "memory":
+            # Nothing has ever been read back, so this cache is not known to be the
+            # whole state. Writing it would replace a durable backend's contents with
+            # one process's partial view. The counters stay in memory — which keeps
+            # them CORRECT for this process — and the operator is told, because the
+            # remedy is the backend's.
+            log.warning(
+                "state has never loaded from %s; NOT writing, so the durable records survive. "
+                "The in-process limits hold; the durability does not until the backend answers.",
+                self.backend.name,
+            )
+            self.persist_ok = False
+            return
         try:
             self.persist_ok = bool(self.backend.save(self.namespace, self._cache))
             if not self.persist_ok:
