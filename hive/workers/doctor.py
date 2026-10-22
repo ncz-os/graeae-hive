@@ -433,13 +433,32 @@ def note_triage(kind: str, ttl: float | None = None, at: float | None = None) ->
     return stamp
 
 
-def dlq_marked(job_id: str, ttl: float | None = None, at: float | None = None) -> bool:
-    """Whether a dead-letter job has already been decided this cycle window."""
+def dlq_decided(job_id: str, ttl: float | None = None) -> bool:
+    """Whether a dead-letter job has already been decided this cycle window.
+
+    A READ. Recording is [`dlq_record_decision`]'s job, deliberately, because the
+    two must not happen at the same moment: a combined "check and mark" marks a
+    job the moment it is LOOKED at, so a job the per-cycle cap cuts off before it
+    is reached is recorded as decided and then never decided again for the whole
+    seen window. The base commit marked at the end of the loop, which is the order
+    that matters, and this keeps it.
+    """
     ttl = DLQ_SEEN_TTL if ttl is None else float(ttl)
-    already = STATE.seen(f"{KEY_DLQ}:{job_id}", ttl=ttl)
-    if not already:
-        STATE.mark(f"{KEY_DLQ}:{job_id}", ttl=ttl, at=at)
-    return already
+    return STATE.seen(f"{KEY_DLQ}:{job_id}", ttl=ttl)
+
+
+def dlq_record_decision(job_id: str, ttl: float | None = None, at: float | None = None) -> float:
+    """Record that a dead-letter job has been DECIDED, durably.
+
+    Called after the decision has been carried out — or after the job is recorded as
+    one its owner handles — and never before. A refusal from the approval gate IS a
+    decision (the doctor decided not to act), so that is recorded too; what must
+    never be recorded is a job the doctor never reached.
+    """
+    ttl = DLQ_SEEN_TTL if ttl is None else float(ttl)
+    stamp = STATE.mark(f"{KEY_DLQ}:{job_id}", ttl=ttl, at=at)
+    _dlq_seen[job_id] = stamp
+    return stamp
 
 
 def _signal(signum, frame):
@@ -2081,7 +2100,7 @@ def handle_dead_letter_queue() -> dict:
     now = time.time()
     # The DLQ-seen set is durable since 2026-10-22: it lived in a module dict, so a
     # restart re-decided every dead-letter job the doctor had already decided. The
-    # dict below is now only the pre-existing in-process mirror — `dlq_marked()`
+    # dict below is now only the pre-existing in-process mirror — `dlq_decided()`
     # answers from the store and nothing reads the mirror — so it is trimmed and
     # kept in step, not rehydrated from the store on every cycle.
     for k in [k for k, t in _dlq_seen.items() if now - t > DLQ_SEEN_TTL]:
@@ -2093,14 +2112,13 @@ def handle_dead_letter_queue() -> dict:
         jid = job.get("id", "")
         if not jid:
             continue
-        # Durable: the first `dlq_marked` call both answers and records, so this
-        # is the only place a dead-letter job enters the seen set.
-        if dlq_marked(jid, ttl=DLQ_SEEN_TTL, at=now):
-            _dlq_seen[jid] = now
+        if dlq_decided(jid, ttl=DLQ_SEEN_TTL):
             summary["skipped_seen"] += 1
             continue
-        _dlq_seen[jid] = now
-        if dlq_protected(job):  # reported, never remediated — and already recorded
+        if dlq_protected(job):
+            # Its owner's job: reported, never remediated. Recorded as decided, so
+            # the next cycle reports it again instead of re-deciding it.
+            dlq_record_decision(jid, at=now)
             summary["protected"] = summary.get("protected", 0) + 1
             log.info(
                 "dlq %s kind=%s project=%s -> left for its owner (protected)",
@@ -2110,11 +2128,17 @@ def handle_dead_letter_queue() -> dict:
             )
             continue
         if acted >= DLQ_MAX_PER_CYCLE:
+            # The cap, not a decision: BREAK WITHOUT RECORDING, so the job is
+            # decided on a later cycle instead of being marked decided and then
+            # never reached again for the whole seen window.
+            summary["deferred"] = summary.get("deferred", 0) + 1
             break
         decision, reason = classify_dead_letter(job)
         outcome = remediate_dead_letter(job, decision, reason)
         summary[decision] = summary.get(decision, 0) + 1
         acted += 1
+        # Recorded AFTER the work, which is the whole ordering.
+        dlq_record_decision(jid, at=now)
         log.info("dlq %s kind=%s -> %s (%s): %s", jid[:12], job.get("kind", "?"), decision, reason, outcome)
         broadcast_doctor_message(
             "doctor.dlq",

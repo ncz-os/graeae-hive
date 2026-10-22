@@ -498,8 +498,9 @@ def test_the_doctor_writes_through_the_store(store, monkeypatch, tmp_path):
     doctor.record_ssh_action("cerberus", at=clock["now"])
     assert doctor.cooldown_active(f"{doctor.KEY_COOLDOWN}:zeroclaw", doctor.AUTO_TRIAGE_COOLDOWN)
     assert doctor.ssh_actions_total(doctor.SSH_RATE_WINDOW_SEC) == 1
-    assert doctor.dlq_marked("dead-1", ttl=doctor.DLQ_SEEN_TTL, at=clock["now"]) is False
-    assert doctor.dlq_marked("dead-1", ttl=doctor.DLQ_SEEN_TTL, at=clock["now"]) is True
+    assert doctor.dlq_decided("dead-1", ttl=doctor.DLQ_SEEN_TTL) is False
+    doctor.dlq_record_decision("dead-1", ttl=doctor.DLQ_SEEN_TTL, at=clock["now"])
+    assert doctor.dlq_decided("dead-1", ttl=doctor.DLQ_SEEN_TTL) is True
 
     reborn = DurableStateStore(
         FileBackend(str(tmp_path / "doctor-state.json")), refresh_secs=0.0, time_fn=lambda: clock["now"]
@@ -729,3 +730,68 @@ def test_an_attributed_skip_is_flagged_as_attributed_and_not_printed_as_observed
     assert outcome["partial"] is True
     exact = doctor_gates.purge_result("cancel_failed", {"deleted": 1, "matched_ids": ["a"]}, ["a", "b"])
     assert exact["attributed"] is False
+
+
+def test_a_job_cut_off_by_the_per_cycle_cap_is_not_marked_decided(monkeypatch, doctor_state):
+    """REGRESSION FIX: marking durably at LOOK time meant a job the per-cycle cap
+    never reached was marked decided and then never remediated for the whole seen
+    window — the base commit marked at the END of the loop, which is the order
+    that matters."""
+    jobs = [{"id": f"dead-{n}", "kind": "zeroclaw", "result": {"error": "timeout"}} for n in range(5)]
+    monkeypatch.setattr(doctor, "fetch_dead_letter_jobs", lambda: list(jobs))
+    monkeypatch.setattr(doctor, "DLQ_APPLY", False)
+    monkeypatch.setattr(doctor, "DLQ_MAX_PER_CYCLE", 2)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+
+    first = doctor.handle_dead_letter_queue()
+    assert first["resubmit"] == 2, first
+    assert first.get("deferred") == 1, first
+    for job in jobs[2:]:
+        assert not doctor.dlq_decided(job["id"]), f"{job['id']} was never decided"
+
+    # The next cycle picks the undecided ones up rather than skipping them, and the
+    # job the cap kept cutting off is still undecided — which is the property that
+    # matters: it is never silently lost, and it is never marked decided either.
+    second = doctor.handle_dead_letter_queue()
+    assert second["resubmit"] == 2, second
+    assert second.get("deferred") == 1, second
+    assert not doctor.dlq_decided("dead-4"), "still undecided after two capped cycles"
+    third = doctor.handle_dead_letter_queue()
+    assert third["resubmit"] == 1, third
+    assert doctor.dlq_decided("dead-4"), "and decided once a cycle reaches it"
+
+
+def test_a_protected_job_is_recorded_as_decided_without_being_remediated(monkeypatch, doctor_state):
+    monkeypatch.setattr(
+        doctor,
+        "fetch_dead_letter_jobs",
+        lambda: [{"id": "dead-p", "kind": "riskyeats:x", "project": "riskyeats", "result": {}}],
+    )
+    monkeypatch.setattr(doctor, "DLQ_PROTECT_PROJECTS", frozenset({"riskyeats"}))
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    summary = doctor.handle_dead_letter_queue()
+    assert summary.get("protected") == 1, summary
+    assert summary["resubmit"] == 0 and summary["remove"] == 0
+    assert doctor.dlq_decided("dead-p"), "reported every cycle, never re-decided"
+
+
+def test_a_refusal_from_the_approval_gate_still_counts_as_a_decision(monkeypatch, doctor_state):
+    """The doctor DID decide — not to act — so the job is recorded. What must never
+    be recorded is a job the doctor never reached."""
+    monkeypatch.setattr(
+        doctor,
+        "fetch_dead_letter_jobs",
+        lambda: [{"id": "dead-r", "kind": "zeroclaw", "result": {"last_decline_reason": "no_repo_mapping"}}],
+    )
+    monkeypatch.setattr(doctor, "DLQ_APPLY", True)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    calls = []
+    monkeypatch.setattr(
+        doctor,
+        "_http",
+        lambda *a, **k: calls.append(a) or (200, {"ok": [], "not_found": [], "skipped_not_dead_letter": []}),
+    )
+    summary = doctor.handle_dead_letter_queue()
+    assert summary["remove"] == 1, summary
+    assert calls == [], "a refusal must not reach the bus"
+    assert doctor.dlq_decided("dead-r")

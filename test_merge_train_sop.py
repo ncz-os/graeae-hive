@@ -603,3 +603,21 @@ def test_an_outcome_with_no_recorded_path_is_skipped_not_written(repo):
     outcome.path = ""
     lines = mt.fast_forward_candidates([outcome], dry_run=False)
     assert lines and all("no recorded repository path" in line for line in lines), lines
+
+
+def test_a_binary_change_is_never_a_fast_forward(repo, tmp_path):
+    """`--numstat` prints `-` for both columns of a binary file, which counted as
+    zero lines — so a branch adding a multi-gigabyte blob was classified
+    fast-forward and pushed with no human ever seeing its size."""
+    git("checkout", "-q", "hive/ff", cwd=repo["work"])
+    with open(os.path.join(repo["work"], "big.bin"), "wb") as handle:
+        handle.write(bytes(4096))
+    git("add", "big.bin", cwd=repo["work"])
+    git("commit", "-qm", "add a binary blob", cwd=repo["work"])
+    # The mirror is a clone OF the work tree, so the work tree has no remote: push
+    # to the mirror by path.
+    subprocess.run(["git", "push", "-q", repo["bare"], "hive/ff"], cwd=repo["work"], check=True)
+
+    bucket, stats = mt.classify(repo["bare"], "main", "hive/ff")
+    assert stats.binary == 1, stats
+    assert bucket == mt.BUCKET_DIVERGENT, (bucket, stats)

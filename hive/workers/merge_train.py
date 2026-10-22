@@ -104,11 +104,15 @@ class BranchStats:
     added: int = 0
     removed: int = 0
     clobbered: int = 0
+    #: Binary files in the diff. `--numstat` prints `-` for both columns of a
+    #: binary file, which silently counted as zero lines; the count is kept so the
+    #: classification is visible in the record, not only in its outcome.
+    binary: int = 0
 
     def describe(self) -> str:
         return (
             f"ahead={self.ahead} behind={self.behind} added={self.added} "
-            f"removed={self.removed} clobbered={self.clobbered}"
+            f"removed={self.removed} clobbered={self.clobbered} binary={self.binary}"
         )
 
 
@@ -146,11 +150,20 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     numstat = _git("diff", "--numstat", merge_base, branch, cwd=repo).splitlines()
     for line in numstat:
         parts = line.split("\t")
-        if len(parts) >= 2:
-            if parts[0].isdigit():
-                stats.added += int(parts[0])
-            if parts[1].isdigit():
-                stats.removed += int(parts[1])
+        if len(parts) < 2:
+            continue
+        if parts[0].isdigit():
+            stats.added += int(parts[0])
+        if parts[1].isdigit():
+            stats.removed += int(parts[1])
+        elif parts[0] == "-" or parts[1] == "-":
+            # A binary file contributes ZERO to both thresholds, so a branch adding
+            # a 4 GB blob was classified fast-forward and pushed with no human ever
+            # seeing its size. Counted at the divergence ceiling so a binary change
+            # lands in `divergent` — a hold — whatever its actual size.
+            stats.binary += 1
+            stats.added = max(stats.added, MAX_TOTAL_LINES)
+            stats.removed = max(stats.removed, MAX_REMOVED_LINES)
     if stats.removed > MAX_REMOVED_LINES or stats.clobbered or (stats.added + stats.removed) > MAX_TOTAL_LINES:
         return BUCKET_DIVERGENT, stats
     merge_tree = _sh(["git", "merge-tree", "--write-tree", base, branch], cwd=repo)
