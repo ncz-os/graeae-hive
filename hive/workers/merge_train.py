@@ -69,6 +69,26 @@ MAX_BULK_CANDIDATES = 500
 #: same reason: it destroys a branch, and so does a `+` refspec.
 FORBIDDEN = ("--force", "-f", "--force-with-lease", "push --mirror", "--delete", "--prune")
 
+#: Hosts and remote names that are never this fleet's own forge. `CANONICAL_REMOTE`
+#: comes from `MERGE_TRAIN_REMOTE`, so a typo there would otherwise redefine
+#: "canonical" and aim the one write at a public forge — and these are also the
+#: short names a remote is usually given, so the check catches the misconfiguration
+#: rather than only the misspelling.
+PUBLIC_FORGE_HOSTS = frozenset(
+    {
+        "gitlab",
+        "gitlab.com",
+        "github",
+        "github.com",
+        "bitbucket",
+        "bitbucket.org",
+        "gitea",
+        "codeberg",
+        "forgejo",
+        "gogs",
+    }
+)
+
 
 def _sh(args: list[str], cwd: str | None = None, timeout: float = 120.0) -> subprocess.CompletedProcess:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout)
@@ -233,11 +253,13 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
         elif parts[0] == "-" or parts[1] == "-":
             # A binary file contributes ZERO to both thresholds, so a branch adding
             # a 4 GB blob was classified fast-forward and pushed with no human ever
-            # seeing its size. Counted at the divergence ceiling so a binary change
-            # lands in `divergent` — a hold — whatever its actual size.
+            # seeing its size. Counted ABOVE the divergence ceiling, so a binary
+            # change lands in `divergent` — a hold — whatever its actual size and
+            # whatever the ceilings are later tuned to: the bucket is decided by one
+            # counter being over its own limit, not by the sum of two ceilings
+            # happening to exceed a third.
             stats.binary += 1
-            stats.added = max(stats.added, MAX_TOTAL_LINES)
-            stats.removed = max(stats.removed, MAX_REMOVED_LINES)
+            stats.added = max(stats.added, MAX_TOTAL_LINES + 1)
     if stats.removed > MAX_REMOVED_LINES or stats.clobbered or (stats.added + stats.removed) > MAX_TOTAL_LINES:
         return BUCKET_DIVERGENT, stats
     merge_tree = _sh(["git", "merge-tree", "--write-tree", base, branch], cwd=repo)
@@ -428,6 +450,16 @@ def fast_forward(repo: str, base: str, sha: str, dry_run: bool = True, remote: s
             f"REFUSED: this engine writes {CANONICAL_REMOTE} only, not {remote!r}; "
             f"an outward push is an outward_send SOP action"
         )
+    if _remote_host(remote).lower() in PUBLIC_FORGE_HOSTS:
+        # `CANONICAL_REMOTE` is read from `MERGE_TRAIN_REMOTE`, so an operator's
+        # typo redefines "canonical" — and `MERGE_TRAIN_REMOTE=gitlab` would
+        # otherwise satisfy the check above and aim the only write at a public
+        # forge. The name itself is refused, so the mistake cannot be laundered
+        # through the one value that is supposed to authorise the write.
+        return (
+            f"REFUSED: {remote!r} names a public forge, not this fleet's canonical remote; "
+            f"an outward push is an outward_send SOP action"
+        )
     if _sh(["git", "rev-parse", "--verify", "-q", f"{sha}^{{commit}}"], cwd=repo).returncode != 0:
         return f"REFUSED: {sha[:12]} is not a commit in {os.path.basename(repo)}"
     if _sh(["git", "merge-base", "--is-ancestor", base, sha], cwd=repo).returncode != 0:
@@ -435,9 +467,26 @@ def fast_forward(repo: str, base: str, sha: str, dry_run: bool = True, remote: s
             f"REFUSED: {base} is not an ancestor of {sha[:12]}, so this is not a fast-forward; "
             f"a divergent or conflicting branch is a human's job"
         )
+    # The remote's URL as well as its name: an innocent alias that happens to point
+    # at a forge is the same mistake as a forge-named alias, and a name check alone
+    # would let it through. A remote git cannot resolve is left to the push, which
+    # fails without writing anything.
+    url = _sh(["git", "remote", "get-url", remote], cwd=repo).stdout.strip()
+    if url and _remote_host(url).lower() in PUBLIC_FORGE_HOSTS:
+        return (
+            f"REFUSED: {remote!r} resolves to {url}, a public forge, not this fleet's canonical "
+            f"remote; an outward push is an outward_send SOP action"
+        )
     if dry_run:
         return f"DRY-RUN: would advance {base} to {sha[:12]}"
-    result = _sh(["git", "push", remote, f"{sha}:refs/heads/{base}"], cwd=repo)
+    args = ["git", "push", remote, f"{sha}:refs/heads/{base}"]
+    # The choke point runs HERE, on the only write, rather than being a helper
+    # nobody calls: a guard that is not in front of the push is documentation.
+    try:
+        assert_no_forced_or_public_writes(args)
+    except ValueError as error:
+        return f"REFUSED: {error}"
+    result = _sh(args, cwd=repo)
     if result.returncode != 0:
         return f"FAILED: push to {remote} rc={result.returncode} {result.stderr.strip()[:160]}"
     return f"advanced {base} to {sha[:12]} on {remote}"
@@ -465,6 +514,36 @@ def outward_request(report: BranchReport, kind: str, target: str) -> dict:
     }
 
 
+def _remote_host(target: str) -> str:
+    """The HOST an outward request names, from either remote spelling.
+
+    A git remote is written two ways and this reads both: `scheme://host/path`
+    (`ssh://git@gitlab.com:22/group/repo.git`) and the scp form
+    (`git@gitlab.com:group/repo.git`). Splitting on `://` alone returned the WHOLE
+    scp string's first path segment — `git@gitlab.com:group` — so the field an
+    operator reads to decide whether to approve named a user and a repository
+    directory rather than a host.
+    """
+    text = (target or "").strip()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+        host = text.split("/", 1)[0]
+    else:
+        # scp form: `user@host:path` (or a bare `host:path`), so the host is what
+        # precedes the FIRST colon — a port in brackets is part of it, not the split.
+        authority = text.split("/", 1)[0]
+        host = authority.rsplit(":", 1)[0] if ":" in authority else authority
+    if "@" in host:
+        host = host.rsplit("@", 1)[1]
+    # A port is not part of the host: `ssh://git@gitlab.com:22/group/repo.git` names
+    # the host `gitlab.com`. Bracketed IPv6 literals keep their brackets.
+    if host.startswith("["):
+        host = host[: host.index("]") + 1] if "]" in host else host
+    elif ":" in host:
+        host = host.split(":", 1)[0]
+    return host or (target or "").strip()
+
+
 def route_outward(report: BranchReport) -> dict | None:
     """What the SOP is asked to send outward, or ``None`` when there is nothing to ask.
 
@@ -488,7 +567,7 @@ def route_outward(report: BranchReport) -> dict | None:
     if report.bucket not in OUTWARD_CANDIDATE_BUCKETS:
         return None
     target = report.target
-    host = target.split("://")[-1].split("/")[0] or target
+    host = _remote_host(target)
     kind = "pr_open" if report.opens_mr else "push_public_forge"
     return outward_request(report, kind, host)
 
@@ -663,11 +742,13 @@ def measure_repo(repo: str, pattern_checked: bool = True) -> RepoOutcome:
         return outcome
     for branch in branches[:MAX_BULK_CANDIDATES]:
         failures: list[str] = []
+        measured = True
         try:
             bucket, stats = classify(repo, base, branch)
             sha = _git("rev-parse", "--verify", "-q", branch, cwd=repo)
         except subprocess.TimeoutExpired:
             bucket, stats, sha = BUCKET_NO_BASE, BranchStats(), ""
+            measured = False
             failures.append(f"{name}/{branch}: git timed out")
         except Exception as error:  # noqa: BLE001 - one bad branch is not a bad cycle
             # The bucket is a PLACEHOLDER for a branch nothing could measure, and
@@ -676,8 +757,12 @@ def measure_repo(repo: str, pattern_checked: bool = True) -> RepoOutcome:
             # any. `no_base` is the placeholder because it is the one bucket that
             # escalates, so an unmeasurable branch can never be written to.
             bucket, stats, sha = BUCKET_NO_BASE, BranchStats(), ""
+            measured = False
             failures.append(f"{name}/{branch}: {type(error).__name__}: {error}")
-        if sha == "":
+        # Only a branch that MEASURED and still resolved to no sha gets this reason:
+        # the except paths above already recorded why, and a second entry for the
+        # same failure doubled every failure count the operator reads.
+        if measured and sha == "":
             failures.append(f"{name}/{branch}: no resolvable sha")
         outcome.reports.append(
             BranchReport(
@@ -803,6 +888,18 @@ def assert_no_forced_or_public_writes(args: list[str]) -> None:
             f"merge-train refuses {args!r}: a push must name {CANONICAL_REMOTE!r}, "
             f"the only remote this engine may write"
         )
+    # A remote NAME is not a remote: `MERGE_TRAIN_REMOTE=gitlab` would satisfy the
+    # check above and make every push in this module aim at a public forge. The
+    # argument AFTER `push` is the one that names it, so that is the one checked —
+    # a refspec is not a remote and must not be read as a host.
+    push_at = lowered.index("push") if "push" in lowered else -1
+    if push_at >= 0 and push_at + 1 < len(args):
+        named = args[push_at + 1]
+        host = _remote_host(named).lower()
+        if host in PUBLIC_FORGE_HOSTS:
+            raise ValueError(
+                f"merge-train refuses {args!r}: {named!r} names a public forge, not this fleet's canonical remote"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:

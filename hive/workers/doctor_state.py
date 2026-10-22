@@ -218,6 +218,12 @@ class BusBackend(StateBackend):
         #: a safety limit is made of — so the store treats a truncated load as no
         #: load at all rather than as a smaller state.
         self.truncated = False
+        #: What this backend has already published for each key, so a write posts
+        #: the records that CHANGED rather than the whole cache. Re-posting every
+        #: record on every write grows the journal by the size of the state per
+        #: write — quadratically over a run — until every read is truncated and the
+        #: store can never load again. Seeded by `load`, updated by `save`.
+        self._published: dict[str, dict] = {}
 
     def load(self, namespace: str) -> dict:
         self.truncated = False
@@ -244,15 +250,36 @@ class BusBackend(StateBackend):
             value = payload.get("value")
             if not isinstance(key, str) or not isinstance(value, dict):
                 continue
-            ts = float(message.get("ts") or 0.0)
+            try:
+                ts = float(message.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                # One message with an ISO timestamp must not discard the whole
+                # read: every OTHER record in the journal is still evidence, and
+                # dropping it all is the same class of defect as the truncation
+                # above. Treated as the oldest possible entry, which loses only
+                # this message's claim to be the newest.
+                log.warning("bus state message for %s has a non-numeric ts; treating it as oldest", key)
+                ts = 0.0
             previous = newest.get(key)
             if previous is None or ts >= previous[0]:
                 newest[key] = (ts, value)
+        # This load was complete, so what it returned is what is already published.
+        self._published = {key: value for key, (_ts, value) in newest.items()}
         return {key: value for key, (_ts, value) in newest.items()}
 
     def save(self, namespace: str, records: dict) -> bool:
+        """Post the records that changed, and only those.
+
+        Incremental because the journal is append-only and unbounded: posting the
+        whole cache on every write would make the read limit reachable after a few
+        dozen writes, and a truncated read is treated as no read at all.
+        """
         written = 0
+        pending = 0
         for key, value in records.items():
+            if self._published.get(key) == value:
+                continue
+            pending += 1
             status, _response = self._http(
                 "POST",
                 "/v1/messages",
@@ -260,7 +287,10 @@ class BusBackend(StateBackend):
             )
             if status in (200, 201, 202, 204):
                 written += 1
-        return written == len(records)
+                # Only a POST the route accepted is recorded as published, so a
+                # failed one is retried by the next write rather than forgotten.
+                self._published[key] = value
+        return written == pending
 
 
 class DurableStateStore:
@@ -393,11 +423,38 @@ class DurableStateStore:
         record already in the journal, and the next replay resurrects the approval
         somebody just revoked. The tombstone is itself a record, so a later load
         sees the retraction as the newest thing said about the key.
+
+        The tombstone just written is never pruned by its own call: a retraction is
+        held for as long as the record it retracts, not for as long as the key's
+        prefix window, so pruning it here is what would let a replay resurrect the
+        approval.
         """
         self._ensure_loaded()
         with self._lock:
             self._cache[key] = {"tombstone": True, "at": self._time()}
-            self._cache = {k: v for k, v in self._cache.items() if self._is_live(v, _prune_ttl_of(k, 0.0))}
+            self._cache = {
+                k: v
+                for k, v in self._cache.items()
+                if (k == key and v.get("tombstone")) or self._is_live(v, _prune_ttl_of(k, 0.0))
+            }
+            self._persist_locked()
+
+    def clear(self) -> None:
+        """Retract every key in ONE write.
+
+        The same effect as forgetting each key in turn, and one round-trip instead
+        of one per key: on a file backend the whole namespace is replaced once, and
+        on the bus the retractions are a single `save`. Used by
+        `doctor.reset_safety_state`, which is a human action on a store that can
+        hold hundreds of keys.
+        """
+        self._ensure_loaded()
+        with self._lock:
+            if not self._cache:
+                return
+            now = self._time()
+            for key in list(self._cache):
+                self._cache[key] = {"tombstone": True, "at": now}
             self._persist_locked()
 
     def refresh(self) -> None:
@@ -427,6 +484,14 @@ class DurableStateStore:
                 # the operator is told, because the alternative is a safety limit
                 # resetting itself with nothing restarted.
                 loaded = {}
+                # A truncated read is a FAILED read. It must not leave `_loaded_ok`
+                # set, because that flag is what lets `_persist_locked` write: a
+                # cache built from a partial journal would overwrite the journal
+                # with the partial view and destroy the records the read dropped.
+                # Nor may it stamp `_loaded_at`, or the next refresh window would
+                # skip the retry and the store would serve the partial cache for
+                # ever, believing it had loaded.
+                self._loaded_ok = False
             # A load that came back empty while the cache holds records is a
             # backend outage, not a wipe, so the cache is kept UNCONDITIONALLY.
             # There is deliberately no "first load was empty, so clear" branch:
@@ -502,9 +567,11 @@ class DurableStateStore:
         prefix = key.split(":", 1)[0]
         if prefix in COUNTER_TTLS:
             return COUNTER_TTLS[prefix]
-        # `max()` over an empty table raises, and this runs inside the write path,
-        # so an unconfigured table degrades to the named default rather than to a
-        # crash on the first write — and never to infinity.
+        # An unconfigured prefix is pruned at the LONGEST window any configured
+        # prefix uses, so an unknown key is never the shortest-lived record in the
+        # cache. `max()` over an empty table raises and this runs inside the write
+        # path, so the `default` keeps an emptied table degrading to the named
+        # default — and never to infinity.
         return max(COUNTER_TTLS.values(), default=DEFAULT_TTL_SECS)
 
     def _persist_locked(self) -> None:

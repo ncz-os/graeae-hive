@@ -180,7 +180,7 @@ def test_release_kinds_never_include_doctor_even_if_only_doctor_is_offered(monke
     assert sent[-1]["eligible_kinds"] == doctor.DEFAULT_RELEASE_KINDS
 
 
-def _approve_cancel(monkeypatch, base_kind, job_ids):
+def _approve_cancel(base_kind, job_ids):
     """Record the operator approval `action_cancel_jobs` now requires.
 
     A purge is a hard delete of up to 20 jobs and every child job, so it waits for
@@ -207,7 +207,7 @@ def test_cancel_removes_the_failed_jobs(monkeypatch):
     monkeypatch.setattr(doctor, "DRY_RUN", False)
     monkeypatch.setattr(doctor, "_http", fake_http)
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
-    _approve_cancel(monkeypatch, "fix:hive-one", ["a"])
+    _approve_cancel("fix:hive-one", ["a"])
     out = doctor.action_cancel_jobs("fix:hive-one")
     assert posted == [("/v1/jobs/purge", {"ids": ["a"], "status": "failed", "reason": "doctor-cancel:fix:hive-one"})]
     assert out.startswith("cancelled 1/1")
@@ -260,7 +260,7 @@ def test_cancel_also_cancels_child_jobs_of_the_purged_parents(monkeypatch):
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
     # The approval covers the PARENT AND ITS CHILDREN, so it is recorded for the
     # id set the executor is about to purge — not for the parent's alone.
-    _approve_cancel(monkeypatch, "fix:hive-one", ["a", "child1"])
+    _approve_cancel("fix:hive-one", ["a", "child1"])
     out = doctor.action_cancel_jobs("fix:hive-one")
     # Only child1 descends from a purged parent; child2 is left alone.
     purge = [c for c in calls if c[0] == "/v1/jobs/purge"]

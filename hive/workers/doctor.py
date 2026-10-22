@@ -222,6 +222,15 @@ AUTO_TRIAGE_COOLDOWN = float(os.environ.get("AUTO_TRIAGE_COOLDOWN", "3600"))  # 
 DLQ_SCAN_INTERVAL = float(os.environ.get("DLQ_SCAN_INTERVAL", str(SCAN_INTERVAL)))
 DLQ_APPLY = os.environ.get("DLQ_APPLY", "0") == "1"
 DLQ_MAX_PER_CYCLE = int(os.environ.get("DLQ_MAX_PER_CYCLE", "20"))
+# The WORK one dead-letter cycle may do, counted in ATTEMPTS rather than in actions.
+# `DLQ_MAX_PER_CYCLE` is a budget for progress: a refusal for want of an approval
+# does not spend it, because a job the doctor was not allowed to act on is still a
+# job the operator has to hear about. That left the work itself unbounded — every
+# refused job in the queue was classified, attempted and broadcast on every cycle,
+# which is one pass over the whole dead-letter queue per cycle for a queue that
+# cannot drain. This bounds the pass. It is at least `DLQ_MAX_PER_CYCLE`, so the
+# action budget still binds first whenever the doctor is actually making progress.
+DLQ_MAX_ATTEMPTS_PER_CYCLE = max(DLQ_MAX_PER_CYCLE, int(os.environ.get("DLQ_MAX_ATTEMPTS_PER_CYCLE", "50")))
 # Once a dead-letter job has a logged decision, don't re-decide it every cycle.
 _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
@@ -366,10 +375,14 @@ def reset_safety_state(state: DurableStateStore | None = None) -> None:
     NOT reachable from the job loop: nothing in `process_triage_job`,
     `handle_dead_letter_queue` or the SSH path calls this. Clearing a safety limit
     is a human action.
+
+    One `clear()` rather than a `forget()` per key: the store's keys are the
+    durable half and there can be hundreds of them, so per-key forgetting is a
+    per-key round-trip to the backend (and, on a file backend, a full rewrite of
+    the state file each time).
     """
     target = STATE if state is None else state
-    for key in list(target.keys()):
-        target.forget(key)
+    target.clear()
     _seen_job_attempts.clear()
     _recent_auto_triage.clear()
     _dlq_seen.clear()
@@ -394,11 +407,21 @@ def record_ssh_action(host: str, at: float | None = None) -> None:
     """Record one SSH restart against the durable rate limiter and the cooldown.
 
     Durable, so a restart of the pod does not hand the doctor a fresh SSH budget.
+
+    The mirror is trimmed HERE rather than on read: `_ssh_rate_ok` no longer
+    prunes it, so a deque nothing reads must not be the only thing bounding its
+    growth, and a mirror trimmed on write is the one a reader can trust to be the
+    window it claims.
     """
     stamp = STATE.mark(f"{KEY_SSH}:{host}", ttl=SSH_RATE_WINDOW_SEC, at=at)
     STATE.touch(f"{KEY_SSH}:all", ttl=SSH_RATE_WINDOW_SEC, at=at)
     STATE.mark(f"{KEY_HOST_COOLDOWN}:{host}", ttl=MIN_HOST_COOLDOWN, at=at)
     _ssh_actions_log.append(stamp)
+    # `clear`/`extend` rather than a slice assignment: the mirror is a deque in
+    # production and a list in some tests, and neither should care which.
+    _live = [entry for entry in _ssh_actions_log if stamp - entry <= SSH_RATE_WINDOW_SEC]
+    _ssh_actions_log.clear()
+    _ssh_actions_log.extend(_live)
     _host_last_action[host] = stamp
 
 
@@ -1041,11 +1064,10 @@ def _ssh_rate_ok(host: str) -> bool:
     2026-10-22: both counters lived in module dicts, so restarting the pod gave
     the doctor a fresh SSH budget on every host. They are now timestamps in the
     state store; the deque/dict mirrors are updated alongside so anything still
-    reading them sees the same thing.
+    reading them sees the same thing, and the deque is trimmed on WRITE
+    (`record_ssh_action`) because nothing here reads it.
     """
     now = time.time()
-    while _ssh_actions_log and now - _ssh_actions_log[0] > SSH_RATE_WINDOW_SEC:
-        _ssh_actions_log.popleft()
     if not STATE.persist_ok:
         # A rate limiter that cannot record what it has already allowed is not a
         # limiter: after a restart it would hand out a fresh budget. Fail closed
@@ -1056,7 +1078,9 @@ def _ssh_rate_ok(host: str) -> bool:
     # Read the cap from the DURABLE count, not from the deque. The deque is a
     # write-only mirror (nothing reads it; it exists so the pre-existing attribute
     # names keep working), so re-syncing it here would cost a second store read on
-    # every check to keep a value nobody consults up to date.
+    # every check to keep a value nobody consults up to date — and trimming it here
+    # would be the only thing bounding its growth, which is why it is trimmed on
+    # write instead.
     total = ssh_actions_total(SSH_RATE_WINDOW_SEC)
     if total >= MAX_SSH_PER_HOUR:
         log.warning("SSH rate cap %d/h reached (durable: %d) — skipping", MAX_SSH_PER_HOUR, total)
@@ -2108,6 +2132,11 @@ def handle_dead_letter_queue() -> dict:
     jobs = fetch_dead_letter_jobs()
     summary = {"scanned": len(jobs), "resubmit": 0, "remove": 0, "needs-review": 0, "skipped_seen": 0}
     acted = 0
+    # Two counters, because a cycle has two things to bound: how much it GETS DONE
+    # (`acted`) and how much work it DOES (`attempts`). Counting only actions left a
+    # DLQ full of refused jobs unbounded — `acted` never advanced, so one cycle
+    # classified, attempted and broadcast every job in the queue, forever.
+    attempts = 0
     for job in jobs:
         jid = job.get("id", "")
         if not jid:
@@ -2129,12 +2158,15 @@ def handle_dead_letter_queue() -> dict:
                 job.get("project") or "-",
             )
             continue
-        if acted >= DLQ_MAX_PER_CYCLE:
+        if acted >= DLQ_MAX_PER_CYCLE or attempts >= DLQ_MAX_ATTEMPTS_PER_CYCLE:
             # The cap, not a decision: BREAK WITHOUT RECORDING, so the job is
             # decided on a later cycle instead of being marked decided and then
-            # never reached again for the whole seen window.
+            # never reached again for the whole seen window. `deferred` counts the
+            # cycle that stopped, not every job behind it — the jobs behind it are
+            # reached on later cycles, in order.
             summary["deferred"] = summary.get("deferred", 0) + 1
             break
+        attempts += 1
         decision, reason = classify_dead_letter(job)
         outcome = remediate_dead_letter(job, decision, reason)
         summary[decision] = summary.get(decision, 0) + 1

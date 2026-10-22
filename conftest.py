@@ -23,7 +23,13 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _doctor_starts_with_no_safety_history(monkeypatch):
-    """Swap in an empty in-memory safety store for the duration of one test."""
+    """Swap in an empty in-memory safety store for the duration of one test.
+
+    The module-level MIRRORS the store keeps in step (`_seen_job_attempts`,
+    `_recent_auto_triage`, `_dlq_seen`, `_ssh_actions_log`, `_host_last_action`) are
+    cleared too. They are process-global for the same reason the store is, and a
+    mirror that survives a test is a loop count the next test escalates on.
+    """
     from hive.workers import doctor
     from hive.workers.doctor_state import DurableStateStore, MemoryBackend
 
@@ -31,4 +37,9 @@ def _doctor_starts_with_no_safety_history(monkeypatch):
     # The gate reads the same store, and the approval it holds is what a test's
     # refusal depends on, so the two are swapped together.
     monkeypatch.setattr(doctor, "APPROVALS", doctor.doctor_gates.ApprovalGate(doctor.STATE, gate_enabled=True))
+    doctor._seen_job_attempts.clear()
+    doctor._recent_auto_triage.clear()
+    doctor._dlq_seen.clear()
+    doctor._ssh_actions_log.clear()
+    doctor._host_last_action.clear()
     yield

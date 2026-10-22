@@ -1002,3 +1002,262 @@ def test_a_failed_first_load_cannot_overwrite_the_durable_records(tmp_path):
     again = DurableStateStore(FileBackend(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
     assert again.seen("cooldown:zeroclaw", ttl=3600.0), "the existing records survived"
     assert again.seen("loop:j", ttl=1800.0), "and the new one landed"
+
+
+# ── 7. review round 2: findings verified against the source ───────────────────
+#
+# Every test below names a deepseek-flash finding from the round-2 review and
+# either disproves it (the disproof is asserted, not argued) or pins the fix.
+
+
+def test_a_refusal_storm_bounds_the_work_one_cycle_does(monkeypatch, doctor_state):
+    """`DLQ_MAX_PER_CYCLE` bounds ACTIONS; nothing bounded the WORK.
+
+    A DLQ whose remediation is refused for want of an approval never advances
+    `acted`, so the cap was never reached and one cycle classified, attempted and
+    broadcast every job in the queue — a full pass per cycle over a queue that
+    cannot drain. The attempt counter bounds the pass, and it is above the action
+    budget so the action budget still binds first whenever the doctor is making
+    progress (and so refusals still do not crowd out the jobs behind them).
+    """
+    jobs = [
+        {"id": f"dead-{n:03d}", "kind": "zeroclaw", "result": {"last_decline_reason": "no_repo_mapping"}}
+        for n in range(180)
+    ]
+    monkeypatch.setattr(doctor, "fetch_dead_letter_jobs", lambda: list(jobs))
+    monkeypatch.setattr(doctor, "DLQ_APPLY", True)
+    monkeypatch.setattr(doctor, "DLQ_MAX_PER_CYCLE", 2)
+    monkeypatch.setattr(doctor, "DLQ_MAX_ATTEMPTS_PER_CYCLE", 5)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    monkeypatch.setattr(doctor, "_http", lambda *a, **k: (200, {"ok": []}))
+    attempted: list[str] = []
+    monkeypatch.setattr(
+        doctor,
+        "classify_dead_letter",
+        lambda job: attempted.append(job["id"]) or ("remove", "no repo mapping"),
+    )
+
+    summary = doctor.handle_dead_letter_queue()
+
+    assert len(attempted) == 5, f"one cycle must not attempt all {len(jobs)} jobs: {len(attempted)}"
+    assert summary.get("deferred") == 1, summary
+    # And a refusal still does not spend the ACTION budget: with the attempt cap
+    # above it, the five refused jobs were all reached rather than the cap breaking
+    # after the first two.
+    assert summary["remove"] == 5, summary
+    assert not any(doctor.dlq_decided(job["id"]) for job in jobs[:5]), "a refusal is still not a decision"
+
+
+def test_the_attempt_budget_is_never_below_the_action_budget():
+    """An attempt cap under the action cap would make the action budget
+    unreachable, which is the same defect in the other direction."""
+    assert doctor.DLQ_MAX_ATTEMPTS_PER_CYCLE >= doctor.DLQ_MAX_PER_CYCLE, (
+        doctor.DLQ_MAX_ATTEMPTS_PER_CYCLE,
+        doctor.DLQ_MAX_PER_CYCLE,
+    )
+
+
+def test_a_truncated_bus_read_is_not_believed_to_have_loaded(tmp_path):
+    """The load itself is the defect, not just what it returns.
+
+    `_ensure_loaded` set `_loaded_ok` before the truncation check, so a truncated
+    read counted as a SUCCESSFUL load: `_loaded_at` was stamped (the store stopped
+    retrying for the whole refresh window) and `_persist_locked` was permitted to
+    write the partial cache over the journal — destroying exactly the records the
+    bounded read dropped. A truncated read is a failed read: the cache is kept, the
+    next read retries, and nothing is written until the backend answers whole.
+    """
+
+    class Journal:
+        name = "bus"
+
+        def __init__(self):
+            self.entries = []
+            self.truncated = False
+            self.saves = 0
+
+        def load(self, namespace):
+            self.truncated = len(self.entries) >= 2
+            newest: dict = {}
+            for key, value in self.entries[-2:]:
+                newest[key] = value
+            return newest
+
+        def save(self, namespace, records):
+            self.saves += 1
+            for key, value in records.items():
+                self.entries.append((key, value))
+            return True
+
+    clock = {"now": 8_000_000.0}
+    journal = Journal()
+    state = DurableStateStore(journal, refresh_secs=0.0, time_fn=lambda: clock["now"])
+
+    state.mark("loop:a", ttl=1800.0, at=clock["now"])
+    state.mark("loop:b", ttl=1800.0, at=clock["now"])
+    saves_before = journal.saves
+
+    # Every read from here on is truncated, so every write must be refused: the
+    # cache holds three records and the read can only ever show two of them.
+    state.mark("loop:c", ttl=1800.0, at=clock["now"])
+    assert journal.truncated is True, "the journal is longer than one read"
+    assert state.persist_ok is False, "a truncated read must not be believed: it would be written back"
+    assert journal.saves == saves_before, "and nothing may be written over the journal"
+
+    # The in-process limits still hold — that is the point of keeping the cache.
+    assert state.last_mark("loop:c") == clock["now"]
+    assert state.last_mark("loop:a") == clock["now"]
+
+
+def test_the_bus_backend_posts_only_what_changed(monkeypatch):
+    """`save` re-posted the whole cache on every write.
+
+    The journal is append-only and the read is bounded, so re-publishing every
+    record per write grows the journal by the size of the state per write until
+    every read is truncated — which, with the truncation treated as a load, stops
+    the store loading at all. `save` posts the records that changed and seeds
+    itself from the records a complete `load` returned.
+    """
+    from hive.workers.doctor_state import BusBackend
+
+    posted: list[dict] = []
+    journal: list[dict] = [
+        {"ts": 1.0, "payload": {"key": "loop:a", "value": {"timestamps": [1.0]}}},
+        {"ts": 2.0, "payload": {"key": "loop:b", "value": {"timestamps": [2.0]}}},
+        {"ts": 3.0, "payload": {"key": "loop:c", "value": {"timestamps": [3.0]}}},
+    ]
+
+    def http(method, path, body=None):
+        if method == "GET":
+            return 200, {"messages": list(journal)}
+        posted.append(body["payload"])
+        journal.append({"ts": float(len(journal)), "payload": body["payload"]})
+        return 201, {}
+
+    clock = {"now": 9_000_000.0}
+    backend = BusBackend(http, limit=50)
+    state = DurableStateStore(backend, namespace="doctor.safety", refresh_secs=0.0, time_fn=lambda: clock["now"])
+
+    # The store holds three keys, so a save that re-posted the cache would publish
+    # three records per write.
+    state.mark("loop:a", ttl=1800.0, at=clock["now"])
+    assert [entry["key"] for entry in posted] == ["loop:a"], posted
+
+    state.mark("loop:b", ttl=1800.0, at=clock["now"])
+    assert [entry["key"] for entry in posted] == ["loop:a", "loop:b"], posted
+
+    state.mark("loop:c", ttl=1800.0, at=clock["now"])
+    assert [entry["key"] for entry in posted] == ["loop:a", "loop:b", "loop:c"], posted
+    assert state.persist_ok is True
+
+    # A brand new backend over the same journal posts what it is given, because it
+    # knows nothing about what is already there.
+    fresh = BusBackend(http, limit=50)
+    fresh.save("doctor.safety", {"loop:d": {"at": 9.0}})
+    assert posted[-1]["key"] == "loop:d"
+
+
+def test_one_malformed_bus_message_does_not_discard_the_whole_read():
+    """`float(message["ts"])` raised on a non-numeric timestamp, and the exception
+    was caught a frame up as "the backend failed" — so one bad message threw away
+    every good record in the journal, which is the same failure as the truncation
+    guard it sat next to."""
+    from hive.workers.doctor_state import BusBackend
+
+    def http(method, path, body=None):
+        assert method == "GET"
+        return 200, {
+            "messages": [
+                {"ts": "2026-10-22T00:00:00Z", "payload": {"key": "loop:a", "value": {"at": 1.0}}},
+                {"ts": 2.0, "payload": {"key": "loop:b", "value": {"at": 2.0}}},
+            ]
+        }
+
+    backend = BusBackend(http, limit=50)
+    assert backend.load("doctor.safety") == {"loop:a": {"at": 1.0}, "loop:b": {"at": 2.0}}
+    assert backend.truncated is False
+
+
+def test_clearing_the_safety_state_is_one_write_not_one_per_key(store, monkeypatch):
+    """`reset_safety_state` forgot every key in turn, which is a round-trip to the
+    backend per key and, on a file backend, a full rewrite of the state file each
+    time — for a store whose whole purpose is to hold a lot of keys."""
+    state, clock = store
+    for n in range(50):
+        state.mark(f"loop:j{n}", ttl=1800.0, at=clock["now"])
+    saves = {"n": 0}
+    original = state.backend.save
+
+    def counting_save(namespace, records):
+        saves["n"] += 1
+        return original(namespace, records)
+
+    monkeypatch.setattr(state.backend, "save", counting_save)
+    doctor.reset_safety_state(state)
+
+    assert saves["n"] == 1, f"one clear is one write, not fifty: {saves['n']}"
+    assert [key for key in state.keys("") if not state._cache[key].get("tombstone")] == [], state.keys("")
+
+    # And a restart agrees: every key was retracted durably, not just in memory.
+    reborn = DurableStateStore(FileBackend(state.backend.path), refresh_secs=0.0, time_fn=state._time)
+    assert reborn.timestamps("loop:j0", ttl=1800.0) == []
+    assert not reborn.seen("loop:j7", ttl=1800.0)
+
+
+def test_the_ssh_mirror_is_trimmed_on_write_not_on_read(monkeypatch, doctor_state):
+    """`_ssh_actions_log` is a write-only mirror, so trimming it inside the rate
+    check was dead work on every check and made the mirror something the check
+    mutates. It is trimmed where it grows instead — and it is still bounded."""
+    _state, clock = doctor_state
+    monkeypatch.setattr(doctor, "SSH_RATE_WINDOW_SEC", 3600.0)
+    doctor.record_ssh_action("cerberus", at=clock["now"])
+    assert len(doctor._ssh_actions_log) == 1
+
+    # A read does not mutate the mirror.
+    snapshot = list(doctor._ssh_actions_log)
+    doctor._ssh_rate_ok("cerberus")
+    assert list(doctor._ssh_actions_log) == snapshot, "a rate check must not prune the mirror"
+
+    # An old entry ages out on the next write, so the mirror cannot grow forever.
+    doctor.record_ssh_action("cerberus", at=clock["now"] + 3601.0)
+    assert len(doctor._ssh_actions_log) == 1, doctor._ssh_actions_log
+    doctor.record_ssh_action("cerberus", at=clock["now"] + 7100.0)
+    assert len(doctor._ssh_actions_log) == 2, doctor._ssh_actions_log
+
+
+def test_the_auto_triage_cooldown_reader_and_writer_agree(monkeypatch, doctor_state):
+    """Raised four times by review, and disproved here rather than argued: the
+    reader asks for `cooldown:<base kind>` and `note_triage(base_kind)` marks
+    `cooldown:<kind>`. The point of the test is the SECOND scan — the durable
+    cooldown is the only thing stopping every cycle re-submitting the same cluster.
+    """
+    _state, clock = doctor_state
+    monkeypatch.setattr(doctor, "CLUSTER_THRESHOLD", 2)
+    monkeypatch.setattr(doctor, "_active_triage_exists", lambda base_kind: False)
+    # `ended_at` is compared against the WALL clock, so the jobs are recent in real
+    # time; the store's clock (below) is what the cooldown is measured on.
+    jobs = [{"id": f"j{n}", "kind": "zeroclaw:build", "ended_at": time.time()} for n in range(3)]
+    submitted: list[str] = []
+    monkeypatch.setattr(
+        doctor,
+        "_http",
+        lambda method, path, *a, **k: (
+            (200, {"jobs": list(jobs)}) if method == "GET" else submitted.append(path) or (201, {"id": "triage-1"})
+        ),
+    )
+
+    clusters = doctor.scan_for_failure_clusters()
+    assert [cluster["base_kind"] for cluster in clusters] == ["zeroclaw:build"], clusters
+    for cluster in clusters:
+        doctor.submit_auto_triage(cluster["base_kind"], cluster["count"], cluster["sample_job_id"])
+    assert len(submitted) == 1, submitted
+
+    # The next cycle inside the cooldown sees nothing to do.
+    again = doctor.scan_for_failure_clusters()
+    assert again == [], f"the durable cooldown must suppress the second cycle: {again}"
+    assert len(submitted) == 1, f"and nothing may be submitted again: {submitted}"
+
+    # Past the window it comes back — so the pin above is the cooldown, not a
+    # permanently dead path.
+    clock["now"] += doctor.AUTO_TRIAGE_COOLDOWN + 1
+    assert [cluster["base_kind"] for cluster in doctor.scan_for_failure_clusters()] == ["zeroclaw:build"]

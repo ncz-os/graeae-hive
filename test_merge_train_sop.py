@@ -14,7 +14,6 @@ real `--force`.
 import ast
 import json
 import os
-import re
 import subprocess
 
 import pytest
@@ -204,15 +203,53 @@ def test_a_merge_request_is_requested_as_pr_open(monkeypatch):
 
 
 def test_no_code_path_in_this_module_pushes_to_a_public_forge():
-    """The only `git push` is inside `fast_forward`, and it refuses a
-    non-canonical remote before reaching it."""
-    source = source_of()
-    # Count real invocations (`_sh([...])`), not every mention of the word: the
-    # choke point's own guard mentions "push" too.
-    pushes = re.findall(r'_sh\(\[[^\]]*"push"[^\]]*', source)
-    assert pushes == ['_sh(["git", "push", remote, f"{sha}:refs/heads/{base}"'], (
-        f"exactly one git push may exist in this module, and it must be the guarded one: {pushes}"
+    """The only `git push` is inside `fast_forward`, and it is guarded.
+
+    Counted from the AST rather than by grepping the text: a regex over source
+    broke on any reformatting — renaming the argument list into a variable, or
+    wrapping the line — while the property being checked (exactly one push, and it
+    passes the guard) is a property of the parsed program.
+    """
+    tree = ast.parse(source_of())
+    # A command list may be spelled inline or bound to a name first; both are the
+    # same command, and the property is about the program rather than the spelling.
+    bindings: dict[str, list] = {}
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and isinstance(node.value, (ast.List, ast.Tuple))
+        ):
+            bindings[node.targets[0].id] = [
+                element.value for element in node.value.elts if isinstance(element, ast.Constant)
+            ]
+
+    def words(argument) -> list:
+        if isinstance(argument, (ast.List, ast.Tuple)):
+            return [element.value for element in argument.elts if isinstance(element, ast.Constant)]
+        if isinstance(argument, ast.Name):
+            return bindings.get(argument.id, [])
+        return []
+
+    pushes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_sh"
+        and node.args
+        and "push" in words(node.args[0])
+    ]
+    assert len(pushes) == 1, f"exactly one git push may exist in this module: {len(pushes)}"
+    in_fast_forward = any(
+        isinstance(node, ast.FunctionDef)
+        and node.name == "fast_forward"
+        and any(child is pushes[0] for child in ast.walk(node))
+        for node in ast.walk(tree)
     )
+    assert in_fast_forward, "the one push must be fast_forward's"
+    source = source_of()
     for forbidden in ("urllib", "gitlab.com/api", "merge_requests", "PRIVATE-TOKEN"):
         assert forbidden not in source, f"{forbidden} may not appear in this module"
 
@@ -268,23 +305,6 @@ def test_the_default_interval_is_a_day():
 
 
 # ── classification ───────────────────────────────────────────────────────────
-
-
-def test_the_buckets_are_the_ones_the_sop_decision_parses(repo):
-    """The two lists are written out separately (this module runs on PYTHIA
-    without the zeroclaw crate), so they are asserted to agree."""
-    expected = {
-        "done",
-        "fast_forward",
-        "cherry_pick",
-        "divergent",
-        "conflict",
-        "no_base",
-    }
-    assert set(mt.BUCKETS) == expected
-    # And the same set as `TrainBucket::ALL` on the zeroclaw side.
-    so_puckets = expected
-    assert len(so_puckets) == len(mt.BUCKETS)
 
 
 def test_a_clean_fast_forward_is_classified_as_one(repo):
@@ -856,27 +876,6 @@ def test_a_failed_repository_still_appears_in_the_json_output(tmp_path, capsys, 
     assert "not a directory" in record["failures"][0], record
 
 
-def test_only_a_bucket_that_wants_a_write_asks_outward(repo, monkeypatch):
-    """A `done` branch needs nothing outward, and a request for it would put a
-    phantom action in front of the operator's approval queue."""
-    monkeypatch.setattr(mt, "ALLOW_PUBLIC_FORGE", True)
-    outward: list[dict] = []
-    outcomes = mt.run_cycle(repos=[repo["bare"]], outward_reports=outward)
-    measured = {report.branch: report.bucket for report in outcomes[0].reports}
-    for request in outward:
-        branch = next(
-            (report for report in outcomes[0].reports if report.repo in request["text"]),
-            None,
-        )
-        assert branch is not None
-        assert branch.bucket in mt.OUTWARD_CANDIDATE_BUCKETS, branch
-    # Nothing that is `done` or `no_base` is ever in the bucket set the engine asks
-    # from, whatever the target says.
-    assert mt.BUCKET_DONE not in mt.OUTWARD_CANDIDATE_BUCKETS
-    assert mt.BUCKET_NO_BASE not in mt.OUTWARD_CANDIDATE_BUCKETS
-    assert measured, measured
-
-
 def test_an_outward_request_never_names_the_canonical_remote(repo, monkeypatch):
     """Every report's target is ARGONAS by default, and naming ARGONAS in an
     `outward_send` request would ask an operator to approve the one write that needs
@@ -900,3 +899,230 @@ def test_a_failed_repository_enqueues_no_outward_request(tmp_path, monkeypatch):
     outward: list[dict] = []
     mt.run_cycle(repos=[str(tmp_path / "not-a-repo.git")], outward_reports=outward)
     assert outward == [], outward
+
+
+# ── review round 2: the write, verified against the source ───────────────────
+
+
+def test_the_only_write_runs_through_the_choke_point(repo, monkeypatch):
+    """`assert_no_forced_or_public_writes` is documented as a single choke point in
+    front of every write — and `fast_forward`, the module's only write, never called
+    it, so the guard was dead code on the path that matters. It is called there now,
+    and a command the guard refuses comes back as this function's REFUSAL string
+    rather than an exception escaping the write path."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        up = os.path.join(tmp, "upstream.git")
+        subprocess.run(["git", "init", "-q", "--bare", up], check=True, capture_output=True)
+        git("remote", "add", "argonas", up, cwd=repo["bare"])
+
+        guarded: list[list[str]] = []
+        pushed: list[list[str]] = []
+        real_guard = mt.assert_no_forced_or_public_writes
+        monkeypatch.setattr(mt, "assert_no_forced_or_public_writes", lambda args: guarded.append(list(args)))
+        monkeypatch.setattr(
+            mt,
+            "_sh",
+            lambda args, cwd=None, timeout=120.0: (
+                pushed.append(list(args)) or subprocess.CompletedProcess(args, 0, "", "")
+            ),
+        )
+        out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False)
+        assert "advanced" in out, out
+        pushes = [command for command in pushed if command[:2] == ["git", "push"]]
+        assert len(guarded) == 1, f"the only write must pass the choke point: {guarded}"
+        assert pushes == [guarded[0]], pushes
+        assert guarded[0] == ["git", "push", "argonas", repo["ff_sha"] + ":refs/heads/main"], guarded[0]
+        # And the real guard passes that exact command.
+        real_guard(guarded[0])
+
+        # When the guard refuses, the refusal is the return value and NO push runs.
+        def refusing(args):
+            raise ValueError("merge-train refuses: a '+' refspec is a force-push and is never allowed")
+
+        monkeypatch.setattr(mt, "assert_no_forced_or_public_writes", refusing)
+        pushed.clear()
+        out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False)
+        assert out.startswith("REFUSED"), out
+        assert "force-push" in out, out
+        assert [command for command in pushed if command[:2] == ["git", "push"]] == [], (
+            f"a refused command must not be pushed: {pushed}"
+        )
+
+
+def test_a_canonical_remote_that_is_a_public_forge_is_refused(repo, monkeypatch):
+    """`CANONICAL_REMOTE` is `MERGE_TRAIN_REMOTE`, read from the environment. An
+    operator's typo — `MERGE_TRAIN_REMOTE=gitlab` — therefore satisfied the
+    "only the canonical remote" check and aimed the module's only write at a public
+    forge. Both the name and the URL it resolves to are refused now."""
+    monkeypatch.setattr(mt, "CANONICAL_REMOTE", "gitlab")
+    out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False, remote="gitlab")
+    assert out.startswith("REFUSED"), out
+    assert "public forge" in out, out
+
+    # And an innocent name that resolves to a forge URL is the same mistake.
+    monkeypatch.setattr(mt, "CANONICAL_REMOTE", "upstream")
+    git("remote", "add", "upstream", "git@gitlab.com:zeroclaw-labs/graeae-hive.git", cwd=repo["bare"])
+    out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False, remote="upstream")
+    assert out.startswith("REFUSED"), out
+    assert "public forge" in out, out
+
+    # ARGONAS itself still writes, or the guard would have closed the module.
+    monkeypatch.setattr(mt, "CANONICAL_REMOTE", "argonas")
+
+
+def test_the_choke_point_itself_refuses_a_forge_remote(monkeypatch):
+    """A remote NAME is not a remote. With `MERGE_TRAIN_REMOTE=gitlab` the
+    "must name the canonical remote" check passes — because gitlab IS the canonical
+    remote now — and the only thing left between a typo and a public-forge push is
+    the guard refusing a forge by name."""
+    for remote in ("gitlab", "github", "bitbucket", "git@gitlab.com:group/repo.git", "ssh://git@gitlab.com:22/g/r.git"):
+        monkeypatch.setattr(mt, "CANONICAL_REMOTE", remote)
+        with pytest.raises(ValueError, match="public forge"):
+            mt.assert_no_forced_or_public_writes(["git", "push", remote, "main"])
+    # And ARGONAS, under whatever it is named, still passes.
+    monkeypatch.setattr(mt, "CANONICAL_REMOTE", "argonas")
+    mt.assert_no_forced_or_public_writes(["git", "push", "argonas", "main"])
+
+
+def test_a_binary_change_is_divergent_by_construction(repo):
+    """A binary file contributes zero to both numstat columns, so a branch adding a
+    4 GB blob was classified `fast_forward` and pushed with nobody seeing its size.
+    The counter is now set ABOVE the divergence ceiling, so the bucket is decided by
+    one counter being over its own limit rather than by the sum of two ceilings
+    happening to exceed a third — which any later retuning of those ceilings would
+    have silently undone."""
+    work = repo["work"]
+    git("checkout", "-q", "-b", "hive/binary", "main", cwd=work)
+    with open(os.path.join(work, "blob.bin"), "wb") as handle:
+        handle.write(b"\x00\x01\x02" * 64 + b"\xff" * 64)
+    git("add", "blob.bin", cwd=work)
+    git("commit", "-qm", "binary blob", cwd=work)
+
+    bucket, stats = mt.classify(work, "main", "hive/binary")
+    assert stats.binary == 1, stats
+    assert stats.added > mt.MAX_TOTAL_LINES, (
+        f"a binary change must be over the divergence ceiling by construction, not by arithmetic: {stats}"
+    )
+    assert bucket == mt.BUCKET_DIVERGENT, (bucket, stats)
+
+    # A branch with no binary file is unaffected: the ordinary thresholds decide.
+    assert mt.classify(work, "main", "hive/ff")[0] == mt.BUCKET_FAST_FORWARD
+
+
+def test_an_outward_request_names_a_host_from_either_remote_spelling(monkeypatch):
+    """`route_outward` split on `://` alone, so an scp-style remote
+    (`git@gitlab.com:group/repo.git`) produced `git@gitlab.com:group` — a user and
+    a repository directory presented to an operator as the host they are approving
+    a write to."""
+    monkeypatch.setattr(mt, "ALLOW_PUBLIC_FORGE", True)
+    for target, expected in (
+        ("gitlab.com", "gitlab.com"),
+        ("ssh://git@gitlab.com:22/group/repo.git", "gitlab.com"),
+        ("https://gitlab.com/group/repo.git", "gitlab.com"),
+        ("git@gitlab.com:group/repo.git", "gitlab.com"),
+        ("git@github.com:group/repo.git", "github.com"),
+    ):
+        report = mt.BranchReport(repo="proj", branch="hive/x", bucket=mt.BUCKET_DIVERGENT, target=target)
+        request = mt.route_outward(report)
+        assert request is not None, target
+        assert request["target"] == expected, f"{target} -> {request['target']}"
+
+
+def test_a_failed_measurement_records_one_failure_not_two(repo, monkeypatch):
+    """`measure_repo` appended "no resolvable sha" after the except path had already
+    appended why it failed, so one unmeasurable branch produced two entries in the
+    list the SOP escalates on and two in the operator's summary."""
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("git exploded")
+
+    monkeypatch.setattr(mt, "classify", boom)
+    outcome = mt.measure_repo(repo["bare"])
+    assert outcome.failed, outcome
+    assert outcome.reports, "the branches are still reported, with the failure on them"
+    for report in outcome.reports:
+        assert len(report.failures) == 1, f"{report.branch}: {report.failures}"
+        assert "git exploded" in report.failures[0], report.failures
+    assert sum(len(report.failures) for report in outcome.reports) == len(outcome.failures)
+
+    # A branch that measured and resolved to no sha still says so — once.
+    monkeypatch.setattr(mt, "classify", lambda *a, **k: (mt.BUCKET_DONE, mt.BranchStats()))
+    monkeypatch.setattr(mt, "_git", lambda *args, **kwargs: "")
+    outcome = mt.measure_repo(repo["bare"])
+    assert outcome.reports, outcome
+    for report in outcome.reports:
+        assert report.failures == [f"{outcome.repo}/{report.branch}: no resolvable sha"], report.failures
+
+
+def test_the_buckets_are_the_ones_the_sop_decision_parses(repo):
+    """The two lists are written out separately (this module runs on PYTHIA without
+    the zeroclaw crate), so they are asserted to agree.
+
+    The agreement checked here is between `BUCKETS` and the buckets `classify` can
+    actually RETURN: a bucket nothing can produce is a bucket the SOP can never see,
+    and a value `classify` returns that is not in `BUCKETS` is one the record would
+    carry as an unknown name. Read out of the source's own AST rather than a second
+    hardcoded list, because a second hardcoded list is exactly what this test
+    exists to catch.
+    """
+    expected = {
+        "done",
+        "fast_forward",
+        "cherry_pick",
+        "divergent",
+        "conflict",
+        "no_base",
+    }
+    assert set(mt.BUCKETS) == expected
+
+    tree = ast.parse(source_of())
+    constants: dict[str, str] = {
+        node.targets[0].id: node.value.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    classify = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef) and node.name == "classify")
+    returned: set[str] = set()
+    for node in ast.walk(classify):
+        if not (isinstance(node, ast.Return) and isinstance(node.value, ast.Tuple) and node.value.elts):
+            continue
+        first = node.value.elts[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            returned.add(first.value)
+        elif isinstance(first, ast.Name):
+            returned.add(constants.get(first.id, first.id))
+    assert returned == set(mt.BUCKETS), (
+        f"classify must return exactly the declared buckets: "
+        f"undeclared={sorted(returned - set(mt.BUCKETS))} unreachable={sorted(set(mt.BUCKETS) - returned)}"
+    )
+
+
+def test_only_a_bucket_that_wants_a_write_asks_outward(repo, monkeypatch):
+    """A `done` branch needs nothing outward, and a request for it would put a
+    phantom action in front of the operator's approval queue. The cycle here is run
+    against a genuinely outward remote, so the loop below is not vacuous."""
+    monkeypatch.setattr(mt, "ALLOW_PUBLIC_FORGE", True)
+    monkeypatch.setattr(mt, "target_remote", lambda: "gitlab.com")
+    outward: list[dict] = []
+    outcomes = mt.run_cycle(repos=[repo["bare"]], outward_reports=outward)
+    measured = {report.branch: report.bucket for report in outcomes[0].reports}
+    assert outward, "a cycle against an outward remote must produce requests to check"
+    for request in outward:
+        branch = next(
+            (report for report in outcomes[0].reports if report.repo in request["text"]),
+            None,
+        )
+        assert branch is not None
+        assert branch.bucket in mt.OUTWARD_CANDIDATE_BUCKETS, branch
+        assert branch.bucket not in (mt.BUCKET_DONE, mt.BUCKET_NO_BASE), branch
+    # Nothing that is `done` or `no_base` is ever in the bucket set the engine asks
+    # from, whatever the target says.
+    assert mt.BUCKET_DONE not in mt.OUTWARD_CANDIDATE_BUCKETS
+    assert mt.BUCKET_NO_BASE not in mt.OUTWARD_CANDIDATE_BUCKETS
+    assert measured, measured
