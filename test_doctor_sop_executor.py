@@ -761,7 +761,9 @@ def test_a_job_cut_off_by_the_per_cycle_cap_is_not_marked_decided(monkeypatch, d
     assert doctor.dlq_decided("dead-4"), "and decided once a cycle reaches it"
 
 
-def test_a_protected_job_is_recorded_as_decided_without_being_remediated(monkeypatch, doctor_state):
+def test_a_protected_job_is_reported_every_cycle_and_never_remediated(monkeypatch, doctor_state):
+    """A protected lane is REPORTED, never remediated — so it must not be recorded
+    as decided, or the owner stops hearing about it after one cycle."""
     monkeypatch.setattr(
         doctor,
         "fetch_dead_letter_jobs",
@@ -769,10 +771,30 @@ def test_a_protected_job_is_recorded_as_decided_without_being_remediated(monkeyp
     )
     monkeypatch.setattr(doctor, "DLQ_PROTECT_PROJECTS", frozenset({"riskyeats"}))
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    for cycle in range(3):
+        summary = doctor.handle_dead_letter_queue()
+        assert summary.get("protected") == 1, f"cycle {cycle}: {summary}"
+        assert summary["resubmit"] == 0 and summary["remove"] == 0
+        assert not doctor.dlq_decided("dead-p"), "a protected job is never 'decided'"
+    assert summary["skipped_seen"] == 0
+
+
+def test_an_approval_refusal_does_not_spend_the_cycle_budget(monkeypatch, doctor_state):
+    """Twenty unapproved purges must not crowd out every job behind them."""
+    jobs = [
+        {"id": f"dead-{n}", "kind": "zeroclaw", "result": {"last_decline_reason": "no_repo_mapping"}} for n in range(5)
+    ]
+    monkeypatch.setattr(doctor, "fetch_dead_letter_jobs", lambda: list(jobs))
+    monkeypatch.setattr(doctor, "DLQ_APPLY", True)
+    monkeypatch.setattr(doctor, "DLQ_MAX_PER_CYCLE", 2)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    monkeypatch.setattr(
+        doctor, "_http", lambda *a, **k: (200, {"ok": [], "not_found": [], "skipped_not_dead_letter": []})
+    )
+
     summary = doctor.handle_dead_letter_queue()
-    assert summary.get("protected") == 1, summary
-    assert summary["resubmit"] == 0 and summary["remove"] == 0
-    assert doctor.dlq_decided("dead-p"), "reported every cycle, never re-decided"
+    assert summary["remove"] == 5, f"refusals must not spend the cap: {summary}"
+    assert summary.get("deferred") in (None, 0), summary
 
 
 def test_a_refusal_from_the_approval_gate_is_not_recorded_as_decided(monkeypatch, doctor_state):

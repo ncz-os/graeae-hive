@@ -2116,9 +2116,11 @@ def handle_dead_letter_queue() -> dict:
             summary["skipped_seen"] += 1
             continue
         if dlq_protected(job):
-            # Its owner's job: reported, never remediated. Recorded as decided, so
-            # the next cycle reports it again instead of re-deciding it.
-            dlq_record_decision(jid, at=now)
+            # Its owner's job: REPORTED, never remediated — which is why it is not
+            # recorded as decided. A protected job produces no decision, so
+            # recording it would mean the owner stops hearing about it after one
+            # cycle, for the whole seen window. The base commit recorded it, which
+            # made "reported" mean "reported once".
             summary["protected"] = summary.get("protected", 0) + 1
             log.info(
                 "dlq %s kind=%s project=%s -> left for its owner (protected)",
@@ -2136,7 +2138,11 @@ def handle_dead_letter_queue() -> dict:
         decision, reason = classify_dead_letter(job)
         outcome = remediate_dead_letter(job, decision, reason)
         summary[decision] = summary.get(decision, 0) + 1
-        acted += 1
+        # Only a real action spends the cycle's budget. Counting refusals against
+        # `DLQ_MAX_PER_CYCLE` lets twenty unapproved purges crowd out every job
+        # behind them, so the cap measures progress rather than attempts.
+        if not outcome.startswith("REFUSED:"):
+            acted += 1
         # Recorded AFTER the work, which is the whole ordering — and NOT recorded when
         # the work was REFUSED for want of an approval. A refusal is not a decision:
         # the doctor wanted to act and was not allowed to, and the operator's

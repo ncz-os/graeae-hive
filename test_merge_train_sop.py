@@ -645,7 +645,9 @@ def test_a_failed_cycle_is_still_recorded(tmp_path):
 
 
 def test_recording_without_a_path_is_a_no_op_not_a_crash():
-    assert mt.record_cycle_end(at=1.0, env={}) is False
+    """With the default path disabled and nothing configured there is nowhere to
+    write, and that says so rather than pretending the cycle was recorded."""
+    assert mt.record_cycle_end(at=1.0, env={"MERGE_TRAIN_NO_DEFAULT_STATE": "1"}) is False
 
 
 def test_a_failed_git_count_is_not_a_clean_done(repo, monkeypatch):
@@ -727,3 +729,75 @@ def test_a_failing_merge_base_is_not_reported_as_no_merge_base(repo, monkeypatch
     assert outcome.failed
     lines = mt.fast_forward_candidates([outcome], dry_run=False)
     assert any("SKIPPED" in line for line in lines), lines
+
+
+def test_the_cadence_record_has_a_default_path(tmp_path, monkeypatch):
+    """With nothing configured and nothing written, `due_for_run` is permanently
+    due — the timer defect with a one-day number in front of it."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    monkeypatch.delenv("MERGE_TRAIN_STATE_PATH", raising=False)
+    monkeypatch.delenv("MERGE_TRAIN_NO_DEFAULT_STATE", raising=False)
+    path = mt.state_path({})
+    assert path.startswith(str(tmp_path)), path
+    assert path.endswith(os.path.join("merge-train", "state.json"))
+
+    env = {"XDG_STATE_HOME": str(tmp_path)}
+    assert mt.record_cycle_end(at=1_000.0, env=env) is True
+    due, wait = mt.due_for_run({**env}, now=1_300.0)
+    assert not due, "the default path has to make the floor real"
+    assert wait == 86_400.0 - 300.0
+
+    # The default is opt-out, and opting out says so rather than pretending.
+    off = mt.state_path({"XDG_STATE_HOME": str(tmp_path), "MERGE_TRAIN_NO_DEFAULT_STATE": "1"})
+    assert off == ""
+    assert mt.record_cycle_end(at=1.0, env={"MERGE_TRAIN_NO_DEFAULT_STATE": "1"}) is False
+
+
+def test_a_failed_merge_tree_is_not_a_clean_fast_forward(repo, monkeypatch):
+    """`merge-tree` exits 1 for a conflict and 128 for a bad object. Treating 128
+    as "no conflict" made `behind == 0` reachable from a repository nobody could
+    read — an unattended push."""
+    real = mt._sh
+    monkeypatch.setattr(
+        mt,
+        "_sh",
+        lambda a, **k: (
+            subprocess.CompletedProcess(a, 128, "", "fatal: bad object\n")
+            if a[:2] == ["git", "merge-tree"]
+            else real(a, **k)
+        ),
+    )
+    with pytest.raises(mt.MeasurementError):
+        mt.classify(repo["bare"], "main", "hive/ff")
+    outcome = mt.measure_repo(repo["bare"])
+    assert any("merge-tree" in failure for failure in outcome.failures), outcome.failures
+    assert all(report.bucket != mt.BUCKET_FAST_FORWARD for report in outcome.reports), [
+        (r.branch, r.bucket) for r in outcome.reports
+    ]
+
+
+def test_json_output_emits_one_line_per_branch(tmp_path, capsys, repo, monkeypatch):
+    """One line per repository would drop every candidate but the first — silently,
+    because the output still looks well-formed."""
+    monkeypatch.setattr(mt, "discover_repos", lambda *a, **k: [repo["bare"]])
+    monkeypatch.setattr(mt, "record_cycle_end", lambda *a, **k: False)
+    monkeypatch.delenv("MERGE_TRAIN_NO_DEFAULT_STATE", raising=False)
+    assert mt.main(["--json"]) in (0, 1)
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.strip()]
+    branches = {json.loads(line)["branch"] for line in lines}
+    assert branches == {report.branch for report in mt.measure_repo(repo["bare"]).reports}
+
+
+def test_exclusions_accept_bare_and_dot_git_spellings(tmp_path):
+    """An exclusion that silently does nothing leaves a repository nobody meant to
+    touch in the train."""
+    root = tmp_path / "gitroot"
+    root.mkdir()
+    for name in ("openclaw.git", "riskyeats.git", "wanted.git"):
+        subprocess.run(["git", "init", "-q", "--bare", str(root / name)], check=True, capture_output=True)
+    for exclude in ({"openclaw"}, {"openclaw.git"}, {"OpenClaw.Git"}):
+        found = [os.path.basename(path) for path in mt.discover_repos(str(root), frozenset(exclude))]
+        assert "openclaw.git" not in found, exclude
+        assert "riskyeats.git" in found, exclude
+        assert "wanted.git" in found, exclude
+    assert len(mt.discover_repos(str(root), frozenset())) == 3

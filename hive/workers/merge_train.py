@@ -215,6 +215,14 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     merge_tree = _sh(["git", "merge-tree", "--write-tree", base, branch], cwd=repo)
     if merge_tree.returncode == 1 or "<<<<<<<" in merge_tree.stdout:
         return BUCKET_CONFLICT, stats
+    if merge_tree.returncode != 0:
+        # 1 is "these conflict". 128 is "fatal: bad object" — the merge was never
+        # computed, and treating that as a clean merge made `behind == 0` reachable
+        # from a repository nobody could read, which is an unattended push.
+        raise MeasurementError(
+            f"merge-tree --write-tree {base} {branch}: "
+            f"{merge_tree.stderr.strip()[:120] or 'failed'}"
+        )
     if stats.behind == 0:
         return BUCKET_FAST_FORWARD, stats
     if stats.added + stats.removed < MAX_CHERRY_LINES:
@@ -236,6 +244,12 @@ def candidate_branches(repo: str, base: str) -> list[str]:
     return [branch for branch in listing.split() if branch != base and BRANCH_PATTERN.search(branch)]
 
 
+def _bare(name: str) -> str:
+    """A repository name without its `.git` suffix, lowercased."""
+    lowered = name.strip().lower()
+    return lowered[:-4] if lowered.endswith(".git") else lowered
+
+
 def discover_repos(git_root: str = GIT_ROOT, exclude: frozenset[str] = EXCLUDE) -> list[str]:
     """The canonical bare repos this train is allowed to look at."""
     try:
@@ -243,7 +257,16 @@ def discover_repos(git_root: str = GIT_ROOT, exclude: frozenset[str] = EXCLUDE) 
     except OSError as error:
         log.warning("cannot read git root %s (%s)", git_root, error)
         return []
-    return [os.path.join(git_root, name) for name in names if name not in exclude]
+    # Compare BARE names. A bare repo on disk is `openclaw.git`; an operator writing
+    # `MERGE_TRAIN_EXCLUDE=openclaw` means `openclaw`. Accepting both spellings
+    # removes the case where an exclusion silently does nothing — which is how a
+    # repository nobody meant to touch stays in the train.
+    excluded = {_bare(name) for name in exclude}
+    return [
+        os.path.join(git_root, name)
+        for name in names
+        if _bare(name) not in excluded
+    ]
 
 
 # ── the decision the SOP reads ───────────────────────────────────────────────
@@ -445,6 +468,30 @@ class Cadence:
         return max(0.0, self.interval - (self._clock() - self.last_run))
 
 
+def state_path(env: dict | None = None) -> str:
+    """Where the cadence record lives.
+
+    A default, because "no record" and "never run" are the same answer to
+    `due_for_run`: with nothing configured and nothing written, the floor never
+    engages and the timer runs at whatever interval the caller chose. The default
+    is under the user's state directory rather than inside the git root, because
+    the git root is the operator's canonical data and this is the engine's own
+    bookkeeping. The path is logged at startup so an operator can see where the
+    cadence lives instead of wondering why it does not.
+    """
+    env = dict(os.environ if env is None else env)
+    configured = (env.get("MERGE_TRAIN_STATE_PATH") or "").strip()
+    if configured:
+        return configured
+    if env.get("MERGE_TRAIN_NO_DEFAULT_STATE"):
+        return ""
+    return os.path.join(
+        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+        "merge-train",
+        "state.json",
+    )
+
+
 def record_cycle_end(at: float | None = None, env: dict | None = None) -> bool:
     """Record that a cycle finished, so the cadence floor can see it.
 
@@ -459,8 +506,9 @@ def record_cycle_end(at: float | None = None, env: dict | None = None) -> bool:
     repository re-runs every five minutes, which is the old behaviour exactly.
     """
     env = dict(os.environ if env is None else env)
-    path = (env.get("MERGE_TRAIN_STATE_PATH") or "").strip()
+    path = state_path(env)
     if not path:
+        log.warning("no cadence record path and the default is disabled; the floor stays at never-run")
         return False
     stamp = time.time() if at is None else float(at)
     blob: dict = {}
@@ -504,7 +552,7 @@ def due_for_run(env: dict | None = None, now: float | None = None) -> tuple[bool
     """
     env = dict(os.environ if env is None else env)
     interval = float(env.get("MERGE_TRAIN_MIN_INTERVAL", MIN_INTERVAL_SECS))
-    path = (env.get("MERGE_TRAIN_STATE_PATH") or "").strip()
+    path = state_path(env)
     last_run: float | None = None
     if path:
         try:
@@ -688,6 +736,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [merge-train] %(message)s")
+    log.info("cadence record: %s", state_path() or "(none: the floor stays at never-run)")
     due, wait = due_for_run()
     if not due:
         log.info("cadence: next run in %.0fs", wait)
@@ -697,7 +746,11 @@ def main(argv: list[str] | None = None) -> int:
     outcomes = run_cycle(git_root=args.git_root, dry_run=not args.apply, outward_reports=outward)
     for outcome in outcomes:
         if args.json:
-            print(json.dumps(outcome.to_record(), sort_keys=True))
+            # One line per MEASURED BRANCH: `merge_train.decide` is called once per
+            # record, so one line per repository would drop every candidate but the
+            # first — silently, because the output still looked well-formed.
+            for record in outcome.to_records():
+                print(json.dumps(record, sort_keys=True))
         else:
             print(" ", outcome.summary())
     for request in outward:
