@@ -57,6 +57,12 @@ import urllib.request
 import uuid
 from collections import deque
 
+# SOP phase 3 (2026-10-22): durable safety state and the destructive-action rails.
+# Both are stdlib-only siblings, importable without the hive package, so the
+# container still runs this module standalone.
+from hive.workers import doctor_gates
+from hive.workers.doctor_state import DurableStateStore, state_store_from_env
+
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
 # C1: bus transport auth bearer token (env-sourced). The doctor SUBMITS jobs
 # (dispatch_codex_fix), so this token must satisfy the bus admin tier if one is
@@ -70,6 +76,9 @@ POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
 ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "900"))
 MAX_SSH_PER_HOUR = int(os.environ.get("MAX_SSH_PER_HOUR", "3"))
+# The window the SSH rate cap is measured over. Named so the durable rate limiter
+# and the in-memory deque cannot drift onto different windows.
+SSH_RATE_WINDOW_SEC = float(os.environ.get("SSH_RATE_WINDOW_SEC", "3600"))
 MIN_HOST_COOLDOWN = int(os.environ.get("MIN_HOST_COOLDOWN", "1800"))
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 # Loop-detection: per-job-id (re)fail counter. If the same job_id keeps
@@ -311,9 +320,11 @@ _running = True
 _urn: str = ""
 _session_id = str(uuid.uuid4())
 
-# Rate-limit state for SSH restart actions
-_ssh_actions_log: deque = deque()
-_host_last_action: dict[str, float] = {}
+# Rate-limit state for SSH restart actions. Both moved to the durable store
+# (2026-10-22): a restart of the pod used to reset the SSH rate limiter, so the
+# first post-restart restart action always looked like the first one.
+_ssh_actions_log: deque = deque()          # legacy mirror, kept for the tests that read it
+_host_last_action: dict[str, float] = {}   # legacy mirror, kept for the tests that read it
 
 # Allowlisted services for restart_service action
 ALLOWED_SERVICE_RE = re.compile(
@@ -321,22 +332,126 @@ ALLOWED_SERVICE_RE = re.compile(
     r"hive-triage|graeae-system-watcher)\.service$"
 )
 
-# Fleet hosts eligible for SSH restart actions (NOT PYTHIA itself, NOT ARGOS)
+# Fleet hosts eligible for SSH restart actions (NOT PYTHIA itself, NOT ARGOS).
+# DEPRECATED 2026-10-22: `doctor_gates.RESTART_TARGETS` is the one table now, and
+# it also holds the connection spec and cixmini. This alias stays so the existing
+# imports keep working, and `action_restart_service` no longer reads it.
 FLEET_HOSTS = {
-    "cerberus": "192.0.2.96",
-    "medusa":   "192.0.2.64",
-    "proteus":  "192.0.2.25",
-    "hydra":    "192.0.2.78",
-    "bigpi":    "192.0.2.65",
-    "clawpi":   "192.0.2.54",
-    "zeropi":   "192.0.2.56",
-    "typhon":   "192.0.2.61",
+    name: entry.get("address", "")
+    for name, entry in doctor_gates.RESTART_TARGETS.items()
+    if entry.get("address")
 }
 # Hosts the doctor must NEVER restart — production-critical only.
 # (User directive 2026-05-26: cixmini is one of our most powerful systems —
-# DO NOT blacklist it. Fix config-side bugs instead.)
-RESTART_BLOCKED_HOSTS = {"argos", "pythia"}
+# DO NOT blacklist it. Fix config-side bugs instead.) Now the one frozenset in
+# `doctor_gates`, which is also the one the decision SOP reads.
+RESTART_BLOCKED_HOSTS = set(doctor_gates.RESTART_BLOCKED_HOSTS)
 SSH_TIMEOUT = 15
+
+# ───────────────────────── Durable safety state ─────────────────────────
+# Built once, at import. `doctor_state.state_store_from_env` picks the backend the
+# environment asks for; with nothing configured it is the in-memory store, which
+# logs once that the safety limits reset on restart. The module-level dicts above
+# and below stay as mirrors for the tests and for anything that reads them
+# directly, but every *enforcement* path goes through the store.
+STATE: DurableStateStore = state_store_from_env()
+APPROVALS = doctor_gates.ApprovalGate(STATE)
+
+# Key prefixes, named once so the TTLs in `COUNTER_TTLS` and the keys the doctor
+# writes cannot drift apart.
+KEY_LOOP = "loop"
+KEY_COOLDOWN = "cooldown"
+KEY_DLQ = "dlq"
+KEY_SSH = "ssh"
+KEY_HOST_COOLDOWN = "host_cooldown"
+KEY_TOKEN_FIX = "token_fix"
+
+
+def reset_safety_state(state: DurableStateStore | None = None) -> None:
+    """Clear every safety counter: the durable store AND the in-memory mirrors.
+
+    Two callers, one function, because the two halves have to move together. A
+    test that clears only the module dicts leaves the durable loop count in place
+    and the next test escalates a job it never touched; an operator who has just
+    changed a limit deliberately needs the same single call.
+
+    NOT reachable from the job loop: nothing in `process_triage_job`,
+    `handle_dead_letter_queue` or the SSH path calls this. Clearing a safety limit
+    is a human action.
+    """
+    target = STATE if state is None else state
+    for key in list(target.keys()):
+        target.forget(key)
+    _seen_job_attempts.clear()
+    _recent_auto_triage.clear()
+    _dlq_seen.clear()
+    _ssh_actions_log.clear()
+    _host_last_action.clear()
+
+
+def loop_attempts(job_id: str, window: float | None = None, at: float | None = None) -> list[float]:
+    """Times the doctor has been handed this job inside the window.
+
+    Durable, so a restart cannot give a job a fresh loop count. The in-memory
+    `_seen_job_attempts` mirror is kept in step for the callers that read it.
+    """
+    window = LOOP_WINDOW_SEC if window is None else float(window)
+    stamps = STATE.touch(f"{KEY_LOOP}:{job_id}", ttl=window, at=at)
+    _seen_job_attempts.setdefault(job_id, [])
+    _seen_job_attempts[job_id] = list(stamps)
+    return stamps
+
+
+def record_ssh_action(host: str, at: float | None = None) -> None:
+    """Record one SSH restart against the durable rate limiter and the cooldown.
+
+    Durable, so a restart of the pod does not hand the doctor a fresh SSH budget.
+    """
+    stamp = STATE.mark(f"{KEY_SSH}:{host}", ttl=SSH_RATE_WINDOW_SEC, at=at)
+    STATE.touch(f"{KEY_SSH}:all", ttl=SSH_RATE_WINDOW_SEC, at=at)
+    STATE.mark(f"{KEY_HOST_COOLDOWN}:{host}", ttl=MIN_HOST_COOLDOWN, at=at)
+    _ssh_actions_log.append(stamp)
+    _host_last_action[host] = stamp
+
+
+def ssh_actions_in_window(host: str, window: float) -> int:
+    """How many SSH actions this host has seen inside `window`, durably."""
+    return len(STATE.timestamps(f"{KEY_SSH}:{host}", ttl=window))
+
+
+def ssh_actions_total(window: float) -> int:
+    """How many SSH actions across the fleet inside `window`, durably."""
+    return len(STATE.timestamps(f"{KEY_SSH}:all", ttl=window))
+
+
+def host_in_cooldown(host: str, now: float | None = None) -> float:
+    """Seconds since the last SSH action on this host, or ``inf`` if never."""
+    last = STATE.last_mark(f"{KEY_HOST_COOLDOWN}:{host}")
+    if last is None:
+        return float("inf")
+    return max(0.0, (time.time() if now is None else now) - last)
+
+
+def cooldown_active(key: str, ttl: float) -> bool:
+    """Whether a cooldown is in force, durably."""
+    return STATE.seen(key, ttl=ttl)
+
+
+def note_triage(kind: str, ttl: float | None = None, at: float | None = None) -> float:
+    """Start the per-kind re-triage cooldown."""
+    ttl = AUTO_TRIAGE_COOLDOWN if ttl is None else float(ttl)
+    stamp = STATE.mark(f"{KEY_COOLDOWN}:{kind}", ttl=ttl, at=at)
+    _recent_auto_triage[kind] = stamp
+    return stamp
+
+
+def dlq_marked(job_id: str, ttl: float | None = None, at: float | None = None) -> bool:
+    """Whether a dead-letter job has already been decided this cycle window."""
+    ttl = DLQ_SEEN_TTL if ttl is None else float(ttl)
+    already = STATE.seen(f"{KEY_DLQ}:{job_id}", ttl=ttl)
+    if not already:
+        STATE.mark(f"{KEY_DLQ}:{job_id}", ttl=ttl, at=at)
+    return already
 
 
 def _signal(signum, frame):
@@ -902,52 +1017,69 @@ def parse_doctor_response(text: str) -> dict | None:
 
 # ───────────────────────── Playbook actions ─────────────────────────
 def _ssh_rate_ok(host: str) -> bool:
+    """The SSH rate cap and the per-host cooldown, read from DURABLE state.
+
+    2026-10-22: both counters lived in module dicts, so restarting the pod gave
+    the doctor a fresh SSH budget on every host. They are now timestamps in the
+    state store; the deque/dict mirrors are updated alongside so anything still
+    reading them sees the same thing.
+    """
     now = time.time()
-    while _ssh_actions_log and now - _ssh_actions_log[0] > 3600:
+    while _ssh_actions_log and now - _ssh_actions_log[0] > SSH_RATE_WINDOW_SEC:
         _ssh_actions_log.popleft()
-    if len(_ssh_actions_log) >= MAX_SSH_PER_HOUR:
-        log.warning("SSH rate cap %d/h reached — skipping", MAX_SSH_PER_HOUR)
+    total = ssh_actions_total(SSH_RATE_WINDOW_SEC)
+    _ssh_actions_log.clear()
+    _ssh_actions_log.extend(STATE.timestamps(f"{KEY_SSH}:all", ttl=SSH_RATE_WINDOW_SEC))
+    if total >= MAX_SSH_PER_HOUR:
+        log.warning("SSH rate cap %d/h reached (durable: %d) — skipping", MAX_SSH_PER_HOUR, total)
         return False
-    last = _host_last_action.get(host, 0)
-    if now - last < MIN_HOST_COOLDOWN:
-        log.warning("host %s cooldown %ds remaining — skipping",
-                    host, int(MIN_HOST_COOLDOWN - (now - last)))
+    since = host_in_cooldown(host, now)
+    if since < MIN_HOST_COOLDOWN:
+        log.warning("host %s cooldown %ds remaining (durable) — skipping",
+                    host, int(MIN_HOST_COOLDOWN - since))
         return False
     return True
 
 
 def _record_ssh_action(host: str):
-    now = time.time()
-    _ssh_actions_log.append(now)
-    _host_last_action[host] = now
+    record_ssh_action(host)
 
 
 def action_restart_service(target_host: str | None, service: str | None) -> str:
     if not target_host or not service:
         return "restart_service missing target_host or service"
-    if target_host.lower() in RESTART_BLOCKED_HOSTS:
-        return f"{target_host} is in restart blocklist (known-broken or production) — REFUSED"
-    ip = FLEET_HOSTS.get(target_host.lower())
-    if not ip:
-        return f"unknown host {target_host!r}"
     if not ALLOWED_SERVICE_RE.match(service):
         return f"service {service!r} not in allowlist"
-    if not _ssh_rate_ok(target_host):
-        return f"rate-limited on {target_host}"
+    # One table, blocklist first, then the allowlist, then the entry's own
+    # configuration. 2026-10-22 this read FLEET_HOSTS before the cixmini branch,
+    # so the whole cixmini path was unreachable and every cixmini restart answered
+    # `unknown host 'cixmini'`. See `doctor_gates.resolve_restart_target`.
+    target, refusal = doctor_gates.resolve_restart_target(target_host)
+    if target is None:
+        return refusal
+    host = target["host"]
+    ip = target["address"]
+    if not _ssh_rate_ok(host):
+        return f"rate-limited on {host}"
+    # A restart kills a running service on a fleet host: it waits for an operator
+    # like every other destructive action, and the approval is scoped to THIS host
+    # and THIS service.
+    blocked = APPROVALS.require("restart_service", host=host, service=service)
+    if blocked:
+        log.warning("restart refused on %s: %s", host, blocked)
+        return f"REFUSED: {blocked}"
     if DRY_RUN:
-        _record_ssh_action(target_host)
-        return f"DRY_RUN: would restart {service} on {target_host} ({ip})"
-    cixmini_password = os.environ.get("CIXMINI_SSH_PASSWORD")
+        _record_ssh_action(host)
+        return f"DRY_RUN: would restart {service} on {host} ({ip})"
     sudo_password = os.environ.get("DOCTOR_SUDO_PASSWORD")
-    if target_host.lower() == "cixmini":
-        if not cixmini_password:
-            return "restart_service refused: CIXMINI_SSH_PASSWORD is not set"
+    if target["auth"] == "password":
+        cixmini_password = os.environ.get("CIXMINI_SSH_PASSWORD", "")
         cmd = [
             "sshpass", "-p", cixmini_password,
             "ssh", "-o", "PubkeyAuthentication=no",
             "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=10",
-            f"mini@{ip}",
+            f"{target['user']}@{ip}",
             f"printf '%s\\n' {shlex.quote(cixmini_password)} | sudo -S systemctl restart {service}",
         ]
     else:
@@ -960,17 +1092,17 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
         cmd = [
             "ssh", "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=10",
-            f"jasonperlow@{ip}",
+            f"{target['user']}@{ip}",
             restart_cmd,
         ]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=SSH_TIMEOUT)
         if r.returncode == 0:
-            _record_ssh_action(target_host)
-            return f"restarted {service} on {target_host}"
-        return f"restart FAILED on {target_host}: {r.stderr[-200:]}"
+            _record_ssh_action(host)
+            return f"restarted {service} on {host}"
+        return f"restart FAILED on {host}: {r.stderr[-200:]}"
     except subprocess.TimeoutExpired:
-        return f"SSH timeout to {target_host}"
+        return f"SSH timeout to {host}"
 
 
 def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
@@ -1038,30 +1170,44 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
     # failed parent is left in place rather than deleted out from under a worker.
     child_ids = _children_of(target_ids)
     purge_ids = target_ids + [cid for cid in child_ids if cid not in target_ids]
+    # 2026-10-22: this is a HARD DELETE of up to 20 jobs and every child job, and
+    # it used to happen at whatever confidence the model claimed. It now waits for
+    # an operator, and the approval is scoped to THIS id set — approving one
+    # cancel never approves the next.
+    blocked = APPROVALS.require("cancel_jobs", base_kind=base_kind, job_ids=sorted(purge_ids))
+    if blocked:
+        log.warning("cancel refused for %s: %s", base_kind, blocked)
+        return f"REFUSED: {blocked}"
     # Failed jobs are terminal and cannot be PATCHed, so a cancel removes them
     # from the queue with the bus purge (failed status only, explicit ids).
     # This is a HARD DELETE (hive.bus.routers.admin.purge_jobs -> DELETE), not
     # a failed->cancelled transition: the row and its audit log are gone. The
     # ids stay on record in this triage job's result and the broadcast.
-    code2, resp2 = _http("POST", "/v1/jobs/purge", {
-        "ids": purge_ids,
-        "status": "failed",
-        "reason": f"doctor-cancel:{base_kind}",
-    })
+    # `doctor_gates.purge_request` owns the endpoint/payload pairing, so the
+    # `ids` key can only ever go to the route that reads `ids`.
+    path, body = doctor_gates.purge_request(
+        "cancel_failed", purge_ids, f"doctor-cancel:{base_kind}"
+    )
+    code2, resp2 = _http("POST", path, body)
+    outcome = doctor_gates.purge_result("cancel_failed", resp2, purge_ids)
     broadcast_doctor_message("doctor.cancel", {
         "host": AGENT_HOST,
         "base_kind": base_kind,
         "job_ids": purge_ids,
         "reason": "doctor-determined-structural-failure",
         "api": code2,
+        "removed": outcome["removed"],
+        "skipped": outcome.get("skipped", []),
     })
-    removed = (resp2 or {}).get("deleted") if isinstance(resp2, dict) else None
-    # Report the confirmed count against the requested count, and say so when
-    # the API did not confirm every id (a partial delete is a failure signal).
-    summary = (f"cancelled {removed if removed is not None else '?'}/{len(purge_ids)} "
+    # Report the CONFIRMED count against the requested count. `removed` counts only
+    # ids the route named as deleted, so a partial delete reads as a partial
+    # delete rather than as a success.
+    summary = (f"cancelled {outcome['removed']}/{len(purge_ids)} "
                f"failed jobs of {base_kind} (api={code2}): {', '.join(purge_ids)}")
-    if removed is not None and removed != len(purge_ids):
-        summary += f"; PARTIAL: {len(purge_ids) - removed} job(s) not deleted"
+    if outcome["partial"]:
+        summary += (f"; PARTIAL: {len(outcome.get('skipped', []))} job(s) not deleted")
+    if code2 != 200:
+        summary += f"; api did not confirm the purge (status={code2})"
     return summary
 
 
@@ -1530,12 +1676,12 @@ def scan_for_failure_clusters() -> list[dict]:
             continue
         counts.setdefault(bk, []).append(j)
     clusters = []
-    now = time.time()
     for bk, jobs in counts.items():
         if len(jobs) < CLUSTER_THRESHOLD:
             continue
-        last = _recent_auto_triage.get(bk, 0)
-        if now - last < AUTO_TRIAGE_COOLDOWN:
+        # Durable since 2026-10-22: the cooldown lived in a module dict, so a pod
+        # restart let every kind be re-triaged immediately.
+        if cooldown_active(f"{KEY_COOLDOWN}:{bk}", AUTO_TRIAGE_COOLDOWN):
             continue
         # Also skip if an active triage:<bk> already exists in queued/running
         if _active_triage_exists(bk):
@@ -1587,7 +1733,7 @@ def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | 
     code, resp = _http("POST", "/v1/jobs", body, timeout=15.0)
     if code in (200, 201) and resp:
         jid = resp.get("id", "")
-        _recent_auto_triage[base_kind] = time.time()
+        note_triage(base_kind)
         log.info("auto-triage submitted id=%s base_kind=%s count=%d",
                  jid[:12], base_kind, count)
         return jid
@@ -1638,9 +1784,9 @@ def process_triage_job(job: dict) -> dict:
     # call.  This prevents broken workers (e.g. cixmini with empty config)
     # from creating an infinite release→fail→release cycle.
     now = time.time()
-    history = _seen_job_attempts.setdefault(job_id, [])
-    history[:] = [t for t in history if (now - t) <= LOOP_WINDOW_SEC]
-    history.append(now)
+    # Durable since 2026-10-22: the loop counter lived in a module dict, so a pod
+    # restart reset it and a job that had already looped three times looked new.
+    history = loop_attempts(job_id, window=LOOP_WINDOW_SEC, at=now)
     if len(history) >= LOOP_ESCALATE_THRESHOLD:
         log.warning("LOOP-DETECT job=%s seen %d times in %ds — escalating",
                     job_id[:12], len(history), int(LOOP_WINDOW_SEC))
@@ -1840,14 +1986,37 @@ def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
             return f"resubmitted {jid[:12]} via admin requeue"
         return f"resubmit FAILED {jid[:12]} code={code} resp={str(resp)[:160]}"
     if decision == "remove":
-        code, resp = _http(
-            "POST", "/v1/admin/jobs/purge", {"job_ids": [jid], "reason": f"doctor-dlq-remove:{reason}"}
+        # A DLQ remove is a hard delete too, so it waits for an operator like
+        # every other destructive action. Scoped to THIS job id.
+        blocked = APPROVALS.require("dlq_remove", job_ids=[jid])
+        if blocked:
+            log.warning("dlq remove refused for %s: %s", jid[:12], blocked)
+            return f"REFUSED: {blocked}"
+        path, body = doctor_gates.purge_request(
+            "dlq_remove", [jid], f"doctor-dlq-remove:{reason}"
         )
-        if code in (200, 201, 204):
-            return f"removed {jid[:12]} via admin purge"
+        code, resp = _http("POST", path, body)
         if code == 404:
-            return f"remove PENDING {jid[:12]}: /v1/admin/jobs/purge not on bus yet"
-        return f"remove FAILED {jid[:12]} code={code} resp={str(resp)[:160]}"
+            return f"remove PENDING {jid[:12]}: {path} not on bus yet"
+        if code not in (200, 201, 204):
+            return f"remove FAILED {jid[:12]} code={code} resp={str(resp)[:160]}"
+        # 2026-10-22: this reported `removed <id> via admin purge` for ANY 2xx,
+        # including the case where the bus returned ok=[] and put the job in
+        # `skipped_not_dead_letter` — i.e. nothing was deleted at all. The result
+        # is now read from the route's own shape and says what happened.
+        outcome = doctor_gates.purge_result("dlq_remove", resp, [jid])
+        if outcome["removed"]:
+            return f"removed {jid[:12]} via admin purge"
+        if jid in outcome.get("not_found", []):
+            return f"remove NO-OP {jid[:12]}: the bus has no such job"
+        if jid in outcome.get("skipped", []):
+            return (
+                f"remove REFUSED {jid[:12]}: not in dead-letter, nothing deleted"
+            )
+        return (
+            f"remove UNCONFIRMED {jid[:12]}: {path} returned 2xx naming no deleted id "
+            f"resp={str(resp)[:120]}"
+        )
     code, resp = _http(
         "POST",
         "/v1/admin/jobs/reclassify",
@@ -1864,18 +2033,27 @@ def handle_dead_letter_queue() -> dict:
     """Scan the dead-letter queue, classify each not-yet-seen job, and remediate
     (dry-run unless DLQ_APPLY=1). Broadcasts a doctor.dlq message per decision."""
     now = time.time()
+    # The DLQ-seen set is durable since 2026-10-22: it lived in a module dict, so a
+    # restart re-decided every dead-letter job the doctor had already decided.
     for k in [k for k, t in _dlq_seen.items() if now - t > DLQ_SEEN_TTL]:
         _dlq_seen.pop(k, None)
+    for key in STATE.keys(f"{KEY_DLQ}:"):
+        _dlq_seen[key.split(":", 1)[1]] = STATE.last_mark(key) or 0.0
     jobs = fetch_dead_letter_jobs()
     summary = {"scanned": len(jobs), "resubmit": 0, "remove": 0, "needs-review": 0, "skipped_seen": 0}
     acted = 0
     for job in jobs:
         jid = job.get("id", "")
-        if not jid or jid in _dlq_seen:
+        if not jid:
+            continue
+        # Durable: the first `dlq_marked` call both answers and records, so this
+        # is the only place a dead-letter job enters the seen set.
+        if dlq_marked(jid, ttl=DLQ_SEEN_TTL, at=now):
+            _dlq_seen[jid] = now
             summary["skipped_seen"] += 1
             continue
-        if dlq_protected(job):
-            _dlq_seen[jid] = now
+        _dlq_seen[jid] = now
+        if dlq_protected(job):  # reported, never remediated — and already recorded
             summary["protected"] = summary.get("protected", 0) + 1
             log.info("dlq %s kind=%s project=%s -> left for its owner (protected)",
                      jid[:12], job.get("kind", "?"), job.get("project") or "-")
@@ -1885,7 +2063,6 @@ def handle_dead_letter_queue() -> dict:
         decision, reason = classify_dead_letter(job)
         outcome = remediate_dead_letter(job, decision, reason)
         summary[decision] = summary.get(decision, 0) + 1
-        _dlq_seen[jid] = now
         acted += 1
         log.info("dlq %s kind=%s -> %s (%s): %s", jid[:12], job.get("kind", "?"), decision, reason, outcome)
         broadcast_doctor_message(
