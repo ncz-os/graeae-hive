@@ -1027,6 +1027,13 @@ def _ssh_rate_ok(host: str) -> bool:
     now = time.time()
     while _ssh_actions_log and now - _ssh_actions_log[0] > SSH_RATE_WINDOW_SEC:
         _ssh_actions_log.popleft()
+    if not STATE.persist_ok:
+        # A rate limiter that cannot record what it has already allowed is not a
+        # limiter: after a restart it would hand out a fresh budget. Fail closed
+        # until the store can write again. The remedy is the store's, not this
+        # function's, so the message says what failed rather than what to retry.
+        log.warning("SSH rate limiter unavailable (safety state is not persisted) — skipping")
+        return False
     total = ssh_actions_total(SSH_RATE_WINDOW_SEC)
     _ssh_actions_log.clear()
     _ssh_actions_log.extend(STATE.timestamps(f"{KEY_SSH}:all", ttl=SSH_RATE_WINDOW_SEC))

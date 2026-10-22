@@ -532,22 +532,48 @@ def test_the_module_needs_no_gitlab_token_at_all():
         assert forbidden not in code, forbidden
 
 
-def test_importing_the_module_does_not_need_the_environment():
-    """Import must not raise on a host with none of its variables set."""
-    saved = dict(os.environ)
+def test_importing_the_module_does_not_need_the_environment(monkeypatch):
+    """Import must not raise on a host with none of its variables set.
+
+    `monkeypatch.delenv` rather than `os.environ.clear()` and putting it back by
+    hand: clearing the whole environment means a failure between the clear and the
+    restore leaves the rest of the session running on an empty environment, which
+    surfaces as some unrelated test failing somewhere else entirely.
+    """
+    import importlib
+
     for key in tuple(os.environ):
         if key.startswith("MERGE_TRAIN"):
-            del os.environ[key]
-    try:
-        import importlib
+            monkeypatch.delenv(key, raising=False)
+    reloaded = importlib.reload(mt)
+    assert reloaded.ALLOW_PUBLIC_FORGE is False
+    assert reloaded.MIN_INTERVAL_SECS == 86_400.0
+    assert reloaded.CANONICAL_REMOTE == "argonas"
+    monkeypatch.undo()
+    importlib.reload(mt)
 
-        reloaded = importlib.reload(mt)
-        assert reloaded.ALLOW_PUBLIC_FORGE is False
-        assert reloaded.MIN_INTERVAL_SECS == 86_400.0
-        assert reloaded.CANONICAL_REMOTE == "argonas"
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
-        import importlib
 
-        importlib.reload(mt)
+def test_the_record_carries_the_base_the_classification_used(repo):
+    """Review finding: `fast_forward_candidates` re-resolved `default_branch` per
+    candidate — a second git call per branch, and one that could name a different
+    branch than the one that was classified. The base now travels on the report."""
+    outcome = mt.measure_repo(repo["bare"])
+    assert outcome.reports
+    assert all(report.base == "main" for report in outcome.reports), [(r.branch, r.base) for r in outcome.reports]
+    # And it is NOT in the record the SOP decides on: a payload field the decision
+    # ignores is a field that can drift unnoticed.
+    assert "base" not in outcome.to_record()
+
+
+def test_a_fast_forward_uses_the_recorded_base_not_a_fresh_resolution(repo, monkeypatch, tmp_path):
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True, capture_output=True)
+    git("remote", "add", "argonas", str(upstream), cwd=repo["bare"])
+    outcome = mt.measure_repo(repo["bare"])
+
+    def explode(*args, **kwargs):
+        raise AssertionError("default_branch must not be re-resolved per candidate")
+
+    monkeypatch.setattr(mt, "default_branch", explode)
+    lines = mt.fast_forward_candidates([outcome], repo_path=repo["bare"], dry_run=False)
+    assert any("advanced main" in line for line in lines), lines

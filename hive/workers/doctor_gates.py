@@ -114,27 +114,39 @@ class ApprovalGate:
         self.store.forget(f"{APPROVAL_PREFIX}:{digest}")
 
     def approved(self, kind: str, digest: str) -> bool:
-        if self.auto_approve:
-            return True
-        if not self.gate_enabled:
-            return False
+        """Whether an APPROVAL for this exact action exists.
+
+        This answers only that question. It deliberately does NOT consider whether
+        the gate is switched on: a disabled gate means "no approval is needed", not
+        "no approval was given", and folding the two into one boolean makes a
+        caller read `approved() == False` as a refusal when the rail is simply off.
+        `require()` owns the switch; this owns the record.
+        """
+        del kind  # the digest is the identity of the action; the kind is not needed
         return self.store.seen(f"{APPROVAL_PREFIX}:{digest}", ttl=self.ttl)
 
     def require(self, kind: str, **parts) -> str | None:
         """``None`` when the action may proceed; the refusal reason when it may not.
 
-        The reason is written for the log an operator reads, and it always names
-        the digest an approval must be recorded against — otherwise "it asked me
-        to approve something" has nothing to approve.
+        The order of the three escape hatches matters and is the whole contract:
+
+        1. a non-destructive action is never gated;
+        2. `DOCTOR_GATE_DESTRUCTIVE=0` switches the rail **off** — the action is
+           allowed, and that is the only thing the switch does;
+        3. a standing auto-approve allows it and says so in the log;
+        4. otherwise an approval recorded for this exact action is required.
+
+        The refusal names the digest an approval must be recorded against —
+        otherwise "it asked me to approve something" has nothing to approve.
         """
         if kind not in DESTRUCTIVE_ACTIONS:
-            return None
-        if self.auto_approve:
-            log.warning("%s proceeding on the STANDING auto-approve (%s)", kind, action_digest(kind, **parts))
             return None
         if not self.gate_enabled:
             return None
         digest = action_digest(kind, **parts)
+        if self.auto_approve:
+            log.warning("%s proceeding on the STANDING auto-approve (%s)", kind, digest)
+            return None
         if self.approved(kind, digest):
             return None
         return (
@@ -205,7 +217,18 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
         removed_ids = [str(mid) for mid in matched] if isinstance(matched, list) else []
         if not isinstance(removed, int):
             removed = len(removed_ids)
-        skipped = [job_id for job_id in requested if job_id not in removed_ids] if removed_ids else []
+        if removed_ids:
+            # The route named the ids it deleted: the ones it did not name are the
+            # ones it kept.
+            skipped = [job_id for job_id in requested if job_id not in removed_ids]
+        else:
+            # No id list, only a count. The count is what the route CONFIRMED, so it
+            # is the number of removals; the shortfall against what was asked for
+            # is the partial. Deriving `skipped` from an empty id list would report
+            # a successful purge as having deleted nothing at all, which is the
+            # false-negative direction of the bug this function exists to close.
+            shortfall = max(0, len(requested) - removed)
+            skipped = requested[len(requested) - shortfall :] if shortfall else []
         return {"removed": removed, "skipped": skipped, "partial": bool(skipped)}
     removed = response.get(removed_key)
     removed_ids = [str(job_id) for job_id in removed] if isinstance(removed, list) else []
@@ -284,12 +307,21 @@ def resolve_restart_target(host: str | None, env: dict | None = None) -> tuple[d
         )
     if entry.get("auth") == "password" and not (env.get(entry.get("password_env", ""), "") or ""):
         return None, (f"restart_service refused: {name} needs {entry.get('password_env')} and it is not set")
-    user = env.get(entry.get("user_env", ""), "") if entry.get("user_env") else entry["user"]
+    # The env overrides the entry's default, and the entry's default is what makes
+    # the host usable without configuration. Reading only the env would turn
+    # cixmini's recorded `mini` user into "unrecorded" on every host that has not
+    # set the override.
+    user = (env.get(entry["user_env"], "") if entry.get("user_env") else "") or entry.get("user", "")
+    if not (user or "").strip():
+        return None, (
+            f"{name} is a restart target but no user is recorded for it; set "
+            f"{entry.get('user_env') or 'the entry user'}"
+        )
     return {
         "host": name,
         "address": address.strip(),
-        "user": (user or entry["user"]).strip(),
-        "auth": entry["auth"],
+        "user": user.strip(),
+        "auth": entry.get("auth", "key"),
     }, ""
 
 

@@ -264,6 +264,12 @@ class DurableStateStore:
         self._cache: dict[str, dict] = {}
         self._loaded_at: float | None = None
         self._warned_memory = False
+        # Whether the last write is believed to have reached the backend. The
+        # cache always holds the newer value, so an in-process limit is never
+        # looser than what it should be; what a failed write costs is DURABILITY
+        # across a restart, and a caller whose limit is a safety boundary (the SSH
+        # rate limiter) can fail closed on this rather than assume the write landed.
+        self.persist_ok = True
 
     # ── the store surface the doctor uses ──────────────────────────────
 
@@ -291,6 +297,9 @@ class DurableStateStore:
                 if isinstance(stamp, (int, float)) and now - float(stamp) <= ttl
             )
             stamps.append(now)
+            # Sorted AFTER the append, not before: `at` is caller-supplied and may
+            # be in the past, and the contract on the return value is oldest-first.
+            stamps.sort()
             self._write_locked(key, {"timestamps": stamps}, ttl=ttl)
             return stamps
 
@@ -418,8 +427,11 @@ class DurableStateStore:
 
     def _persist_locked(self) -> None:
         try:
-            self.backend.save(self.namespace, self._cache)
+            self.persist_ok = bool(self.backend.save(self.namespace, self._cache))
+            if not self.persist_ok:
+                log.warning("state save was not accepted; the counters are in memory only")
         except Exception as error:  # noqa: BLE001 - see _ensure_loaded
+            self.persist_ok = False
             log.warning("state save failed (%s); the in-process limits still hold", error)
 
 

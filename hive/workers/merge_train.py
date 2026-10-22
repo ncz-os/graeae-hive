@@ -193,6 +193,7 @@ class BranchReport:
     branch: str
     bucket: str
     target: str
+    base: str = ""
     sha: str = ""
     opens_mr: bool = False
     ahead: int = 0
@@ -201,6 +202,10 @@ class BranchReport:
     failures: list[str] = field(default_factory=list)
 
     def to_record(self) -> dict:
+        # `base` is deliberately NOT in the record: `merge_train.decide` does not
+        # read it, and a payload field the decision ignores is a field that can
+        # drift without anything noticing. It travels on the report for the
+        # executor's own use.
         return {
             "repo": self.repo,
             "branch": self.branch,
@@ -430,6 +435,7 @@ def measure_repo(repo: str, pattern_checked: bool = True) -> RepoOutcome:
                 branch=branch,
                 bucket=bucket,
                 target=CANONICAL_REMOTE,
+                base=base,
                 sha=sha,
                 ahead=stats.ahead,
                 behind=stats.behind,
@@ -493,9 +499,13 @@ def fast_forward_candidates(
             if repo_path is None:
                 results.append(f"{report.repo}/{report.branch}: {report.sha[:12]} (not applied)")
                 continue
+            # The base the classification used, recorded when the branch was
+            # measured — not re-resolved here, which would be a second git call per
+            # branch and could name a different branch than the one classified.
+            base = report.base or default_branch(repo_path)
             results.append(
                 f"{report.repo}/{report.branch}: "
-                f"{fast_forward(repo_path, default_branch(repo_path), report.sha, dry_run=dry_run)}"
+                f"{fast_forward(repo_path, base, report.sha, dry_run=dry_run)}"
             )
     return results
 

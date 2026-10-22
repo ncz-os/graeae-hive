@@ -532,3 +532,123 @@ def test_state_reflects_the_time_the_module_last_read_it(store):
     state, clock = store
     assert state._time() == clock["now"]  # noqa: SLF001
     assert time.time() > clock["now"], "the fixture's clock is frozen on purpose"
+
+
+# ── 5. review round 1: findings verified against the source ─────────────────
+
+
+def test_a_purge_that_confirmed_a_count_but_named_no_ids_is_not_reported_as_a_total_failure():
+    """`matched_ids` absent + an integer `deleted` used to yield
+    `skipped == requested`, so a successful purge read as having deleted nothing.
+
+    The count is what the route CONFIRMED, so it is the removal count; the shortfall
+    against what was asked for is the partial.
+    """
+    outcome = doctor_gates.purge_result("cancel_failed", {"deleted": 1}, ["a", "b", "c"])
+    assert outcome["removed"] == 1
+    assert outcome["partial"] is True
+    assert sorted(outcome["skipped"]) == ["b", "c"], outcome
+    # And a complete purge that simply does not echo the ids is not partial.
+    full = doctor_gates.purge_result("cancel_failed", {"deleted": 2}, ["a", "b"])
+    assert full["removed"] == 2
+    assert full["partial"] is False
+    assert full["skipped"] == []
+
+
+def test_a_purge_naming_its_ids_reports_the_unnamed_ones_as_skipped():
+    outcome = doctor_gates.purge_result("cancel_failed", {"deleted": 1, "matched_ids": ["a"]}, ["a", "b"])
+    assert outcome["removed"] == 1
+    assert outcome["skipped"] == ["b"]
+
+
+def test_a_restart_target_with_no_recorded_user_is_refused_by_name(monkeypatch):
+    """`entry["user"]` would KeyError. Now the refusal names what to record."""
+    monkeypatch.setitem(doctor_gates.RESTART_TARGETS, "ghost", {"address": "10.0.0.1"})
+    target, reason = doctor_gates.resolve_restart_target("ghost", env={})
+    assert target is None
+    assert "no user is recorded" in reason
+    target, reason = doctor_gates.resolve_restart_target("ghost", env={"GHOST_USER": "g"})
+    assert target is None, "no user_env key means the env read does not apply"
+    assert "no user is recorded" in reason
+
+
+def test_the_cixmini_sudo_user_is_read_at_resolve_time():
+    """Not at import: a later config change must not need a restart to take."""
+    env = {"CIXMINI_IP": "192.0.2.99", "CIXMINI_SSH_PASSWORD": "x"}
+    assert doctor_gates.resolve_restart_target("cixmini", env=env)[0]["user"] == "mini"
+    env["DOCTOR_CIXMINI_SUDO_USER"] = "operator"
+    assert doctor_gates.resolve_restart_target("cixmini", env=env)[0]["user"] == "operator"
+
+
+def test_disabling_the_gate_allows_the_action_rather_than_refusing_it():
+    """`approved()` used to answer for a disabled gate, so `False` read as a
+    refusal when the rail was simply off.
+
+    `approved()` now answers only "is there an approval"; the switch lives in
+    `require()`. Both readings are pinned, because the failure mode is an operator
+    setting DOCTOR_GATE_DESTRUCTIVE=0 to turn the rail OFF and getting the reverse.
+    """
+    state = DurableStateStore(MemoryBackend())
+    off = doctor_gates.ApprovalGate(state, gate_enabled=False, auto_approve=False)
+    for kind in sorted(doctor_gates.DESTRUCTIVE_ACTIONS):
+        assert off.require(kind, x=1) is None, f"{kind} with the gate off must be allowed"
+    digest = doctor_gates.action_digest("cancel_jobs", job_ids=["a"])
+    assert off.approved("cancel_jobs", digest) is False, "no approval was recorded"
+    assert off.require("cancel_jobs", job_ids=["a"]) is None, "and the gate is off"
+
+    on = doctor_gates.ApprovalGate(state, gate_enabled=True, auto_approve=False)
+    assert on.require("cancel_jobs", job_ids=["a"]) is not None
+    on.record_approval("cancel_jobs", digest)
+    assert on.approved("cancel_jobs", digest) is True
+    assert on.require("cancel_jobs", job_ids=["a"]) is None
+
+
+def test_a_safety_limit_that_cannot_be_persisted_fails_the_ssh_rate_limiter_closed(monkeypatch, doctor_state):
+    """A failed write leaves the cache ahead of the backend, so a restart would
+    hand out a fresh SSH budget.
+
+    The cache is still newer (an in-process limit is never looser), but the limiter
+    refuses outright rather than pretend the record exists.
+    """
+    state, _clock = doctor_state
+    monkeypatch.setattr(doctor, "MIN_HOST_COOLDOWN", 0.0)
+    assert doctor._ssh_rate_ok("cerberus") is True, "a healthy store allows one"
+
+    state.persist_ok = False
+    assert doctor._ssh_rate_ok("cerberus") is False, "an unpersistable limiter allows nothing"
+    assert doctor._ssh_rate_ok("hydra") is False, "on any host"
+
+    state.persist_ok = True
+    assert doctor._ssh_rate_ok("cerberus") is True, "and recovers when the store writes again"
+
+
+def test_the_store_reports_whether_its_last_write_landed(store):
+    state, clock = store
+    assert state.persist_ok is True
+    state.touch("loop:j", ttl=1800.0, at=clock["now"])
+
+    class RefusingBackend:
+        name = "file"
+
+        def load(self, namespace):
+            return {}
+
+        def save(self, namespace, records):
+            return False
+
+    state.backend = RefusingBackend()
+    state.touch("loop:j", ttl=1800.0, at=clock["now"])
+    assert state.persist_ok is False, "a backend that says no must be believed"
+    # The cache still holds the newer value: the limit is not loosened in-process.
+    assert len(state.timestamps("loop:j", ttl=1800.0)) == 2
+
+
+def test_touch_returns_oldest_first_even_for_a_backdated_stamp(store):
+    """`touch` sorted before appending, so a caller-supplied `at` in the past
+    returned an unsorted list against an oldest-first contract."""
+    state, clock = store
+    clock["now"] = 10_000.0
+    state.touch("loop:j", ttl=1800.0, at=9_000.0)
+    stamps = state.touch("loop:j", ttl=1800.0, at=9_500.0)
+    assert stamps == sorted(stamps), stamps
+    assert stamps == [9_000.0, 9_500.0]
