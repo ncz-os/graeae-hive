@@ -621,3 +621,52 @@ def test_a_binary_change_is_never_a_fast_forward(repo, tmp_path):
     bucket, stats = mt.classify(repo["bare"], "main", "hive/ff")
     assert stats.binary == 1, stats
     assert bucket == mt.BUCKET_DIVERGENT, (bucket, stats)
+
+
+def test_a_completed_cycle_records_when_it_ran(tmp_path):
+    """Without this the record file is never written, `due_for_run` reads
+    'never run' forever, and the daily floor never engages — the 5-minute timer
+    defect with a one-day number in front of it."""
+    path = str(tmp_path / "mt.json")
+    env = {"MERGE_TRAIN_STATE_PATH": path}
+    assert mt.record_cycle_end(at=1_000.0, env=env) is True
+    due, wait = mt.due_for_run(env, now=1_300.0)
+    assert not due, "300s after a recorded run is not a day"
+    assert wait == 86_400.0 - 300.0
+
+
+def test_a_failed_cycle_is_still_recorded(tmp_path):
+    """The cycle RAN; what it failed at is in the outcome records. Not recording a
+    failed cycle would mean a broken repository re-runs every five minutes."""
+    path = str(tmp_path / "mt.json")
+    assert mt.record_cycle_end(at=1_000.0, env={"MERGE_TRAIN_STATE_PATH": path}) is True
+    due, _wait = mt.due_for_run({"MERGE_TRAIN_STATE_PATH": path}, now=1_300.0)
+    assert not due
+
+
+def test_recording_without_a_path_is_a_no_op_not_a_crash():
+    assert mt.record_cycle_end(at=1.0, env={}) is False
+
+
+def test_a_failed_git_count_is_not_a_clean_done(repo, monkeypatch):
+    """`_git` returns "" for a failed command as readily as for zero, so
+    `int(... or 0)` read a broken measurement as DONE — a clean record for a
+    measurement that never happened."""
+    real_sh = mt._sh
+
+    def explode(args, **kwargs):
+        if args[:2] == ["git", "rev-list"]:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: bad object\n")
+        return real_sh(args, **kwargs)
+
+    monkeypatch.setattr(mt, "_sh", explode)
+    with pytest.raises(mt.MeasurementError):
+        mt.classify(repo["bare"], "main", "hive/ff")
+
+    # And `measure_repo` turns that into a recorded failure rather than a bucket.
+    outcome = mt.measure_repo(repo["bare"])
+    assert outcome.failed, outcome.failures
+    assert any("rev-list" in failure for failure in outcome.failures), outcome.failures
+    assert all(report.bucket != mt.BUCKET_DONE for report in outcome.reports), [
+        (r.branch, r.bucket) for r in outcome.reports
+    ]

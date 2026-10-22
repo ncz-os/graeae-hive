@@ -212,13 +212,29 @@ class BusBackend(StateBackend):
         self.topic = topic
         self.actor_urn = actor_urn
         self.limit = int(limit)
+        #: Set by `load` when the route returned as many messages as were asked
+        #: for, i.e. the journal is longer than one read. A bounded read of an
+        #: unbounded journal silently drops the OLDEST records — which are the ones
+        #: a safety limit is made of — so the store treats a truncated load as no
+        #: load at all rather than as a smaller state.
+        self.truncated = False
 
     def load(self, namespace: str) -> dict:
+        self.truncated = False
         status, response = self._http("GET", f"/v1/messages?topic={namespace}&limit={self.limit}")
         if status != 200 or not isinstance(response, dict):
             log.warning("bus state read failed (status=%s); serving from cache", status)
             return {}
         messages = response.get("messages") or []
+        if len(messages) >= self.limit:
+            self.truncated = True
+            log.warning(
+                "bus state read hit the %d-message limit for %s; the journal is longer than one "
+                "read, so this load is INCOMPLETE and the cache is kept",
+                self.limit,
+                namespace,
+            )
+            return {}
         newest: dict[str, tuple[float, dict]] = {}
         for message in messages:
             payload = message.get("payload")
@@ -354,9 +370,20 @@ class DurableStateStore:
             return sorted(key for key in self._cache if key.startswith(prefix))
 
     def forget(self, key: str) -> None:
+        """Retract a key, durably.
+
+        Written as a TOMBSTONE rather than as an omission, because the bus backend
+        is an append-only journal: dropping the key from the cache leaves the
+        record already in the journal, and the next replay resurrects the approval
+        somebody just revoked. The tombstone is itself a record, so a later load
+        sees the retraction as the newest thing said about the key.
+        """
         self._ensure_loaded()
         with self._lock:
-            self._cache.pop(key, None)
+            self._cache[key] = {"tombstone": True, "at": self._time()}
+            self._cache = {
+                k: v for k, v in self._cache.items() if self._is_live(v, _prune_ttl_of(k, 0.0))
+            }
             self._persist_locked()
 
     def refresh(self) -> None:
@@ -376,6 +403,13 @@ class DurableStateStore:
                 loaded = self.backend.load(self.namespace)
             except Exception as error:  # noqa: BLE001 - a backend must never stop the doctor
                 log.warning("state load failed (%s); serving from cache", error)
+                loaded = {}
+            if getattr(self.backend, "truncated", False):
+                # A bounded read of a longer journal would drop the oldest records,
+                # and the oldest records are the ones a window is made of. Treat it
+                # as no answer rather than as a smaller state: the cache is kept and
+                # the operator is told, because the alternative is a safety limit
+                # resetting itself with nothing restarted.
                 loaded = {}
             # A load that came back empty while the cache holds records is a
             # backend outage, not a wipe, so the cache is kept UNCONDITIONALLY.
@@ -401,12 +435,16 @@ class DurableStateStore:
         self._ensure_loaded()
         with self._lock:
             record = self._cache.get(key) or {}
+        if record.get("tombstone"):
+            return {}
         if ttl is None:
             return record
         return record if self._is_live(record, ttl) else {}
 
     def _record_locked(self, key: str, ttl: float) -> dict:
         record = self._cache.get(key) or {}
+        if record.get("tombstone"):
+            return {}
         return record if self._is_live(record, ttl) else {}
 
     def _is_live(self, record: dict, ttl: float) -> bool:
@@ -419,12 +457,15 @@ class DurableStateStore:
         stamps = [float(s) for s in record.get("timestamps", []) if isinstance(s, (int, float))]
         at = record.get("at")
         newest = max([*stamps, float(at)] if isinstance(at, (int, float)) else stamps, default=None)
+        # A tombstone carries `at` and nothing else, so the line above already sees
+        # it; it is named here so the retraction is not mistaken for missing data.
         if newest is None:
             return False
         return (self._time() - newest) <= ttl
 
     def _write_locked(self, key: str, record: dict, ttl: float) -> None:
-        self._cache[key] = record
+        # A real write supersedes a retraction: the key is being used again.
+        self._cache[key] = {**record, "tombstone": False}
         # Prune with the LONGER of this write's window and the key's canonical one.
         # Pruning with `ttl` alone means a caller passing a short window silently
         # truncates the history a caller with the canonical window depends on — the

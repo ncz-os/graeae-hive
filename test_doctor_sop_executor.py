@@ -795,3 +795,86 @@ def test_a_refusal_from_the_approval_gate_still_counts_as_a_decision(monkeypatch
     assert summary["remove"] == 1, summary
     assert calls == [], "a refusal must not reach the bus"
     assert doctor.dlq_decided("dead-r")
+
+
+def test_a_revoked_approval_does_not_come_back_from_the_journal(gate, tmp_path):
+    """A bus backend is an append-only journal: dropping the key from the cache
+    leaves the record already in the journal, and the next replay resurrects the
+    approval somebody just revoked. `forget` writes a tombstone instead."""
+    state = gate.store
+    digest = doctor_gates.action_digest("cancel_jobs", job_ids=["a"])
+    gate.record_approval("cancel_jobs", digest)
+    assert gate.approved("cancel_jobs", digest)
+
+    gate.revoke(digest)
+    assert not gate.approved("cancel_jobs", digest), "revoked immediately"
+    assert state._cache[f"approval:{digest}"].get("tombstone") is True
+
+    # A rebuild from the durable source — a restart — must agree.
+    reborn = DurableStateStore(type(state.backend)(state.backend.path), refresh_secs=0.0, time_fn=state._time)
+    assert not reborn.seen(f"approval:{digest}", ttl=900.0), "a restart must not resurrect it"
+
+    # And a later approval supersedes the retraction.
+    gate.record_approval("cancel_jobs", digest)
+    assert gate.approved("cancel_jobs", digest)
+
+
+def test_a_tombstone_eventually_expires(store):
+    """Otherwise a retracted key is a permanent record."""
+    state, clock = store
+    state.set_value("loop:j", {"x": 1}, ttl=1800.0)
+    state.forget("loop:j")
+    assert state.value("loop:j", "gone") == "gone"
+    assert "loop:j" in state.keys(""), "the tombstone is a record, not an omission"
+    clock["now"] += 86_401
+    state.touch("loop:other", ttl=10.0, at=clock["now"])
+    assert "loop:j" not in state.keys(""), "and it ages out like any other"
+
+
+def test_a_truncated_bus_read_is_not_treated_as_a_smaller_state(tmp_path):
+    """A bounded read of a longer journal drops the OLDEST records, which are the
+    ones a safety window is made of. A truncated load must be treated as no answer
+    rather than as a smaller state."""
+    clock = {"now": 7_000_000.0}
+    limit = 4
+
+    class Journal:
+        """An append-only log that outgrows one read."""
+
+        name = "bus"
+
+        def __init__(self):
+            self.entries = []
+
+        def load(self, namespace):
+            window = self.entries[-limit:]
+            self.truncated = len(self.entries) >= limit
+            newest = {}
+            for key, value in window:
+                newest[key] = value
+            return newest
+
+        def save(self, namespace, records):
+            for key, value in records.items():
+                self.entries.append((key, value))
+            return True
+
+    journal = Journal()
+    state = DurableStateStore(journal, refresh_secs=0.0, time_fn=lambda: clock["now"])
+    state.mark("loop:j1", ttl=1800.0, at=clock["now"])
+    for n in range(limit):
+        state.mark(f"filler:{n}", ttl=1800.0, at=clock["now"])
+    # `loop:j1` is now older than one read's window.
+    assert journal.entries[0][0] == "loop:j1"
+
+    # `refresh_secs=0.0` means this read IS a reload — the periodic kind, not the
+    # explicit `refresh()` the operator asks for when they want the backend's answer
+    # whatever it is. A truncated reload must keep the live state it already holds.
+    assert state.last_mark("loop:j1") is not None, "a truncated read must not drop live state"
+    assert journal.truncated is True
+
+    # The explicit `refresh()` is the escape hatch and it DOES believe the backend,
+    # so after it the truncated answer is all there is. Documented, not accidental:
+    # the guarantee above is about the periodic reload, not this.
+    state.refresh()
+    assert state.last_mark("loop:j1") is None

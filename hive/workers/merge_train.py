@@ -37,11 +37,14 @@ Env:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import subprocess
+import tempfile
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 
 log = logging.getLogger("merge_train")
@@ -97,6 +100,15 @@ BUCKETS = (
 )
 
 
+class MeasurementError(RuntimeError):
+    """git could not answer, so no bucket is known for this branch.
+
+    Distinct from "no merge base" and from "nothing to merge", both of which are
+    buckets. Without it a failed `rev-list` reads as zero commits, which is DONE:
+    a clean record for a measurement that never happened.
+    """
+
+
 @dataclass
 class BranchStats:
     ahead: int = 0
@@ -123,6 +135,22 @@ def default_branch(repo: str) -> str:
     return "main"
 
 
+def _count(repo: str, spec: str) -> int:
+    """`rev-list --count` for a spec, as an int — or a [`MeasurementError`].
+
+    `_git` returns "" for a failed command as readily as for a zero count, so
+    `int(_git(...) or 0)` reads a broken measurement as ZERO commits, which is
+    DONE: a branch nobody looks at again. Every count checks the exit code.
+    """
+    result = _sh(["git", "rev-list", "--count", spec], cwd=repo)
+    if result.returncode != 0:
+        raise MeasurementError(f"rev-list --count {spec}: {result.stderr.strip()[:120] or 'failed'}")
+    text = result.stdout.strip()
+    if not text.isdigit():
+        raise MeasurementError(f"rev-list --count {spec}: {text[:60]!r} is not a count")
+    return int(text)
+
+
 def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     """The bucket for one branch, measured against `base`.
 
@@ -130,18 +158,19 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     the operator's: a big divergence or any clobber is divergent whatever the
     merge says, then the merge itself, then behind/0 is a fast-forward, then a
     small conflict-free change behind is a cherry-pick candidate.
+
+    Raises [`MeasurementError`] when git cannot answer: a measurement that failed
+    and a measurement that says "nothing to merge" are different facts, and the
+    caller has to be able to tell them apart.
     """
     stats = BranchStats()
     merge_base = _git("merge-base", base, branch, cwd=repo)
     if not merge_base:
         return BUCKET_NO_BASE, stats
-    try:
-        stats.ahead = int(_git("rev-list", "--count", f"{base}..{branch}", cwd=repo) or 0)
-    except ValueError:
-        return BUCKET_NO_BASE, stats
+    stats.ahead = _count(repo, f"{base}..{branch}")
     if stats.ahead == 0:
         return BUCKET_DONE, stats
-    stats.behind = int(_git("rev-list", "--count", f"{branch}..{base}", cwd=repo) or 0)
+    stats.behind = _count(repo, f"{branch}..{base}")
     deleted = set(
         filter(None, _git("diff", "--name-only", "--diff-filter=D", merge_base, branch, cwd=repo).splitlines())
     )
@@ -379,6 +408,55 @@ class Cadence:
         return max(0.0, self.interval - (self._clock() - self.last_run))
 
 
+def record_cycle_end(at: float | None = None, env: dict | None = None) -> bool:
+    """Record that a cycle finished, so the cadence floor can see it.
+
+    Without this the record file is never written, `due_for_run` reads "never run"
+    forever, and the daily floor never engages — the 5-minute timer defect with a
+    one-day number in front of it. Written atomically for the same reason the
+    doctor's state file is: a truncated write would read as a parse error and be
+    treated as never-run.
+
+    Recorded even when the cycle had failures: the cycle RAN, and what it failed at
+    is in the outcome records. NOT recording a failed cycle would mean a broken
+    repository re-runs every five minutes, which is the old behaviour exactly.
+    """
+    env = dict(os.environ if env is None else env)
+    path = (env.get("MERGE_TRAIN_STATE_PATH") or "").strip()
+    if not path:
+        return False
+    stamp = time.time() if at is None else float(at)
+    blob: dict = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            existing = json.load(handle)
+        if isinstance(existing, dict):
+            blob = existing
+    except (OSError, ValueError):
+        # A missing or unreadable record is overwritten rather than merged into: the
+        # one field this file exists for is `last_run`.
+        pass
+    blob["last_run"] = stamp
+    directory = os.path.dirname(path) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".merge-train-state-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(blob, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+            return True
+        except OSError:
+            with suppress(OSError):
+                os.unlink(temp_path)
+            raise
+    except OSError as error:
+        log.warning("merge-train state %s not writable (%s); the floor stays at never-run", path, error)
+        return False
+
+
 def due_for_run(env: dict | None = None, now: float | None = None) -> tuple[bool, float]:
     """``(due, seconds_until_due)`` from the environment's own record.
 
@@ -394,8 +472,6 @@ def due_for_run(env: dict | None = None, now: float | None = None) -> tuple[bool
     if path:
         try:
             with open(path, encoding="utf-8") as handle:
-                import json
-
                 blob = json.load(handle)
             if isinstance(blob, dict) and isinstance(blob.get("last_run"), (int, float)):
                 last_run = float(blob["last_run"])
@@ -589,6 +665,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.apply:
         for line in fast_forward_candidates(outcomes, dry_run=False):
             log.info("ff %s", line)
+    # The cycle RAN, whatever it found. Recording that is what makes the floor mean
+    # anything on the next invocation.
+    if record_cycle_end():
+        log.info("cycle end recorded")
     return 1 if any(outcome.failed for outcome in outcomes) else 0
 
 
