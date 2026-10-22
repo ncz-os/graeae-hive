@@ -734,12 +734,16 @@ def test_a_failing_merge_base_is_not_reported_as_no_merge_base(repo, monkeypatch
 def test_the_cadence_record_has_a_default_path(tmp_path, monkeypatch):
     """With nothing configured and nothing written, `due_for_run` is permanently
     due — the timer defect with a one-day number in front of it."""
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
     monkeypatch.delenv("MERGE_TRAIN_STATE_PATH", raising=False)
     monkeypatch.delenv("MERGE_TRAIN_NO_DEFAULT_STATE", raising=False)
-    path = mt.state_path({})
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    path = mt.state_path({"XDG_STATE_HOME": str(tmp_path)})
     assert path.startswith(str(tmp_path)), path
     assert path.endswith(os.path.join("merge-train", "state.json"))
+    # The SUPPLIED env is the only one that decides: an empty one yields no path
+    # rather than a path into the real user's home.
+    assert mt.state_path({}) == "", "the real HOME must not be reachable from a scoped env"
+    assert mt.state_path({"HOME": str(tmp_path)}).startswith(str(tmp_path))
 
     env = {"XDG_STATE_HOME": str(tmp_path)}
     assert mt.record_cycle_end(at=1_000.0, env=env) is True
@@ -801,3 +805,39 @@ def test_exclusions_accept_bare_and_dot_git_spellings(tmp_path):
         assert "riskyeats.git" in found, exclude
         assert "wanted.git" in found, exclude
     assert len(mt.discover_repos(str(root), frozenset())) == 3
+
+
+def test_a_failed_diff_is_not_nothing_clobbered(repo, monkeypatch):
+    """Two empty sets intersect to nothing, so a failed clobber check read as
+    "nothing is clobbered" — one of the three conditions that stop a branch being
+    fast-forwarded and pushed unattended."""
+    real = mt._sh
+    monkeypatch.setattr(
+        mt,
+        "_sh",
+        lambda a, **k: (
+            subprocess.CompletedProcess(a, 128, "", "fatal: bad object\n") if a[:2] == ["git", "diff"] else real(a, **k)
+        ),
+    )
+    # `hive/behind` is the branch that actually REACHES the diff: a fast-forward
+    # returns before it, so the clobber check only runs for a branch that is behind
+    # — where a failure used to read as "nothing is clobbered" and then as a
+    # cherry-pick by size.
+    with pytest.raises(mt.MeasurementError):
+        mt.classify(repo["bare"], "main", "hive/behind")
+    outcome = mt.measure_repo(repo["bare"])
+    assert any("diff --name-only" in f or "diff --numstat" in f for f in outcome.failures), outcome.failures
+    measured = {report.branch: report.bucket for report in outcome.reports}
+    assert measured["hive/behind"] != mt.BUCKET_CHERRY, measured["hive/behind"]
+
+
+def test_a_repository_level_failure_reaches_the_record(tmp_path):
+    """It is why the whole repository is skipped; a record carrying only the first
+    branch's failures would let the SOP decide a branch the run never looked at."""
+    bare = tmp_path / "empty.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, capture_output=True)
+    outcome = mt.measure_repo(str(bare))
+    assert outcome.failed
+    record = outcome.to_record()
+    assert record["failures"] == outcome.failures, record
+    assert "no branch matched" in record["failures"][0]

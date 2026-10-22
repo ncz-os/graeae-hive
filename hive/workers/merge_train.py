@@ -168,6 +168,29 @@ def _merge_base(repo: str, base: str, branch: str) -> str | None:
     return text or None
 
 
+def _diff_names(repo: str, merge_base: str, other: str, extra: tuple[str, ...] = ()) -> set[str]:
+    """A `git diff --name-only` result as a set of paths, or a [`MeasurementError`].
+
+    Every one of these calls can fail, and `_git` returns "" for a failure exactly
+    as it does for an empty diff. Two empty sets intersect to nothing, so a failed
+    clobber check read as "nothing is clobbered" — one of the three conditions that
+    make a branch DIVERGENT, and therefore one of the three that stand between it
+    and a classification the SOP would otherwise have to reason about.
+    """
+    result = _sh(["git", "diff", *extra, "--name-only", merge_base, other], cwd=repo)
+    if result.returncode != 0:
+        raise MeasurementError(f"diff --name-only {merge_base} {other}: {result.stderr.strip()[:120] or 'failed'}")
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _diff_lines(repo: str, merge_base: str, other: str) -> list[str]:
+    """A `git diff --numstat` result as its lines, or a [`MeasurementError`]."""
+    result = _sh(["git", "diff", "--numstat", merge_base, other], cwd=repo)
+    if result.returncode != 0:
+        raise MeasurementError(f"diff --numstat {merge_base} {other}: {result.stderr.strip()[:120] or 'failed'}")
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
 def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     """The bucket for one branch, measured against `base`.
 
@@ -188,12 +211,10 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
     if stats.ahead == 0:
         return BUCKET_DONE, stats
     stats.behind = _count(repo, f"{branch}..{base}")
-    deleted = set(
-        filter(None, _git("diff", "--name-only", "--diff-filter=D", merge_base, branch, cwd=repo).splitlines())
-    )
-    touched_base = set(filter(None, _git("diff", "--name-only", merge_base, base, cwd=repo).splitlines()))
+    deleted = _diff_names(repo, merge_base, branch, extra=("--diff-filter=D",))
+    touched_base = _diff_names(repo, merge_base, base)
     stats.clobbered = len(deleted & touched_base)
-    numstat = _git("diff", "--numstat", merge_base, branch, cwd=repo).splitlines()
+    numstat = _diff_lines(repo, merge_base, branch)
     for line in numstat:
         parts = line.split("\t")
         if len(parts) < 2:
@@ -220,8 +241,7 @@ def classify(repo: str, base: str, branch: str) -> tuple[str, BranchStats]:
         # computed, and treating that as a clean merge made `behind == 0` reachable
         # from a repository nobody could read, which is an unattended push.
         raise MeasurementError(
-            f"merge-tree --write-tree {base} {branch}: "
-            f"{merge_tree.stderr.strip()[:120] or 'failed'}"
+            f"merge-tree --write-tree {base} {branch}: {merge_tree.stderr.strip()[:120] or 'failed'}"
         )
     if stats.behind == 0:
         return BUCKET_FAST_FORWARD, stats
@@ -262,11 +282,7 @@ def discover_repos(git_root: str = GIT_ROOT, exclude: frozenset[str] = EXCLUDE) 
     # removes the case where an exclusion silently does nothing — which is how a
     # repository nobody meant to touch stays in the train.
     excluded = {_bare(name) for name in exclude}
-    return [
-        os.path.join(git_root, name)
-        for name in names
-        if _bare(name) not in excluded
-    ]
+    return [os.path.join(git_root, name) for name in names if _bare(name) not in excluded]
 
 
 # ── the decision the SOP reads ───────────────────────────────────────────────
@@ -355,7 +371,16 @@ class RepoOutcome:
             }
         # The record carries the FIRST branch's measurements; the SOP decides per
         # branch, so a repository with several candidates is run once per branch.
-        return self.reports[0].to_record()
+        record = self.reports[0].to_record()
+        # The REPOSITORY's own failures travel with it. They are why the whole
+        # repository is skipped, and a record carrying only the first branch's
+        # failures would let the SOP decide a branch the run never looked at — which
+        # is the `run failed` this replaces, arriving through a structured payload.
+        if self.failures:
+            merged = list(record.get("failures", []))
+            merged.extend(f for f in self.failures if f not in merged)
+            record["failures"] = merged
+        return record
 
     def summary(self) -> str:
         if self.failed:
@@ -474,10 +499,17 @@ def state_path(env: dict | None = None) -> str:
     A default, because "no record" and "never run" are the same answer to
     `due_for_run`: with nothing configured and nothing written, the floor never
     engages and the timer runs at whatever interval the caller chose. The default
-    is under the user's state directory rather than inside the git root, because
-    the git root is the operator's canonical data and this is the engine's own
+    is under the user's state directory rather than inside the git root, because the
+    git root is the operator's canonical data and this is the engine's own
     bookkeeping. The path is logged at startup so an operator can see where the
     cadence lives instead of wondering why it does not.
+
+    Read from the SUPPLIED environment only. A caller that passes a scoped env — a
+    test, or anything else that means "pretend this is the host" — must not get the
+    real user's state directory, so `os.environ` is never consulted here and an env
+    with no state directory yields "" rather than a path into the caller's home.
+    Nowhere to record is fail-closed and says so; a path the caller did not choose is
+    not.
     """
     env = dict(os.environ if env is None else env)
     configured = (env.get("MERGE_TRAIN_STATE_PATH") or "").strip()
@@ -485,11 +517,15 @@ def state_path(env: dict | None = None) -> str:
         return configured
     if env.get("MERGE_TRAIN_NO_DEFAULT_STATE"):
         return ""
-    return os.path.join(
-        os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
-        "merge-train",
-        "state.json",
-    )
+    xdg_state = (env.get("XDG_STATE_HOME") or "").strip()
+    if xdg_state:
+        # XDG_STATE_HOME is ALREADY the state directory, so it is not extended with
+        # `.local/state`; only the HOME fallback is.
+        return os.path.join(xdg_state, "merge-train", "state.json")
+    home = (env.get("HOME") or "").strip()
+    if not home:
+        return ""
+    return os.path.join(home, ".local", "state", "merge-train", "state.json")
 
 
 def record_cycle_end(at: float | None = None, env: dict | None = None) -> bool:

@@ -927,3 +927,46 @@ def test_a_truncated_bus_read_is_not_treated_as_a_smaller_state(tmp_path):
     # the guarantee above is about the periodic reload, not this.
     state.refresh()
     assert state.last_mark("loop:j1") is None
+
+
+def test_a_password_auth_restart_is_refused_when_the_password_is_absent(monkeypatch, doctor_state):
+    """Raised four times by review; asserted here rather than argued.
+
+    `resolve_restart_target` refuses when the password variable is unset or EMPTY
+    (`not (env.get(...) or "")` is true for `""`), and it runs before the subprocess
+    is built — so the second read of the variable can only see the same value.
+    """
+    monkeypatch.setenv("CIXMINI_IP", "192.0.2.99")
+    monkeypatch.delenv("CIXMINI_SSH_PASSWORD", raising=False)
+    target, reason = doctor_gates.resolve_restart_target("cixmini")
+    assert target is None
+    assert "CIXMINI_SSH_PASSWORD" in reason
+
+    # Empty is as absent as unset.
+    monkeypatch.setenv("CIXMINI_SSH_PASSWORD", "")
+    assert doctor_gates.resolve_restart_target("cixmini")[0] is None
+
+    # And through the executor, with the gate satisfied so nothing else refuses.
+    monkeypatch.setenv("CIXMINI_SSH_PASSWORD", "")
+    monkeypatch.setattr(doctor, "DRY_RUN", False)
+    digest = doctor_gates.action_digest(
+        "restart_service", host="cixmini", service="zeroclaw-doctor.service"
+    )
+    doctor.APPROVALS.record_approval("restart_service", digest)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("no subprocess may be built without a password")
+
+    monkeypatch.setattr(doctor.subprocess, "run", boom)
+    out = doctor.action_restart_service("cixmini", "zeroclaw-doctor.service")
+    assert "CIXMINI_SSH_PASSWORD" in out, out
+
+
+def test_each_cancel_test_starts_with_no_approval(tmp_path):
+    """The approval now lives in a DURABLE store, so a test that does not clear it
+    could inherit one recorded by the test before it. The conftest fixture swaps in a
+    fresh store per test; this proves the swap happened rather than assuming it."""
+    from hive.workers.doctor_state import MemoryBackend
+
+    assert isinstance(doctor.STATE.backend, MemoryBackend), type(doctor.STATE.backend)
+    assert doctor.STATE.keys("") == [], doctor.STATE.keys("")
