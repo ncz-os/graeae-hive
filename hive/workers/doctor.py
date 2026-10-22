@@ -40,6 +40,7 @@ Env:
   DOCTOR_OPENWEIGHT_MODEL    model id for the open-weight path (default deepseek-chat)
   DOCTOR_OPENWEIGHT_API_KEY  key for open-weight path (falls back to config.toml deepseek)
 """
+
 from __future__ import annotations
 
 import json
@@ -85,7 +86,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 # coming back to the doctor (because we released it and some broken worker
 # re-failed it), we escalate instead of releasing it again.
 _seen_job_attempts: dict[str, list[float]] = {}
-LOOP_WINDOW_SEC = float(os.environ.get("LOOP_WINDOW_SEC", "1800"))   # 30 min
+LOOP_WINDOW_SEC = float(os.environ.get("LOOP_WINDOW_SEC", "1800"))  # 30 min
 LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
 
 # ── Per-phase model selection (2026-06-02) ──
@@ -113,19 +114,15 @@ _PHASE_MODELS = {
     "fix": DOCTOR_FIX_MODEL,
 }
 # OpenAI-compatible local endpoint: CERBERUS gemma4-31b (the durable brain).
-DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get(
-    "DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
+DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get("DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
 DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "gemma4-31b")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
 DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
 # Per-phase bases. All default to CERBERUS; override any phase to a LIGHT model
 # on HYDRA/ACHILLES (e.g. DOCTOR_TRIAGE_BASE_URL=http://192.0.2.78:8080/v1).
-DOCTOR_TRIAGE_BASE_URL = os.environ.get(
-    "DOCTOR_TRIAGE_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
-DOCTOR_REVIEW_BASE_URL = os.environ.get(
-    "DOCTOR_REVIEW_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
-DOCTOR_FIX_BASE_URL = os.environ.get(
-    "DOCTOR_FIX_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+DOCTOR_TRIAGE_BASE_URL = os.environ.get("DOCTOR_TRIAGE_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+DOCTOR_REVIEW_BASE_URL = os.environ.get("DOCTOR_REVIEW_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+DOCTOR_FIX_BASE_URL = os.environ.get("DOCTOR_FIX_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 _PHASE_BASE_URLS = {
     "triage": DOCTOR_TRIAGE_BASE_URL,
     "review": DOCTOR_REVIEW_BASE_URL,
@@ -144,17 +141,13 @@ DOCTOR_FALLBACK_BASE_URLS: list[str] = [
     u.strip().rstrip("/")
     for u in os.environ.get(
         "DOCTOR_FALLBACK_BASE_URLS",
-        "http://192.0.2.78:8080/v1,"
-        "http://192.0.2.11:8080/v1,"
-        "http://192.0.2.96:8080/v1",
+        "http://192.0.2.78:8080/v1,http://192.0.2.11:8080/v1,http://192.0.2.96:8080/v1",
     ).split(",")
     if u.strip()
 ]
 DOCTOR_FALLBACK_MODELS: list[str] = [
     m.strip()
-    for m in os.environ.get(
-        "DOCTOR_FALLBACK_MODELS", "gemma4-e2b,gemma4-e2b,gemma4-31b"
-    ).split(",")
+    for m in os.environ.get("DOCTOR_FALLBACK_MODELS", "gemma4-e2b,gemma4-e2b,gemma4-31b").split(",")
     if m.strip()
 ]
 
@@ -189,11 +182,7 @@ def _fallback_rungs(phase_base: str, phase_model: str | None = None) -> list[tup
         if not base or base in seen:
             continue
         seen.add(base)
-        model = (
-            (DOCTOR_FALLBACK_MODELS[idx] or "").strip()
-            if idx < len(DOCTOR_FALLBACK_MODELS)
-            else ""
-        )
+        model = (DOCTOR_FALLBACK_MODELS[idx] or "").strip() if idx < len(DOCTOR_FALLBACK_MODELS) else ""
         rungs.append((base, model or default_model))
     return rungs
 
@@ -216,9 +205,10 @@ def _classify_attempt_failure(reason: str) -> str:
         return "transport"
     return "other"
 
+
 # Self-triage scanner config
-SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))   # seconds between failed-cluster scans
-CLUSTER_THRESHOLD = int(os.environ.get('CLUSTER_THRESHOLD', '1'))  # min failures of same base_kind to trigger a triage
+SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))  # seconds between failed-cluster scans
+CLUSTER_THRESHOLD = int(os.environ.get("CLUSTER_THRESHOLD", "1"))  # min failures of same base_kind to trigger a triage
 CLUSTER_WINDOW_SEC = float(os.environ.get("CLUSTER_WINDOW_SEC", "21600"))  # only look at failures in last 6h
 # To avoid re-triaging the same cluster repeatedly, we remember kinds we've already
 # auto-triaged within this rolling window:
@@ -242,9 +232,7 @@ DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
 DLQ_PROTECT_KIND_PREFIXES = tuple(
     p.strip() for p in os.environ.get("DLQ_PROTECT_KIND_PREFIXES", "").split(",") if p.strip()
 )
-DLQ_PROTECT_PROJECTS = frozenset(
-    p.strip() for p in os.environ.get("DLQ_PROTECT_PROJECTS", "").split(",") if p.strip()
-)
+DLQ_PROTECT_PROJECTS = frozenset(p.strip() for p in os.environ.get("DLQ_PROTECT_PROJECTS", "").split(",") if p.strip())
 
 
 def dlq_protected(job: dict) -> bool:
@@ -253,6 +241,8 @@ def dlq_protected(job: dict) -> bool:
     if DLQ_PROTECT_KIND_PREFIXES and kind.startswith(DLQ_PROTECT_KIND_PREFIXES):
         return True
     return str(job.get("project") or "") in DLQ_PROTECT_PROJECTS
+
+
 # Job-level "permanently unschedulable" decline reasons -> remove. Mirrors
 # hive.bus.domain.jobs.DECLINE_REASON_PREFIXES (kept literal: this module is
 # stdlib-only so it can run in the container without the hive package).
@@ -291,22 +281,22 @@ TOKEN_FIX_WINDOW_SEC = float(os.environ.get("TOKEN_FIX_WINDOW_SEC", "3600"))  # 
 FLEET_LAN_TOKEN = os.environ.get("FLEET_LAN_TOKEN", "")
 # Known failure signatures → automatic dispatch (no LLM needed)
 KNOWN_FAILURE_SIGNATURES: list[tuple[re.Pattern, str]] = [
-    (re.compile(r'no token for host', re.IGNORECASE), 'token_mismatch'),
-    (re.compile(r'pair gateway first via POST /pair', re.IGNORECASE), 'token_mismatch'),
-    (re.compile(r'gateway.*unauthorized.*token', re.IGNORECASE), 'token_mismatch'),
+    (re.compile(r"no token for host", re.IGNORECASE), "token_mismatch"),
+    (re.compile(r"pair gateway first via POST /pair", re.IGNORECASE), "token_mismatch"),
+    (re.compile(r"gateway.*unauthorized.*token", re.IGNORECASE), "token_mismatch"),
 ]
 # Full fleet including Mac hosts (ULTRA, STUDIO) and sshpass hosts (MEDUSA, HYDRA)
 ALL_FLEET_HOSTS: dict[str, dict] = {
-    "ultra":    {"ip": "192.0.2.60", "os": "macos",   "auth": "passwordless", "user": "jasonperlow"},
-    "studio":   {"ip": "192.0.2.10", "os": "macos",   "auth": "passwordless", "user": "jasonperlow"},
-    "medusa":   {"ip": "192.0.2.64", "os": "linux",   "auth": "sshpass",      "user": "jasonperlow"},
-    "hydra":    {"ip": "192.0.2.78", "os": "linux",   "auth": "sshpass",      "user": "jasonperlow"},
-    "cerberus": {"ip": "192.0.2.96", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
-    "proteus":  {"ip": "192.0.2.25", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
-    "bigpi":    {"ip": "192.0.2.65", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
-    "clawpi":   {"ip": "192.0.2.54", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
-    "zeropi":   {"ip": "192.0.2.56", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
-    "typhon":   {"ip": "192.0.2.61", "os": "linux",   "auth": "passwordless", "user": "jasonperlow"},
+    "ultra": {"ip": "192.0.2.60", "os": "macos", "auth": "passwordless", "user": "jasonperlow"},
+    "studio": {"ip": "192.0.2.10", "os": "macos", "auth": "passwordless", "user": "jasonperlow"},
+    "medusa": {"ip": "192.0.2.64", "os": "linux", "auth": "sshpass", "user": "jasonperlow"},
+    "hydra": {"ip": "192.0.2.78", "os": "linux", "auth": "sshpass", "user": "jasonperlow"},
+    "cerberus": {"ip": "192.0.2.96", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
+    "proteus": {"ip": "192.0.2.25", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
+    "bigpi": {"ip": "192.0.2.65", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
+    "clawpi": {"ip": "192.0.2.54", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
+    "zeropi": {"ip": "192.0.2.56", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
+    "typhon": {"ip": "192.0.2.61", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
 }
 
 logging.basicConfig(
@@ -323,8 +313,8 @@ _session_id = str(uuid.uuid4())
 # Rate-limit state for SSH restart actions. Both moved to the durable store
 # (2026-10-22): a restart of the pod used to reset the SSH rate limiter, so the
 # first post-restart restart action always looked like the first one.
-_ssh_actions_log: deque = deque()          # legacy mirror, kept for the tests that read it
-_host_last_action: dict[str, float] = {}   # legacy mirror, kept for the tests that read it
+_ssh_actions_log: deque = deque()  # write-only mirror; the cap reads the durable store
+_host_last_action: dict[str, float] = {}  # legacy mirror, kept for the tests that read it
 
 # Allowlisted services for restart_service action
 ALLOWED_SERVICE_RE = re.compile(
@@ -337,9 +327,7 @@ ALLOWED_SERVICE_RE = re.compile(
 # it also holds the connection spec and cixmini. This alias stays so the existing
 # imports keep working, and `action_restart_service` no longer reads it.
 FLEET_HOSTS = {
-    name: entry.get("address", "")
-    for name, entry in doctor_gates.RESTART_TARGETS.items()
-    if entry.get("address")
+    name: entry.get("address", "") for name, entry in doctor_gates.RESTART_TARGETS.items() if entry.get("address")
 }
 # Hosts the doctor must NEVER restart — production-critical only.
 # (User directive 2026-05-26: cixmini is one of our most powerful systems —
@@ -472,9 +460,16 @@ def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.
     registering_orchestrator = (
         path == "/v1/agents/register"
         and isinstance(body, dict)
-        and str(body.get("runtime") or "").lower() in {
-            "claude-code", "claude-cli", "claude", "human", "mnemos",
-            "doctor", "dream-walker", "unknown",
+        and str(body.get("runtime") or "").lower()
+        in {
+            "claude-code",
+            "claude-cli",
+            "claude",
+            "human",
+            "mnemos",
+            "doctor",
+            "dream-walker",
+            "unknown",
         }
     )
     token = HIVE_BUS_ADMIN_TOKEN if path.startswith("/v1/admin/") or registering_orchestrator else HIVE_BUS_TOKEN
@@ -518,9 +513,15 @@ def register() -> str:
         "autonomy_level": "autonomous",
         "auth_method": "subscription",
         "capabilities": [
-            "triage", "diagnose", "fix-agents", "fix-code",
-            "dispatch-codex", "resubmit-jobs", "restart-services",
-            "bus-http-read", "bus-http-write",
+            "triage",
+            "diagnose",
+            "fix-agents",
+            "fix-code",
+            "dispatch-codex",
+            "resubmit-jobs",
+            "restart-services",
+            "bus-http-read",
+            "bus-http-write",
         ],
         "version": "zeroclaw-doctor/1.0",
         "metadata": {
@@ -599,8 +600,7 @@ def release_out_of_scope_job(job: dict) -> str:
     if code in (200, 201, 204):
         log.warning("released out-of-scope job %s kind=%s back to queue", job_id[:12], kind)
         return f"released {job_id[:12]} ({kind}) to queue (out of doctor scope)"
-    log.error("could not release out-of-scope job %s kind=%s code=%s resp=%s",
-              job_id[:12], kind, code, str(resp)[:200])
+    log.error("could not release out-of-scope job %s kind=%s code=%s resp=%s", job_id[:12], kind, code, str(resp)[:200])
     return f"failed to release out-of-scope job {job_id[:12]} code={code}"
 
 
@@ -650,9 +650,9 @@ def fetch_failed_jobs_for_kind(base_kind: str, limit: int = 10) -> list[dict]:
     # match kind prefix OR exact base_kind after stripping [tag] suffix
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
     matched = [
-        j for j in jobs
-        if (j.get("kind") or "").startswith(base_kind)
-        or strip_re.sub("", j.get("kind", "")).strip() == base_kind
+        j
+        for j in jobs
+        if (j.get("kind") or "").startswith(base_kind) or strip_re.sub("", j.get("kind", "")).strip() == base_kind
     ]
     matched.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return matched[:limit]
@@ -716,8 +716,7 @@ When to use each action_type:
 """
 
 
-def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict],
-                        registry: dict, failure_count_hint: int) -> str:
+def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry: dict, failure_count_hint: int) -> str:
     msg = [
         "TRIAGE REQUEST",
         f"triage_job_id: {job.get('id', '')}",
@@ -748,15 +747,17 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict],
         )
         if result_preview:
             msg.append(f"    result: {result_preview}")
-    msg.extend([
-        "",
-        "AGENT REGISTRY SUMMARY:",
-        f"  by_kind: {json.dumps(registry.get('by_kind', {}))}",
-        f"  by_host: {json.dumps(registry.get('by_host', {}))}",
-        f"  by_status: {json.dumps(registry.get('by_status', {}))}",
-        "",
-        "Respond with the JSON action object only.",
-    ])
+    msg.extend(
+        [
+            "",
+            "AGENT REGISTRY SUMMARY:",
+            f"  by_kind: {json.dumps(registry.get('by_kind', {}))}",
+            f"  by_host: {json.dumps(registry.get('by_host', {}))}",
+            f"  by_status: {json.dumps(registry.get('by_status', {}))}",
+            "",
+            "Respond with the JSON action object only.",
+        ]
+    )
     return "\n".join(msg)
 
 
@@ -781,9 +782,7 @@ def _invoke_gateway(prompt: str) -> tuple[bool, str]:
     full = DOCTOR_SYSTEM + "\n\n" + prompt
     url = f"http://{DOCTOR_GATEWAY_HOST}:{DOCTOR_GATEWAY_PORT}/webhook"
     data = json.dumps({"message": full}).encode()
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"content-type": "application/json"})
+    req = urllib.request.Request(url, data=data, method="POST", headers={"content-type": "application/json"})
     log.info("invoking gateway codex path %s prompt_chars=%d", url, len(full))
     try:
         with urllib.request.urlopen(req, timeout=DOCTOR_GATEWAY_TIMEOUT) as r:
@@ -816,8 +815,6 @@ def _gateway_failure_allows_fallback(reason: str) -> bool:
         "temporarily unavailable",
     )
     return any(marker in text for marker in outage_markers)
-
-
 
 
 def _openweight_api_key() -> str:
@@ -870,8 +867,7 @@ def _invoke_openweight(
     else:
         log.warning("no open-weight API key; calling %s unauthenticated (ok for local)", base)
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
-    log.info("invoking model=%s at %s (alias=%s, prompt_chars=%d)",
-             model_id, base, model_alias, len(prompt))
+    log.info("invoking model=%s at %s (alias=%s, prompt_chars=%d)", model_id, base, model_alias, len(prompt))
     try:
         with urllib.request.urlopen(req, timeout=DOCTOR_OPENWEIGHT_TIMEOUT) as r:
             resp = json.loads(r.read())
@@ -939,16 +935,18 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     for idx, (base, model) in enumerate(chain):
         # Pass the model ONLY as the keyword: _invoke_openweight's second
         # positional parameter is the alias label, not the model id.
-        ok, text = _invoke_openweight(
-            prompt, model_alias, base_url=base, model=model
-        )
+        ok, text = _invoke_openweight(prompt, model_alias, base_url=base, model=model)
         if ok and text.strip():
             if idx == 0:
                 log.info("doctor phase=%s answered by %s model=%s", phase, base, model)
             else:
                 log.warning(
                     "doctor phase=%s FAILOVER: %s (model=%s) answered after %s failed (%s)",
-                    phase, base, model, last_base, str(last_reason)[:160],
+                    phase,
+                    base,
+                    model,
+                    last_base,
+                    str(last_reason)[:160],
                 )
                 text = (
                     f"[doctor failover: {base} model={model} after {last_base} "
@@ -961,18 +959,20 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
         if kind not in _FAILOVER_ELIGIBLE_REASONS:
             log.warning(
                 "doctor phase=%s endpoint %s failed non-retryably (%s): %s",
-                phase, base, kind, str(text)[:200],
+                phase,
+                base,
+                kind,
+                str(text)[:200],
             )
             break
         log.warning(
             "doctor phase=%s endpoint %s failed (%s) — trying next local endpoint",
-            phase, base, kind,
+            phase,
+            base,
+            kind,
         )
 
-    return False, (
-        f"model ({model_alias}) failed on every local endpoint; "
-        f"last {last_base}: {last_reason}"
-    )
+    return False, (f"model ({model_alias}) failed on every local endpoint; last {last_base}: {last_reason}")
 
 
 _CODE_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)```", re.IGNORECASE)
@@ -1034,16 +1034,17 @@ def _ssh_rate_ok(host: str) -> bool:
         # function's, so the message says what failed rather than what to retry.
         log.warning("SSH rate limiter unavailable (safety state is not persisted) — skipping")
         return False
+    # Read the cap from the DURABLE count, not from the deque. The deque is a
+    # write-only mirror (nothing reads it; it exists so the pre-existing attribute
+    # names keep working), so re-syncing it here would cost a second store read on
+    # every check to keep a value nobody consults up to date.
     total = ssh_actions_total(SSH_RATE_WINDOW_SEC)
-    _ssh_actions_log.clear()
-    _ssh_actions_log.extend(STATE.timestamps(f"{KEY_SSH}:all", ttl=SSH_RATE_WINDOW_SEC))
     if total >= MAX_SSH_PER_HOUR:
         log.warning("SSH rate cap %d/h reached (durable: %d) — skipping", MAX_SSH_PER_HOUR, total)
         return False
     since = host_in_cooldown(host, now)
     if since < MIN_HOST_COOLDOWN:
-        log.warning("host %s cooldown %ds remaining (durable) — skipping",
-                    host, int(MIN_HOST_COOLDOWN - since))
+        log.warning("host %s cooldown %ds remaining (durable) — skipping", host, int(MIN_HOST_COOLDOWN - since))
         return False
     return True
 
@@ -1082,10 +1083,16 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
     if target["auth"] == "password":
         cixmini_password = os.environ.get("CIXMINI_SSH_PASSWORD", "")
         cmd = [
-            "sshpass", "-p", cixmini_password,
-            "ssh", "-o", "PubkeyAuthentication=no",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
+            "sshpass",
+            "-p",
+            cixmini_password,
+            "ssh",
+            "-o",
+            "PubkeyAuthentication=no",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=10",
             f"{target['user']}@{ip}",
             f"printf '%s\\n' {shlex.quote(cixmini_password)} | sudo -S systemctl restart {service}",
         ]
@@ -1097,8 +1104,11 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
                 f"printf '%s\\n' {shlex.quote(sudo_password)} | sudo -S systemctl restart {service}"
             )
         cmd = [
-            "ssh", "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=10",
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "ConnectTimeout=10",
             f"{target['user']}@{ip}",
             restart_cmd,
         ]
@@ -1120,18 +1130,21 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
         return f"could not fetch failed jobs (code={code})"
     failed = resp.get("jobs", [])
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
-    target_ids = [
-        j["id"] for j in failed
-        if strip_re.sub("", j.get("kind", "")).strip() == base_kind
-    ][:max(1, int(max_resubmits))]
+    target_ids = [j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind][
+        : max(1, int(max_resubmits))
+    ]
     if not target_ids:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
         return f"DRY_RUN: would requeue {len(target_ids)} jobs of {base_kind}"
-    code2, resp2 = _http("POST", "/v1/admin/jobs/requeue", {
-        "job_ids": target_ids,
-        "reason": f"doctor-resubmit:{base_kind}",
-    })
+    code2, resp2 = _http(
+        "POST",
+        "/v1/admin/jobs/requeue",
+        {
+            "job_ids": target_ids,
+            "reason": f"doctor-resubmit:{base_kind}",
+        },
+    )
     return f"requeued {len(target_ids)} jobs of {base_kind} (api={code2})"
 
 
@@ -1162,10 +1175,9 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
         return f"could not fetch failed jobs (code={code})"
     failed = resp.get("jobs", [])
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
-    target_ids = [
-        j["id"] for j in failed
-        if strip_re.sub("", j.get("kind", "")).strip() == base_kind
-    ][:max(1, int(max_cancels))]
+    target_ids = [j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind][
+        : max(1, int(max_cancels))
+    ]
     if not target_ids:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
@@ -1192,27 +1204,30 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
     # ids stay on record in this triage job's result and the broadcast.
     # `doctor_gates.purge_request` owns the endpoint/payload pairing, so the
     # `ids` key can only ever go to the route that reads `ids`.
-    path, body = doctor_gates.purge_request(
-        "cancel_failed", purge_ids, f"doctor-cancel:{base_kind}"
-    )
+    path, body = doctor_gates.purge_request("cancel_failed", purge_ids, f"doctor-cancel:{base_kind}")
     code2, resp2 = _http("POST", path, body)
     outcome = doctor_gates.purge_result("cancel_failed", resp2, purge_ids)
-    broadcast_doctor_message("doctor.cancel", {
-        "host": AGENT_HOST,
-        "base_kind": base_kind,
-        "job_ids": purge_ids,
-        "reason": "doctor-determined-structural-failure",
-        "api": code2,
-        "removed": outcome["removed"],
-        "skipped": outcome.get("skipped", []),
-    })
+    broadcast_doctor_message(
+        "doctor.cancel",
+        {
+            "host": AGENT_HOST,
+            "base_kind": base_kind,
+            "job_ids": purge_ids,
+            "reason": "doctor-determined-structural-failure",
+            "api": code2,
+            "removed": outcome["removed"],
+            "skipped": outcome.get("skipped", []),
+        },
+    )
     # Report the CONFIRMED count against the requested count. `removed` counts only
     # ids the route named as deleted, so a partial delete reads as a partial
     # delete rather than as a success.
-    summary = (f"cancelled {outcome['removed']}/{len(purge_ids)} "
-               f"failed jobs of {base_kind} (api={code2}): {', '.join(purge_ids)}")
+    summary = (
+        f"cancelled {outcome['removed']}/{len(purge_ids)} "
+        f"failed jobs of {base_kind} (api={code2}): {', '.join(purge_ids)}"
+    )
     if outcome["partial"]:
-        summary += (f"; PARTIAL: {len(outcome.get('skipped', []))} job(s) not deleted")
+        summary += f"; PARTIAL: {len(outcome.get('skipped', []))} job(s) not deleted"
     if code2 != 200:
         summary += f"; api did not confirm the purge (status={code2})"
     return summary
@@ -1302,17 +1317,14 @@ def _release_job(job_id: str, release_eligible_kinds: list | None) -> tuple[str,
     # Our job is currently 'running' (we patched it on claim), so we must
     # release in TWO steps: (1) status running→queued (clears claimed_by),
     # (2) PATCH eligible_kinds on the now-queued job.
-    code1, resp1 = _http("PATCH", f"/v1/jobs/{job_id}",
-                         {"status": "queued", "claimed_by": _urn})
+    code1, resp1 = _http("PATCH", f"/v1/jobs/{job_id}", {"status": "queued", "claimed_by": _urn})
     if code1 not in (200, 201, 204):
         return f"release step 1 FAILED code={code1} resp={str(resp1)[:200]}", False
-    code2, resp2 = _http("PATCH", f"/v1/jobs/{job_id}",
-                         {"status": "queued", "eligible_kinds": new_kinds})
+    code2, resp2 = _http("PATCH", f"/v1/jobs/{job_id}", {"status": "queued", "eligible_kinds": new_kinds})
     if code2 in (200, 201, 204):
         return f"released {job_id[:12]} → queued, eligible_kinds={new_kinds}", True
     # Step 1 already succeeded so the job IS released; the kind retag just failed.
-    return (f"released {job_id[:12]} → queued (eligible_kinds retag failed "
-            f"code={code2} resp={str(resp2)[:200]})"), True
+    return (f"released {job_id[:12]} → queued (eligible_kinds retag failed code={code2} resp={str(resp2)[:200]})"), True
 
 
 def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) -> str:
@@ -1327,8 +1339,9 @@ def action_release_to_queue(job_id: str, release_eligible_kinds: list | None) ->
     return _release_job(job_id, release_eligible_kinds)[0]
 
 
-def apply_release(job_id: str, is_explicit_triage: bool, base_kind: str,
-                  release_eligible_kinds: list | None) -> tuple[str, bool]:
+def apply_release(
+    job_id: str, is_explicit_triage: bool, base_kind: str, release_eligible_kinds: list | None
+) -> tuple[str, bool]:
     """Carry out a release_to_queue decision. Returns (summary, released).
 
     On a triage:<kind> wrapper, "release" means re-run the ORIGINAL failed
@@ -1387,19 +1400,19 @@ def _extract_host_from_job(job: dict, failed_jobs: list[dict]) -> str:
     # Check the triage job itself
     for field in ("claimed_by", "submitter_urn"):
         val = job.get(field) or ""
-        m = re.search(r'urn:agent:\w+:(\w+)', val)
+        m = re.search(r"urn:agent:\w+:(\w+)", val)
         if m:
             return m.group(1).lower()
     # Check recent failed jobs
     for fj in failed_jobs[:10]:
         for field in ("claimed_by", "submitter_urn"):
             val = fj.get(field) or ""
-            m = re.search(r'urn:agent:\w+:(\w+)', val)
+            m = re.search(r"urn:agent:\w+:(\w+)", val)
             if m:
                 return m.group(1).lower()
     # Try extracting from kind (e.g. "zeroclaw[ULTRA]")
     kind = job.get("kind") or ""
-    m = re.search(r'\[(\w+)\]', kind)
+    m = re.search(r"\[(\w+)\]", kind)
     if m:
         return m.group(1).lower()
     return ""
@@ -1435,29 +1448,27 @@ def _build_token_fix_codex_task(offending_host: str) -> str:
             f'PASSWORD="${{{password_var}:-$DOCTOR_SSH_PASSWORD}}"; '
             f'if [ -n "$PASSWORD" ]; then '
             f'sshpass -p "$PASSWORD" ssh -o PubkeyAuthentication=no '
-            f'-o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}; '
-            f'else ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}; fi'
+            f"-o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}; "
+            f"else ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}; fi"
         )
     else:
-        ssh_prefix = f'ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}'
+        ssh_prefix = f"ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 {user}@{ip}"
 
     # Build restart commands based on OS
     if os_type == "macos":
         restart_gateway = (
-            f'launchctl bootout gui/$(id -u {user}) '
-            f'~/Library/LaunchAgents/com.zeroclaw.gateway.plist 2>/dev/null || true; '
-            f'sleep 1; '
-            f'launchctl bootstrap gui/$(id -u {user}) '
-            f'~/Library/LaunchAgents/com.zeroclaw.gateway.plist'
+            f"launchctl bootout gui/$(id -u {user}) "
+            f"~/Library/LaunchAgents/com.zeroclaw.gateway.plist 2>/dev/null || true; "
+            f"sleep 1; "
+            f"launchctl bootstrap gui/$(id -u {user}) "
+            f"~/Library/LaunchAgents/com.zeroclaw.gateway.plist"
         )
         restart_worker = (
-            'pkill -f zeroclaw-wss-worker 2>/dev/null || true; '
-            'sleep 1; '
-            'nohup ~/zeroclaw-wss-worker &>/dev/null &'
+            "pkill -f zeroclaw-wss-worker 2>/dev/null || true; sleep 1; nohup ~/zeroclaw-wss-worker &>/dev/null &"
         )
-        restart_cmd = f'{restart_gateway}; {restart_worker}'
+        restart_cmd = f"{restart_gateway}; {restart_worker}"
     else:
-        restart_cmd = 'sudo systemctl restart zeroclaw-gateway; for i in 1 2 3 4; do sudo systemctl restart zeroclaw-wss-worker@$i; done'
+        restart_cmd = "sudo systemctl restart zeroclaw-gateway; for i in 1 2 3 4; do sudo systemctl restart zeroclaw-wss-worker@$i; done"
 
     return f"""FLEET INFRA FIX: Gateway token mismatch on {offending_host} ({ip}, {os_type} via {auth})
 
@@ -1547,8 +1558,7 @@ CONSTRAINTS (READ CAREFULLY):
 - If ANY step fails, report the exact error and escalate."""
 
 
-def _match_known_signature(job: dict, base_kind: str,
-                           failed: list[dict]) -> dict | None:
+def _match_known_signature(job: dict, base_kind: str, failed: list[dict]) -> dict | None:
     """Check if the triage job or its associated failures match a known,
     auto-fixable signature. Returns an action dict (bypassing the LLM)
     or None if no signature matches.
@@ -1561,7 +1571,8 @@ def _match_known_signature(job: dict, base_kind: str,
     # doctor:* job that failed with a transient error would match its own
     # "ConnectionClosed" and release itself, skipping the terminal PATCH.
     own_failures = [
-        fj for fj in failed[:8]
+        fj
+        for fj in failed[:8]
         if not (
             str(fj.get("kind") or "").startswith(DOCTOR_CLAIM_KIND_PREFIXES)
             or (_urn and str(fj.get("claimed_by") or "") == _urn)
@@ -1579,19 +1590,29 @@ def _match_known_signature(job: dict, base_kind: str,
 
     unsched = _is_unschedulable(own_failures)
     if unsched:
-        return {"action_type": "escalate", "confidence": 1.0,
-                "reason": f"unschedulable ({unsched}): the submitter must "
-                          "create the branch or map the repo; a retry cannot fix it; no LLM"}
+        return {
+            "action_type": "escalate",
+            "confidence": 1.0,
+            "reason": f"unschedulable ({unsched}): the submitter must "
+            "create the branch or map the repo; a retry cannot fix it; no LLM",
+        }
 
     # Transient gateway/session error (ws-400 / ConnectionClosed) — e.g. a worker
     # restart severed the WSS mid-job. Release to queue WITHOUT burning codex-cli.
-    _transient = ("ws_exception" in search_text or "ConnectionClosed" in search_text
-                  or "reason_phrase='Bad Request'" in search_text)
-    _structural = any(x in search_text for x in ("Traceback", "SyntaxError",
-                      "no_workspace", "clone_failed", "no_zeroclaw_handler"))
+    _transient = (
+        "ws_exception" in search_text
+        or "ConnectionClosed" in search_text
+        or "reason_phrase='Bad Request'" in search_text
+    )
+    _structural = any(
+        x in search_text for x in ("Traceback", "SyntaxError", "no_workspace", "clone_failed", "no_zeroclaw_handler")
+    )
     if _transient and not _structural:
-        return {"action_type": "release_to_queue", "confidence": 0.9,
-                "reason": "transient ws/gateway error (ws-400/ConnectionClosed) — retry; no LLM"}
+        return {
+            "action_type": "release_to_queue",
+            "confidence": 0.9,
+            "reason": "transient ws/gateway error (ws-400/ConnectionClosed) — retry; no LLM",
+        }
 
     for pattern, sig_name in KNOWN_FAILURE_SIGNATURES:
         if not pattern.search(search_text):
@@ -1599,53 +1620,58 @@ def _match_known_signature(job: dict, base_kind: str,
 
         offending_host = _extract_host_from_job(job, failed)
         if not offending_host:
-            log.info("signature matched '%s' but could not extract host — "
-                     "falling through to LLM diagnosis", sig_name)
+            log.info("signature matched '%s' but could not extract host — falling through to LLM diagnosis", sig_name)
             return None
 
         # Check rate limit
         if not _check_token_fix_rate_limit(offending_host):
             count = len(_token_fix_attempts.get(offending_host.lower(), []))
-            log.warning("token-fix rate cap reached for %s (%d in %ds) — escalating",
-                        offending_host, count, int(TOKEN_FIX_WINDOW_SEC))
+            log.warning(
+                "token-fix rate cap reached for %s (%d in %ds) — escalating",
+                offending_host,
+                count,
+                int(TOKEN_FIX_WINDOW_SEC),
+            )
             return {
                 "action_type": "escalate",
                 "confidence": 1.0,
                 "reason": (
                     f"token-fix rate-limit: {count} fixes dispatched for "
-                    f"{offending_host} in last {int(TOKEN_FIX_WINDOW_SEC/3600)}h"
+                    f"{offending_host} in last {int(TOKEN_FIX_WINDOW_SEC / 3600)}h"
                 ),
             }
 
         # Check host is known
         if offending_host.lower() not in ALL_FLEET_HOSTS:
-            log.warning("token-fix: host %s not in ALL_FLEET_HOSTS — "
-                        "falling through to LLM", offending_host)
+            log.warning("token-fix: host %s not in ALL_FLEET_HOSTS — falling through to LLM", offending_host)
             return None
 
         # SECURITY (review C2/H3): fail closed without a configured LAN token. The
         # codex fix rewrites gateway-tokens.json / config.toml paired_tokens; with
         # no FLEET_LAN_TOKEN we would bake an empty token and lock the gateway out.
         if not FLEET_LAN_TOKEN:
-            log.warning("token-fix: FLEET_LAN_TOKEN unset — escalating instead of "
-                        "dispatching a fix that would write an empty token")
+            log.warning(
+                "token-fix: FLEET_LAN_TOKEN unset — escalating instead of "
+                "dispatching a fix that would write an empty token"
+            )
             return {
                 "action_type": "escalate",
                 "confidence": 1.0,
-                "reason": (f"token-mismatch on {offending_host} but FLEET_LAN_TOKEN is not "
-                           "configured; cannot safely auto-fix"),
+                "reason": (
+                    f"token-mismatch on {offending_host} but FLEET_LAN_TOKEN is not configured; cannot safely auto-fix"
+                ),
             }
 
         _record_token_fix_attempt(offending_host)
-        log.info("AUTO-DETECT signature=%s host=%s — bypassing LLM, "
-                 "dispatching codex fix directly", sig_name, offending_host)
+        log.info(
+            "AUTO-DETECT signature=%s host=%s — bypassing LLM, dispatching codex fix directly", sig_name, offending_host
+        )
 
         return {
             "action_type": "dispatch_codex_fix",
             "confidence": 0.95,
             "reason": (
-                f"auto-detected signature '{sig_name}': "
-                f"'no token for host' gateway-auth failure on {offending_host}"
+                f"auto-detected signature '{sig_name}': 'no token for host' gateway-auth failure on {offending_host}"
             ),
             "codex_task": _build_token_fix_codex_task(offending_host),
             "target_host": offending_host,
@@ -1693,11 +1719,13 @@ def scan_for_failure_clusters() -> list[dict]:
         # Also skip if an active triage:<bk> already exists in queued/running
         if _active_triage_exists(bk):
             continue
-        clusters.append({
-            "base_kind": bk,
-            "count": len(jobs),
-            "sample_job_id": jobs[0].get("id", ""),
-        })
+        clusters.append(
+            {
+                "base_kind": bk,
+                "count": len(jobs),
+                "sample_job_id": jobs[0].get("id", ""),
+            }
+        )
     return clusters
 
 
@@ -1723,7 +1751,7 @@ def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | 
         "kind": f"triage:{base_kind}",
         "description": (
             f"HIVE AUTO-TRIAGE — {count} fails of base_kind={base_kind} in last "
-            f"{int(CLUSTER_WINDOW_SEC/3600)}h.\n"
+            f"{int(CLUSTER_WINDOW_SEC / 3600)}h.\n"
             f"Sample failed job id: {sample_job_id}\n\n"
             f"Doctor: analyze failure pattern, diagnose root cause, dispatch fix "
             f"(codex sub-job, service restart, or resubmit) and clear the failed cluster."
@@ -1741,11 +1769,9 @@ def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | 
     if code in (200, 201) and resp:
         jid = resp.get("id", "")
         note_triage(base_kind)
-        log.info("auto-triage submitted id=%s base_kind=%s count=%d",
-                 jid[:12], base_kind, count)
+        log.info("auto-triage submitted id=%s base_kind=%s count=%d", jid[:12], base_kind, count)
         return jid
-    log.warning("auto-triage submit failed code=%s base_kind=%s resp=%s",
-                code, base_kind, str(resp)[:200])
+    log.warning("auto-triage submit failed code=%s base_kind=%s resp=%s", code, base_kind, str(resp)[:200])
     return None
 
 
@@ -1781,7 +1807,7 @@ def process_triage_job(job: dict) -> dict:
     desc = job.get("description", "") or ""
 
     is_explicit_triage = kind.startswith("triage:")
-    base_kind = kind[len("triage:"):] if is_explicit_triage else _base_kind(kind)
+    base_kind = kind[len("triage:") :] if is_explicit_triage else _base_kind(kind)
 
     m = re.search(r"(\d+)\s+fail", desc, re.IGNORECASE)
     failure_count = int(m.group(1)) if m else 0
@@ -1795,22 +1821,29 @@ def process_triage_job(job: dict) -> dict:
     # restart reset it and a job that had already looped three times looked new.
     history = loop_attempts(job_id, window=LOOP_WINDOW_SEC, at=now)
     if len(history) >= LOOP_ESCALATE_THRESHOLD:
-        log.warning("LOOP-DETECT job=%s seen %d times in %ds — escalating",
-                    job_id[:12], len(history), int(LOOP_WINDOW_SEC))
+        log.warning(
+            "LOOP-DETECT job=%s seen %d times in %ds — escalating", job_id[:12], len(history), int(LOOP_WINDOW_SEC)
+        )
         return {
             "exit_code": 0,
-            "stdout": (f"action=escalate; conf=1.00; reason=loop-detect "
-                       f"({len(history)} doctor-cycles in {int(LOOP_WINDOW_SEC)}s); "
-                       f"likely a broken worker is reclaiming. Human review required."),
-            "action": {"action_type": "escalate", "confidence": 1.0,
-                       "reason": f"loop-detect {len(history)} attempts"},
+            "stdout": (
+                f"action=escalate; conf=1.00; reason=loop-detect "
+                f"({len(history)} doctor-cycles in {int(LOOP_WINDOW_SEC)}s); "
+                f"likely a broken worker is reclaiming. Human review required."
+            ),
+            "action": {"action_type": "escalate", "confidence": 1.0, "reason": f"loop-detect {len(history)} attempts"},
             "base_kind": base_kind,
             "loop_detected": True,
         }
 
-    log.info("processing %s job=%s base_kind=%s failures=%d attempt=%d",
-             "TRIAGE" if is_explicit_triage else "DIRECT",
-             job_id[:12], base_kind, failure_count, len(history))
+    log.info(
+        "processing %s job=%s base_kind=%s failures=%d attempt=%d",
+        "TRIAGE" if is_explicit_triage else "DIRECT",
+        job_id[:12],
+        base_kind,
+        failure_count,
+        len(history),
+    )
 
     failed = fetch_failed_jobs_for_kind(base_kind, limit=10)
     registry = fetch_agent_registry_summary()
@@ -1823,38 +1856,42 @@ def process_triage_job(job: dict) -> dict:
         a = known_action.get("action_type", "no_action")
         reason = known_action.get("reason", "")
         log.info("doctor decision (SIGNATURE-MATCH): action=%s reason=%s", a, reason)
-        parts = [f"action={a}", f"conf={known_action.get('confidence', 1.0):.2f}",
-                 f"reason={reason}"]
+        parts = [f"action={a}", f"conf={known_action.get('confidence', 1.0):.2f}", f"reason={reason}"]
         released = False
         if a == "dispatch_codex_fix":
-            parts.append(action_dispatch_codex_fix(
-                known_action.get("codex_task"), job_id))
-            broadcast_doctor_message("doctor.fix.token_mismatch", {
-                "host": AGENT_HOST,
-                "job_id": job_id,
-                "target_host": known_action.get("target_host"),
-                "signature": known_action.get("signature"),
-                "base_kind": base_kind,
-            })
+            parts.append(action_dispatch_codex_fix(known_action.get("codex_task"), job_id))
+            broadcast_doctor_message(
+                "doctor.fix.token_mismatch",
+                {
+                    "host": AGENT_HOST,
+                    "job_id": job_id,
+                    "target_host": known_action.get("target_host"),
+                    "signature": known_action.get("signature"),
+                    "base_kind": base_kind,
+                },
+            )
             # Re-run the failed work now the offending host is fixed (the
             # original jobs for a triage wrapper, else this job itself).
             text, released = apply_release(
-                job_id, is_explicit_triage, base_kind,
-                known_action.get("release_eligible_kinds"))
+                job_id, is_explicit_triage, base_kind, known_action.get("release_eligible_kinds")
+            )
             parts.append(text)
         elif a == "release_to_queue":
             text, released = apply_release(
-                job_id, is_explicit_triage, base_kind,
-                known_action.get("release_eligible_kinds"))
+                job_id, is_explicit_triage, base_kind, known_action.get("release_eligible_kinds")
+            )
             parts.append(text)
         elif a == "escalate":
             parts.append("escalated to human")
-            broadcast_doctor_message("doctor.escalate.token_mismatch", {
-                "host": AGENT_HOST,
-                "job_id": job_id,
-                "reason": reason,
-                "base_kind": base_kind,
-            })
+            broadcast_doctor_message(
+                "doctor.escalate.token_mismatch",
+                {
+                    "host": AGENT_HOST,
+                    "job_id": job_id,
+                    "reason": reason,
+                    "base_kind": base_kind,
+                },
+            )
         else:
             parts.append(f"unknown auto-action {a!r}")
         return {
@@ -1905,19 +1942,21 @@ def process_triage_job(job: dict) -> dict:
         text, released = apply_release(job_id, is_explicit_triage, base_kind, rk_clean)
         parts.append(text)
     elif a == "restart_service" and conf >= 0.7:
-        parts.append(action_restart_service(
-            action.get("target_host"), action.get("service_name")))
+        parts.append(action_restart_service(action.get("target_host"), action.get("service_name")))
     elif a == "resubmit_jobs":
-        parts.append(action_resubmit_jobs(
-            action.get("resubmit_base_kind") or base_kind,
-            int(action.get("max_resubmits", 20) or 20)))
+        parts.append(
+            action_resubmit_jobs(
+                action.get("resubmit_base_kind") or base_kind, int(action.get("max_resubmits", 20) or 20)
+            )
+        )
     elif a == "cancel_jobs":
-        parts.append(action_cancel_jobs(
-            action.get("resubmit_base_kind") or base_kind,
-            int(action.get("max_resubmits", 20) or 20)))
+        parts.append(
+            action_cancel_jobs(
+                action.get("resubmit_base_kind") or base_kind, int(action.get("max_resubmits", 20) or 20)
+            )
+        )
     elif a == "dispatch_codex_fix":
-        parts.append(action_dispatch_codex_fix(
-            action.get("codex_task"), job_id))
+        parts.append(action_dispatch_codex_fix(action.get("codex_task"), job_id))
     elif a == "no_action":
         parts.append("no action — triage cleared")
     elif a == "escalate":
@@ -1971,9 +2010,7 @@ def classify_dead_letter(job: dict) -> tuple[str, str]:
     decline_reason = str(res.get("last_decline_reason") or "").strip()
     if decline_reason.startswith(DLQ_UNSCHEDULABLE_PREFIXES):
         return "remove", f"unschedulable:{decline_reason}"
-    blob = " ".join(
-        str(res.get(k) or "") for k in ("error", "note", "stderr", "stdout", "last_decline_reason", "raw")
-    )
+    blob = " ".join(str(res.get(k) or "") for k in ("error", "note", "stderr", "stdout", "last_decline_reason", "raw"))
     blob += " " + json.dumps(res.get("last_decline_result") or "")
     if DLQ_TRANSIENT_RE.search(blob):
         return "resubmit", "transient-infra-failure"
@@ -1999,9 +2036,7 @@ def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
         if blocked:
             log.warning("dlq remove refused for %s: %s", jid[:12], blocked)
             return f"REFUSED: {blocked}"
-        path, body = doctor_gates.purge_request(
-            "dlq_remove", [jid], f"doctor-dlq-remove:{reason}"
-        )
+        path, body = doctor_gates.purge_request("dlq_remove", [jid], f"doctor-dlq-remove:{reason}")
         code, resp = _http("POST", path, body)
         if code == 404:
             return f"remove PENDING {jid[:12]}: {path} not on bus yet"
@@ -2017,13 +2052,8 @@ def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
         if jid in outcome.get("not_found", []):
             return f"remove NO-OP {jid[:12]}: the bus has no such job"
         if jid in outcome.get("skipped", []):
-            return (
-                f"remove REFUSED {jid[:12]}: not in dead-letter, nothing deleted"
-            )
-        return (
-            f"remove UNCONFIRMED {jid[:12]}: {path} returned 2xx naming no deleted id "
-            f"resp={str(resp)[:120]}"
-        )
+            return f"remove REFUSED {jid[:12]}: not in dead-letter, nothing deleted"
+        return f"remove UNCONFIRMED {jid[:12]}: {path} returned 2xx naming no deleted id resp={str(resp)[:120]}"
     code, resp = _http(
         "POST",
         "/v1/admin/jobs/reclassify",
@@ -2062,8 +2092,12 @@ def handle_dead_letter_queue() -> dict:
         _dlq_seen[jid] = now
         if dlq_protected(job):  # reported, never remediated — and already recorded
             summary["protected"] = summary.get("protected", 0) + 1
-            log.info("dlq %s kind=%s project=%s -> left for its owner (protected)",
-                     jid[:12], job.get("kind", "?"), job.get("project") or "-")
+            log.info(
+                "dlq %s kind=%s project=%s -> left for its owner (protected)",
+                jid[:12],
+                job.get("kind", "?"),
+                job.get("project") or "-",
+            )
             continue
         if acted >= DLQ_MAX_PER_CYCLE:
             break
@@ -2088,8 +2122,7 @@ def handle_dead_letter_queue() -> dict:
 
 
 def main():
-    log.info("starting on %s url=%s alias=%s dry_run=%s",
-             AGENT_HOST, HIVE_URL, DOCTOR_AGENT_ALIAS, DRY_RUN)
+    log.info("starting on %s url=%s alias=%s dry_run=%s", AGENT_HOST, HIVE_URL, DOCTOR_AGENT_ALIAS, DRY_RUN)
     register()
     last_hb = time.time()
     last_scan = 0.0
@@ -2117,16 +2150,17 @@ def main():
                 try:
                     clusters = scan_for_failure_clusters()
                     if clusters:
-                        log.info("scan: %d failed-clusters above threshold",
-                                 len(clusters))
+                        log.info("scan: %d failed-clusters above threshold", len(clusters))
                         for c in clusters[:5]:  # cap to avoid burst-submit
-                            submit_auto_triage(c["base_kind"], c["count"],
-                                               c["sample_job_id"])
-                        broadcast_doctor_message("doctor.scan", {
-                            "host": AGENT_HOST,
-                            "clusters_found": len(clusters),
-                            "auto_triaged": min(5, len(clusters)),
-                        })
+                            submit_auto_triage(c["base_kind"], c["count"], c["sample_job_id"])
+                        broadcast_doctor_message(
+                            "doctor.scan",
+                            {
+                                "host": AGENT_HOST,
+                                "clusters_found": len(clusters),
+                                "auto_triaged": min(5, len(clusters)),
+                            },
+                        )
                 except Exception as e:
                     log.warning("scan error: %s", e)
 
@@ -2139,12 +2173,15 @@ def main():
             kind = job.get("kind", "?")
             log.info("claimed job %s kind=%s", job_id[:12], kind)
             patch_job(job_id, "running")
-            broadcast_doctor_message("doctor.triage", {
-                "host": AGENT_HOST,
-                "job_id": job_id,
-                "kind": kind,
-                "stage": "claimed",
-            })
+            broadcast_doctor_message(
+                "doctor.triage",
+                {
+                    "host": AGENT_HOST,
+                    "job_id": job_id,
+                    "kind": kind,
+                    "stage": "claimed",
+                },
+            )
 
             t0 = time.time()
             try:
@@ -2161,24 +2198,30 @@ def main():
                     # 'running' until its claim lease expired and loop.
                     status = "done" if result.get("exit_code", 1) == 0 else "failed"
                     patch_job(job_id, status, result)
-                log.info("job %s → %s in %ds: %s",
-                         job_id[:12], status, dur, result.get("stdout", "")[:200])
-                broadcast_doctor_message("doctor.triage", {
-                    "host": AGENT_HOST,
-                    "job_id": job_id,
-                    "kind": kind,
-                    "stage": "complete",
-                    "status": status,
-                    "action_type": (result.get("action") or {}).get("action_type"),
-                    "summary": result.get("stdout", "")[:240],
-                    "duration_sec": dur,
-                })
+                log.info("job %s → %s in %ds: %s", job_id[:12], status, dur, result.get("stdout", "")[:200])
+                broadcast_doctor_message(
+                    "doctor.triage",
+                    {
+                        "host": AGENT_HOST,
+                        "job_id": job_id,
+                        "kind": kind,
+                        "stage": "complete",
+                        "status": status,
+                        "action_type": (result.get("action") or {}).get("action_type"),
+                        "summary": result.get("stdout", "")[:240],
+                        "duration_sec": dur,
+                    },
+                )
             except Exception as e:
                 log.exception("process_triage_job crashed")
-                patch_job(job_id, "failed", {
-                    "exit_code": 99,
-                    "error": f"{type(e).__name__}: {e}",
-                })
+                patch_job(
+                    job_id,
+                    "failed",
+                    {
+                        "exit_code": 99,
+                        "error": f"{type(e).__name__}: {e}",
+                    },
+                )
 
         except KeyboardInterrupt:
             break

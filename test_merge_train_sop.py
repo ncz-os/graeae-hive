@@ -210,8 +210,9 @@ def test_no_code_path_in_this_module_pushes_to_a_public_forge():
     # Count real invocations (`_sh([...])`), not every mention of the word: the
     # choke point's own guard mentions "push" too.
     pushes = re.findall(r'_sh\(\[[^\]]*"push"[^\]]*', source)
-    assert len(pushes) == 1, f"exactly one git push may exist in this module, found {pushes}"
-    assert pushes[0].startswith('_sh(["git", "push", remote, f"{sha}:refs/heads/{base}"'), pushes
+    assert pushes == ['_sh(["git", "push", remote, f"{sha}:refs/heads/{base}"'], (
+        f"exactly one git push may exist in this module, and it must be the guarded one: {pushes}"
+    )
     for forbidden in ("urllib", "gitlab.com/api", "merge_requests", "PRIVATE-TOKEN"):
         assert forbidden not in source, f"{forbidden} may not appear in this module"
 

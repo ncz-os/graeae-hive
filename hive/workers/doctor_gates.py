@@ -206,6 +206,14 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
     on the bulk route — is reported in ``skipped`` rather than counted, which is
     the whole point: the doctor's summary must not claim a removal that did not
     happen.
+
+    What is exact and what is an attribution: **`removed` is always exact** — it is
+    the route's own count, or the length of the route's own id list. `skipped` is
+    exact when the route names the ids it deleted, and is otherwise an
+    ATTRIBUTION: a route that returns a count but no id list cannot say which ids
+    it kept, so the shortfall is reported against the tail of the requested list
+    and the count is what the operator should believe. Reporting no skips at all
+    would hide a partial purge; reporting the count as zero would invent one.
     """
     spec = PURGE_INTENTS[intent]
     removed_key = spec["removed_key"]

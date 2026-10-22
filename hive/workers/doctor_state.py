@@ -371,14 +371,16 @@ class DurableStateStore:
                 log.warning("state load failed (%s); serving from cache", error)
                 loaded = {}
             # A load that came back empty while the cache holds records is a
-            # backend outage, not a wipe: keep what we know. `refresh()` is how
-            # an operator asks for a genuine reload.
+            # backend outage, not a wipe, so the cache is kept UNCONDITIONALLY.
+            # There is deliberately no "first load was empty, so clear" branch:
+            # every writer calls this before it writes, so a non-empty cache already
+            # implies a previous load happened, and the branch was unreachable. An
+            # operator who wants the backend's answer rather than the cache's asks
+            # for it with `refresh()`.
             if loaded:
                 self._cache = loaded
-            elif self._loaded_at is None:
-                if self._cache:
-                    log.warning("state load returned nothing; keeping %d cached records", len(self._cache))
-                self._cache = {}
+            elif self._cache:
+                log.warning("state load returned nothing; keeping %d cached records", len(self._cache))
             self._loaded_at = now
             if self.backend.name == "memory" and not self._warned_memory:
                 self._warned_memory = True
