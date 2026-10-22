@@ -225,6 +225,10 @@ class RepoOutcome:
     """One repository's cycle: every branch, plus why anything failed."""
 
     repo: str
+    #: The path this outcome was measured from, so the writer reaches the SAME
+    #: repository the classifier read. `repo` is only a basename, and two bare
+    #: repos under one root can share one.
+    path: str = ""
     reports: list[BranchReport] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
 
@@ -399,7 +403,7 @@ def measure_repo(repo: str, pattern_checked: bool = True) -> RepoOutcome:
     failed`" and a record an operator can act on.
     """
     name = os.path.basename(repo)
-    outcome = RepoOutcome(repo=name)
+    outcome = RepoOutcome(repo=name, path=repo)
     if not os.path.isdir(repo):
         outcome.failures.append(f"{name}: not a directory")
         return outcome
@@ -467,7 +471,7 @@ def run_cycle(
             outcome = measure_repo(repo)
         except Exception as error:  # noqa: BLE001 - the whole point of this cycle
             name = os.path.basename(repo)
-            outcome = RepoOutcome(repo=name, failures=[f"{name}: {type(error).__name__}: {error}"])
+            outcome = RepoOutcome(repo=name, path=repo, failures=[f"{name}: {type(error).__name__}: {error}"])
             log.warning("merge-train %s failed: %s", name, error)
         outcomes.append(outcome)
         if outward_reports is not None:
@@ -478,34 +482,37 @@ def run_cycle(
     return outcomes
 
 
-def fast_forward_candidates(
-    outcomes: list[RepoOutcome], repo_path: str | None = None, dry_run: bool = True
-) -> list[str]:
+def fast_forward_candidates(outcomes: list[RepoOutcome], dry_run: bool = True) -> list[str]:
     """Fast-forward every clean fast-forward bucket, ARGONAS only.
 
     A bucket is fast-forwardable only when the repository recorded NO failure this
     cycle and the branch is in the fast-forward bucket — the same pairing the
     decision enforces, so the executor cannot be talked into writing from a
     repository whose measurement failed.
+
+    Each outcome carries the path it was measured from. Taking one shared path as
+    an argument instead is a guess: the outcome's `repo` is a basename, so the
+    argument version wrote the same branch into whichever repository the caller
+    happened to name — and with none named, `--apply` reported success having
+    written nothing at all.
     """
     results: list[str] = []
     for outcome in outcomes:
         if outcome.failed:
             results.append(f"{outcome.repo}: SKIPPED, {len(outcome.failures)} recorded failure(s)")
             continue
+        if not outcome.path:
+            results.append(f"{outcome.repo}: SKIPPED, no recorded repository path to write")
+            continue
         for report in outcome.reports:
             if report.bucket != BUCKET_FAST_FORWARD:
-                continue
-            if repo_path is None:
-                results.append(f"{report.repo}/{report.branch}: {report.sha[:12]} (not applied)")
                 continue
             # The base the classification used, recorded when the branch was
             # measured — not re-resolved here, which would be a second git call per
             # branch and could name a different branch than the one classified.
-            base = report.base or default_branch(repo_path)
+            base = report.base or default_branch(outcome.path)
             results.append(
-                f"{report.repo}/{report.branch}: "
-                f"{fast_forward(repo_path, base, report.sha, dry_run=dry_run)}"
+                f"{report.repo}/{report.branch}: {fast_forward(outcome.path, base, report.sha, dry_run=dry_run)}"
             )
     return results
 
@@ -531,9 +538,7 @@ def assert_no_forced_or_public_writes(args: list[str]) -> None:
     for arg in args:
         stripped = arg.strip()
         if stripped.startswith("+") or "+refs/" in stripped:
-            raise ValueError(
-                f"merge-train refuses {args!r}: a '+' refspec is a force-push and is never allowed"
-            )
+            raise ValueError(f"merge-train refuses {args!r}: a '+' refspec is a force-push and is never allowed")
     if "push" in lowered and CANONICAL_REMOTE not in lowered:
         raise ValueError(
             f"merge-train refuses {args!r}: a push must name {CANONICAL_REMOTE!r}, "

@@ -184,6 +184,18 @@ PURGE_INTENTS = {
 }
 
 
+def _as_id_list(value) -> list[str]:
+    """Ids from a response field, or an empty list.
+
+    Never iterates anything that is not a list: a route that answered with the
+    string `"ok"` instead of a list would otherwise yield `["o", "k"]` and report
+    two deleted jobs that do not exist.
+    """
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if isinstance(item, (str, int))]
+
+
 def purge_request(intent: str, job_ids: list[str], reason: str) -> tuple[str, dict]:
     """The (path, body) for one purge intent.
 
@@ -221,10 +233,10 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
         return {"removed": 0, "skipped": list(requested), "partial": bool(requested)}
     if intent == "cancel_failed":
         removed = response.get(removed_key)
-        matched = response.get("matched_ids")
-        removed_ids = [str(mid) for mid in matched] if isinstance(matched, list) else []
+        removed_ids = _as_id_list(response.get("matched_ids"))
         if not isinstance(removed, int):
             removed = len(removed_ids)
+        removed = max(0, removed)
         if removed_ids:
             # The route named the ids it deleted: the ones it did not name are the
             # ones it kept.
@@ -239,12 +251,26 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
             skipped = requested[len(requested) - shortfall :] if shortfall else []
         return {"removed": removed, "skipped": skipped, "partial": bool(skipped)}
     removed = response.get(removed_key)
-    removed_ids = [str(job_id) for job_id in removed] if isinstance(removed, list) else []
-    skipped = [str(job_id) for job_id in (response.get("skipped_not_dead_letter") or [])]
-    not_found = [str(job_id) for job_id in (response.get("not_found") or [])]
-    untouched = [job_id for job_id in requested if job_id not in removed_ids]
+    # `ok` is a list today. If a future bus returned a bare count instead, that
+    # count is still what it CONFIRMED, so it is honoured rather than read as
+    # "nothing was deleted" — the same rule the bulk route already gets.
+    if isinstance(removed, int):
+        removed_count, removed_ids = max(0, removed), []
+    else:
+        removed_ids = _as_id_list(removed)
+        removed_count = len(removed_ids)
+    skipped = _as_id_list(response.get("skipped_not_dead_letter"))
+    not_found = _as_id_list(response.get("not_found"))
+    if removed_ids:
+        untouched = [job_id for job_id in requested if job_id not in removed_ids]
+    else:
+        # No id list: a count is all the route confirmed, so the shortfall is what
+        # it kept. Deriving `untouched` from an empty id list while ALSO honouring
+        # the count would report "1 removed" and "1 not removed" for one request.
+        shortfall = max(0, len(requested) - removed_count)
+        untouched = requested[len(requested) - shortfall :] if shortfall else []
     return {
-        "removed": len(removed_ids),
+        "removed": removed_count,
         "skipped": skipped,
         "not_found": not_found,
         "untouched": untouched,

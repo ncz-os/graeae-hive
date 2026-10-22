@@ -425,7 +425,12 @@ class DurableStateStore:
         """The longest window this key could be under, so one namespace's
         entries do not expire on another's TTL."""
         prefix = key.split(":", 1)[0]
-        return COUNTER_TTLS.get(prefix, max(COUNTER_TTLS.values()))
+        if prefix in COUNTER_TTLS:
+            return COUNTER_TTLS[prefix]
+        # `max()` over an empty table raises, and this runs inside the write path,
+        # so an unconfigured table degrades to "does not expire" rather than to a
+        # crash on the first write.
+        return max(COUNTER_TTLS.values(), default=0.0) or float("inf")
 
     def _persist_locked(self) -> None:
         try:

@@ -444,7 +444,7 @@ def test_a_failed_repository_is_never_fast_forwarded(repo, tmp_path):
     git("remote", "add", "argonas", str(upstream), cwd=repo["bare"])
     outcome = mt.measure_repo(repo["bare"])
     outcome.failures.append("one branch could not be read")
-    lines = mt.fast_forward_candidates([outcome], repo_path=repo["bare"], dry_run=False)
+    lines = mt.fast_forward_candidates([outcome], dry_run=False)
     assert any("SKIPPED" in line for line in lines), lines
     refs = subprocess.run(
         ["git", "for-each-ref", "refs/heads"], cwd=str(upstream), capture_output=True, text=True
@@ -576,5 +576,30 @@ def test_a_fast_forward_uses_the_recorded_base_not_a_fresh_resolution(repo, monk
         raise AssertionError("default_branch must not be re-resolved per candidate")
 
     monkeypatch.setattr(mt, "default_branch", explode)
-    lines = mt.fast_forward_candidates([outcome], repo_path=repo["bare"], dry_run=False)
+    lines = mt.fast_forward_candidates([outcome], dry_run=False)
     assert any("advanced main" in line for line in lines), lines
+
+
+def test_apply_writes_to_each_repository_measured_not_to_one_named_path(repo, tmp_path):
+    """`main()` used to pass no path at all, so `--apply` took the "not applied"
+    branch, wrote nothing, and reported success. The outcome carries its own path."""
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True, capture_output=True)
+    git("remote", "add", "argonas", str(upstream), cwd=repo["bare"])
+    outcome = mt.measure_repo(repo["bare"])
+    assert outcome.path == repo["bare"], "the outcome must remember where it was measured"
+
+    lines = mt.fast_forward_candidates([outcome], dry_run=False)
+    assert any("advanced main" in line for line in lines), lines
+    refs = subprocess.run(
+        ["git", "for-each-ref", "refs/heads"], cwd=str(upstream), capture_output=True, text=True
+    ).stdout.strip()
+    assert "main" in refs, f"--apply must actually write: {refs}"
+
+
+def test_an_outcome_with_no_recorded_path_is_skipped_not_written(repo):
+    """No path means there is nothing to write; it must say so rather than guess."""
+    outcome = mt.measure_repo(repo["bare"])
+    outcome.path = ""
+    lines = mt.fast_forward_candidates([outcome], dry_run=False)
+    assert lines and all("no recorded repository path" in line for line in lines), lines

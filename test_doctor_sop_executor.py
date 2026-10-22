@@ -652,3 +652,33 @@ def test_touch_returns_oldest_first_even_for_a_backdated_stamp(store):
     stamps = state.touch("loop:j", ttl=1800.0, at=9_500.0)
     assert stamps == sorted(stamps), stamps
     assert stamps == [9_000.0, 9_500.0]
+
+
+def test_a_purge_result_never_iterates_a_string():
+    """A route that answered with the string "ok" would otherwise yield
+    ["o", "k"] and report two deleted jobs that do not exist."""
+    outcome = doctor_gates.purge_result("dlq_remove", {"ok": "ok", "not_found": "yes"}, ["j"])
+    assert outcome["removed"] == 0
+    assert outcome["not_found"] == []
+    # A malformed id list is fail-closed: nothing is read as confirmed removed.
+    bulk = doctor_gates.purge_result("cancel_failed", {"matched_ids": "a"}, ["a", "b"])
+    assert bulk["removed"] == 0
+    assert sorted(bulk["skipped"]) == ["a", "b"], bulk
+
+
+def test_an_integer_count_on_the_dlq_route_is_honoured():
+    """`ok` is a list today; a bare count is still a confirmation."""
+    outcome = doctor_gates.purge_result("dlq_remove", {"ok": 1}, ["a"])
+    assert outcome["removed"] == 1
+    assert outcome["partial"] is False
+
+
+def test_an_empty_counter_table_does_not_crash_the_write_path(store, monkeypatch):
+    """`_ttl_for` runs inside the write path; `max()` over an empty table raises."""
+    import hive.workers.doctor_state as state_module
+
+    state, clock = store
+    monkeypatch.setattr(state_module, "COUNTER_TTLS", {})
+    # No prefix matches and the table is empty: the record must still be written.
+    state.mark("unlisted-prefix", ttl=60.0, at=clock["now"])
+    assert state.last_mark("unlisted-prefix") == clock["now"]

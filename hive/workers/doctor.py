@@ -2071,11 +2071,12 @@ def handle_dead_letter_queue() -> dict:
     (dry-run unless DLQ_APPLY=1). Broadcasts a doctor.dlq message per decision."""
     now = time.time()
     # The DLQ-seen set is durable since 2026-10-22: it lived in a module dict, so a
-    # restart re-decided every dead-letter job the doctor had already decided.
+    # restart re-decided every dead-letter job the doctor had already decided. The
+    # dict below is now only the pre-existing in-process mirror — `dlq_marked()`
+    # answers from the store and nothing reads the mirror — so it is trimmed and
+    # kept in step, not rehydrated from the store on every cycle.
     for k in [k for k, t in _dlq_seen.items() if now - t > DLQ_SEEN_TTL]:
         _dlq_seen.pop(k, None)
-    for key in STATE.keys(f"{KEY_DLQ}:"):
-        _dlq_seen[key.split(":", 1)[1]] = STATE.last_mark(key) or 0.0
     jobs = fetch_dead_letter_jobs()
     summary = {"scanned": len(jobs), "resubmit": 0, "remove": 0, "needs-review": 0, "skipped_seen": 0}
     acted = 0
