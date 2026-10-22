@@ -882,13 +882,17 @@ def assert_no_forced_or_public_writes(args: list[str]) -> None:
     never force" is one assertion rather than a habit spread over call sites.
     """
     lowered = [arg.strip().lower() for arg in args]
-    # Matched against BOTH each argument and the whole command: an entry like
-    # "push --mirror" spans two tokens, so a per-argument scan silently misses it
-    # and `--mirror` sails through — a mirror push overwrites every ref on the
-    # remote, which is worse than any force-push.
+    # Single-token entries are matched as WHOLE ARGUMENTS, never as substrings: a
+    # refspec carries the destination branch name, and `-f` inside `hive/fix-thing`
+    # would otherwise read as a force-push flag and refuse an ordinary fast-forward.
+    #
+    # Multi-word entries ("push --mirror") span two tokens, so those are matched
+    # against the whole command — a mirror push overwrites every ref on the remote,
+    # which is worse than any force-push, and `--mirror` alone is not ours to judge.
     joined = " ".join(lowered)
     for forbidden in FORBIDDEN:
-        if any(forbidden in arg for arg in lowered) or forbidden in joined:
+        found = forbidden in joined if " " in forbidden else any(arg == forbidden for arg in lowered)
+        if found:
             raise ValueError(f"merge-train refuses {args!r}: {forbidden} is never allowed")
     # A `+` refspec is a force-push with no flag to grep for. `git push argonas
     # +main:refs/heads/main` deletes main's history in one token, so the refspecs

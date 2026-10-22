@@ -37,9 +37,18 @@ def _doctor_starts_with_no_safety_history(monkeypatch):
     # The gate reads the same store, and the approval it holds is what a test's
     # refusal depends on, so the two are swapped together.
     monkeypatch.setattr(doctor, "APPROVALS", doctor.doctor_gates.ApprovalGate(doctor.STATE, gate_enabled=True))
-    doctor._seen_job_attempts.clear()
-    doctor._recent_auto_triage.clear()
-    doctor._dlq_seen.clear()
-    doctor._ssh_actions_log.clear()
-    doctor._host_last_action.clear()
+    mirrors = (
+        doctor._seen_job_attempts,
+        doctor._recent_auto_triage,
+        doctor._dlq_seen,
+        doctor._ssh_actions_log,
+        doctor._host_last_action,
+    )
+    for mirror in mirrors:
+        mirror.clear()
     yield
+    # Cleared again on the way out: the mirrors are process-global and the
+    # production code writes them, so a test that left entries behind would leak
+    # them into whatever runs next.
+    for mirror in mirrors:
+        mirror.clear()

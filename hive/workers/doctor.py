@@ -2165,11 +2165,9 @@ def handle_dead_letter_queue() -> dict:
         if acted >= DLQ_MAX_PER_CYCLE or attempts >= DLQ_MAX_ATTEMPTS_PER_CYCLE:
             # The cap, not a decision: BREAK WITHOUT RECORDING, so the job is
             # decided on a later cycle instead of being marked decided and then
-            # never reached again for the whole seen window. `deferred` counts the
-            # cycle that stopped, not every job behind it — the jobs behind it are
-            # reached on later cycles, in order.
-            # every job this cycle did not reach, so the summary carries the size
-            # of the backlog behind the cap rather than the fact that one was hit.
+            # never reached again for the whole seen window. `deferred` counts
+            # EVERY job this cycle did not reach, so the summary carries the size of
+            # the backlog behind the cap rather than the fact that one was hit.
             summary["deferred"] = summary.get("deferred", 0) + (len(jobs) - index)
             break
         attempts += 1

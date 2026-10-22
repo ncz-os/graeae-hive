@@ -1154,3 +1154,31 @@ def tmp_path_of(repo):
     import pathlib
 
     return pathlib.Path(repo["bare"]).parent
+
+
+def test_a_branch_name_that_contains_a_forbidden_flag_is_not_a_flag(repo, tmp_path):
+    """`-f` inside `hive/fix-thing` is a branch name, not a force-push flag. The
+    guard matched single-token entries as substrings of any argument, so the
+    refspec `sha:refs/heads/hive/fix-thing` was refused as a forced push — the choke
+    point refusing the one write it exists to protect."""
+    work = repo["work"]
+    git("checkout", "-q", "-b", "hive/fix-thing", "main", cwd=work)
+    with open(os.path.join(work, "F"), "w", encoding="utf-8") as handle:
+        handle.write("f\n")
+    git("add", "F", cwd=work)
+    git("commit", "-qm", "fix thing", cwd=work)
+    sha = git("rev-parse", "HEAD", cwd=work).stdout.strip()
+    upstream = tmp_path / "upstream.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True, capture_output=True)
+    git("remote", "add", "argonas", str(upstream), cwd=repo["bare"])
+    # The bare mirror is the repo the engine writes, so the branch has to be in it.
+    git("fetch", "-q", work, "+refs/heads/hive/fix-thing:refs/heads/hive/fix-thing", cwd=repo["bare"])
+    assert git("rev-parse", "hive/fix-thing", cwd=repo["bare"]).stdout.strip() == sha
+    out = mt.fast_forward(repo["bare"], "hive/fix-thing", sha, dry_run=False)
+    assert "advanced" in out, out
+
+    # And the real thing is still refused.
+    with pytest.raises(ValueError, match="never allowed"):
+        mt.assert_no_forced_or_public_writes(["git", "push", "--force", "argonas", "main"])
+    with pytest.raises(ValueError, match="force-push"):
+        mt.assert_no_forced_or_public_writes(["git", "push", "argonas", "+main"])
