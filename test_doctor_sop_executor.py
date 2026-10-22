@@ -18,11 +18,13 @@ per-kind cooldown, the DLQ-seen set and the SSH rate limiter.
 """
 
 import json
+import subprocess
 import time
 
 import pytest
 
 from hive.workers import doctor, doctor_gates
+from hive.workers import merge_train as mt
 from hive.workers.doctor_state import (
     COUNTER_TTLS,
     DurableStateStore,
@@ -63,6 +65,10 @@ def doctor_state(monkeypatch, tmp_path):
     monkeypatch.setattr(doctor, "DRY_RUN", False)
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
     return state, clock
+
+
+def git(*args, cwd):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
 
 
 def _http_stub(recorder, jobs=None):
@@ -745,7 +751,9 @@ def test_a_job_cut_off_by_the_per_cycle_cap_is_not_marked_decided(monkeypatch, d
 
     first = doctor.handle_dead_letter_queue()
     assert first["resubmit"] == 2, first
-    assert first.get("deferred") == 1, first
+    # `deferred` is the number of jobs this cycle did not reach, so the backlog
+    # behind the cap is visible in one number rather than implied.
+    assert first.get("deferred") == 3, first
     for job in jobs[2:]:
         assert not doctor.dlq_decided(job["id"]), f"{job['id']} was never decided"
 
@@ -1040,7 +1048,9 @@ def test_a_refusal_storm_bounds_the_work_one_cycle_does(monkeypatch, doctor_stat
     summary = doctor.handle_dead_letter_queue()
 
     assert len(attempted) == 5, f"one cycle must not attempt all {len(jobs)} jobs: {len(attempted)}"
-    assert summary.get("deferred") == 1, summary
+    assert summary.get("deferred") == len(jobs) - len(attempted), (
+        f"deferred must be the backlog the cap left: {summary}"
+    )
     # And a refusal still does not spend the ACTION budget: with the attempt cap
     # above it, the five refused jobs were all reached rather than the cap breaking
     # after the first two.
@@ -1261,3 +1271,63 @@ def test_the_auto_triage_cooldown_reader_and_writer_agree(monkeypatch, doctor_st
     # permanently dead path.
     clock["now"] += doctor.AUTO_TRIAGE_COOLDOWN + 1
     assert [cluster["base_kind"] for cluster in doctor.scan_for_failure_clusters()] == ["zeroclaw:build"]
+
+
+def test_a_journal_of_exactly_one_page_is_not_truncation(tmp_path):
+    """A journal of exactly `limit` messages is COMPLETE, not a page of a longer
+    one. Treating a full page as truncation refused to load from the exact moment
+    the store became safe to read — and, with `_loaded_ok` false, wrote nothing."""
+    from hive.workers.doctor_state import BusBackend
+
+    journal = [{"ts": float(n), "payload": {"key": f"loop:j{n}", "value": {"at": float(n)}}} for n in range(4)]
+
+    def http(method, path, body=None):
+        assert method == "GET", method
+        window = int(path.split("limit=")[1])
+        return 200, {"messages": journal[:window]}
+
+    backend = BusBackend(http, limit=4)
+    loaded = backend.load("doctor.safety")
+    assert backend.truncated is False, "exactly one page is the whole journal"
+    assert set(loaded) == {"loop:j0", "loop:j1", "loop:j2", "loop:j3"}
+
+    # One more message and it IS longer than one read.
+    journal.append({"ts": 9.0, "payload": {"key": "loop:j4", "value": {"at": 9.0}}})
+    backend.load("doctor.safety")
+    assert backend.truncated is True
+
+
+def test_a_push_that_names_the_canonical_remote_anywhere_is_still_refused():
+    """`git push gitlab argonas:main` contains the canonical name and must not pass:
+    the remote is the token AFTER `push`, and a whole-line membership test cannot
+    tell the two apart."""
+    with pytest.raises(ValueError, match="must name"):
+        mt.assert_no_forced_or_public_writes(["git", "push", "gitlab", "argonas:main"])
+    with pytest.raises(ValueError, match="must name"):
+        mt.assert_no_forced_or_public_writes(["git", "push", "origin", "main"])
+    mt.assert_no_forced_or_public_writes(["git", "push", "argonas", "abc:refs/heads/main"])
+
+
+def test_an_unreadable_git_root_is_a_failed_cycle_not_an_empty_one(tmp_path, monkeypatch, capsys):
+    """`discover_repos` returned `[]` for an unreadable root as well as for an empty
+    one, so a cycle that looked at nothing printed nothing and exited zero."""
+    missing = tmp_path / "not-there"
+    with pytest.raises(mt.MeasurementError):
+        mt.discover_repos(str(missing))
+    outcomes = mt.run_cycle(git_root=str(missing))
+    assert outcomes and outcomes[0].failed, outcomes
+    assert "git root" in outcomes[0].failures[0], outcomes[0].failures
+
+
+def test_purge_counts_beside_named_ids_do_not_overstate(tmp_path):
+    """A route that names the ids it deleted is the exact truth; a count beside it
+    that disagrees must not print "5 removed, 3 skipped" for one request."""
+    names = ["a", "b"]
+    outcome = doctor_gates.purge_result(
+        "cancel_failed",
+        {"deleted": 5, "matched_ids": names},
+        names + ["c", "d", "e"],
+    )
+    assert outcome["removed"] == 2, outcome
+    assert outcome["skipped"] == ["c", "d", "e"], outcome
+    assert outcome["partial"] is True, outcome

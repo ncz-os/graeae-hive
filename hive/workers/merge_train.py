@@ -311,12 +311,18 @@ def _bare(name: str) -> str:
 
 
 def discover_repos(git_root: str = GIT_ROOT, exclude: frozenset[str] = EXCLUDE) -> list[str]:
-    """The canonical bare repos this train is allowed to look at."""
+    """The canonical bare repos this train is allowed to look at.
+
+    Raises [`MeasurementError`] when the root cannot be read at all. An empty root
+    is a fact; an UNREADABLE root is a broken cycle, and returning `[]` for both let
+    a cycle that looked at nothing print nothing and exit zero — the `run failed`
+    warning's twin, with no warning at all.
+    """
     try:
         names = sorted(name for name in os.listdir(git_root) if name.endswith(".git"))
     except OSError as error:
         log.warning("cannot read git root %s (%s)", git_root, error)
-        return []
+        raise MeasurementError(f"cannot read git root {git_root}: {error}") from error
     # Compare BARE names. A bare repo on disk is `openclaw.git`; an operator writing
     # `MERGE_TRAIN_EXCLUDE=openclaw` means `openclaw`. Accepting both spellings
     # removes the case where an exclusion silently does nothing — which is how a
@@ -467,11 +473,13 @@ def fast_forward(repo: str, base: str, sha: str, dry_run: bool = True, remote: s
             f"REFUSED: {base} is not an ancestor of {sha[:12]}, so this is not a fast-forward; "
             f"a divergent or conflicting branch is a human's job"
         )
-    # The remote's URL as well as its name: an innocent alias that happens to point
-    # at a forge is the same mistake as a forge-named alias, and a name check alone
-    # would let it through. A remote git cannot resolve is left to the push, which
-    # fails without writing anything.
-    url = _sh(["git", "remote", "get-url", remote], cwd=repo).stdout.strip()
+    # The remote's PUSH url as well as its name: an innocent alias that happens to
+    # push to a forge is the same mistake as a forge-named alias, and a name check
+    # alone would let it through. `--push`, because a remote may fetch from one place
+    # and push to another (`remote.<name>.pushurl`), and the fetch url says nothing
+    # about where this write lands. A remote git cannot resolve is left to the push,
+    # which fails without writing anything.
+    url = _sh(["git", "remote", "get-url", "--push", remote], cwd=repo).stdout.strip()
     if url and _remote_host(url).lower() in PUBLIC_FORGE_HOSTS:
         return (
             f"REFUSED: {remote!r} resolves to {url}, a public forge, not this fleet's canonical "
@@ -799,7 +807,13 @@ def run_cycle(
     can see what the SOP would be asked to send.
     """
     outcomes: list[RepoOutcome] = []
-    targets = repos if repos is not None else discover_repos(git_root)
+    try:
+        targets = repos if repos is not None else discover_repos(git_root)
+    except MeasurementError as error:
+        # The cycle could not start. That is a FAILED outcome the SOP escalates on,
+        # not an empty cycle that reports nothing and exits zero.
+        log.warning("merge-train cycle could not start: %s", error)
+        return [RepoOutcome(repo=os.path.basename(git_root), failures=[f"cycle: {error}"])]
     for repo in targets:
         try:
             outcome = measure_repo(repo)
@@ -883,18 +897,20 @@ def assert_no_forced_or_public_writes(args: list[str]) -> None:
         stripped = arg.strip()
         if stripped.startswith("+") or "+refs/" in stripped:
             raise ValueError(f"merge-train refuses {args!r}: a '+' refspec is a force-push and is never allowed")
-    if "push" in lowered and CANONICAL_REMOTE not in lowered:
-        raise ValueError(
-            f"merge-train refuses {args!r}: a push must name {CANONICAL_REMOTE!r}, "
-            f"the only remote this engine may write"
-        )
-    # A remote NAME is not a remote: `MERGE_TRAIN_REMOTE=gitlab` would satisfy the
-    # check above and make every push in this module aim at a public forge. The
-    # argument AFTER `push` is the one that names it, so that is the one checked —
-    # a refspec is not a remote and must not be read as a host.
+    # The argument AFTER `push` is the remote: `git push <remote> <refspec>`. It is
+    # compared as a TOKEN, because a whole-command membership test is satisfied by
+    # `git push gitlab argonas:main` — the canonical name does appear, somewhere.
     push_at = lowered.index("push") if "push" in lowered else -1
     if push_at >= 0 and push_at + 1 < len(args):
         named = args[push_at + 1]
+        if named != CANONICAL_REMOTE:
+            raise ValueError(
+                f"merge-train refuses {args!r}: a push must name {CANONICAL_REMOTE!r}, "
+                f"the only remote this engine may write"
+            )
+        # A remote NAME is not a remote: `MERGE_TRAIN_REMOTE=gitlab` satisfies the
+        # check above and aims every push in this module at a public forge. The
+        # refspec after the remote is not a remote and is never read as a host.
         host = _remote_host(named).lower()
         if host in PUBLIC_FORGE_HOSTS:
             raise ValueError(

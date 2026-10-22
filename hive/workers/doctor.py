@@ -419,6 +419,10 @@ def record_ssh_action(host: str, at: float | None = None) -> None:
     _ssh_actions_log.append(stamp)
     # `clear`/`extend` rather than a slice assignment: the mirror is a deque in
     # production and a list in some tests, and neither should care which.
+    # Trimmed against `stamp`, which is the STORE's clock for this record and the
+    # same clock `seen()` and `timestamps()` window against. The wall clock is not
+    # used here: a caller that backdates `at` (a replay, a test) would otherwise
+    # have every entry it just recorded trimmed away as "old".
     _live = [entry for entry in _ssh_actions_log if stamp - entry <= SSH_RATE_WINDOW_SEC]
     _ssh_actions_log.clear()
     _ssh_actions_log.extend(_live)
@@ -2137,7 +2141,7 @@ def handle_dead_letter_queue() -> dict:
     # DLQ full of refused jobs unbounded — `acted` never advanced, so one cycle
     # classified, attempted and broadcast every job in the queue, forever.
     attempts = 0
-    for job in jobs:
+    for index, job in enumerate(jobs):
         jid = job.get("id", "")
         if not jid:
             continue
@@ -2164,7 +2168,9 @@ def handle_dead_letter_queue() -> dict:
             # never reached again for the whole seen window. `deferred` counts the
             # cycle that stopped, not every job behind it — the jobs behind it are
             # reached on later cycles, in order.
-            summary["deferred"] = summary.get("deferred", 0) + 1
+            # every job this cycle did not reach, so the summary carries the size
+            # of the backlog behind the cap rather than the fact that one was hit.
+            summary["deferred"] = summary.get("deferred", 0) + (len(jobs) - index)
             break
         attempts += 1
         decision, reason = classify_dead_letter(job)

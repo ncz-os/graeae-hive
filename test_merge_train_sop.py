@@ -1126,3 +1126,31 @@ def test_only_a_bucket_that_wants_a_write_asks_outward(repo, monkeypatch):
     assert mt.BUCKET_DONE not in mt.OUTWARD_CANDIDATE_BUCKETS
     assert mt.BUCKET_NO_BASE not in mt.OUTWARD_CANDIDATE_BUCKETS
     assert measured, measured
+
+
+def test_the_push_url_is_the_one_checked(repo):
+    """A remote can fetch from one place and push to another
+    (`remote.<name>.pushurl`), so the URL that decides whether the only write leaves
+    the fleet is the PUSH url, not the fetch url."""
+    upstream = tmp_path_of(repo) / "upstream.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True, capture_output=True)
+    git("remote", "add", "argonas", str(upstream), cwd=repo["bare"])
+    out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=True)
+    assert "DRY-RUN" in out, out
+
+    # A remote whose PUSH url is a public forge is refused; one whose FETCH url is
+    # a forge but whose push url is ARGONAS is not.
+    git("remote", "set-url", "--push", "argonas", "git@gitlab.com:group/repo.git", cwd=repo["bare"])
+    out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False)
+    assert out.startswith("REFUSED"), out
+    assert "public forge" in out, out
+
+    git("remote", "set-url", "--push", "argonas", str(upstream), cwd=repo["bare"])
+    out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False)
+    assert "advanced main" in out, out
+
+
+def tmp_path_of(repo):
+    import pathlib
+
+    return pathlib.Path(repo["bare"]).parent

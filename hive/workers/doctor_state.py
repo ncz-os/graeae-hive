@@ -227,12 +227,18 @@ class BusBackend(StateBackend):
 
     def load(self, namespace: str) -> dict:
         self.truncated = False
-        status, response = self._http("GET", f"/v1/messages?topic={namespace}&limit={self.limit}")
+        # ONE more than the window is asked for, so "the journal is longer than one
+        # read" is DECIDABLE: a journal of exactly `limit` messages is complete, and
+        # asking for `limit` and treating a full page as truncation called that
+        # complete journal truncated — refusing to load from the exact moment it
+        # became safe to.
+        window = self.limit + 1
+        status, response = self._http("GET", f"/v1/messages?topic={namespace}&limit={window}")
         if status != 200 or not isinstance(response, dict):
             log.warning("bus state read failed (status=%s); serving from cache", status)
             return {}
         messages = response.get("messages") or []
-        if len(messages) >= self.limit:
+        if len(messages) >= window:
             self.truncated = True
             log.warning(
                 "bus state read hit the %d-message limit for %s; the journal is longer than one "

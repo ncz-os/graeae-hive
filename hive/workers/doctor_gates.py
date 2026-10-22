@@ -238,6 +238,12 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
             removed = len(removed_ids)
         removed = max(0, removed)
         if removed_ids:
+            # The route NAMED the ids it deleted, and that list is the exact truth.
+            # It is preferred over the count beside it, which can disagree: a route
+            # reporting five deletions while naming two would otherwise print
+            # "5 removed, 3 skipped" for a request of five — or "5 removed" for a
+            # request of two.
+            removed = len(removed_ids)
             # The route named the ids it deleted: the ones it did not name are the
             # ones it kept.
             skipped = [job_id for job_id in requested if job_id not in removed_ids]
