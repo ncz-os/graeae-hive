@@ -75,3 +75,22 @@ def test_expired_grant_refused(tmp_path):
     blob["doctor.state"][f"approval:{digest}"]["value"]["expires_at"] = 1
     path.write_text(json.dumps(blob))
     assert gate(path).require("dlq_remove", job_ids=["a"])
+
+
+def test_a_grant_that_expires_while_waiting_for_the_lock_is_refused(tmp_path, monkeypatch):
+    import hive.workers.doctor_state as doctor_state
+
+    now = [1000.0]
+    path = tmp_path / "state.json"
+    store = DurableStateStore(FileBackend(str(path)), refresh_secs=0, time_fn=lambda: now[0])
+    approvals = ApprovalGate(store, ttl=900)
+    digest = action_digest("dlq_remove", job_ids=["a"])
+    approvals.record_approval("dlq_remove", digest, by="operator:alice")
+    real_flock = doctor_state.fcntl.flock
+
+    def slow_flock(handle, operation):
+        now[0] += 1000.0
+        return real_flock(handle, operation)
+
+    monkeypatch.setattr(doctor_state.fcntl, "flock", slow_flock)
+    assert approvals.require("dlq_remove", job_ids=["a"])
