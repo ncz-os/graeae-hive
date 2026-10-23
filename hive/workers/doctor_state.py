@@ -177,6 +177,21 @@ class FileBackend(StateBackend):
                 os.unlink(temp_path)
             return False
 
+    def consume_grant(self, namespace: str, key: str, digest: str, now: float, max_age: float) -> bool:
+        """Validate and spend one grant under the same cross-process file lock."""
+        directory = os.path.dirname(self.path) or "."
+        os.makedirs(directory, exist_ok=True)
+        with open(self.path + ".lock", "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            records = self.load(namespace)  # invalid/unreadable state refuses
+            record = records.get(key, {})
+            grant = record.get("value") if not record.get("tombstone") else None
+            if not _valid_unspent_grant(grant, digest, now, max_age):
+                return False
+            updated = dict(records)
+            updated[key] = {**record, "value": {**grant, "used": True}, "at": now}
+            return self._replace(namespace, updated)
+
 
 class BusBackend(StateBackend):
     """Records travel as ``<namespace>`` messages on the bus.
@@ -283,6 +298,22 @@ class BusBackend(StateBackend):
                 # failed one is retried by the next write rather than forgotten.
                 self._published[key] = value
         return written == pending
+
+
+def _valid_unspent_grant(grant, digest: str, now: float, max_age: float) -> bool:
+    return (
+        isinstance(grant, dict)
+        and grant.get("digest") == digest
+        and isinstance(grant.get("approver"), str)
+        and grant["approver"].startswith("operator:")
+        and grant.get("used") is False
+        and type(grant.get("granted_at")) in (int, float)
+        and type(grant.get("expires_at")) in (int, float)
+        and math.isfinite(grant["granted_at"])
+        and math.isfinite(grant["expires_at"])
+        and max_age > 0
+        and grant["granted_at"] <= now < min(grant["expires_at"], grant["granted_at"] + max_age)
+    )
 
 
 class DurableStateStore:
@@ -404,6 +435,29 @@ class DurableStateStore:
         if last is None:
             return False
         return (self._time() - last) <= ttl
+
+    def consume_grant(self, digest: str, max_age: float) -> bool:
+        """Spend a scoped grant; file authority is reread while its lock is held."""
+        key = f"approval:{digest}"
+        now = self._time()
+        if isinstance(self.backend, FileBackend):
+            with self._lock:
+                try:
+                    accepted = self.backend.consume_grant(self.namespace, key, digest, now, max_age)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    self._loaded_ok = False
+                    self.persist_ok = False
+                    return False
+                self._loaded_at = None
+                self.persist_ok = accepted
+                return accepted
+        self.reload()
+        with self._lock:
+            grant = self._cache.get(key, {}).get("value")
+            if not self._loaded_ok or not self.persist_ok or not _valid_unspent_grant(grant, digest, now, max_age):
+                return False
+            self._write_locked(key, {"value": {**grant, "used": True}, "at": now}, ttl=self._ttl_for(key))
+            return self.persist_ok
 
     def value(self, key: str, default=None):
         record = self._get(key, ttl=None)

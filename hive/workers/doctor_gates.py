@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 
 log = logging.getLogger("doctor.gates")
@@ -52,34 +53,57 @@ class ApprovalGate:
         self.store = store
         self.gate_enabled = GATE_DESTRUCTIVE if gate_enabled is None else bool(gate_enabled)
         self.auto_approve = AUTO_APPROVE_DESTRUCTIVE if auto_approve is None else bool(auto_approve)
-        self.ttl = APPROVAL_TTL_SECS if ttl is None else float(ttl)
+        configured_ttl = APPROVAL_TTL_SECS if ttl is None else float(ttl)
+        self.ttl = min(configured_ttl, 900.0) if math.isfinite(configured_ttl) else 0.0
 
-    def record_approval(self, kind: str, digest: str, by: str = "operator") -> None:
-        """Record an approval for exactly this action. Idempotent."""
-        self.store.mark(f"{APPROVAL_PREFIX}:{digest}", ttl=self.ttl)
+    def record_approval(self, kind: str, digest: str, by: str = "operator:local") -> None:
+        """Operator CLI issues a scoped, expiring, single-use grant."""
+        if (
+            self.ttl <= 0
+            or kind not in DESTRUCTIVE_ACTIONS
+            or not by.startswith("operator:")
+            or len(by) <= len("operator:")
+        ):
+            raise ValueError("grant requires a known action and operator approver identity")
+        now = self.store._time()
+        grant = {"digest": digest, "approver": by, "granted_at": now, "expires_at": now + self.ttl, "used": False}
+        self.store.set_value(f"{APPROVAL_PREFIX}:{digest}", grant, ttl=self.ttl)
+        if not self.store.loaded_ok or not self.store.persist_ok:
+            raise OSError("grant was not persisted")
         log.info("approval recorded kind=%s digest=%s by=%s", kind, digest[:12], by)
 
     def revoke(self, digest: str) -> None:
         self.store.forget(f"{APPROVAL_PREFIX}:{digest}")
 
     def approved(self, kind: str, digest: str) -> bool:
-        """Require an exact grant from fresh, healthy state."""
-        del kind  # the digest is the identity of the action; the kind is not needed
+        """Inspection only; the executor must call `require` to consume."""
+        del kind
         self.store.reload()
-        found = self.store.seen(f"{APPROVAL_PREFIX}:{digest}", ttl=self.ttl)
-        return found and self.store.loaded_ok and self.store.persist_ok
+        grant = self.store.value(f"{APPROVAL_PREFIX}:{digest}")
+        return (
+            self.store.loaded_ok
+            and self.store.persist_ok
+            and isinstance(grant, dict)
+            and grant.get("digest") == digest
+            and grant.get("used") is False
+            and isinstance(grant.get("approver"), str)
+            and grant["approver"].startswith("operator:")
+            and type(grant.get("granted_at")) in (int, float)
+            and type(grant.get("expires_at")) in (int, float)
+            and math.isfinite(grant["granted_at"])
+            and math.isfinite(grant["expires_at"])
+            and self.ttl > 0
+            and self.store._time() < min(grant["expires_at"], grant["granted_at"] + self.ttl)
+        )
 
     def require(self, kind: str, **parts) -> str | None:
         """Return a refusal unless this exact privileged action is approved."""
         if kind not in DESTRUCTIVE_ACTIONS:
             return None
         digest = action_digest(kind, **parts)
-        if self.approved(kind, digest):
+        if self.store.consume_grant(digest, self.ttl):
             return None
-        return (
-            f"{kind} needs an operator approval; none is recorded for digest {digest} "
-            f"(parts={parts}). Record a scoped operator approval."
-        )
+        return f"{kind} needs a scoped operator grant for digest {digest}"
 
 
 # ── the one purge contract ──────────────────────────────────────────────────
