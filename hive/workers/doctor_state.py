@@ -335,6 +335,16 @@ class DurableStateStore:
         #: previous process left — the load failed, so nobody knows what those
         #: records were, and overwriting them is the one thing that must not happen.
         self._loaded_ok = False
+        #: The records this process wrote while the backend was refusing them, by
+        #: key. A write during an outage reaches the cache and nothing else:
+        #: `_persist_locked` refuses it because nothing has ever loaded, so the
+        #: first load that SUCCEEDS is the moment the cache is replaced by the
+        #: backend's state — and that replacement is where a mark made during the
+        #: outage is forgotten, resetting a safety limit with nothing restarted.
+        #: Merged back over the loaded state while it is still true, and dropped
+        #: only once a save has been ACCEPTED, because a load is not what makes a
+        #: record durable and the next load would otherwise drop the merge again.
+        self._written_since_load: dict[str, dict] = {}
 
     # ── the store surface the doctor uses ──────────────────────────────
 
@@ -385,11 +395,7 @@ class DurableStateStore:
         which is the same shape as "never happened".
         """
         record = self._get(key, ttl=None)
-        candidates = [float(stamp) for stamp in record.get("timestamps", []) if isinstance(stamp, (int, float))]
-        at = record.get("at")
-        if isinstance(at, (int, float)):
-            candidates.append(float(at))
-        return max(candidates) if candidates else None
+        return _newest_of(record)
 
     def seen(self, key: str, ttl: float) -> bool:
         """Whether ``key`` was marked inside ``ttl``.
@@ -506,7 +512,7 @@ class DurableStateStore:
             # operator who wants the backend's answer rather than the cache's asks
             # for it with `refresh()`.
             if loaded:
-                self._cache = loaded
+                self._cache = self._merged_over(loaded)
             elif self._cache:
                 log.warning("state load returned nothing; keeping %d cached records", len(self._cache))
             if not self._loaded_ok:
@@ -514,6 +520,10 @@ class DurableStateStore:
                 # failed load marked as fresh would be skipped for the whole refresh
                 # window, and the cache it serves is not known to be complete.
                 return
+            # NOT cleared here. A load does not make these records durable — only an
+            # accepted save does — and `refresh_secs` reloads long before the next
+            # write arrives, so clearing on the load would drop the merged records
+            # at the very next refresh and leave the limit reset anyway.
             self._loaded_at = now
             if self.backend.name == "memory" and not self._warned_memory:
                 self._warned_memory = True
@@ -522,6 +532,26 @@ class DurableStateStore:
                     "SSH rate counters reset on every restart. Set DOCTOR_STATE_PATH (file) or "
                     "DOCTOR_STATE_BACKEND=bus to make them durable."
                 )
+
+    def _merged_over(self, loaded: dict) -> dict:
+        """``loaded`` with this process's refused writes merged back over it.
+
+        Replacing the cache with what loaded is how a retraction another process
+        made gets applied here, so the replacement is not the whole answer: the
+        marks the refused writes are made of exist only in the cache, and dropping
+        them resets a limit the process is still enforcing. Newest ``at`` wins per
+        key, so another process's more recent record still takes the key back, and
+        a tombstone merges like any other record — a retraction still retracts.
+        """
+        if not self._written_since_load:
+            return loaded
+        merged = dict(loaded)
+        for key, record in self._written_since_load.items():
+            theirs = _newest_of(merged.get(key) or {})
+            mine = _newest_of(record)
+            if theirs is None or (mine is not None and mine >= theirs):
+                merged[key] = record
+        return merged
 
     def _get(self, key: str, ttl: float | None) -> dict:
         self._ensure_loaded()
@@ -545,12 +575,11 @@ class DurableStateStore:
         A record with no timestamp at all is NOT live: it cannot be expired, so it
         is also not evidence of anything. `set_value` therefore stamps `at` too,
         so every record this store writes has a lifetime.
+
+        A tombstone carries `at` and nothing else, so the stamp below already sees
+        it; it is named here so the retraction is not mistaken for missing data.
         """
-        stamps = [float(s) for s in record.get("timestamps", []) if isinstance(s, (int, float))]
-        at = record.get("at")
-        newest = max([*stamps, float(at)] if isinstance(at, (int, float)) else stamps, default=None)
-        # A tombstone carries `at` and nothing else, so the line above already sees
-        # it; it is named here so the retraction is not mistaken for missing data.
+        newest = _newest_of(record)
         if newest is None:
             return False
         return (self._time() - newest) <= ttl
@@ -587,6 +616,14 @@ class DurableStateStore:
             # one process's partial view. The counters stay in memory — which keeps
             # them CORRECT for this process — and the operator is told, because the
             # remedy is the backend's.
+            #
+            # Everything still in the cache at this moment is a record this process
+            # wrote and the backend refused, so it is exactly what the next load
+            # that SUCCEEDS must not drop. Snapshotted at this one choke point
+            # rather than at each write site, so `mark`/`touch`/`set_value`/
+            # `forget`/`clear` cannot each forget to record one. `refresh()` drops
+            # the cache and these with it, which is that method's documented job.
+            self._written_since_load.update(self._cache)
             log.warning(
                 "state has never loaded from %s; NOT writing, so the durable records survive. "
                 "The in-process limits hold; the durability does not until the backend answers.",
@@ -596,11 +633,33 @@ class DurableStateStore:
             return
         try:
             self.persist_ok = bool(self.backend.save(self.namespace, self._cache))
-            if not self.persist_ok:
+            if self.persist_ok:
+                # The backend now holds everything the cache holds, so the records
+                # it refused have arrived. They no longer need merging over the next
+                # load, and keeping them would resurrect one the write path has since
+                # pruned as expired. A save that is refused or raises leaves them.
+                self._written_since_load.clear()
+            else:
                 log.warning("state save was not accepted; the counters are in memory only")
         except Exception as error:  # noqa: BLE001 - see _ensure_loaded
             self.persist_ok = False
             log.warning("state save failed (%s); the in-process limits still hold", error)
+
+
+def _newest_of(record: dict) -> float | None:
+    """The newest stamp a record carries, or None if it carries none.
+
+    `at` and `timestamps` are the two shapes the write paths use — `mark` and
+    `set_value` write `at`, `touch` writes `timestamps`, `forget` writes a
+    tombstone's `at` — so "which of these two records is newer" is the newest of
+    both. None means the record is not evidence of anything, which is the same
+    thing `_is_live` says about one it will not honour.
+    """
+    stamps = [float(s) for s in record.get("timestamps", []) if isinstance(s, (int, float))]
+    at = record.get("at")
+    if isinstance(at, (int, float)):
+        stamps.append(float(at))
+    return max(stamps) if stamps else None
 
 
 def _prune_ttl_of(key: str, floor: float) -> float:
