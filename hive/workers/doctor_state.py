@@ -1,65 +1,30 @@
 #!/usr/bin/env python3
-"""Durable safety state for the Hive doctor (zeroclaw SOP phase 3, 2026-10-22).
+"""Doctor safety state: one local file in production, with guarded replacement.
 
-The doctor keeps four counters that are **safety limits**, and it keeps all four
-in module-level dicts:
+Reads distinguish a complete empty state from unavailable/corrupt state. Writes
+compare the file with the bytes last read under a process lock, then fsync and
+atomically replace it. A stale writer refuses; its actual pending mutations are
+retained for the next successful read. Counters may remain conservatively cached
+on outage; approvals require fresh, healthy state.
 
-| State | Today | Limit it enforces |
-|---|---|---|
-| `_seen_job_attempts` | dict of job id -> list of timestamps | loop detection (escalate at 3 cycles) |
-| `_recent_auto_triage` | dict of base_kind -> timestamp | the per-kind re-triage cooldown |
-| `_dlq_seen` | dict of job id -> timestamp | do not re-decide a dead-letter job every cycle |
-| `_ssh_actions_log` / `_host_last_action` | deque + dict | SSH rate limit and per-host cooldown |
-
-A restart wipes all of them. That is not a performance problem: it resets every
-safety limit the doctor has. After a pod restart the SSH rate limiter believes it
-has never restarted anything, the loop detector believes it has never seen the job,
-and the DLQ sweep re-decides every dead-letter job it has already decided — which
-is how a broken worker gets another cycle.
-
-This module moves them behind a store whose source of truth is **outside the
-process**, with an in-memory cache in front so the 30-second loop does not pay an
-HTTP round trip per read:
-
-    store = state_store_from_env()          # or DurableStateStore(backend)
-    history = store.touch_timestamps("loop:job-1", window=1800.0)
-    if len(history) >= 3:
-        ...                                   # escalate
-
-## Backends, and what happens when they are not configured
-
-`DOCTOR_STATE_BACKEND` picks one:
-
-- `auto` (default) — `bus` when a bus URL is reachable-looking (one is configured
-  and `DOCTOR_STATE_BACKEND` was not forced), else `file`, else `memory`.
-- `bus` — records travel as `doctor.state` messages on the bus the doctor already
-  talks to. No bus change, no new route, no new table.
-- `file` — one JSON file, replaced atomically. Durable across a restart and needs
-  no network.
-- `memory` — today's behaviour, with one difference: the store logs, once, that
-  the safety limits will reset on restart. Silently pretending otherwise is the
-  defect this module exists to remove.
-
-Every backend failure is non-fatal: the cache keeps serving, so a bus outage
-degrades the doctor's durability, never its safety. It never makes a limit *looser*
-than the cache says, and the cache is only ever populated from a real read or a
-real write.
-
-Env:
-  DOCTOR_STATE_BACKEND   auto | bus | file | memory (default: auto)
-  DOCTOR_STATE_PATH      file backend path (default: none -> memory)
-  DOCTOR_STATE_NAMESPACE bus topic prefix (default: doctor.state)
-  DOCTOR_STATE_REFRESH   cache refresh interval, seconds (default: 30)
+The environment factory supports auto/file only, defaulting to
+$XDG_STATE_HOME/hive-doctor/state.json or $HOME/.local/state/hive-doctor/state.json.
+DOCTOR_STATE_PATH overrides that path. Existing bus deployments require an
+operator migration; this code never silently migrates or resets their history.
+MemoryBackend and BusBackend are retained for offline tests/replay compatibility.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
 import time
+from collections import Counter
 from contextlib import suppress
 
 log = logging.getLogger("doctor.state")
@@ -130,23 +95,34 @@ class FileBackend(StateBackend):
 
     def __init__(self, path: str):
         self.path = os.path.expanduser(path)
+        self._read_bytes: bytes | None = None
+        self._read_ok = False
+
+    def _read(self) -> bytes | None:
+        try:
+            with open(self.path, "rb") as handle:
+                return handle.read()
+        except FileNotFoundError:
+            return None
 
     def load(self, namespace: str) -> dict:
-        try:
-            with open(self.path, encoding="utf-8") as handle:
-                blob = json.load(handle)
-        except FileNotFoundError:
-            return {}
-        except (OSError, ValueError) as error:
-            log.warning("state file %s unreadable (%s); treating as empty", self.path, error)
-            return {}
+        self._read_ok = False
+        raw = self._read()
+        blob = json.loads(raw) if raw is not None else {}
         if not isinstance(blob, dict):
-            log.warning("state file %s is not an object; treating as empty", self.path)
-            return {}
-        records = blob.get(namespace)
-        if not isinstance(records, dict):
-            return {}
-        return {str(key): dict(value) for key, value in records.items() if isinstance(value, dict)}
+            raise ValueError("state file is not an object")
+        records = blob.get(namespace, {})
+        if not isinstance(records, dict) or any(not isinstance(v, dict) for v in records.values()):
+            raise ValueError("invalid state namespace")
+        for record in records.values():
+            stamps = record.get("timestamps", [])
+            if not isinstance(stamps, list):
+                raise ValueError("invalid safety history")
+            values = [*stamps, *([record["at"]] if "at" in record else [])]
+            if not values or any(type(v) not in (int, float) or not math.isfinite(v) for v in values):
+                raise ValueError("invalid safety timestamp")
+        self._read_bytes, self._read_ok = raw, True
+        return records
 
     # The namespace is the CONTAINER, not a key prefix: the store's keys are bare
     # (`loop:<job id>`), and this backend persists every one of them under the
@@ -156,18 +132,21 @@ class FileBackend(StateBackend):
     # the failure on the read side instead of the write side.
 
     def save(self, namespace: str, records: dict) -> bool:
-        blob: dict = {}
-        try:
-            with open(self.path, encoding="utf-8") as handle:
-                existing = json.load(handle)
-            if isinstance(existing, dict):
-                blob = existing
-        except FileNotFoundError:
-            pass
-        except (OSError, ValueError):
-            # A corrupt file must not stop the doctor writing a good one; the
-            # namespace is replaced wholesale either way.
-            log.warning("state file %s unreadable before save; rewriting", self.path)
+        if not self._read_ok:
+            return False
+        directory = os.path.dirname(self.path) or "."
+        os.makedirs(directory, exist_ok=True)
+        # Serialize comparison + replacement across cooperating processes. A stale
+        # writer refuses instead of overwriting records it has never read.
+        with open(self.path + ".lock", "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if self._read() != self._read_bytes:
+                self._read_ok = False
+                return False
+            return self._replace(namespace, records)
+
+    def _replace(self, namespace: str, records: dict) -> bool:
+        blob = json.loads(self._read_bytes) if self._read_bytes is not None else {}
         blob[namespace] = records
         directory = os.path.dirname(self.path) or "."
         # Write to a sibling temp file and `os.replace` it in, so a crash mid-write
@@ -185,6 +164,12 @@ class FileBackend(StateBackend):
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.path)
+            self._read_bytes = json.dumps(blob).encode()
+            dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
             return True
         except OSError as error:
             log.warning("state file %s not writable (%s); keeping in memory", self.path, error)
@@ -235,9 +220,10 @@ class BusBackend(StateBackend):
         window = self.limit + 1
         status, response = self._http("GET", f"/v1/messages?topic={namespace}&limit={window}")
         if status != 200 or not isinstance(response, dict):
-            log.warning("bus state read failed (status=%s); serving from cache", status)
-            return {}
-        messages = response.get("messages") or []
+            raise OSError(f"bus state read failed (status={status})")
+        messages = response.get("messages")
+        if not isinstance(messages, list):
+            raise ValueError("bus state response has no messages list")
         if len(messages) >= window:
             self.truncated = True
             log.warning(
@@ -348,6 +334,12 @@ class DurableStateStore:
 
     # ── the store surface the doctor uses ──────────────────────────────
 
+    @property
+    def loaded_ok(self) -> bool:
+        """Whether the last read was complete and successful."""
+        self._ensure_loaded()
+        return self._loaded_ok
+
     def timestamps(self, key: str, ttl: float) -> list[float]:
         """Every recorded timestamp for ``key`` still inside ``ttl``, oldest first."""
         now = self._time()
@@ -365,18 +357,19 @@ class DurableStateStore:
         self._ensure_loaded()
         with self._lock:
             now = self._time() if at is None else float(at)
-            record = self._record_locked(key, ttl=ttl)
+            retention = max(self._ttl_for(key), ttl)
+            record = self._record_locked(key, ttl=retention)
             stamps = sorted(
                 float(stamp)
                 for stamp in record.get("timestamps", [])
-                if isinstance(stamp, (int, float)) and now - float(stamp) <= ttl
+                if isinstance(stamp, (int, float)) and now - float(stamp) <= retention
             )
             stamps.append(now)
             # Sorted AFTER the append, not before: `at` is caller-supplied and may
             # be in the past, and the contract on the return value is oldest-first.
             stamps.sort()
             self._write_locked(key, {"timestamps": stamps}, ttl=ttl)
-            return stamps
+            return [stamp for stamp in stamps if now - stamp <= ttl]
 
     def mark(self, key: str, ttl: float, at: float | None = None) -> float:
         """Record a single timestamp for ``key`` (the cooldown / seen-set shape)."""
@@ -444,6 +437,7 @@ class DurableStateStore:
         self._ensure_loaded()
         with self._lock:
             self._cache[key] = {"tombstone": True, "at": self._time()}
+            self._written_since_load[key] = self._cache[key]
             self._cache = {
                 k: v
                 for k, v in self._cache.items()
@@ -467,7 +461,14 @@ class DurableStateStore:
             now = self._time()
             for key in list(self._cache):
                 self._cache[key] = {"tombstone": True, "at": now}
+                self._written_since_load[key] = self._cache[key]
             self._persist_locked()
+
+    def reload(self) -> None:
+        """Read fresh authority without discarding this process's pending writes."""
+        with self._lock:
+            self._loaded_at = None
+        self._ensure_loaded()
 
     def refresh(self) -> None:
         """Drop the cache so the next read comes from the backend."""
@@ -509,21 +510,18 @@ class DurableStateStore:
                 # skip the retry and the store would serve the partial cache for
                 # ever, believing it had loaded.
                 self._loaded_ok = False
-            # A load that came back empty while the cache holds records is a
-            # backend outage, not a wipe, so the cache is kept UNCONDITIONALLY.
-            # There is deliberately no "first load was empty, so clear" branch:
-            # every writer calls this before it writes, so a non-empty cache already
-            # implies a previous load happened, and the branch was unreachable. An
-            # operator who wants the backend's answer rather than the cache's asks
-            # for it with `refresh()`.
-            if loaded:
+            if self._loaded_ok:
+                if not loaded:
+                    # Missing counters must never loosen a local safety limit.
+                    # Grants are different: an empty authoritative read revokes
+                    # them. Only pending writes may be merged back below.
+                    loaded = {k: v for k, v in self._cache.items() if not k.startswith("approval:")}
                 self._cache = self._merged_over(loaded)
-            elif self._cache:
-                log.warning("state load returned nothing; keeping %d cached records", len(self._cache))
             if not self._loaded_ok:
                 # Leave `_loaded_at` unset so the NEXT read retries the backend. A
                 # failed load marked as fresh would be skipped for the whole refresh
                 # window, and the cache it serves is not known to be complete.
+                self.persist_ok = False
                 return
             # NOT cleared here. A load does not make these records durable — only an
             # accepted save does — and `refresh_secs` reloads long before the next
@@ -534,8 +532,8 @@ class DurableStateStore:
                 self._warned_memory = True
                 log.warning(
                     "doctor safety state is IN MEMORY: cooldowns, loop history, DLQ-seen and the "
-                    "SSH rate counters reset on every restart. Set DOCTOR_STATE_PATH (file) or "
-                    "DOCTOR_STATE_BACKEND=bus to make them durable."
+                    "SSH rate counters reset on every restart. Use the file runtime backend "
+                    "with DOCTOR_STATE_PATH to make them durable."
                 )
 
     def _merged_over(self, loaded: dict) -> dict:
@@ -552,6 +550,13 @@ class DurableStateStore:
             return loaded
         merged = dict(loaded)
         for key, record in self._written_since_load.items():
+            other = merged.get(key) or {}
+            if "timestamps" in record and "timestamps" in other and not other.get("tombstone"):
+                # Both writers extended the same history. Preserve the shared
+                # prefix once and every distinct reservation from either writer.
+                stamps = Counter(record["timestamps"]) | Counter(other["timestamps"])
+                merged[key] = {"timestamps": sorted(stamps.elements()), "tombstone": False}
+                continue
             theirs = _newest_of(merged.get(key) or {})
             mine = _newest_of(record)
             if theirs is None or (mine is not None and mine >= theirs):
@@ -592,6 +597,7 @@ class DurableStateStore:
     def _write_locked(self, key: str, record: dict, ttl: float) -> None:
         # A real write supersedes a retraction: the key is being used again.
         self._cache[key] = {**record, "tombstone": False}
+        self._written_since_load[key] = self._cache[key]
         # Prune with the LONGER of this write's window and the key's canonical one.
         # Pruning with `ttl` alone means a caller passing a short window silently
         # truncates the history a caller with the canonical window depends on — the
@@ -615,6 +621,9 @@ class DurableStateStore:
         return max(COUNTER_TTLS.values(), default=DEFAULT_TTL_SECS)
 
     def _persist_locked(self) -> None:
+        self._written_since_load = {
+            key: record for key, record in self._written_since_load.items() if key in self._cache
+        }
         if not self._loaded_ok and self.backend.name != "memory":
             # Nothing has ever been read back, so this cache is not known to be the
             # whole state. Writing it would replace a durable backend's contents with
@@ -635,28 +644,12 @@ class DurableStateStore:
             except Exception as error:  # noqa: BLE001 - see _ensure_loaded
                 self.persist_ok = False
                 log.warning("state save failed (%s); the in-process limits still hold", error)
-        # A record that is in the cache and NOT in the backend exists nowhere else,
-        # and the next load that succeeds replaces the cache — so every write the
-        # backend did not accept is remembered, whichever of the three ways it was
-        # not accepted: refused for never having loaded, refused as not accepted,
-        # or lost to an exception. A save that is refused on only SOME keys (the bus
-        # backend posts one message per key) leaves any of them behind, which is
-        # why the whole cache is snapshotted rather than the one key just written,
-        # and why it is snapshotted HERE — the one choke point every write path
-        # goes through, so `mark`/`touch`/`set_value`/`forget`/`clear` cannot each
-        # forget to record one.
+        # Pending entries are actual local mutations, not a snapshot of reads.
+        # Copying the whole cache here can resurrect an unrelated revoked grant.
         if self.persist_ok:
-            # The backend now holds everything the cache holds, so those records
-            # have arrived and no longer need merging over the next load. Keeping
-            # them would resurrect one the write path has since pruned as expired.
             self._written_since_load.clear()
         else:
-            # TAKEN, not accumulated. At the moment of a refusal the whole cache is
-            # what the backend has not taken, so it replaces the snapshot rather
-            # than adding to it: `update` never removes, and a key the write path
-            # has since pruned as expired would otherwise stay here and be merged
-            # back over the loaded state on the next load that succeeds.
-            self._written_since_load = dict(self._cache)
+            self._loaded_at = None
 
 
 def _newest_of(record: dict) -> float | None:
@@ -681,77 +674,25 @@ def _prune_ttl_of(key: str, floor: float) -> float:
 
 
 def state_store_from_env(env: dict | None = None, time_fn=_now) -> DurableStateStore:
-    """Build the store the environment asks for.
+    """One runtime backend: a local durable file, opened lazily on first use.
 
-    ``auto`` never silently picks the memory backend when a durable option is
-    configured: a path or a bus URL wins, and only a host with neither gets
-    memory (with the warning the store logs on first use).
+    The message journal is bounded and has no snapshot/compaction contract.
+    MemoryBackend and BusBackend remain available to offline replay/tests, but
+    neither is a runtime safety store. Explicit old settings fail at startup.
     """
     env = dict(os.environ if env is None else env)
     backend_name = (env.get("DOCTOR_STATE_BACKEND") or "auto").strip().lower()
+    if backend_name not in {"auto", "file"}:
+        raise ValueError("doctor runtime requires DOCTOR_STATE_BACKEND=file (or auto)")
+    path = (env.get("DOCTOR_STATE_PATH") or "").strip()
+    if not path:
+        root = env.get("XDG_STATE_HOME")
+        if not root:
+            home = env.get("HOME")
+            if not home:
+                raise ValueError("set DOCTOR_STATE_PATH or HOME for durable doctor state")
+            root = os.path.join(home, ".local", "state")
+        path = os.path.join(root, "hive-doctor", "state.json")
     namespace = (env.get("DOCTOR_STATE_NAMESPACE") or DEFAULT_NAMESPACE).strip() or DEFAULT_NAMESPACE
     refresh = float(env.get("DOCTOR_STATE_REFRESH") or DEFAULT_REFRESH_SECS)
-    path = (env.get("DOCTOR_STATE_PATH") or "").strip()
-    bus_url = (env.get("HIVE_URL") or "").strip()
-
-    if backend_name == "auto":
-        if path:
-            backend_name = "file"
-        elif bus_url:
-            backend_name = "bus"
-        else:
-            backend_name = "memory"
-
-    if backend_name == "file":
-        if not path:
-            log.warning("DOCTOR_STATE_BACKEND=file but DOCTOR_STATE_PATH is unset; using memory")
-            backend = MemoryBackend()
-        else:
-            backend = FileBackend(path)
-    elif backend_name == "bus":
-        if not bus_url:
-            log.warning("DOCTOR_STATE_BACKEND=bus but HIVE_URL is unset; using memory")
-            backend = MemoryBackend()
-        else:
-            backend = BusBackend(_env_http(bus_url, env), topic=namespace)
-    elif backend_name == "memory":
-        backend = MemoryBackend()
-    else:
-        raise ValueError(f"unknown DOCTOR_STATE_BACKEND {backend_name!r}")
-
-    return DurableStateStore(backend, namespace=namespace, refresh_secs=refresh, time_fn=time_fn)
-
-
-def _env_http(bus_url: str, env: dict):
-    """A minimal `http(method, path, body)` bound to the bus URL.
-
-    Deliberately its own urllib call rather than the doctor's `_http`: this
-    module must be importable without the doctor's registration state, and the
-    doctor's helper attaches a mutation actor URN the store does not have until
-    the doctor has registered.
-    """
-    import urllib.error
-    import urllib.request
-
-    token = env.get("HIVE_BUS_TOKEN") or env.get("HIVE_BUS_ADMIN_TOKEN") or ""
-
-    def http(method: str, path: str, body: dict | None = None, timeout: float = 10.0):
-        data = json.dumps(body).encode() if body is not None else None
-        headers = {"content-type": "application/json"}
-        if token:
-            headers["authorization"] = f"Bearer {token}"
-        request = urllib.request.Request(f"{bus_url.rstrip('/')}{path}", data=data, method=method, headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                raw = response.read()
-                return response.status, (json.loads(raw) if raw else None)
-        except urllib.error.HTTPError as error:
-            try:
-                return error.code, json.loads(error.read())
-            except Exception:  # noqa: BLE001 - a non-JSON error body is still a status
-                return error.code, None
-        except Exception as error:  # noqa: BLE001 - the store degrades, it does not stop
-            log.warning("state http %s %s: %s", method, path, error)
-            return 0, None
-
-    return http
+    return DurableStateStore(FileBackend(path), namespace=namespace, refresh_secs=refresh, time_fn=time_fn)

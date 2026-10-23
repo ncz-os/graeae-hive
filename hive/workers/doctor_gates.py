@@ -1,60 +1,10 @@
 #!/usr/bin/env python3
-"""The rails the doctor SOP's decisions need on the executor side (phase 3).
+"""Executor safety rails: exact approvals, purge contracts, restart targets.
 
-Three defects this module closes, each of them a behaviour change rather than a
-refactor. All three are gated so that deploying this file alone changes nothing
-until an operator sets the switch.
-
-## 1. Destructive actions were never gated
-
-`cancel_jobs` hard-deleted up to 20 jobs **plus every child job** through
-`POST /v1/jobs/purge`, at whatever confidence the model claimed, and a DLQ
-`remove` did the same for a single job. `restart_service` killed a systemd unit on
-a fleet host. None of the three waited for anyone.
-
-`ApprovalGate.require()` is now on all three paths. An approval is **scoped to a
-digest of the action** — the kind plus the exact ids, or the host and service —
-so approving one purge never approves the next. The standing auto-approve that
-removes the wait entirely is `DOCTOR_AUTO_APPROVE_DESTRUCTIVE`, **off unless set**.
-
-## 2. Two purge endpoints with two payload keys, and one wrong success report
-
-| Intent | Route | id key | Response | Count read from |
-|---|---|---|---|---|
-| `cancel_failed` | `POST /v1/jobs/purge` | `ids` (+ `status: failed`) | `{deleted, matched_ids}` | `deleted` |
-| `dlq_remove` | `POST /v1/admin/jobs/purge` | `job_ids` | `{ok, not_found, skipped_not_dead_letter}` | `ok` |
-
-The DLQ path reported `removed <id> via admin purge` for **any** 2xx — including
-the case where the bus returned `ok: []` and the job was in
-`skipped_not_dead_letter`, i.e. nothing was deleted at all. That is a doctor
-telling the operator it removed a job it did not remove. `purge_request` /
-`purge_result` now own the whole contract in one table, and `purge_result` says
-what actually happened.
-
-## 3. `cixmini` was offered as a restart target and could never be reached
-
-`DOCTOR_SYSTEM` lists `cixmini` among the legal `target_host` values and
-`action_restart_service` has a whole branch for it (sshpass, `mini@ip`,
-`CIXMINI_SSH_PASSWORD`) — but the function resolves the address from `FLEET_HOSTS`
-*before* that branch, and `cixmini` is not in `FLEET_HOSTS`. So the branch was
-dead code and every cixmini restart answered `unknown host 'cixmini'`.
-
-`resolve_restart_target()` is now the single source: one table of restart targets,
-blocklist winning over allowlist, and a target that is listed but unconfigured
-refused **by name** ("no recorded address, set CIXMINI_IP") instead of pretending
-it is an unknown host. cixmini is now consistently in or out.
-
-Env:
-  DOCTOR_GATE_DESTRUCTIVE          "0" to turn the rail OFF (default: ON). The
-                                   opt-out exists only for the transition window,
-                                   before the SOP can issue approvals; with the
-                                   gate ON and no approvals arriving, a
-                                   destructive action is REFUSED, which is the
-                                   intended fail-closed behaviour.
-  DOCTOR_AUTO_APPROVE_DESTRUCTIVE  "1" for a standing auto-approve (default: off)
-  DOCTOR_APPROVAL_TTL              seconds an approval stays valid (default: 900)
-  CIXMINI_IP                      the address for the cixmini restart target
-  DOCTOR_CIXMINI_SUDO_USER         the ssh/sudo user on cixmini (default: mini)
+Every purge, restart and delegated code-fix task requires a scoped approval.
+Legacy gate_enabled/auto_approve constructor options are accepted for caller
+compatibility but cannot authorize work. Approvals are refreshed from healthy
+state before use; configuration flags and model output are never grants.
 """
 
 from __future__ import annotations
@@ -73,9 +23,8 @@ AUTO_APPROVE_DESTRUCTIVE = os.environ.get("DOCTOR_AUTO_APPROVE_DESTRUCTIVE", "0"
 APPROVAL_TTL_SECS = float(os.environ.get("DOCTOR_APPROVAL_TTL", "900"))
 APPROVAL_PREFIX = "approval"
 
-# The actions that wait for an operator. Everything else in the playbook is
-# bounded and reversible (a release, a requeue) or is a dispatch.
-DESTRUCTIVE_ACTIONS = frozenset({"cancel_jobs", "dlq_remove", "restart_service"})
+# Privileged work includes delegated tasks, which can themselves restart/purge.
+DESTRUCTIVE_ACTIONS = frozenset({"cancel_jobs", "dlq_remove", "restart_service", "dispatch_codex_fix"})
 
 
 def action_digest(kind: str, **parts) -> str:
@@ -114,45 +63,22 @@ class ApprovalGate:
         self.store.forget(f"{APPROVAL_PREFIX}:{digest}")
 
     def approved(self, kind: str, digest: str) -> bool:
-        """Whether an APPROVAL for this exact action exists.
-
-        This answers only that question. It deliberately does NOT consider whether
-        the gate is switched on: a disabled gate means "no approval is needed", not
-        "no approval was given", and folding the two into one boolean makes a
-        caller read `approved() == False` as a refusal when the rail is simply off.
-        `require()` owns the switch; this owns the record.
-        """
+        """Require an exact grant from fresh, healthy state."""
         del kind  # the digest is the identity of the action; the kind is not needed
-        return self.store.seen(f"{APPROVAL_PREFIX}:{digest}", ttl=self.ttl)
+        self.store.reload()
+        found = self.store.seen(f"{APPROVAL_PREFIX}:{digest}", ttl=self.ttl)
+        return found and self.store.loaded_ok and self.store.persist_ok
 
     def require(self, kind: str, **parts) -> str | None:
-        """``None`` when the action may proceed; the refusal reason when it may not.
-
-        The order of the three escape hatches matters and is the whole contract:
-
-        1. a non-destructive action is never gated;
-        2. `DOCTOR_GATE_DESTRUCTIVE=0` switches the rail **off** — the action is
-           allowed, and that is the only thing the switch does;
-        3. a standing auto-approve allows it and says so in the log;
-        4. otherwise an approval recorded for this exact action is required.
-
-        The refusal names the digest an approval must be recorded against —
-        otherwise "it asked me to approve something" has nothing to approve.
-        """
+        """Return a refusal unless this exact privileged action is approved."""
         if kind not in DESTRUCTIVE_ACTIONS:
             return None
-        if not self.gate_enabled:
-            return None
         digest = action_digest(kind, **parts)
-        if self.auto_approve:
-            log.warning("%s proceeding on the STANDING auto-approve (%s)", kind, digest)
-            return None
         if self.approved(kind, digest):
             return None
         return (
             f"{kind} needs an operator approval; none is recorded for digest {digest} "
-            f"(parts={parts}). Record it, or set DOCTOR_AUTO_APPROVE_DESTRUCTIVE=1 for a "
-            f"standing auto-approve."
+            f"(parts={parts}). Record a scoped operator approval."
         )
 
 

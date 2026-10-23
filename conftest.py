@@ -22,7 +22,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _doctor_starts_with_no_safety_history(monkeypatch):
+def _doctor_starts_with_no_safety_history(monkeypatch, tmp_path):
     """Swap in an empty in-memory safety store for the duration of one test.
 
     The module-level MIRRORS the store keeps in step (`_seen_job_attempts`,
@@ -30,6 +30,10 @@ def _doctor_starts_with_no_safety_history(monkeypatch):
     cleared too. They are process-global for the same reason the store is, and a
     mirror that survives a test is a loop count the next test escalates on.
     """
+    # A fixture can reload doctor after this store swap. Keep that constructor
+    # in scratch too, so a reloaded module cannot write a configured live file.
+    monkeypatch.setenv("DOCTOR_STATE_BACKEND", "file")
+    monkeypatch.setenv("DOCTOR_STATE_PATH", str(tmp_path / "runtime-state.json"))
     from hive.workers import doctor
     from hive.workers.doctor_state import DurableStateStore, MemoryBackend
 

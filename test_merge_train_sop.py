@@ -31,7 +31,8 @@ def git(*args, cwd):
 
 
 @pytest.fixture
-def repo(tmp_path):
+def repo(tmp_path, monkeypatch):
+    monkeypatch.setattr(mt, "GIT_ROOT", str(tmp_path))
     """A bare repo whose `main` has four interesting branches against it.
 
     Built so each bucket is real rather than mocked: `hive/ff` is a strict
@@ -176,7 +177,7 @@ def test_the_public_forge_path_is_off_by_default():
 
 def test_an_enabled_opt_in_requests_rather_than_sends(monkeypatch):
     monkeypatch.setattr(mt, "ALLOW_PUBLIC_FORGE", True)
-    report = mt.BranchReport(repo="proj", branch="hive/ff", bucket=mt.BUCKET_DIVERGENT, target="gitlab.com")
+    report = mt.BranchReport(repo="proj", branch="hive/ff", bucket=mt.BUCKET_FAST_FORWARD, target="gitlab.com")
     request = mt.route_outward(report)
     assert request is not None
     assert request["kind"] == "push_public_forge"
@@ -195,7 +196,7 @@ def test_a_merge_request_is_requested_as_pr_open(monkeypatch):
     report = mt.BranchReport(
         repo="proj",
         branch="hive/wip",
-        bucket=mt.BUCKET_DIVERGENT,
+        bucket=mt.BUCKET_FAST_FORWARD,
         target="argonas",
         opens_mr=True,
     )
@@ -292,11 +293,11 @@ def test_the_record_is_read_from_the_environment(tmp_path):
     assert wait == 86_400.0 - 300.0
 
 
-def test_an_unreadable_record_is_treated_as_never_run(tmp_path):
+def test_an_unreadable_record_refuses_a_run(tmp_path):
     path = tmp_path / "state.json"
     path.write_text("{not json", encoding="utf-8")
     due, _wait = mt.due_for_run({"MERGE_TRAIN_STATE_PATH": str(path)}, now=1000.0)
-    assert due
+    assert not due
 
 
 def test_the_default_interval_is_a_day():
@@ -886,7 +887,7 @@ def test_an_outward_request_never_names_the_canonical_remote(repo, monkeypatch):
     assert outward == [], outward
 
     # A genuinely outward target does produce a request.
-    report = mt.BranchReport(repo="proj", branch="hive/x", bucket=mt.BUCKET_DIVERGENT, target="gitlab.com")
+    report = mt.BranchReport(repo="proj", branch="hive/x", bucket=mt.BUCKET_FAST_FORWARD, target="gitlab.com")
     request = mt.route_outward(report)
     assert request is not None
     assert request["target"] == "gitlab.com"
@@ -925,7 +926,8 @@ def test_the_only_write_runs_through_the_choke_point(repo, monkeypatch):
             mt,
             "_sh",
             lambda args, cwd=None, timeout=120.0: (
-                pushed.append(list(args)) or subprocess.CompletedProcess(args, 0, "", "")
+                pushed.append(list(args))
+                or subprocess.CompletedProcess(args, 0, "ssh://git@argonas/repo.git" if args[1] == "remote" else "", "")
             ),
         )
         out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False)
@@ -959,14 +961,14 @@ def test_a_canonical_remote_that_is_a_public_forge_is_refused(repo, monkeypatch)
     monkeypatch.setattr(mt, "CANONICAL_REMOTE", "gitlab")
     out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False, remote="gitlab")
     assert out.startswith("REFUSED"), out
-    assert "public forge" in out, out
+    assert "REFUSED" in out, out
 
     # And an innocent name that resolves to a forge URL is the same mistake.
     monkeypatch.setattr(mt, "CANONICAL_REMOTE", "upstream")
     git("remote", "add", "upstream", "git@gitlab.com:zeroclaw-labs/graeae-hive.git", cwd=repo["bare"])
     out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False, remote="upstream")
     assert out.startswith("REFUSED"), out
-    assert "public forge" in out, out
+    assert "REFUSED" in out, out
 
     # ARGONAS itself still writes, or the guard would have closed the module.
     monkeypatch.setattr(mt, "CANONICAL_REMOTE", "argonas")
@@ -979,7 +981,7 @@ def test_the_choke_point_itself_refuses_a_forge_remote(monkeypatch):
     the guard refusing a forge by name."""
     for remote in ("gitlab", "github", "bitbucket", "git@gitlab.com:group/repo.git", "ssh://git@gitlab.com:22/g/r.git"):
         monkeypatch.setattr(mt, "CANONICAL_REMOTE", remote)
-        with pytest.raises(ValueError, match="public forge"):
+        with pytest.raises(ValueError, match="only remote"):
             mt.assert_no_forced_or_public_writes(["git", "push", remote, "main"])
     # And ARGONAS, under whatever it is named, still passes.
     monkeypatch.setattr(mt, "CANONICAL_REMOTE", "argonas")
@@ -1024,7 +1026,7 @@ def test_an_outward_request_names_a_host_from_either_remote_spelling(monkeypatch
         ("git@gitlab.com:group/repo.git", "gitlab.com"),
         ("git@github.com:group/repo.git", "github.com"),
     ):
-        report = mt.BranchReport(repo="proj", branch="hive/x", bucket=mt.BUCKET_DIVERGENT, target=target)
+        report = mt.BranchReport(repo="proj", branch="hive/x", bucket=mt.BUCKET_FAST_FORWARD, target=target)
         request = mt.route_outward(report)
         assert request is not None, target
         assert request["target"] == expected, f"{target} -> {request['target']}"
@@ -1115,7 +1117,7 @@ def test_only_a_bucket_that_wants_a_write_asks_outward(repo, monkeypatch):
     assert outward, "a cycle against an outward remote must produce requests to check"
     for request in outward:
         branch = next(
-            (report for report in outcomes[0].reports if report.repo in request["text"]),
+            (report for report in outcomes[0].reports if f"{report.repo}:{report.branch} (" in request["text"]),
             None,
         )
         assert branch is not None
@@ -1143,7 +1145,7 @@ def test_the_push_url_is_the_one_checked(repo):
     git("remote", "set-url", "--push", "argonas", "git@gitlab.com:group/repo.git", cwd=repo["bare"])
     out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False)
     assert out.startswith("REFUSED"), out
-    assert "public forge" in out, out
+    assert "REFUSED" in out, out
 
     git("remote", "set-url", "--push", "argonas", str(upstream), cwd=repo["bare"])
     out = mt.fast_forward(repo["bare"], "main", repo["ff_sha"], dry_run=False)

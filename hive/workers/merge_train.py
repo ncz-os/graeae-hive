@@ -133,7 +133,7 @@ class MeasurementError(RuntimeError):
 #: nothing outward: one has nothing to merge and the other has nothing to compute
 #: against. Mirrors the decision's own rule, so the engine cannot ask for something
 #: `merge_train.decide` would hold.
-OUTWARD_CANDIDATE_BUCKETS = frozenset({BUCKET_FAST_FORWARD, BUCKET_CHERRY, BUCKET_DIVERGENT, BUCKET_CONFLICT})
+OUTWARD_CANDIDATE_BUCKETS = frozenset({BUCKET_FAST_FORWARD})
 
 
 @dataclass
@@ -397,7 +397,10 @@ class RepoOutcome:
         only had `to_record()` would decide the first branch and silently drop the
         other three.
         """
-        return [report.to_record() for report in self.reports]
+        records = [report.to_record() for report in self.reports]
+        for record in records:
+            record["failures"] = list(dict.fromkeys(record["failures"] + self.failures))
+        return records
 
     def to_record(self) -> dict:
         """The `record` payload for the FIRST measured branch, failures and all.
@@ -451,7 +454,7 @@ def fast_forward(repo: str, base: str, sha: str, dry_run: bool = True, remote: s
     """
     if not sha or not sha.strip():
         return "REFUSED: fast-forward with no sha"
-    if remote != CANONICAL_REMOTE:
+    if remote != "argonas":
         return (
             f"REFUSED: this engine writes {CANONICAL_REMOTE} only, not {remote!r}; "
             f"an outward push is an outward_send SOP action"
@@ -477,14 +480,17 @@ def fast_forward(repo: str, base: str, sha: str, dry_run: bool = True, remote: s
     # push to a forge is the same mistake as a forge-named alias, and a name check
     # alone would let it through. `--push`, because a remote may fetch from one place
     # and push to another (`remote.<name>.pushurl`), and the fetch url says nothing
-    # about where this write lands. A remote git cannot resolve is left to the push,
-    # which fails without writing anything.
-    url = _sh(["git", "remote", "get-url", "--push", remote], cwd=repo).stdout.strip()
-    if url and _remote_host(url).lower() in PUBLIC_FORGE_HOSTS:
+    # about where this write lands. An unresolved destination refuses the push.
+    resolved = _sh(["git", "remote", "get-url", "--push", "--all", remote], cwd=repo)
+    urls = resolved.stdout.splitlines()
+    if resolved.returncode or not urls or not all(_is_argonas_url(url) for url in urls):
         return (
-            f"REFUSED: {remote!r} resolves to {url}, a public forge, not this fleet's canonical "
-            f"remote; an outward push is an outward_send SOP action"
+            "REFUSED: push destinations are not all verified ARGONAS endpoints; "
+            "an outward push is an outward_send SOP action"
         )
+    mirror = _sh(["git", "config", "--bool", f"remote.{remote}.mirror"], cwd=repo)
+    if mirror.returncode not in (0, 1) or mirror.stdout.strip() not in ("", "false"):
+        return "REFUSED: mirror push configuration is not allowed"
     if dry_run:
         return f"DRY-RUN: would advance {base} to {sha[:12]}"
     args = ["git", "push", remote, f"{sha}:refs/heads/{base}"]
@@ -498,6 +504,20 @@ def fast_forward(repo: str, base: str, sha: str, dry_run: bool = True, remote: s
     if result.returncode != 0:
         return f"FAILED: push to {remote} rc={result.returncode} {result.stderr.strip()[:160]}"
     return f"advanced {base} to {sha[:12]} on {remote}"
+
+
+def _is_argonas_url(url: str) -> bool:
+    """Accept only ARGONAS SSH or a path beneath the configured canonical mount.
+
+    Remote aliases and a public-host denylist cannot establish this boundary.
+    Local paths are resolved to exclude symlinks escaping the canonical root.
+    """
+    if url.startswith("/"):
+        root = os.path.realpath(GIT_ROOT)
+        return os.path.commonpath([root, os.path.realpath(url)]) == root
+    if url.startswith("ssh://") or (":" in url and "://" not in url):
+        return _remote_host(url).lower() == "argonas"
+    return False
 
 
 def outward_request(report: BranchReport, kind: str, target: str) -> dict:
@@ -563,7 +583,7 @@ def route_outward(report: BranchReport) -> dict | None:
     whether the engine *asks*, which is what puts the action in front of an operator
     instead of in front of a forge.
     """
-    if not ALLOW_PUBLIC_FORGE:
+    if not ALLOW_PUBLIC_FORGE or report.failures:
         return None
     if report.target == CANONICAL_REMOTE and not report.opens_mr:
         # Naming ARGONAS in an `outward_send` request would ask an operator to
@@ -671,10 +691,12 @@ def record_cycle_end(at: float | None = None, env: dict | None = None) -> bool:
             existing = json.load(handle)
         if isinstance(existing, dict):
             blob = existing
-    except (OSError, ValueError):
-        # A missing or unreadable record is overwritten rather than merged into: the
-        # one field this file exists for is `last_run`.
+        else:
+            return False
+    except FileNotFoundError:
         pass
+    except (OSError, ValueError):
+        return False
     blob["last_run"] = stamp
     directory = os.path.dirname(path) or "."
     try:
@@ -714,8 +736,15 @@ def due_for_run(env: dict | None = None, now: float | None = None) -> tuple[bool
                 blob = json.load(handle)
             if isinstance(blob, dict) and isinstance(blob.get("last_run"), (int, float)):
                 last_run = float(blob["last_run"])
+            else:
+                return False, float("inf")
+        except FileNotFoundError:
+            pass
         except (OSError, ValueError) as error:
-            log.warning("merge-train state %s unreadable (%s); treating as never-run", path, error)
+            log.warning("merge-train state %s unreadable (%s); refusing cycle", path, error)
+            return False, float("inf")
+    else:
+        return False, float("inf")
     cadence = Cadence(last_run, interval=interval, now=now)
     return cadence.due(), cadence.seconds_until_due()
 
@@ -907,7 +936,7 @@ def assert_no_forced_or_public_writes(args: list[str]) -> None:
     push_at = lowered.index("push") if "push" in lowered else -1
     if push_at >= 0 and push_at + 1 < len(args):
         named = args[push_at + 1]
-        if named != CANONICAL_REMOTE:
+        if named != "argonas":
             raise ValueError(
                 f"merge-train refuses {args!r}: a push must name {CANONICAL_REMOTE!r}, "
                 f"the only remote this engine may write"
@@ -960,13 +989,15 @@ def main(argv: list[str] | None = None) -> int:
         # Printed, never sent: the outward_send SOP is what sends it, after an
         # operator approves it.
         log.info("OUTWARD REQUEST (not sent): %s", json.dumps(request, sort_keys=True))
+    if not record_cycle_end():
+        log.error("cycle refused: cadence could not be persisted")
+        return 1
     if args.apply:
         for line in fast_forward_candidates(outcomes, dry_run=False):
             log.info("ff %s", line)
     # The cycle RAN, whatever it found. Recording that is what makes the floor mean
     # anything on the next invocation.
-    if record_cycle_end():
-        log.info("cycle end recorded")
+    log.info("cycle recorded")
     return 1 if any(outcome.failed for outcome in outcomes) else 0
 
 

@@ -43,9 +43,7 @@ class Bus:
     def __call__(self, request, timeout=0):
         url = request.full_url
         body = json.loads(request.data) if request.data else None
-        self.calls.append(
-            {"method": request.get_method(), "url": url, "body": body}
-        )
+        self.calls.append({"method": request.get_method(), "url": url, "body": body})
         if url.endswith("/v1/jobs/next") or "/v1/jobs/next?" in url:
             if self.next_job is None:
                 return Reply(b"", status=204)
@@ -127,9 +125,7 @@ def _job(kind, eligible_kinds=None):
 
 
 def test_doctor_ineligible_for_zeroclaw_fix_job():
-    ok, reason = job_agent_eligible(
-        _job("fix:singularity-shell-about-graphic", ["zeroclaw"]), _agent("doctor")
-    )
+    ok, reason = job_agent_eligible(_job("fix:singularity-shell-about-graphic", ["zeroclaw"]), _agent("doctor"))
     assert ok is False
     assert "out of scope" in reason
 
@@ -159,9 +155,7 @@ def test_doctor_ineligible_for_codex_fix_dispatch_even_with_explicit_doctor_opt_
     # eligible_kinds=['zeroclaw']), never executed by the doctor itself.
     # The exclude check runs BEFORE the opt-in check so this is rejected
     # even though 'doctor' is a literal opt-in.
-    ok, reason = job_agent_eligible(
-        _job("doctor:codex-fix:1729000000", ["doctor"]), _agent("doctor")
-    )
+    ok, reason = job_agent_eligible(_job("doctor:codex-fix:1729000000", ["doctor"]), _agent("doctor"))
     assert ok is False, reason
     assert "codex-fix" in reason
 
@@ -200,8 +194,8 @@ def test_doctor_releases_normal_worker_jobs(doctor, monkeypatch, kind):
     assert len(patches) == 1, patches
     assert patches[0]["url"].endswith("/v1/jobs/abc12345-wrong")
     body = patches[0]["body"]
-    assert body["status"] == "queued"                 # back to the queue
-    assert body.get("status") != "failed"             # NOT failed
+    assert body["status"] == "queued"  # back to the queue
+    assert body.get("status") != "failed"  # NOT failed
     assert body["claimed_by"] == doctor._urn
     assert body["result"]["worker_error"] == "released_by_host"
     assert "status" not in body["result"]
@@ -232,6 +226,10 @@ def test_scope_prefixes_are_explicit(doctor):
 # ─────────────────────── dispatch never requires Codex ───────────────────────
 def test_dispatch_codex_fix_never_requires_hard_codex(doctor, monkeypatch):
     bus = _install(doctor, monkeypatch, None)
+    doctor.APPROVALS.record_approval(
+        "dispatch_codex_fix",
+        doctor.doctor_gates.action_digest("dispatch_codex_fix", task="fix the thing", parent_job_id="parent-1"),
+    )
     out = doctor.action_dispatch_codex_fix("fix the thing", "parent-1")
     assert "submitted" in out
     submits = [c for c in bus.calls if c["method"] == "POST" and c["url"].endswith("/v1/jobs")]
@@ -262,8 +260,14 @@ from hive.bus.domain.eligibility import (  # noqa: E402
 def test_alias_table_does_not_bridge_doctor_to_executor_kinds():
     # "doctor" must not appear in any executor's alias set.
     for runtime in (
-        "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
-        "claude", "claude-code", "claude-cli",
+        "zeroclaw",
+        "codex",
+        "codex-cli",
+        "opencode",
+        "opencode-cli",
+        "claude",
+        "claude-code",
+        "claude-cli",
     ):
         aliases = RUNTIME_KIND_MAP.get(runtime, set())
         assert DOCTOR_KIND not in aliases, (
@@ -327,9 +331,7 @@ def test_doctor_opt_in_via_explicit_doctor_entry_still_works():
     # opt-in path described in the task ("whose eligible_kinds explicitly
     # lists 'doctor'"). The wildcard / executor entries do not subvert it.
     for eligible_kinds in (["*", "doctor"], ["zeroclaw", "doctor"]):
-        ok, reason = job_agent_eligible(
-            _job("feat:explicit-opt-in", eligible_kinds), _agent("doctor")
-        )
+        ok, reason = job_agent_eligible(_job("feat:explicit-opt-in", eligible_kinds), _agent("doctor"))
         assert ok is True, (eligible_kinds, reason)
 
 
@@ -341,8 +343,14 @@ def test_doctor_opt_in_exclude_aliases_blocks_wildcard_and_executors():
     # keep the doctor out of that alias set -- this test forces the choice.
     assert "*" in DOCTOR_OPT_IN_EXCLUDE_ALIASES
     for alias in (
-        "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
-        "claude", "claude-code", "claude-cli",
+        "zeroclaw",
+        "codex",
+        "codex-cli",
+        "opencode",
+        "opencode-cli",
+        "claude",
+        "claude-code",
+        "claude-cli",
     ):
         assert alias in DOCTOR_OPT_IN_EXCLUDE_ALIASES, alias
 
@@ -356,7 +364,10 @@ def test_runtime_kind_map_invariant_fires_when_executor_aliases_doctor():
 
     src_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
-        "hive", "bus", "domain", "eligibility.py",
+        "hive",
+        "bus",
+        "domain",
+        "eligibility.py",
     )
     with open(src_path) as fh:
         original = fh.read()
@@ -376,8 +387,7 @@ def test_runtime_kind_map_invariant_fires_when_executor_aliases_doctor():
         assert "zeroclaw" in str(exc)
     else:
         pytest.fail(
-            "module-level RUNTIME_KIND_MAP invariant did NOT fire when "
-            "executor runtime 'zeroclaw' aliased 'doctor'"
+            "module-level RUNTIME_KIND_MAP invariant did NOT fire when executor runtime 'zeroclaw' aliased 'doctor'"
         )
     finally:
         sys.modules.pop(mod_name, None)

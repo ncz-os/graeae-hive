@@ -308,11 +308,6 @@ ALL_FLEET_HOSTS: dict[str, dict] = {
     "typhon": {"ip": "192.0.2.61", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
 }
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [doctor] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
 log = logging.getLogger("doctor")
 
 _running = True
@@ -347,8 +342,7 @@ SSH_TIMEOUT = 15
 
 # ───────────────────────── Durable safety state ─────────────────────────
 # Built once, at import. `doctor_state.state_store_from_env` picks the backend the
-# environment asks for; with nothing configured it is the in-memory store, which
-# logs once that the safety limits reset on restart. The module-level dicts above
+# environment asks for; auto/file use a persistent local file. The module-level dicts above
 # and below stay as mirrors for the tests and for anything that reads them
 # directly, but every *enforcement* path goes through the store.
 STATE: DurableStateStore = state_store_from_env()
@@ -492,10 +486,6 @@ def _signal(signum, frame):
     global _running
     log.info("signal %s — shutting down after current job", signum)
     _running = False
-
-
-signal.signal(signal.SIGTERM, _signal)
-signal.signal(signal.SIGINT, _signal)
 
 
 # ───────────────────────── HTTP helpers ─────────────────────────
@@ -719,47 +709,14 @@ def fetch_agent_registry_summary() -> dict:
 
 
 # ───────────────────────── Doctor LLM prompt ─────────────────────────
-DOCTOR_SYSTEM = """\
-You are the PYTHIA Hive Mind doctor. You diagnose failed jobs and decide
-how to release them back to the queue or take corrective action.
-
-CRITICAL RULES:
-  1. DO NOT call any tools. Tools are disabled. Calling them aborts you.
-  2. DO NOT output any prose. No greetings, no explanation, no markdown.
-  3. Your ENTIRE response must be ONE valid JSON object, nothing else.
-  4. Begin your response with `{` and end with `}`. No code fences.
-
-Output STRICT JSON only (no prose, no markdown fences), one object:
-  "action_type": "release_to_queue" | "restart_service" | "resubmit_jobs" |
-                 "cancel_jobs" | "dispatch_codex_fix" | "no_action" |
-                 "escalate"
-  "confidence":  0.0..1.0
-  "reason":      short string explaining the diagnosis
-  "release_eligible_kinds": list of kinds that should be retried, e.g.
-                 ["zeroclaw","codex","opencode"], for release_to_queue.
-                 Use [] (empty) to allow any worker.  Use ["doctor"] to
-                 keep the job in the doctor pool (only if you want re-diagnosis).
-  "target_host": fleet hostname or null (cixmini|cerberus|medusa|proteus|
-                 hydra|bigpi|clawpi|zeropi|typhon)
-  "service_name":"zeroclaw-worker@1.service" pattern or null
-  "resubmit_base_kind": kind prefix to resubmit (for resubmit_jobs/cancel_jobs)
-  "codex_task":  short imperative task for codex sub-job, or null
-  "max_resubmits": integer cap, default 20
-
-When to use each action_type:
-  - "release_to_queue": DEFAULT for a failed-job claim. You've inspected the
-    failure and want to put it back into the queue so other workers (or
-    specific kinds) can retry. Provide release_eligible_kinds.  This is
-    the right answer for most claimed fail jobs.
-  - "restart_service": failure pattern is clearly a stuck worker (timeout,
-    no heartbeat). Provide target_host AND service_name.
-  - "resubmit_jobs": broad pattern across MANY failures of same base_kind
-    look transient. Operates on the failed queue at large.
-  - "cancel_jobs": failures are structural (payload malformed, kind dead).
-  - "dispatch_codex_fix": code bug in our workers / scripts. Provide codex_task.
-  - "no_action": failure is informational only.
-  - "escalate": confidence < 0.5 or beyond doctor authority.
+DOCTOR_SYSTEM = """You diagnose Hive job failures. Return one JSON object with
+"action_type" (release_to_queue, no_action, or escalate), "confidence" (0..1),
+"reason" (diagnosis), and optional "release_eligible_kinds" drawn only from
+zeroclaw, opencode, zoder, claude. Release requires confidence at least 0.7.
+Do not call tools. Purges, restarts and fix tasks require deterministic decisions
+and exact operator approvals; they are not model-selectable actions.
 """
+DOCTOR_SYSTEM += "\nDiagnostic hosts: " + "|".join(doctor_gates.restart_target_names())
 
 
 def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry: dict, failure_count_hint: int) -> str:
@@ -1072,7 +1029,7 @@ def _ssh_rate_ok(host: str) -> bool:
     (`record_ssh_action`) because nothing here reads it.
     """
     now = time.time()
-    if not STATE.persist_ok:
+    if not STATE.loaded_ok or not STATE.persist_ok:
         # A rate limiter that cannot record what it has already allowed is not a
         # limiter: after a restart it would hand out a fresh budget. Fail closed
         # until the store can write again. The remedy is the store's, not this
@@ -1126,6 +1083,11 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
     if DRY_RUN:
         _record_ssh_action(host)
         return f"DRY_RUN: would restart {service} on {host} ({ip})"
+    # Reserve before the effect. A timeout may still have restarted the unit;
+    # every attempted restart consumes budget, including an interrupted process.
+    _record_ssh_action(host)
+    if not STATE.persist_ok:
+        return "REFUSED: restart budget could not be persisted"
     sudo_password = os.environ.get("DOCTOR_SUDO_PASSWORD")
     if target["auth"] == "password":
         cixmini_password = os.environ.get("CIXMINI_SSH_PASSWORD", "")
@@ -1162,7 +1124,6 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=SSH_TIMEOUT)
         if r.returncode == 0:
-            _record_ssh_action(host)
             return f"restarted {service} on {host}"
         return f"restart FAILED on {host}: {r.stderr[-200:]}"
     except subprocess.TimeoutExpired:
@@ -1177,9 +1138,9 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
         return f"could not fetch failed jobs (code={code})"
     failed = resp.get("jobs", [])
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
-    target_ids = [j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind][
-        : max(1, int(max_resubmits))
-    ]
+    target_ids = [
+        j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind and not dlq_protected(j)
+    ][: max(0, min(20, int(max_resubmits)))]
     if not target_ids:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
@@ -1209,7 +1170,7 @@ def _children_of(parent_ids: list[str], limit: int = 200) -> list[str]:
             continue
         for child in resp.get("jobs", []) or []:
             cid = child.get("id")
-            if cid and cid not in found:
+            if cid and cid not in found and not dlq_protected(child):
                 found.append(cid)
     return found
 
@@ -1222,9 +1183,9 @@ def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
         return f"could not fetch failed jobs (code={code})"
     failed = resp.get("jobs", [])
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
-    target_ids = [j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind][
-        : max(1, int(max_cancels))
-    ]
+    target_ids = [
+        j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind and not dlq_protected(j)
+    ][: max(0, min(20, int(max_cancels)))]
     if not target_ids:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
@@ -1423,6 +1384,9 @@ def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str
         return "dispatch_codex_fix missing codex_task"
     if len(codex_task) > 4000:
         codex_task = codex_task[:4000]
+    blocked = APPROVALS.require("dispatch_codex_fix", task=codex_task, parent_job_id=parent_job_id)
+    if blocked:
+        return f"REFUSED: {blocked}"
     body = {
         "kind": f"doctor:codex-fix:{int(time.time())}",
         "description": codex_task,
@@ -1821,10 +1785,13 @@ def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | 
     if DRY_RUN:
         log.info("DRY_RUN: would auto-submit triage:%s (count=%d)", base_kind, count)
         return None
+    note_triage(base_kind)
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        log.warning("auto-triage refused: cooldown could not be persisted")
+        return None
     code, resp = _http("POST", "/v1/jobs", body, timeout=15.0)
     if code in (200, 201) and resp:
         jid = resp.get("id", "")
-        note_triage(base_kind)
         log.info("auto-triage submitted id=%s base_kind=%s count=%d", jid[:12], base_kind, count)
         return jid
     log.warning("auto-triage submit failed code=%s base_kind=%s resp=%s", code, base_kind, str(resp)[:200])
@@ -1853,6 +1820,51 @@ def broadcast_doctor_message(topic: str, payload: dict):
 
 
 # ───────────────────────── Triage loop ─────────────────────────
+def execute_sop_decision(job: dict) -> dict:
+    """Interpret the versioned decision envelope; never ask a model to execute prose.
+
+    Payload approval flags carry no authority. Destructive helpers require their
+    own exact approval in the local store, including delegated fix tasks.
+    """
+    try:
+        envelope = json.loads(job.get("description") or "")
+        if not isinstance(envelope, dict) or envelope.get("version") != 1:
+            raise ValueError("unsupported decision envelope")
+        action = envelope["action"]
+        original = envelope["job_id"]
+        if not isinstance(action, dict) or not isinstance(original, str):
+            raise ValueError("missing action or original job id")
+        kind = action.get("action")
+        if kind in {"release_to_queue", "dispatch_codex_fix"} and not original:
+            raise ValueError("missing original job id")
+        if kind == "resubmit_jobs":
+            text = action_resubmit_jobs(action["base_kind"], action["max"])
+        elif kind == "cancel_jobs":
+            text = action_cancel_jobs(action["base_kind"], action["max"])
+        elif kind == "restart_service":
+            text = action_restart_service(action["host"], action["service"])
+        elif kind == "dispatch_codex_fix":
+            text = action_dispatch_codex_fix(action["task"], original)
+        elif kind in {"release_to_queue", "dlq_remove"}:
+            target = original if kind == "release_to_queue" else action["job_id"]
+            from urllib.parse import quote
+
+            code, current = _http("GET", f"/v1/jobs/{quote(target, safe='')}")
+            if code != 200 or not isinstance(current, dict) or dlq_protected(current):
+                raise ValueError("original job unavailable or protected")
+            if kind == "release_to_queue":
+                text = action_release_to_queue(target, action["release_eligible_kinds"])
+            else:
+                text = remediate_dead_letter(current, "remove", "sop-decision")
+        elif kind == "no_action":
+            text = "no action"
+        else:
+            raise ValueError("unknown executor action")
+        return {"exit_code": int(text.startswith("REFUSED")), "stdout": text, "action": action}
+    except (ValueError, TypeError, KeyError) as error:
+        return {"exit_code": 1, "stdout": f"REFUSED: invalid SOP decision ({error})"}
+
+
 def process_triage_job(job: dict) -> dict:
     """Process either an explicit triage:<base_kind> job OR any other job whose
     eligible_kinds includes 'doctor'.  The user's directive (2026-05-26):
@@ -1861,6 +1873,13 @@ def process_triage_job(job: dict) -> dict:
     job_id = job.get("id", "")
     kind = job.get("kind", "")
     desc = job.get("description", "") or ""
+
+    if dlq_protected(job):
+        return {"exit_code": 0, "stdout": "protected lane: escalated", "action": {"action_type": "escalate"}}
+    if kind == "doctor:execute":
+        if not STATE.loaded_ok or not STATE.persist_ok:
+            return {"exit_code": 1, "stdout": "REFUSED: safety state unavailable"}
+        return execute_sop_decision(job)
 
     is_explicit_triage = kind.startswith("triage:")
     base_kind = kind[len("triage:") :] if is_explicit_triage else _base_kind(kind)
@@ -1876,6 +1895,8 @@ def process_triage_job(job: dict) -> dict:
     # Durable since 2026-10-22: the loop counter lived in a module dict, so a pod
     # restart reset it and a job that had already looped three times looked new.
     history = loop_attempts(job_id, window=LOOP_WINDOW_SEC, at=now)
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        return {"exit_code": 1, "stdout": "REFUSED: safety state unavailable"}
     if len(history) >= LOOP_ESCALATE_THRESHOLD:
         log.warning(
             "LOOP-DETECT job=%s seen %d times in %ds — escalating", job_id[:12], len(history), int(LOOP_WINDOW_SEC)
@@ -1985,8 +2006,14 @@ def process_triage_job(job: dict) -> dict:
         }
 
     a = action.get("action_type", "no_action")
-    conf = float(action.get("confidence", 0.0) or 0.0)
+    try:
+        conf = float(action.get("confidence", 0.0) or 0.0)
+    except (ValueError, TypeError):
+        conf = 0.0
     reason = action.get("reason", "")
+    if a not in {"release_to_queue", "no_action", "escalate"} or (a == "release_to_queue" and not 0.7 <= conf <= 1.0):
+        action = {"action_type": "escalate", "reason": reason, "proposed_action": a}
+        a = "escalate"
     log.info("doctor decision: action=%s conf=%.2f reason=%s", a, conf, reason)
 
     parts = [f"action={a}", f"conf={conf:.2f}", f"reason={reason}"]
@@ -1997,22 +2024,6 @@ def process_triage_job(job: dict) -> dict:
         rk_clean = [k for k in rk if isinstance(k, str) and k] if isinstance(rk, list) else None
         text, released = apply_release(job_id, is_explicit_triage, base_kind, rk_clean)
         parts.append(text)
-    elif a == "restart_service" and conf >= 0.7:
-        parts.append(action_restart_service(action.get("target_host"), action.get("service_name")))
-    elif a == "resubmit_jobs":
-        parts.append(
-            action_resubmit_jobs(
-                action.get("resubmit_base_kind") or base_kind, int(action.get("max_resubmits", 20) or 20)
-            )
-        )
-    elif a == "cancel_jobs":
-        parts.append(
-            action_cancel_jobs(
-                action.get("resubmit_base_kind") or base_kind, int(action.get("max_resubmits", 20) or 20)
-            )
-        )
-    elif a == "dispatch_codex_fix":
-        parts.append(action_dispatch_codex_fix(action.get("codex_task"), job_id))
     elif a == "no_action":
         parts.append("no action — triage cleared")
     elif a == "escalate":
@@ -2075,6 +2086,10 @@ def classify_dead_letter(job: dict) -> tuple[str, str]:
 
 def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
     """Carry out a DLQ decision. No-op (logs intent only) unless DLQ_APPLY=1."""
+    if dlq_protected(job):
+        return "REFUSED: protected lane"
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        return "REFUSED: safety state unavailable"
     jid = job.get("id", "")
     if not DLQ_APPLY:
         return f"DLQ_DRY_RUN: would {decision} {jid[:12]} ({reason})"
@@ -2209,6 +2224,13 @@ def handle_dead_letter_queue() -> dict:
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [doctor] %(message)s",
+        handlers=[logging.StreamHandler(sys.stdout)],
+    )
+    signal.signal(signal.SIGTERM, _signal)
+    signal.signal(signal.SIGINT, _signal)
     log.info("starting on %s url=%s alias=%s dry_run=%s", AGENT_HOST, HIVE_URL, DOCTOR_AGENT_ALIAS, DRY_RUN)
     register()
     last_hb = time.time()

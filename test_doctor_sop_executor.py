@@ -138,17 +138,17 @@ def test_an_approval_for_one_cancel_does_not_approve_the_next(monkeypatch, docto
     assert doctor.action_cancel_jobs("zeroclaw").startswith("REFUSED")
 
 
-def test_the_standing_auto_approve_is_off_unless_configured():
+def test_the_standing_auto_approve_never_substitutes_for_scoped_approval():
     state = DurableStateStore(MemoryBackend())
     assert doctor_gates.AUTO_APPROVE_DESTRUCTIVE is False, "the standing auto-approve ships OFF"
     off = doctor_gates.ApprovalGate(state, gate_enabled=True, auto_approve=False)
     assert off.require("cancel_jobs", job_ids=["j"]) is not None
     on = doctor_gates.ApprovalGate(state, gate_enabled=True, auto_approve=True)
-    assert on.require("cancel_jobs", job_ids=["j"]) is None
+    assert on.require("cancel_jobs", job_ids=["j"]) is not None
 
 
 def test_a_non_destructive_action_is_never_gated(gate):
-    for kind in ("release_to_queue", "resubmit_jobs", "dispatch_codex_fix", "no_action"):
+    for kind in ("release_to_queue", "resubmit_jobs", "no_action"):
         assert gate.require(kind, anything=1) is None, kind
     for kind in sorted(doctor_gates.DESTRUCTIVE_ACTIONS):
         assert gate.require(kind, anything=1) is not None, kind
@@ -297,7 +297,7 @@ def test_the_restart_prompt_and_the_executor_read_one_table():
     a known host whose configuration is missing (which it names)."""
     import re
 
-    offered = re.search(r'"target_host": fleet hostname or null \(([^)]*)\)', doctor.DOCTOR_SYSTEM)
+    offered = re.search(r"Diagnostic hosts: ([^\n]+)", doctor.DOCTOR_SYSTEM)
     assert offered, "DOCTOR_SYSTEM must list its target hosts"
     names = {name.strip() for name in offered.group(1).replace("\n", "").split("|") if name.strip()}
     known = set(doctor_gates.RESTART_TARGETS)
@@ -457,17 +457,19 @@ def test_a_backend_outage_degrades_durability_not_the_limit(store):
     assert state.timestamps("loop:j1", ttl=1800.0) == []
 
 
-def test_a_corrupt_state_file_is_ignored_and_overwritten(tmp_path):
+def test_a_corrupt_state_file_is_preserved_for_operator_recovery(tmp_path):
     path = tmp_path / "state.json"
     path.write_text("{not json", encoding="utf-8")
     backend = FileBackend(str(path))
-    assert backend.load("doctor.state") == {}
-    assert backend.save("doctor.state", {"doctor.state/loop:j": {"timestamps": [1.0]}}) is True
-    assert backend.load("doctor.state")["doctor.state/loop:j"]["timestamps"] == [1.0]
+    with pytest.raises(ValueError):
+        backend.load("doctor.state")
+    assert backend.save("doctor.state", {"loop:j": {"timestamps": [1.0]}}) is False
+    assert path.read_text() == "{not json"
 
 
 def test_the_backend_choice_is_explicit_and_the_memory_one_says_so():
-    assert isinstance(state_store_from_env({"DOCTOR_STATE_BACKEND": "memory"}).backend, MemoryBackend)
+    with pytest.raises(ValueError):
+        state_store_from_env({"DOCTOR_STATE_BACKEND": "memory"})
     assert isinstance(
         state_store_from_env({"DOCTOR_STATE_BACKEND": "file", "DOCTOR_STATE_PATH": "/tmp/x"}).backend, FileBackend
     )
@@ -587,27 +589,16 @@ def test_the_cixmini_sudo_user_is_read_at_resolve_time():
     assert doctor_gates.resolve_restart_target("cixmini", env=env)[0]["user"] == "operator"
 
 
-def test_disabling_the_gate_allows_the_action_rather_than_refusing_it():
-    """`approved()` used to answer for a disabled gate, so `False` read as a
-    refusal when the rail was simply off.
-
-    `approved()` now answers only "is there an approval"; the switch lives in
-    `require()`. Both readings are pinned, because the failure mode is an operator
-    setting DOCTOR_GATE_DESTRUCTIVE=0 to turn the rail OFF and getting the reverse.
-    """
+def test_disabling_the_gate_does_not_replace_scoped_approval():
     state = DurableStateStore(MemoryBackend())
     off = doctor_gates.ApprovalGate(state, gate_enabled=False, auto_approve=False)
     for kind in sorted(doctor_gates.DESTRUCTIVE_ACTIONS):
-        assert off.require(kind, x=1) is None, f"{kind} with the gate off must be allowed"
+        assert off.require(kind, x=1) is not None
     digest = doctor_gates.action_digest("cancel_jobs", job_ids=["a"])
-    assert off.approved("cancel_jobs", digest) is False, "no approval was recorded"
-    assert off.require("cancel_jobs", job_ids=["a"]) is None, "and the gate is off"
-
-    on = doctor_gates.ApprovalGate(state, gate_enabled=True, auto_approve=False)
-    assert on.require("cancel_jobs", job_ids=["a"]) is not None
-    on.record_approval("cancel_jobs", digest)
-    assert on.approved("cancel_jobs", digest) is True
-    assert on.require("cancel_jobs", job_ids=["a"]) is None
+    assert off.approved("cancel_jobs", digest) is False
+    off.record_approval("cancel_jobs", digest)
+    assert off.approved("cancel_jobs", digest) is True
+    assert off.require("cancel_jobs", job_ids=["a"]) is None
 
 
 def test_a_safety_limit_that_cannot_be_persisted_fails_the_ssh_rate_limiter_closed(monkeypatch, doctor_state):
