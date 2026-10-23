@@ -1346,19 +1346,26 @@ def test_purge_counts_beside_named_ids_do_not_overstate(tmp_path):
 
 
 class FlakyBackend(FileBackend):
-    """A durable backend that can be taken away and given back."""
+    """A durable backend that can be taken away for reads, or for writes, or both.
+
+    The two halves are separate because a bus that answers a GET and drops a POST is
+    the ordinary shape of a partial outage, and it loses durability exactly the way a
+    dead backend does — from the cache's point of view the record is in one place
+    only, and that is what the merge has to remember.
+    """
 
     def __init__(self, path):
         super().__init__(path)
-        self.up = True
+        self.readable = True
+        self.writable = True
 
     def load(self, namespace):
-        if not self.up:
+        if not self.readable:
             raise OSError("bus is down")
         return super().load(namespace)
 
     def save(self, namespace, records):
-        if not self.up:
+        if not self.writable:
             raise OSError("bus is down")
         return super().save(namespace, records)
 
@@ -1373,7 +1380,7 @@ def test_a_mark_made_during_the_outage_survives_the_reload(tmp_path):
     state.mark("cooldown:zeroclaw", ttl=3600.0, at=clock["now"])
     assert state.persist_ok is True, "the healthy path persists"
 
-    backend.up = False
+    backend.readable = False
     clock["now"] += 30
     outage_stamp = clock["now"]
     state.touch("loop:j1", ttl=1800.0, at=clock["now"])
@@ -1383,7 +1390,7 @@ def test_a_mark_made_during_the_outage_survives_the_reload(tmp_path):
 
     # `refresh_secs=0.0` makes every read a reload, so this read IS the first
     # successful load since the outage — the replacement that used to lose it.
-    backend.up = True
+    backend.readable = True
     assert len(state.timestamps("loop:j1", ttl=1800.0)) == 1, (
         "the reload must not forget a mark the outage refused to write"
     )
@@ -1416,7 +1423,7 @@ def test_a_backend_record_newer_than_the_refused_write_wins(tmp_path):
     state = DurableStateStore(backend, refresh_secs=0.0, time_fn=lambda: clock["now"])
     state.mark("loop:j1", ttl=1800.0, at=clock["now"])
 
-    backend.up = False
+    backend.readable = False
     clock["now"] += 10
     state.touch("loop:j1", ttl=1800.0, at=clock["now"])  # refused; cache at = clock["now"]
     assert state.persist_ok is False
@@ -1426,7 +1433,7 @@ def test_a_backend_record_newer_than_the_refused_write_wins(tmp_path):
     other = DurableStateStore(FileBackend(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
     other.forget("loop:j1")
 
-    backend.up = True
+    backend.readable = True
     assert state.seen("loop:j1", ttl=1800.0) is False, (
         f"the newer retraction must stand; cached at {state.last_mark('loop:j1')}"
     )
@@ -1444,13 +1451,13 @@ def test_a_tombstone_written_during_the_outage_still_retracts(tmp_path):
     state.mark("dlq:dead-1", ttl=21600.0, at=clock["now"])
     assert state.persist_ok is True
 
-    backend.up = False
+    backend.readable = False
     clock["now"] += 30
     state.forget("cooldown:zeroclaw")
     assert state.persist_ok is False
     assert state.seen("cooldown:zeroclaw", ttl=3600.0) is False, "the retraction holds in-process"
 
-    backend.up = True
+    backend.readable = True
     assert state.seen("cooldown:zeroclaw", ttl=3600.0) is False, (
         "the healed reload must not resurrect the retracted key"
     )
@@ -1488,3 +1495,61 @@ def test_a_healthy_reload_is_the_backends_answer_and_nothing_else(tmp_path):
     healed.forget("dlq:dead-1")
     assert healed.seen("dlq:dead-1", ttl=21600.0) is False
     assert healed.seen("cooldown:zeroclaw", ttl=3600.0), "and only that one"
+
+
+def test_a_write_the_backend_refused_survives_the_next_reload(tmp_path):
+    """A save the backend did not accept loses durability exactly as a load that
+    failed does, and it has to be remembered the same way.
+
+    The read side keeps answering — a bus that serves a GET and drops a POST is the
+    ordinary shape of a partial outage — so the next reload succeeds, replaces the
+    cache, and would hand the process a clean sheet for every limit recorded in
+    between. `persist_ok` says the write did not land; the merge is what stops the
+    process's own enforcement from quietly relaxing because of it.
+    """
+    path = str(tmp_path / "s.json")
+    clock = {"now": 11_000_000.0}
+    backend = FlakyBackend(path)
+    state = DurableStateStore(backend, refresh_secs=0.0, time_fn=lambda: clock["now"])
+    state.mark("cooldown:zeroclaw", ttl=3600.0, at=clock["now"])
+    assert state.persist_ok is True
+
+    backend.writable = False
+    clock["now"] += 30
+    stamp = clock["now"]
+    state.touch("ssh:all", ttl=3600.0, at=clock["now"])
+    assert state.persist_ok is False, "the save was refused"
+    assert len(state.timestamps("ssh:all", ttl=3600.0)) == 1, "and the limit holds in-process"
+
+    backend.writable = True
+    assert len(state.timestamps("ssh:all", ttl=3600.0)) == 1, (
+        "a successful reload must not drop a record the backend never accepted"
+    )
+    # Once a save is accepted the whole state, merged record included, is durable.
+    clock["now"] += 5
+    state.mark("dlq:dead-1", ttl=21600.0, at=clock["now"])
+    assert state.persist_ok is True
+    reread = DurableStateStore(FileBackend(path), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    assert reread.timestamps("ssh:all", ttl=3600.0) == [stamp], reread.timestamps("ssh:all", ttl=3600.0)
+    assert reread.seen("cooldown:zeroclaw", ttl=3600.0)
+
+
+def test_refresh_drops_the_unpersisted_records_with_the_cache(tmp_path):
+    """`refresh()` is the operator's "believe the backend from scratch", so the
+    records the backend never accepted go with the cache: a merge that survived it
+    would put back exactly what it was asked to drop, under the one method whose
+    documented job is to stop serving them."""
+    path = str(tmp_path / "s.json")
+    clock = {"now": 11_500_000.0}
+    backend = FlakyBackend(path)
+    state = DurableStateStore(backend, refresh_secs=0.0, time_fn=lambda: clock["now"])
+
+    backend.readable = False
+    state.touch("loop:j1", ttl=1800.0, at=clock["now"])
+    assert state.persist_ok is False
+    assert state._written_since_load, "the refused write was remembered"
+
+    state.refresh()
+    assert state._written_since_load == {}, "refresh() drops what the cache drops"
+    backend.readable = True
+    assert state.timestamps("loop:j1", ttl=1800.0) == [], "the operator asked for the backend's answer"

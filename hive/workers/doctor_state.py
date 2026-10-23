@@ -474,6 +474,11 @@ class DurableStateStore:
         with self._lock:
             self._loaded_at = None
             self._cache = {}
+            # The unpersisted records go WITH the cache. This is the operator's
+            # "believe the backend from scratch", so merging them back over the
+            # loaded state would put back precisely what it was asked to drop —
+            # and, unlike an unattended reload, nobody is left to be confused by it.
+            self._written_since_load = {}
 
     # ── internals ──────────────────────────────────────────────────────
 
@@ -616,34 +621,37 @@ class DurableStateStore:
             # one process's partial view. The counters stay in memory — which keeps
             # them CORRECT for this process — and the operator is told, because the
             # remedy is the backend's.
-            #
-            # Everything still in the cache at this moment is a record this process
-            # wrote and the backend refused, so it is exactly what the next load
-            # that SUCCEEDS must not drop. Snapshotted at this one choke point
-            # rather than at each write site, so `mark`/`touch`/`set_value`/
-            # `forget`/`clear` cannot each forget to record one. `refresh()` drops
-            # the cache and these with it, which is that method's documented job.
-            self._written_since_load.update(self._cache)
             log.warning(
                 "state has never loaded from %s; NOT writing, so the durable records survive. "
                 "The in-process limits hold; the durability does not until the backend answers.",
                 self.backend.name,
             )
             self.persist_ok = False
-            return
-        try:
-            self.persist_ok = bool(self.backend.save(self.namespace, self._cache))
-            if self.persist_ok:
-                # The backend now holds everything the cache holds, so the records
-                # it refused have arrived. They no longer need merging over the next
-                # load, and keeping them would resurrect one the write path has since
-                # pruned as expired. A save that is refused or raises leaves them.
-                self._written_since_load.clear()
-            else:
-                log.warning("state save was not accepted; the counters are in memory only")
-        except Exception as error:  # noqa: BLE001 - see _ensure_loaded
-            self.persist_ok = False
-            log.warning("state save failed (%s); the in-process limits still hold", error)
+        else:
+            try:
+                self.persist_ok = bool(self.backend.save(self.namespace, self._cache))
+                if not self.persist_ok:
+                    log.warning("state save was not accepted; the counters are in memory only")
+            except Exception as error:  # noqa: BLE001 - see _ensure_loaded
+                self.persist_ok = False
+                log.warning("state save failed (%s); the in-process limits still hold", error)
+        # A record that is in the cache and NOT in the backend exists nowhere else,
+        # and the next load that succeeds replaces the cache — so every write the
+        # backend did not accept is remembered, whichever of the three ways it was
+        # not accepted: refused for never having loaded, refused as not accepted,
+        # or lost to an exception. A save that is refused on only SOME keys (the bus
+        # backend posts one message per key) leaves any of them behind, which is
+        # why the whole cache is snapshotted rather than the one key just written,
+        # and why it is snapshotted HERE — the one choke point every write path
+        # goes through, so `mark`/`touch`/`set_value`/`forget`/`clear` cannot each
+        # forget to record one.
+        if self.persist_ok:
+            # The backend now holds everything the cache holds, so those records
+            # have arrived and no longer need merging over the next load. Keeping
+            # them would resurrect one the write path has since pruned as expired.
+            self._written_since_load.clear()
+        else:
+            self._written_since_load.update(self._cache)
 
 
 def _newest_of(record: dict) -> float | None:
