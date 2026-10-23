@@ -1553,3 +1553,39 @@ def test_refresh_drops_the_unpersisted_records_with_the_cache(tmp_path):
     assert state._written_since_load == {}, "refresh() drops what the cache drops"
     backend.readable = True
     assert state.timestamps("loop:j1", ttl=1800.0) == [], "the operator asked for the backend's answer"
+
+
+def test_a_pruned_record_is_not_carried_by_the_snapshot(tmp_path):
+    """The snapshot of what the backend refused was accumulated with `update`.
+
+    `update` only ever adds, so a key the write path pruned as expired stayed in the
+    snapshot, and the merge handed it back over the loaded state. Every read that
+    passes a TTL filters it again, so no limit is extended — but `value()` reads
+    with no window and returns the record, and the next accepted write persists it
+    again. The snapshot is not a running total: at the moment of a refusal the whole
+    cache IS what the backend has not taken, so it is taken, not accumulated.
+    """
+    path = str(tmp_path / "s.json")
+    clock = {"now": 12_000_000.0}
+    backend = FlakyBackend(path)
+    state = DurableStateStore(backend, refresh_secs=0.0, time_fn=lambda: clock["now"])
+    state.mark("cooldown:zeroclaw", ttl=3600.0, at=clock["now"])
+    assert state.persist_ok is True
+
+    backend.writable = False
+    clock["now"] += 10
+    state.set_value("failures:hydra", "cycle failed", ttl=COUNTER_TTLS["failures"])
+    assert state.persist_ok is False
+    assert state.value("failures:hydra") == "cycle failed"
+
+    # Past the value's window, a write to another key prunes it from the cache.
+    clock["now"] += COUNTER_TTLS["failures"] + 1
+    state.mark("ssh:cerberus", ttl=3600.0, at=clock["now"])
+    assert "failures:hydra" not in state._cache, "the write path expired it"
+    assert "failures:hydra" not in state._written_since_load, "and the snapshot dropped it with it"
+
+    # A successful reload must not hand it back: `value()` reads with no window, so
+    # an resurrected record would be served as live.
+    backend.writable = True
+    assert state.value("failures:hydra") is None, "an expired record came back from the merge"
+    assert state.seen("ssh:cerberus", ttl=3600.0), "and the live one is still there"

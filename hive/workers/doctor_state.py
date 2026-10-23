@@ -651,7 +651,12 @@ class DurableStateStore:
             # them would resurrect one the write path has since pruned as expired.
             self._written_since_load.clear()
         else:
-            self._written_since_load.update(self._cache)
+            # TAKEN, not accumulated. At the moment of a refusal the whole cache is
+            # what the backend has not taken, so it replaces the snapshot rather
+            # than adding to it: `update` never removes, and a key the write path
+            # has since pruned as expired would otherwise stay here and be merged
+            # back over the loaded state on the next load that succeeds.
+            self._written_since_load = dict(self._cache)
 
 
 def _newest_of(record: dict) -> float | None:
