@@ -141,6 +141,10 @@ class JobOut(BaseModel):
     repo: str | None = None
     head_branch: str | None = None
     base_branch: str | None = None
+    # Submit-time branch admission (2026-10-25): the base_branch the worker
+    # will create head_branch FROM, set only when head_branch was absent on
+    # origin and base_branch existed there. NULL = nothing to create.
+    branch_created_from: str | None = None
     pr_number: int | None = None
     max_retries: int | None = None
     retry_count: int | None = None
@@ -157,6 +161,25 @@ class JobUpdate(BaseModel):
     status: str
     result: dict | None = None
     claimed_by: str | None = None
+    # SUBMITTER CANCELLATION (2026-10-25). A claimed job could only be updated
+    # by its claimant, so a submitter could not cancel or supersede its own job
+    # (an orchestrator had to force-DELETE the row and kill the worker). These
+    # two fields are the ONLY extra input that path accepts:
+    #
+    #   reason       -- why the job is being stopped; recorded on the audit row
+    #                   and in the job.cancelled event, so the claimant's
+    #                   operator can see who stopped it and why.
+    #   cancel_actor -- the urn claiming the cancellation. It is an identity
+    #                   CLAIM, authorized against the job's submitter_urn or,
+    #                   for an agent registered with the 'orchestrator'
+    #                   capability, cross-job authority. It never widens what a
+    #                   caller may write: any other field in the same request
+    #                   is refused for a non-claimant cancel.
+    #
+    # Both are optional and NULL for every existing caller (workers send
+    # neither), so this is backward-compatible.
+    reason: str | None = Field(None, max_length=2000)
+    cancel_actor: str | None = Field(None, max_length=255)
     tokens_in: int | None = None  # workers SHOULD report token usage on done/failed for cost audit
     tokens_out: int | None = None
     result_mnemos_id: str | None = None  # mem_XXX id where worker stored the outcome — closes provenance loop
@@ -172,6 +195,14 @@ class JobUpdate(BaseModel):
     claimed_provider: str | None = Field(None, max_length=128)
     claimed_runtime: str | None = Field(None, max_length=128)
     claimed_cost_tier: str | None = Field(None, max_length=128)
+
+    @field_validator("reason", "cancel_actor", mode="before")
+    @classmethod
+    def _strip_cancel_fields(cls, v):
+        if isinstance(v, str):
+            v = v.strip()
+            return v or None
+        return v
 
     @field_validator(
         "claimed_model",

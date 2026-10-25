@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   repo TEXT,                                    -- owner/name path on that site
   head_branch TEXT,                             -- branch / PR head to check out
   base_branch TEXT,                             -- optional upstream branch head_branch forks off (worker clones base_branch then creates head_branch locally if head_branch doesn't exist upstream)
+  branch_created_from TEXT,                     -- submit-time admission: base_branch the worker will create head_branch FROM (head_branch absent on origin, base present)
   pr_number INTEGER,                            -- PR/MR number (forge-specific ref scheme)
   project TEXT,                                 -- #10 FIX: separate project tag from capabilities (riskyeats/investorclaw/etc)
   status TEXT NOT NULL CHECK(status IN ('queued','offered','claimed','running','done','failed','failed_completion','cancelled','dead-letter','needs-review')),
@@ -400,6 +401,11 @@ class SqliteHiveRepository(HiveMindRepository):
                 # hive_worker.py on 4d4fc85 already reads job.get("base_branch") so the
                 # optional/nullable contract is the one it expects.
                 ("jobs", "base_branch", "base_branch TEXT"),
+                # branch_created_from (2026-10-25): the base_branch the worker will
+                # create head_branch from, recorded at SUBMIT when head_branch is
+                # absent on origin but base_branch exists (submit-time branch
+                # admission). NULL means "nothing to create".
+                ("jobs", "branch_created_from", "branch_created_from TEXT"),
                 ("jobs", "pr_number", "pr_number INTEGER"),
             )
             # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
@@ -663,10 +669,10 @@ class SqliteHiveRepository(HiveMindRepository):
         await db.execute(
             "INSERT INTO jobs (id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
             "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, preferred_providers, "
-            "preferred_models, mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, base_branch, pr_number, "
+            "preferred_models, mnemos_refs, depends_on, max_retries, dedup_hash, site, repo, head_branch, base_branch, branch_created_from, pr_number, "
             "status, started_at, ended_at, result, claimed_provider, claimed_model, claimed_cost_tier, "
             "estimated_cost_usd, result_mnemos_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 fields["id"],
                 fields["submitter_urn"],
@@ -690,6 +696,7 @@ class SqliteHiveRepository(HiveMindRepository):
                 fields.get("repo"),
                 fields.get("head_branch"),
                 fields.get("base_branch"),
+                fields.get("branch_created_from"),
                 fields.get("pr_number"),
                 fields.get("status", "queued"),
                 fields["started_at"],
@@ -1203,7 +1210,8 @@ class SqliteHiveRepository(HiveMindRepository):
         db = tx
         async with db.execute(
             "SELECT status, claimed_by, claimed_provider, claimed_model, retry_count, "
-            "max_retries, COALESCE(decline_count, 0), kind, repo, result FROM jobs WHERE id=?",
+            "max_retries, COALESCE(decline_count, 0), kind, repo, result, submitter_urn "
+            "FROM jobs WHERE id=?",
             (job_id,),
         ) as cur:
             return await cur.fetchone()
@@ -1309,6 +1317,12 @@ class SqliteHiveRepository(HiveMindRepository):
         ) as cur:
             r = await cur.fetchone()
         return r[0] if r else None
+
+    async def active_agent_models(self, tx: Transaction) -> list[dict[str, Any]]:
+        """``[{"model", "provider"}]`` for every non-offline agent (narrow read)."""
+        db = tx
+        async with db.execute("SELECT model, provider FROM agents WHERE status != 'offline'") as cur:
+            return [{"model": r[0], "provider": r[1]} for r in await cur.fetchall()]
 
     async def worker_stats_rows(
         self, tx: Transaction, *, kind: str | None, include_system: bool, top_n: int

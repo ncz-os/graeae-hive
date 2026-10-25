@@ -47,6 +47,10 @@ _ORACLE_JOB_ADDITIONS = {
     # addition is safe on BOTH a fresh HIVE_JOBS install and a legacy live
     # HIVE_JOBS table pre-dating the column.
     "BASE_BRANCH": "base_branch VARCHAR2(255)",
+    # branch_created_from (2026-10-25): submit-time branch admission records
+    # the base_branch the worker will create head_branch from when the head
+    # ref is absent on origin. Additive-only, same idempotent gate.
+    "BRANCH_CREATED_FROM": "branch_created_from VARCHAR2(255)",
 }
 _ORACLE_REQUIRED_JOB_COLUMNS = {
     "ID",

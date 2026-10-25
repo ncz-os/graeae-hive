@@ -35,6 +35,7 @@ from hive.bus.deps import (
     require_orchestrator_submitter,
     uuidv7,
 )
+from hive.bus.domain.branch_admission import branch_admission
 from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
     THROTTLE_HEADROOM,
@@ -66,6 +67,7 @@ from hive.bus.domain.jobs import (
     stable_worker_id,
     valid_completion_proof,
 )
+from hive.bus.domain.model_admission import admission_warnings, forbidden_model, served_model_names
 from hive.bus.domain.workspace import resolve_workspace_shadow
 from hive.bus.schemas import JobCreate, JobUpdate
 from hive.core.models import COST_TIERS
@@ -76,7 +78,8 @@ router = APIRouter()
 _JOB_COLUMNS = (
     "id, submitter_urn, parent_job_id, kind, description, priority, status, "
     "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, base_branch, pr_number, max_retries, retry_count, "
+    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, base_branch, "
+    "branch_created_from, pr_number, max_retries, retry_count, "
     "claimed_at, claim_lease_expires_at, last_update_at, claimed_model, claimed_provider, "
     "claimed_runtime, claimed_cost_tier, "
     # Fault 2026-10-17: JobCreate accepted these and the row carried them, but
@@ -104,6 +107,51 @@ def _result_model_author(result: Any) -> str | None:
         return None
     author = author.strip()
     return author or None
+
+
+#: Capability that marks an agent as an explicit cross-job actor (a human
+#: operator console or a triage authority). It is the ONLY second key that can
+#: cancel somebody else's claimed job, and it must be declared at registration
+#: — it is never inferred from a runtime or a role table.
+ORCHESTRATOR_CAPABILITY = "orchestrator"
+
+
+async def _has_orchestrator_capability(actor_urn: str | None, tx=None) -> bool:
+    """Whether ``actor_urn`` is REGISTERED and declares the orchestrator capability.
+
+    Identity always comes from the server-side ``agents`` row, never from the
+    request body: a caller cannot mint the right to cancel someone else's job
+    by writing ``cancel_actor``/``submitter_urn`` into the PATCH. An unknown or
+    unregistered urn is simply not orchestrator-capable.
+
+    ``tx`` is the caller's open transaction. Reusing it matters: opening a
+    second connection inside the PATCH transaction takes a second SQLite write
+    lock (deadlock risk) and a second pooled Db2/Oracle connection per cancel.
+    A connection is only opened when no transaction is supplied (direct calls).
+    """
+    urn = (actor_urn or "").strip()
+    if not urn:
+        return False
+    if tx is not None:
+        async with tx.execute("SELECT capabilities FROM agents WHERE urn=?", (urn,)) as cur:
+            row = await cur.fetchone()
+    else:
+        async with (
+            connect_db() as db,
+            db.execute("SELECT capabilities FROM agents WHERE urn=?", (urn,)) as cur,
+        ):
+            row = await cur.fetchone()
+    if not row:
+        return False
+    caps = row[0]
+    if isinstance(caps, str):
+        try:
+            caps = json.loads(caps)
+        except (TypeError, ValueError):
+            caps = None
+    if not isinstance(caps, list):
+        return False
+    return ORCHESTRATOR_CAPABILITY in {_norm_str(c) for c in caps if isinstance(c, str)}
 
 
 @router.get("/v1/jobs")
@@ -176,22 +224,23 @@ async def get_job(job_id: str):
         "repo": r[16],
         "head_branch": r[17],
         "base_branch": r[18],
-        "pr_number": r[19],
-        "max_retries": r[20],
-        "retry_count": r[21],
-        "claimed_at": r[22],
-        "claim_lease_expires_at": r[23],
-        "last_update_at": r[24],
-        "claimed_model": r[25],
-        "claimed_provider": r[26],
-        "claimed_runtime": r[27],
-        "claimed_cost_tier": r[28],
-        "preferred_providers": json.loads(r[29]) if r[29] else None,
-        "preferred_models": json.loads(r[30]) if r[30] else None,
-        "depends_on": json.loads(r[31]) if r[31] else None,
-        "project": r[32],
-        "max_cost_tier": r[33],
-        "mnemos_refs": json.loads(r[34]) if r[34] else None,
+        "branch_created_from": r[19],
+        "pr_number": r[20],
+        "max_retries": r[21],
+        "retry_count": r[22],
+        "claimed_at": r[23],
+        "claim_lease_expires_at": r[24],
+        "last_update_at": r[25],
+        "claimed_model": r[26],
+        "claimed_provider": r[27],
+        "claimed_runtime": r[28],
+        "claimed_cost_tier": r[29],
+        "preferred_providers": json.loads(r[30]) if r[30] else None,
+        "preferred_models": json.loads(r[31]) if r[31] else None,
+        "depends_on": json.loads(r[32]) if r[32] else None,
+        "project": r[33],
+        "max_cost_tier": r[34],
+        "mnemos_refs": json.loads(r[35]) if r[35] else None,
     }
 
 
@@ -313,6 +362,41 @@ async def create_job(req: JobCreate):
                 f"registered_agent_kinds={sorted(registered_aliases)!r}",
             )
 
+    # SUBMIT-TIME ADMISSION (2026-10-25): the two ways a job used to be
+    # accepted in a state it could not start from.
+    #
+    #  1. preferred_models: a forbidden model or a name no registered worker
+    #     serves silently fell back (e.g. to qwen38). A forbidden name is
+    #     rejected (422); an unserved name is ACCEPTED with a warning, because
+    #     a preference is not a requirement and a worker may register later.
+    #  2. head_branch: nine jobs died because the ref did not exist on the
+    #     ARGONAS remote. We now probe it here: present -> fine; missing with
+    #     a usable base_branch -> accepted and recorded as branch_created_from;
+    #     missing with no base -> 422 naming the ref.
+    warnings: list[str] = []
+    if req.preferred_models:
+        bad_models = [m for m in req.preferred_models if forbidden_model(m)]
+        if bad_models:
+            raise HTTPException(
+                422,
+                f"preferred_models contains forbidden model(s): {bad_models}. The fleet's "
+                "routing policy forbids these routes (they can never run); request a "
+                "served model or drop the preference.",
+            )
+        async with hive_repo().connection() as tx:
+            _agent_models = await hive_repo().active_agent_models(tx)
+        warnings.extend(admission_warnings(req.preferred_models, served_model_names(_agent_models)))
+
+    _branches = branch_admission(
+        repo=req.repo,
+        head_branch=req.head_branch,
+        base_branch=req.base_branch,
+    )
+    warnings.extend(_branches["warnings"])
+    if not _branches["ok"]:
+        raise HTTPException(422, _branches["detail"])
+    _branch_created_from = _branches["branch_created_from"]
+
     # GRAEAE permanent logjam-fix: SUBMIT-TIME WORKSPACE ADMISSION (SHADOW / log-only).
     try:
         _ws, _wsrc = resolve_workspace_shadow(req.kind, req.description, req.target_workspace, req.project)
@@ -375,6 +459,7 @@ async def create_job(req: JobCreate):
         repo=req.repo,
         head_branch=req.head_branch,
         base_branch=req.base_branch,
+        branch_created_from=_branch_created_from,
         pr_number=(int(req.pr_number) if req.pr_number is not None else None),
         started_at=now,
     )
@@ -424,6 +509,7 @@ async def create_job(req: JobCreate):
                 "source_job_id": cached["source_job_id"],
                 "result": cached["result"],
                 "result_mnemos_id": cached.get("result_mnemos_id"),
+                "warnings": warnings,
             }
         # role check moved to the top of create_job() so cache hits and cache
         # misses share the same enforcement.
@@ -458,7 +544,7 @@ async def create_job(req: JobCreate):
                 raise
             _row = await hive_repo().find_active_dedup_job(tx, dedup_hash=dedup_hash)
             if _row:
-                return {"id": _row[0], "created_at": _row[1], "coalesced": True}
+                return {"id": _row[0], "created_at": _row[1], "coalesced": True, "warnings": warnings}
             raise
         await emit_event(
             tx,
@@ -476,7 +562,17 @@ async def create_job(req: JobCreate):
             },
         )
         await tx.commit()
-    return {"id": job_id, "created_at": now, "mnemos_refs": req.mnemos_refs}
+    # ``warnings[]`` is the submitter-facing half of preferred_models /
+    # head_branch admission: a submitted preference no worker serves, or a
+    # branch that could not be verified, is reported here instead of being
+    # discovered as a silent fallback (or a dead job) later.
+    return {
+        "id": job_id,
+        "created_at": now,
+        "mnemos_refs": req.mnemos_refs,
+        "branch_created_from": _branch_created_from,
+        "warnings": warnings,
+    }
 
 
 @router.post("/v1/jobs/next")
@@ -751,6 +847,10 @@ async def update_job(job_id: str, req: JobUpdate):
         )
     original_claimed_by_was_set = field_was_set(req, "claimed_by")
     original_result_mnemos_was_set = field_was_set(req, "result_mnemos_id")
+    # `req.result` is normalized (assigned) further down, which ADDS "result" to
+    # model_fields_set. Capture the caller's intent now, so a submitter cancel
+    # is not refused for a field the caller never sent.
+    original_result_was_set = field_was_set(req, "result")
     # #3 FIX: Hallucination guard now surfaces failure_reason + exit_code=-2.
     halluc_reason = None
     completion_rejected = False
@@ -808,6 +908,7 @@ async def update_job(job_id: str, req: JobUpdate):
             job_kind,
             job_repo,
             existing_result,
+            job_submitter,
         ) = current
 
         # Preserve reviewer-owned keys across a worker's result write. The hive
@@ -827,6 +928,83 @@ async def update_job(job_id: str, req: JobUpdate):
                 for _rk in ("hive_reviews", "deepseek_reviews"):
                     if _prev.get(_rk) and not req.result.get(_rk):
                         req.result[_rk] = _prev[_rk]
+
+        # ---- SUBMITTER CANCELLATION (2026-10-25) -------------------------
+        # A submitter could not cancel or supersede its OWN claimed job: the
+        # claimant-only rule below answered 403 "job update requires claimed_by
+        # to match the current claimant", so an orchestrator had to force-DELETE
+        # the record and kill the worker process by hand.
+        #
+        # This grants exactly one field — status=cancelled with a reason — to
+        # two callers besides the claimant:
+        #   * the job's own submitter_urn;
+        #   * an agent carrying the explicit `orchestrator` capability
+        #     (a human operator / triage authority acting across jobs).
+        # Everything else stays claimant-only: the block below is scoped to
+        # `submitted_cancel`, and any non-status field the caller also sent is
+        # rejected rather than silently applied.
+        submitted_cancel = req.status == "cancelled" and req.claimed_by is None
+        cancel_actor = None
+        cancel_reason = None
+        cancel_authorized_by = None
+        if submitted_cancel:
+            if old_claimed_by is None:
+                # Nobody is holding it: there is no claim to override, and the
+                # unclaimed paths below (with their own authorization) must not
+                # be bypassed by a caller who omits claimed_by.
+                raise HTTPException(
+                    403,
+                    "cancelling an unclaimed job requires claimed_by to match the current claimant "
+                    "or its current status",
+                )
+            # ALLOWLIST, not a denylist. The elevation is exactly
+            # {status, reason, cancel_actor}; every other field the caller
+            # supplied is refused. A denylist silently let through fields the
+            # author forgot to enumerate (priority, repo, head_branch,
+            # base_branch, deadline, depends_on, ...), so a non-claimant could
+            # mutate routing/identity under the guise of a cancel.
+            _CANCEL_ALLOWED_FIELDS = frozenset({"status", "reason", "cancel_actor"})
+            # `result` is normalized by an unconditional assignment at line ~876,
+            # which adds it to fields_set whether or not the caller sent it.
+            # Trust the capture taken BEFORE that (original_result_was_set).
+            _supplied = set(req.model_fields_set) - {"result"}
+            if original_result_was_set:
+                _supplied.add("result")
+            _extra_fields = sorted(_supplied - _CANCEL_ALLOWED_FIELDS)
+            if _extra_fields:
+                raise HTTPException(
+                    403,
+                    "a submitter/orchestrator cancel may set only status, reason and cancel_actor; "
+                    f"refusing to also update {_extra_fields}",
+                )
+            # The actor is the caller-declared principal, but it is only an
+            # IDENTITY CLAIM: it must match the job's own submitter_urn, or the
+            # agent row for that urn must carry the orchestrator capability.
+            # Request-body fields can never widen that -- `submitter_urn` on the
+            # PATCH is deliberately NOT consulted (a caller cannot become the
+            # submitter by writing the field), and an unknown urn has no row,
+            # so it can never be orchestrator-capable.
+            cancel_actor = (req.cancel_actor or "").strip() or None
+            cancel_reason = (req.reason or "").strip() or None
+            if not cancel_actor:
+                raise HTTPException(
+                    403,
+                    "cancel requires claimed_by to match the current claimant, or cancel_actor naming "
+                    "the job's submitter_urn, or an agent registered with the 'orchestrator' capability",
+                )
+            is_own_submitter = isinstance(job_submitter, str) and bool(job_submitter) and cancel_actor == job_submitter
+            # Reuse the OPEN transaction: a second connection here would take a
+            # second SQLite write lock (deadlock risk) or a second pooled
+            # Db2/Oracle connection per cancel.
+            is_orchestrator = (not is_own_submitter) and await _has_orchestrator_capability(cancel_actor, tx)
+            if not (is_own_submitter or is_orchestrator):
+                raise HTTPException(
+                    403,
+                    "cancel requires claimed_by to match the current claimant, or the job's "
+                    "submitter_urn, or an agent with the 'orchestrator' capability; "
+                    f"actor={cancel_actor!r} submitter={job_submitter!r} claimant={old_claimed_by!r}",
+                )
+            cancel_authorized_by = "submitter" if is_own_submitter else "orchestrator-capability"
 
         if req.status not in STATUS_TRANSITIONS.get(old_status, set()):
             raise HTTPException(409, f"invalid status transition {old_status!r} -> {req.status!r}")
@@ -862,7 +1040,18 @@ async def update_job(job_id: str, req: JobUpdate):
                     f"claimed_by overwrite rejected: current={old_claimed_by!r} requested={req.claimed_by!r}",
                 )
 
-        if old_claimed_by and req.status in {"claimed", "running", "done", "failed", "cancelled"}:
+        # DEFECT 2026-10-25: this was the wall that made a submitter unable to
+        # cancel its own claimed job ("job update requires claimed_by to match
+        # the current claimant"), forcing a manual force-DELETE + worker kill.
+        # A `submitted_cancel` -- already authorized above against the job's
+        # submitter_urn or a registered orchestrator capability, and already
+        # restricted to status/reason/cancel_actor -- is the ONE case that may
+        # pass without matching the claimant. Everything else still must.
+        if (
+            old_claimed_by
+            and req.status in {"claimed", "running", "done", "failed", "cancelled"}
+            and not submitted_cancel
+        ):
             if not claimed_by_was_set or req.claimed_by != old_claimed_by:
                 raise HTTPException(403, "job update requires claimed_by to match the current claimant")
 
@@ -1138,20 +1327,57 @@ async def update_job(job_id: str, req: JobUpdate):
                             cached_at=time.time(),
                         )
 
+        # AUDIT: a submitter/orchestrator cancel is recorded with WHO did it and
+        # WHY, on the row's own transition. The claimant's own cancel keeps the
+        # claimant as actor, so the audit trail never hides a forced stop.
         await hive_repo().insert_job_audit(
             tx,
             job_id=job_id,
             ts=now,
-            actor_urn=req.claimed_by or old_claimed_by,
+            actor_urn=(cancel_actor if submitted_cancel else (req.claimed_by or old_claimed_by)),
             old_status=old_status,
             new_status="dead-letter" if dead_lettered else ("queued" if retried else req.status),
             old_claimed_by=old_claimed_by,
             new_claimed_by=None if release_to_queue else effective_claimed_by,
-            patch_json=json.dumps(patch_payload, default=str),
+            patch_json=json.dumps(
+                {
+                    **patch_payload,
+                    **(
+                        {
+                            "cancel": {
+                                "actor": cancel_actor,
+                                "reason": cancel_reason,
+                                "authorized_by": cancel_authorized_by,
+                                "claimant_observed": False,
+                            }
+                        }
+                        if submitted_cancel
+                        else {}
+                    ),
+                },
+                default=str,
+            ),
         )
         await tx.commit()
 
     async with hive_repo().connection() as event_tx:
+        if submitted_cancel:
+            # The claimant learns of the stop from its next heartbeat/update:
+            # the row is terminal, so its renewal PATCH gets a 409 and its
+            # worker shuts down cleanly (hive_worker stops on 403/409). The
+            # event makes that visible to dashboards in the meantime.
+            await emit_event(
+                event_tx,
+                "job.cancelled",
+                {
+                    "id": job_id,
+                    "actor": cancel_actor,
+                    "reason": cancel_reason,
+                    "authorized_by": cancel_authorized_by,
+                    "submitter": job_submitter,
+                    "previous_claimant": old_claimed_by,
+                },
+            )
         if req.status == "failed" and retry_count < max_retries:
             await emit_event(
                 event_tx,

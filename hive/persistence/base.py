@@ -174,7 +174,14 @@ class HiveMindRepository(ABC):
     ) -> int: ...
 
     @abstractmethod
-    async def job_update_context(self, tx: Transaction, job_id: str) -> Row | None: ...
+    async def job_update_context(self, tx: Transaction, job_id: str) -> Row | None:
+        """PATCH pre-read: status/claim/provenance/retry/decline/kind/repo/result/submitter.
+
+        ``submitter_urn`` is the last column so the PATCH handler can authorize a
+        submitter (or orchestrator-capable agent) cancellation of its own job
+        without a second query (defect 2026-10-25).
+        """
+        ...
 
     @abstractmethod
     async def job_stats_context(self, tx: Transaction, job_id: str) -> Row | None: ...
@@ -199,6 +206,17 @@ class HiveMindRepository(ABC):
 
     @abstractmethod
     async def active_orchestrator_urn(self, tx: Transaction) -> str | None: ...
+
+    @abstractmethod
+    async def active_agent_models(self, tx: Transaction) -> list[dict[str, Any]]:
+        """``[{"model", "provider"}]`` for every non-offline agent.
+
+        Feeds submit-time ``preferred_models`` admission (which model names
+        some registered worker can actually serve). Deliberately narrow: two
+        columns, no JSON parsing, so the check stays cheap on the hot submit
+        path and every backend can answer it with one indexed SELECT.
+        """
+        ...
 
     # ---- stats reads ----
     @abstractmethod
