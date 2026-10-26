@@ -1,0 +1,14 @@
+[Unit]
+Description=Run the DeepSeek month-to-date spend alert hourly
+
+[Timer]
+# Hourly, at :05 past, so the snapshot lands after the balance settles. A
+# persistent timer runs once at boot if a slot was missed while powered off.
+OnCalendar=*-*-* *:05:00
+Persistent=true
+RandomizedDelaySec=60
+AccuracySec=1min
+Unit=deepseek-spend-alert.service
+
+[Install]
+WantedBy=timers.target
