@@ -109,12 +109,23 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
   widen it) — `master` when it is unreadable, detached or malformed.
 - The slug comes from a **job string**, so it is treated as hostile:
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, no `.git` suffix, no `..`; the test is
-  `os.path.isdir(root/slug + ".git")` and a bare dir whose realpath escapes the
-  realpath of the root is refused (a planted symlink cannot redirect a worker's
-  push).
+  ONE `os.lstat(root/slug + ".git")` and the answer must be a directory. A
+  symlink is refused even when it points *inside* the root: `isdir` follows
+  links, so a planted `<slug>.git -> /elsewhere/x.git` would otherwise be
+  advertised and workers told to push there. Containment is
+  `os.path.commonpath([root, path]) == root` (not `startswith(root + os.sep)`,
+  which turns a root of `/` into `//` and declares everything contained). The
+  root itself may legitimately be a symlink — the NFS mount is one on some
+  hosts — and is used as given, so the child path is inside it by construction.
+  The slug is **normalized once** (leading/trailing space only; ARGONAS paths
+  are case-sensitive) before it is used as the cache key, the probed path and
+  the returned id, so `" x "` and `"x"` share one entry.
 - Results are cached in a small TTL cache (`_FallbackCache`): positives 60 s,
   negatives 10 s. The fallback never raises (an unreadable mount is a miss) and
-  costs one `stat` call per lookup. **One** lock guards the cache's ordered dict
+  costs **one `lstat` plus one `open`** of the bare repo's `HEAD` — no
+  directory listing, no git subprocess, and no stat of the root itself
+  (`os.path.abspath`, which does no I/O; `realpath` would stat every missing
+  component). A test counts them. **One** lock guards the cache's ordered dict
   and its order together — a single lock means no lock-order hazard and no
   eviction race, and it is held only for constant-time dict operations, so the
   probe runs with no lock held at all: a stalled mount delays just the caller
@@ -122,8 +133,11 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
   (single lock, unlocked probe, no race under 8 threads) have regression tests.
   On overflow the least-recently-used entry is evicted **one at a time**, so a
   flood of hostile job strings cannot erase every warm entry and stampede the
-  mount with re-probes. The cache hands back entries, never its internal
-  `(expires_at, entry)` bookkeeping.
+  mount with re-probes — one entry per insert, never a full clear. The cache
+  hands back entries, never its internal `(expires_at, entry)` bookkeeping.
+  The post-probe write is **store-if-absent** (compare-and-swap under the same
+  lock): a NEGATIVE answer computed before a repo existed cannot overwrite the
+  fresher POSITIVE answer another thread already cached.
 - Containment is `os.path.commonpath([root, path]) == root`, not a `startswith`
   of `root + os.sep` — the string form turns a root of `/` into `//` and would
   have declared every absolute path contained.

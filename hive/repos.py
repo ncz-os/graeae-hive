@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import threading
 import time
 from collections import OrderedDict
@@ -236,13 +237,29 @@ class _FallbackCache:
             self._entries.move_to_end(slug)
             return True, entry
 
-    def store(self, slug: str, ttl: float, entry: dict[str, Any] | None) -> None:
-        """Cache ``entry`` (possibly None) for ``ttl`` seconds, evicting only as needed."""
+    def store(self, slug: str, ttl: float, entry: dict[str, Any] | None, *, only_if_absent: bool = False) -> bool:
+        """Cache ``entry`` (possibly None) for ``ttl`` seconds; True when stored.
+
+        ``only_if_absent`` is the compare-and-swap the probe needs: the probe
+        runs with no lock held, so between a miss and this call another thread
+        may already have answered -- and a NEGATIVE answer computed before the
+        repo existed must never overwrite that fresher POSITIVE one. The check
+        and the insert happen under the same lock, so the decision is atomic.
+
+        At most ONE entry is evicted per insert (the LRU end), so concurrent
+        inserts at capacity cannot evict N entries for N inserts.
+        """
         with self._lock:
+            if only_if_absent and slug in self._entries:
+                expires_at, _ = self._entries[slug]
+                if expires_at > time.monotonic():  # a LIVE answer already exists
+                    return False
+                # expired: fall through and replace it
             self._entries[slug] = (time.monotonic() + ttl, entry)
             self._entries.move_to_end(slug)
             while len(self._entries) > self._max:
                 self._entries.popitem(last=False)  # the LRU end, one at a time
+            return True
 
     def clear(self) -> None:
         with self._lock:
@@ -276,15 +293,25 @@ def _valid_slug(slug: str) -> bool:
     return not slug.endswith(".git") and ".." not in slug
 
 
-def _bare_head_branch(bare_dir: str) -> str:
+def _read_text(path: str) -> str | None:
+    """The file's text, or None if it cannot be read. Never raises."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _bare_head_branch(bare_dir: str, head_text: str | None) -> str:
     """Default branch named by the bare repo's ``HEAD``, else ``"master"``.
 
-    Read as plain text (no git subprocess: the fallback must not block) and
-    validated as a branch name, because the file's content is remote state.
+    ``head_text`` is the HEAD file's content, which the caller reads with the
+    single open() its budget allows. It is nothing but text from the mount and
+    is validated as a branch name because of that.
     """
     try:
-        head = Path(bare_dir, "HEAD").read_text(errors="replace").strip()
-    except OSError:
+        head = (head_text or "").strip()
+    except Exception:  # noqa: BLE001 - defensive: never let a read break a lookup
         return "master"
     prefix = "ref: refs/heads/"
     if not head.startswith(prefix):
@@ -315,6 +342,19 @@ def _contained(path: str, root: str) -> bool:
         return False
 
 
+def _canonical_root(root: str) -> str:
+    """``root`` as an absolute, lexically-normal path WITHOUT stat-ing it.
+
+    ``os.path.realpath`` is not free: when the root does not exist yet it
+    resolves component by component, which is three stat calls per lookup on a
+    missing mount. ``abspath`` only does getcwd/expanduser, so the "one stat
+    call" budget holds. The root may legitimately BE a symlink (the NFS mount
+    is one on some hosts) and is not resolved here; a child that escapes is
+    refused by ``_contained`` on the same path we stat.
+    """
+    return os.path.abspath(root)
+
+
 def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
     """Synthesize a catalog-shaped entry for ``<root>/<slug>.git``, or None.
 
@@ -324,26 +364,27 @@ def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
     have workers push to) a repository outside ARGONAS.
     """
     try:
-        # Leading/trailing space is a submitter typo, not a different repo; the
-        # slug is matched exactly otherwise (never lowercased -- ARGONAS paths
-        # are case-sensitive, and returning a name the caller did not ask for
-        # would hand a worker the wrong id).
-        slug = (slug or "").strip()
         if not _valid_slug(slug):
             return None
-        root = argonas_git_root()
+        # Build the candidate from ONE canonical root (no stat), so containment
+        # is decided on exactly the path the directory test uses and a link
+        # cannot be swapped between two calls to point outside the root.
+        root = _canonical_root(argonas_git_root())
         bare = os.path.join(root, slug + ".git")
-        if not os.path.isdir(bare):
+        if not _contained(bare, root):  # belt and braces: the slug is already safe
             return None
-        # Never follow a link out of the root: a bare dir that resolves outside
-        # the (realpath'd) root is not an ARGONAS repo, so a planted link cannot
-        # make the bus advertise -- and workers push to -- anything else.
-        real_root = os.path.realpath(root)
-        real_bare = os.path.realpath(bare)
-        if not _contained(real_bare, real_root):
+        # THE one stat call. lstat, not isdir: isdir follows a symlink, so a
+        # planted `<slug>.git -> /elsewhere/x.git` would be reported as an
+        # ARGONAS repo and workers would be told to push there.
+        try:
+            st = os.lstat(bare)
+        except OSError:  # absent, or an unreadable/stalled mount
             return None
-        if not os.path.isdir(real_bare):
+        if not stat.S_ISDIR(st.st_mode):
             return None
+        # ONE read of the bare repo's HEAD: a single open()+read, no directory
+        # listing, no second stat, no subprocess.
+        head_text = _read_text(os.path.join(bare, "HEAD"))
         return {
             "id": slug,
             "display_name": slug,
@@ -352,25 +393,47 @@ def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
             "argonas_bare": bare,
             "clone_ssh": argonas_ssh_url(slug),
             "clone_nfs": argonas_nfs_path(slug),
-            "default_branch": _bare_head_branch(bare),
+            "default_branch": _bare_head_branch(bare, head_text),
             "status": "active",
         }
     except Exception:  # noqa: BLE001 - a broken mount must never break a lookup
         return None
 
 
+def _normalize_slug(slug: object) -> str:
+    """The cache/probe key for a job-supplied name: stripped, otherwise exact.
+
+    Leading/trailing space is a submitter typo, not a different repo. Nothing
+    else is rewritten: ARGONAS paths are case-sensitive, and answering for a
+    name the caller did not ask for would hand a worker the wrong id.
+    """
+    return slug.strip() if isinstance(slug, str) else ""
+
+
 def _fallback_entry(slug: str) -> dict[str, Any] | None:
     """Cached ARGONAS live lookup for one slug (positive 60 s, negative 10 s).
 
-    Three separate steps, so the lock is never held across filesystem I/O:
-    read the cache, probe (one stat, unlocked, no lock held at all), write the
-    cache. A stalled mount therefore delays only the caller that touched it.
+    The slug is normalized FIRST, so the cache key, the probed path and the
+    returned id are the same string -- otherwise ``" x "`` and ``"x"`` would
+    occupy different keys and re-probe each other.
+
+    Three separate steps, so the lock is never held across filesystem I/O: read
+    the cache, probe (unlocked, no lock held at all), write the cache. The write
+    is store-if-absent, so an answer computed before a repo was created cannot
+    overwrite a fresher one that another thread already cached. A stalled mount
+    therefore delays only the caller that touched it.
     """
-    hit, cached = _FALLBACK.lookup(slug)
+    key = _normalize_slug(slug)
+    if not key:
+        return None
+    hit, cached = _FALLBACK.lookup(key)
     if hit:
         return cached
-    entry = _probe_argonas_live(slug)
-    _FALLBACK.store(slug, _POSITIVE_TTL if entry is not None else _NEGATIVE_TTL, entry)
+    entry = _probe_argonas_live(key)
+    stored = _FALLBACK.store(key, _POSITIVE_TTL if entry is not None else _NEGATIVE_TTL, entry, only_if_absent=True)
+    if not stored:  # another thread answered while we probed: prefer its answer
+        hit, cached = _FALLBACK.lookup(key)
+        return cached if hit else entry
     return entry
 
 

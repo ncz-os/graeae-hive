@@ -83,6 +83,8 @@ class _FallbackCase(unittest.TestCase):
         base = Path(self.td.name)
         self.root = base / "argonas_git"
         self.root.mkdir()
+        self.outside = base / "outside"  # never inside the root
+        self.outside.mkdir()
         catalog = base / "repos.json"
         catalog.write_text(json.dumps(CATALOG))
         self._env = mock.patch.dict(
@@ -183,8 +185,7 @@ class HostileSlugTests(_FallbackCase):
 
     def setUp(self):
         super().setUp()
-        self.outside = Path(self.td.name) / "outside"
-        self.outside.mkdir()
+        self.outside.mkdir(exist_ok=True)
         _make_bare(self.outside, "escaped")
         _make_bare(self.root, "legit")
 
@@ -231,23 +232,19 @@ class HostileSlugTests(_FallbackCase):
         self.assertIsNone(repos.find_exact("escape"))
         self.assertIsNone(repos._probe_argonas_live("escape"))
 
-    def test_symlink_inside_the_root_still_works(self):
-        # A link that stays inside the root is followed and synthesized with
-        # the ID THE CALLER ASKED FOR -- never the link target's name.
+    def test_symlink_inside_the_root_is_refused(self):
+        # A link is not a repository, even when it points INSIDE the root: the
+        # directory test must be lstat, not isdir (isdir follows the link and
+        # would advertise whatever it points at). In-root links are refused
+        # too, so there is no "allowed symlink" category to reason about.
         _make_bare(self.root, "real-one", head="ref: refs/heads/main\n")
         os.symlink(self.root / "real-one.git", self.root / "alias-one.git")
-        entry = repos._probe_argonas_live("alias-one")
+        self.assertIsNone(repos._probe_argonas_live("alias-one"))
+        self.assertIsNone(repos.find_exact("alias-one"))
+        # the real directory is still served, by its own name
+        entry = repos._probe_argonas_live("real-one")
         self.assertIsNotNone(entry)
-        self.assertEqual(entry["id"], "alias-one")
-        self.assertEqual(entry["display_name"], "alias-one")
-        self.assertEqual(entry["argonas_bare"], str(self.root / "alias-one.git"))
-        self.assertEqual(
-            entry["clone_ssh"],
-            "ssh://jasonperlow@192.0.2.101/mnt/datapool/git/alias-one.git",
-        )
-        self.assertEqual(entry["default_branch"], "main")  # read through the link
-        self.assertEqual(entry["sources"], ["argonas-live"])
-        self.assertEqual(entry["status"], "active")
+        self.assertEqual(entry["default_branch"], "main")
 
     def test_whitespace_branch_names_are_rejected_through_the_probe(self):
         # Exercises the full _probe_argonas_live path (not just the helper), so
@@ -274,9 +271,25 @@ class HostileSlugTests(_FallbackCase):
         _make_bare(self.root, "refcheck", head="ref: refs/heads/feat/fine-name_1\n")
         self.assertEqual(repos._probe_argonas_live("refcheck")["default_branch"], "feat/fine-name_1")
 
+    def test_symlinked_root_still_finds_its_children(self):
+        # The ROOT being a symlink is legitimate (the NFS mount is one on some
+        # hosts). It is used as given, so the child path is
+        # <link>/<slug>.git -- inside the root by construction, whatever the
+        # link points at. Resolving it would cost a stat per lookup and would
+        # only move the check onto a path we do not stat.
+        _make_bare(self.root, "behind-link", head="ref: refs/heads/trunk\n")
+        link = self.outside / "root-link"
+        link.symlink_to(self.root)
+        with mock.patch.dict(os.environ, {"HIVE_ARGONAS_GIT_ROOT": str(link)}):
+            entry = repos._probe_argonas_live("behind-link")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["argonas_bare"], str(link / "behind-link.git"))
+        self.assertEqual(entry["id"], "behind-link")
+        self.assertEqual(entry["default_branch"], "trunk")  # README read through the link
+
     def test_symlinked_root_is_its_own_realpath(self):
-        # A legitimately symlinked MOUNT is fine: containment is compared in
-        # realpath space, not against the unresolved spelling.
+        # A legitimately symlinked MOUNT is fine: the child is joined onto the
+        # root as given, so it is inside by construction.
         link = Path(self.td.name) / "argonas_link"
         link.symlink_to(self.root)
         with mock.patch.dict(os.environ, {"HIVE_ARGONAS_GIT_ROOT": str(link)}):
@@ -315,6 +328,124 @@ class ContainmentTests(_FallbackCase):
         _make_bare(inner, "realdir")
         with mock.patch.dict(os.environ, {"HIVE_ARGONAS_GIT_ROOT": str(self.root)}):
             self.assertIsNone(repos._probe_argonas_live("nested"))
+
+
+class StatBudgetTests(_FallbackCase):
+    """The fallback must cost ONE stat call: the mount may be slow or stalled."""
+
+    def _spy(self, owner, name):
+        seen: list[str] = []
+        real = getattr(owner, name)
+
+        def spy(path, *a, **k):
+            seen.append(os.fspath(path))
+            return real(path, *a, **k)
+
+        return seen, spy
+
+    def test_hit_costs_exactly_one_stat_and_one_read(self):
+        _make_bare(self.root, "budgeted", head="ref: refs/heads/main\n")
+        stats, lstat_spy = self._spy(repos.os, "lstat")
+        reads, realpath_spy = self._spy(repos.os.path, "abspath")
+        files: list[str] = []
+        real_read = repos._read_text
+
+        def read_text(path):
+            files.append(path)
+            return real_read(path)
+
+        with (
+            mock.patch("hive.repos.os.lstat", side_effect=lstat_spy),
+            mock.patch("hive.repos.os.path.abspath", side_effect=realpath_spy),
+            mock.patch("hive.repos._read_text", side_effect=read_text),
+        ):
+            entry = repos._probe_argonas_live("budgeted")
+        self.assertIsNotNone(entry)
+        self.assertEqual(len(stats), 1, f"expected one stat, saw {stats}")
+        self.assertEqual(len(files), 1, f"expected one read, saw {files}")
+        self.assertEqual(entry["default_branch"], "main")
+
+    def test_miss_costs_one_stat_and_no_read(self):
+        stats, lstat_spy = self._spy(repos.os, "lstat")
+        files: list[str] = []
+        with (
+            mock.patch("hive.repos.os.lstat", side_effect=lstat_spy),
+            mock.patch("hive.repos._read_text", side_effect=lambda p: files.append(p)),
+        ):
+            self.assertIsNone(repos._probe_argonas_live("absent"))
+        self.assertEqual(len(stats), 1)
+        self.assertEqual(files, [])
+
+    def test_symlink_refused_at_the_same_one_stat(self):
+        os.symlink(self.outside / "escaped.git", self.root / "escape2.git")
+        stats, lstat_spy = self._spy(repos.os, "lstat")
+        with mock.patch("hive.repos.os.lstat", side_effect=lstat_spy):
+            self.assertIsNone(repos._probe_argonas_live("escape2"))
+        self.assertEqual(len(stats), 1)  # refused by the very stat that found it
+
+
+class NormalizationTests(_FallbackCase):
+    def test_padded_slug_uses_one_cache_key(self):
+        _make_bare(self.root, "padded")
+        self.assertIsNotNone(repos.find_exact("  padded  "))
+        self.assertEqual(list(repos._FALLBACK._entries), ["padded"])
+        self.assertIsNotNone(repos.find_exact("padded"))
+        self.assertEqual(list(repos._FALLBACK._entries), ["padded"])
+
+    def test_padded_negative_is_cached_once(self):
+        with mock.patch("hive.repos._probe_argonas_live", wraps=repos._probe_argonas_live) as probe:
+            self.assertIsNone(repos.find_exact("  late  "))
+            _make_bare(self.root, "late")
+            # still the cached NEGATIVE, for both spellings, not a second probe
+            self.assertIsNone(repos.find_exact("late"))
+            self.assertIsNone(repos.find_exact("  late  "))
+            self.assertEqual(probe.call_count, 1)
+
+    def test_non_string_slugs_answer_none(self):
+        for bad in (None, 7, b"bytes", ""):
+            self.assertIsNone(repos._fallback_entry(bad))
+            self.assertIsNone(repos._probe_argonas_live(bad))
+
+    def test_normalize_is_strip_only(self):
+        # Case and inner characters are ARGONAS-significant: never rewritten.
+        self.assertEqual(repos._normalize_slug("  Mixed.Case-1  "), "Mixed.Case-1")
+        self.assertEqual(repos._normalize_slug("x"), "x")
+
+
+class StoreIfAbsentTests(unittest.TestCase):
+    def test_a_stale_negative_never_overwrites_a_fresh_answer(self):
+        cache = repos._FallbackCache()
+        cache.store("slug", 60, {"id": "fresh"}, only_if_absent=True)
+        stored = cache.store("slug", 10, None, only_if_absent=True)
+        self.assertFalse(stored)
+        self.assertEqual(cache.lookup("slug"), (True, {"id": "fresh"}))
+
+    def test_an_expired_entry_is_replaced(self):
+        cache = repos._FallbackCache()
+        cache.store("slug", 10, {"id": "old"})
+        real = time.monotonic
+        with mock.patch("hive.repos.time.monotonic", lambda: real() + 11):
+            self.assertTrue(cache.store("slug", 60, None, only_if_absent=True))
+            self.assertEqual(cache.lookup("slug"), (True, None))
+
+    def test_losing_the_race_returns_the_other_threads_answer(self):
+        """Probe A started before the repo existed; B finished first with a hit."""
+        _make_bare = None
+        with mock.patch.object(repos, "_FALLBACK", repos._FallbackCache()):
+            repos._FALLBACK.store("raced", 60, {"id": "raced", "winner": "B"})
+            # A's probe says "miss", and its store must not win.
+            with mock.patch("hive.repos._probe_argonas_live", return_value=None):
+                repos._FALLBACK.lookup("raced")  # warm, so no probe happens at all
+                answer = repos._fallback_entry("raced")
+            self.assertEqual(answer["winner"], "B")
+
+    def test_eviction_removes_one_entry_per_insert(self):
+        cache = repos._FallbackCache(max_entries=2)
+        cache.store("a", 60, {})
+        cache.store("b", 60, {})
+        cache.store("c", 60, {})
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(list(cache._entries), ["b", "c"])
 
 
 class CatalogWinsTests(_FallbackCase):
