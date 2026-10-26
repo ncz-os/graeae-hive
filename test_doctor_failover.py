@@ -123,9 +123,6 @@ def doctor_defaults(monkeypatch):
     from hive.workers import doctor as _doctor
 
     yield importlib.reload(_doctor)
-    # Leave the module as other tests in this process expect to find it.
-    monkeypatch.undo()
-    importlib.reload(_doctor)
 
 
 # ─────────────────────────── repo defaults ───────────────────────────
@@ -171,7 +168,7 @@ def test_fix_base_env_override_still_wins(monkeypatch):
     try:
         assert importlib.reload(_doctor).DOCTOR_FIX_BASE_URL == ACHILLES
     finally:
-        monkeypatch.undo()
+        monkeypatch.delenv("DOCTOR_FIX_BASE_URL", raising=False)
         importlib.reload(_doctor)
 
 

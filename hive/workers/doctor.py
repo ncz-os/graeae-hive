@@ -164,6 +164,11 @@ DOCTOR_FALLBACK_MODELS: list[str] = [
 # Doctor v2 runs beside the existing doctor first.  Enforcing it is an
 # explicit operator switch after the side-by-side report has been reviewed.
 DOCTOR_V2_MODE = os.environ.get("DOCTOR_V2_MODE", "shadow").strip().lower()
+if DOCTOR_V2_MODE not in {"shadow", "enforce"}:
+    # Only "enforce" enforces; anything else (a typo like "enforced") runs shadow.
+    logging.getLogger("doctor").warning(
+        "DOCTOR_V2_MODE=%r is not 'shadow' or 'enforce'; running v2 in shadow mode", DOCTOR_V2_MODE
+    )
 DOCTOR_V2_RULES_PATH = os.environ.get(
     "DOCTOR_V2_RULES_PATH",
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs", "doctor_v2_rules.toml"),

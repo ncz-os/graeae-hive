@@ -317,3 +317,19 @@ def test_legacy_signature_resubmit_key_is_still_counted(monkeypatch):
     store.touch(legacy, doctor.SAME_SIGNATURE_RETRY_TTL)
     doctor._record_signature_resubmit("fix:hive-one", "sig-b")
     assert len(doctor._signature_resubmits("fix:hive-one", "sig-b")) == 2
+
+
+def test_unknown_v2_mode_warns_and_runs_shadow(monkeypatch, caplog):
+    import importlib
+    import logging
+
+    monkeypatch.setenv("DOCTOR_V2_MODE", "enforced")
+    with caplog.at_level(logging.WARNING, logger="doctor"):
+        reloaded = importlib.reload(doctor)
+    try:
+        assert reloaded.DOCTOR_V2_MODE == "enforced"
+        assert any("not 'shadow' or 'enforce'" in r.getMessage() for r in caplog.records)
+    finally:
+        # Only this test's env change is reverted; conftest's scratch state env stays.
+        monkeypatch.delenv("DOCTOR_V2_MODE", raising=False)
+        importlib.reload(doctor)
