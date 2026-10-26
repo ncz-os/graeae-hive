@@ -287,3 +287,33 @@ def test_cancel_also_cancels_child_jobs_of_the_purged_parents(monkeypatch):
     purge = [c for c in calls if c[0] == "/v1/jobs/purge"]
     assert purge and purge[0][1]["ids"] == ["a", "child1"]
     assert "child1" in out and "child2" not in out
+
+
+def test_same_signature_resubmits_survive_unrelated_writes_for_the_full_window(monkeypatch):
+    """The per-signature retry cap is a 30-day window. Under the old `failures:`
+    key prefix every unrelated write pruned it at the 1-day `failures` TTL."""
+    from hive.workers.doctor_state import DurableStateStore, MemoryBackend
+
+    clock = {"now": 1_000_000.0}
+    store = DurableStateStore(MemoryBackend(), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    monkeypatch.setattr(doctor, "STATE", store)
+
+    doctor._record_signature_resubmit("fix:hive-one", "sig-a")
+    clock["now"] += 3 * 86400  # past the 1-day `failures` window, inside 30 days
+    doctor.note_triage("fix:other")  # an unrelated write prunes the cache
+    assert len(doctor._signature_resubmits("fix:hive-one", "sig-a")) == 1
+
+    clock["now"] += 28 * 86400  # now past SAME_SIGNATURE_RETRY_TTL
+    doctor.note_triage("fix:other2")
+    assert doctor._signature_resubmits("fix:hive-one", "sig-a") == []
+
+
+def test_legacy_signature_resubmit_key_is_still_counted(monkeypatch):
+    from hive.workers.doctor_state import DurableStateStore, MemoryBackend
+
+    store = DurableStateStore(MemoryBackend(), refresh_secs=0.0)
+    monkeypatch.setattr(doctor, "STATE", store)
+    legacy = doctor._legacy_same_signature_retry_key("fix:hive-one", "sig-b")
+    store.touch(legacy, doctor.SAME_SIGNATURE_RETRY_TTL)
+    doctor._record_signature_resubmit("fix:hive-one", "sig-b")
+    assert len(doctor._signature_resubmits("fix:hive-one", "sig-b")) == 2

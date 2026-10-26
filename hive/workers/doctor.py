@@ -170,7 +170,12 @@ DOCTOR_V2_RULES_PATH = os.environ.get(
 )
 try:
     DOCTOR_V2_RULES = doctor_v2.load_rules(DOCTOR_V2_RULES_PATH)
-except (OSError, RuntimeError, ValueError):
+except (OSError, RuntimeError, ValueError) as _rules_error:
+    # v2 is then off (shadow and enforce alike) and the LLM path decides; say so,
+    # or DOCTOR_V2_MODE=enforce with a bad rules path looks like it is enforcing.
+    logging.getLogger("doctor").warning(
+        "doctor v2 rules not loaded from %s (%s); v2 decisions are disabled", DOCTOR_V2_RULES_PATH, _rules_error
+    )
     DOCTOR_V2_RULES = []
 
 
@@ -1928,8 +1933,7 @@ def _doctor_v2_decision(job: dict, base_kind: str, failed: list[dict]) -> doctor
         if isinstance(result.get("signature"), str):
             prior.append({"signature": result["signature"], "action": result.get("action")})
     snapshot = doctor_v2.collect_evidence(target, prior_actions=prior)
-    retry_key = _same_signature_retry_key(base_kind, snapshot.signature)
-    prior_resubmits = STATE.timestamps(retry_key, SAME_SIGNATURE_RETRY_TTL)
+    prior_resubmits = _signature_resubmits(base_kind, snapshot.signature)
     prior.extend({"signature": snapshot.signature, "action": "release_to_queue"} for _ in prior_resubmits)
     snapshot = doctor_v2.collect_evidence(target, prior_actions=prior)
     decision = doctor_v2.decide_rules(snapshot, DOCTOR_V2_RULES, retry_cap=_max_same_signature_resubmits())
@@ -1955,8 +1959,24 @@ def _doctor_v2_decision(job: dict, base_kind: str, failed: list[dict]) -> doctor
 
 
 def _same_signature_retry_key(base_kind: str, signature: str) -> str:
+    # Its own prefix, listed in COUNTER_TTLS at SAME_SIGNATURE_RETRY_TTL. Under the
+    # old `failures:` prefix the store pruned these records on the 1-day
+    # `failures` window at every unrelated write, so the 30-day cap was a 1-day cap.
+    digest = hashlib.sha256(base_kind.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"v2_resubmit:{digest}:{signature}"
+
+
+def _legacy_same_signature_retry_key(base_kind: str, signature: str) -> str:
+    """The pre-2026-10-26 key; still read so a deploy does not reset live counts."""
     digest = hashlib.sha256(base_kind.encode("utf-8", "replace")).hexdigest()[:16]
     return f"failures:doctor_v2_resubmit:{digest}:{signature}"
+
+
+def _signature_resubmits(base_kind: str, signature: str) -> list[float]:
+    """Every recorded resubmission of this signature inside the retry window."""
+    stamps = STATE.timestamps(_same_signature_retry_key(base_kind, signature), SAME_SIGNATURE_RETRY_TTL)
+    legacy = STATE.timestamps(_legacy_same_signature_retry_key(base_kind, signature), SAME_SIGNATURE_RETRY_TTL)
+    return sorted(set(stamps) | set(legacy))
 
 
 def _record_signature_resubmit(base_kind: str, signature: str) -> None:
@@ -2136,8 +2156,7 @@ def process_triage_job(job: dict) -> dict:
     # Residual release decisions must cite the original evidence and obey the
     # same durable per-signature retry ceiling as deterministic rules.
     residual_evidence = doctor_v2.collect_evidence(failed[0] if failed else job)
-    retry_key = _same_signature_retry_key(base_kind, residual_evidence.signature)
-    used_retries = len(STATE.timestamps(retry_key, SAME_SIGNATURE_RETRY_TTL))
+    used_retries = len(_signature_resubmits(base_kind, residual_evidence.signature))
     if "evidence_quote" in action or "quote" in action or action.get("action_type") == "release_to_queue":
         residual = doctor_v2.validate_llm_decision(
             action,

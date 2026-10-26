@@ -51,6 +51,7 @@ COUNTER_TTLS = {
     "host_cooldown": 1800.0,  # MIN_HOST_COOLDOWN
     "token_fix": 3600.0,  # TOKEN_FIX_WINDOW_SEC
     "failures": 86400.0,  # a repository's recorded cycle failures
+    "v2_resubmit": 30 * 86400.0,  # doctor SAME_SIGNATURE_RETRY_TTL
 }
 
 
