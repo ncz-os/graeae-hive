@@ -392,9 +392,10 @@ async def create_job(req: JobCreate):
     # `git ls-remote` (up to PROBE_TIMEOUT per ref); a blocking call here would
     # stall EVERY concurrent request (including /v1/jobs/next claims) on the
     # single-threaded bus loop. to_thread runs it in the default executor.
-    # Gated on head_branch: with no head there is nothing to probe or create,
-    # so skip the thread dispatch entirely.
-    if req.head_branch:
+    # Gated on head_branch AND repo: with no head there is nothing to probe
+    # or create, and with no repo there is no remote to probe — skip the
+    # thread dispatch (and the branch_not_verified warning) entirely.
+    if req.head_branch and req.repo:
         _branches = await asyncio.to_thread(
             branch_admission,
             repo=req.repo,
@@ -688,24 +689,18 @@ async def dequeue_next_job(agent_urn: str):
                         },
                     )
 
-            # DEPENDENCY ADMISSION (fault 2026-10-25): compute the blocked set
-            # over the SAME window the claim reads, so the exclusion cannot
-            # diverge from the candidate set. The exclusion is ADVISORY here —
-            # the binding gate is the in-transaction re-check inside
-            # claim_job, so a candidate that slips through (deps not yet done
-            # at scan time, or a stale pre-read) is still refused at the
-            # compare-and-set. The loop below re-checks every candidate's
-            # deps as a cheap, visible backstop (fail open: a candidate the
-            # pre-scan already excluded cannot reappear in the same read).
-            _pre = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW)
-            _blocked_dep_jobs = await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[r[0] for r in _pre])
-            candidates = await hive_repo().queued_candidates(
-                tx,
-                agent_urn=agent_urn,
-                now=now,
-                limit=CLAIM_SCAN_WINDOW,
-                unsatisfied_dep_job_ids=_blocked_dep_jobs,
-            )
+            # DEPENDENCY ADMISSION (fault 2026-10-25): ONE candidate scan,
+            # then the blocked set computed over that scan's ids and applied
+            # in Python — no second SQL scan on the hot path. The exclusion
+            # is ADVISORY here — the binding gate is the in-transaction
+            # re-check inside claim_job (the SAME _deps_all_done evaluation),
+            # so a candidate that slips through (deps not yet done at scan
+            # time, or a stale pre-read) is still refused at the
+            # compare-and-set.
+            candidates = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW)
+            _blocked_dep_jobs = await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[r[0] for r in candidates])
+            if _blocked_dep_jobs:
+                candidates = [r for r in candidates if r[0] not in _blocked_dep_jobs]
             # Role-aware ordering (hive.scheduler is the single source of truth).
             worker_profile = sched.worker_profile_from_metadata(
                 urn=agent_urn,
@@ -1546,26 +1541,29 @@ async def claim_job(job_id: str, by: str):
             raise HTTPException(409, f"job is in retry backoff until {j_retry_backoff_until} (now={now})")
 
         # PRE-READ GATE (2026-10-25): fail CLOSED on any non-empty depends_on
-        # whose entries are not all done — including malformed JSON and
-        # references to unknown job ids (a dep that does not exist can never
-        # reach done; the COUNT-based check answers 0 for a missing row, and
-        # 0 >= 1 is false, so the job stays blocked). The in-transaction
-        # re-check in claim_job repeats this under the write lock; the pre-read
-        # exists so the caller gets a named 409 naming the unsatisfied dep ids
-        # instead of the same refusal from inside the tx. Dep-free jobs (the
-        # common case) cost nothing here: the column is read in the context
-        # SELECT already, and NULL/empty means satisfied.
+        # whose entries are not all done — including malformed JSON, non-string
+        # entries, and references to unknown job ids (a dep that does not exist
+        # can never reach done, so completed_job_ids simply never lists it and
+        # the job stays blocked). The in-transaction re-check in claim_job
+        # repeats the SAME evaluation (_deps_all_done) under the write lock;
+        # the pre-read exists so the caller gets a named 409 naming the
+        # unsatisfied dep ids instead of the same refusal from inside the tx.
+        # Dep-free jobs (the common case) cost nothing here: the column is read
+        # in the context SELECT already, and NULL/empty means satisfied.
         if j_deps_json:
             _parsed_deps = None
             try:
                 _parsed_deps = json.loads(j_deps_json)
             except (TypeError, ValueError):
                 _parsed_deps = None
-            if not isinstance(_parsed_deps, list):
+            if not isinstance(_parsed_deps, list) or any(not isinstance(d, str) or not d.strip() for d in _parsed_deps):
                 raise HTTPException(
-                    409, f"job has unsatisfied DAG dependencies: {job_id} (depends_on is not a list of job ids)"
+                    409,
+                    f"job has unsatisfied DAG dependencies: {job_id} "
+                    "(depends_on must be a list of job-id strings; refusing to claim a job whose "
+                    "dependency set cannot be evaluated)",
                 )
-            _missing = sorted({str(d) for d in _parsed_deps if d is not None})
+            _missing = sorted({d.strip() for d in _parsed_deps})
             if _missing:
                 _done = await hive_repo().completed_job_ids(tx, ids=_missing)
                 _unsat = sorted(set(_missing) - _done)
