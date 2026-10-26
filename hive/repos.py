@@ -7,18 +7,35 @@ serves* it — it never hits the network.
 
 Replaces the hand-maintained ``~/.claude/PROJECT_LOCATIONS.md`` (now GENERATED
 from this catalog).
+
+The catalog is a BUILD ARTIFACT (last built 2026-10-15), so a repo created on
+ARGONAS afterwards has no entry — and there is no add-repo API, and the built
+file is root-owned on the bus host. On a catalog MISS only, :func:`_raw_entry`
+and :func:`find_exact` therefore fall back to a *synthesized* entry when a bare
+repo ``<slug>.git`` actually exists under the ARGONAS git root as this host
+sees it (``HIVE_ARGONAS_GIT_ROOT``, default: the ARGONAS NFS mount -- taken
+from ``hive.registry``, the one place the fleet spells that path). See
+:func:`_fallback_entry`.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
+from hive.registry import argonas_nfs_path, argonas_ssh_url
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CATALOG_PATH = _REPO_ROOT / "data" / "repos.json"
+
+# Source tag stamped on a synthesized (not-built-into-the-catalog) entry, so a
+# consumer can tell live-ARGONAS answers from catalog rows.
+LIVE_SOURCE = "argonas-live"
 
 
 def _catalog_path(path: str | os.PathLike | None = None) -> Path:
@@ -138,6 +155,14 @@ def list_repos(
     source: str | None = None,
     host: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Filtered view of the BUILT catalog.
+
+    Catalog-only ON PURPOSE: it never consults the ARGONAS live fallback. This
+    is an index over an artifact, and walking the mount to enumerate it would
+    turn a cheap read into a network filesystem sweep on every dashboard poll.
+    A repo created after the build is reachable by id (:func:`get_repo` /
+    ``GET /v1/repos/{id}``), not by listing.
+    """
     out = []
     for entry in load_catalog().values():
         if status and entry.get("status", "active") != status:
@@ -154,17 +179,142 @@ def list_repos(
     return sorted(out, key=lambda e: e["id"])
 
 
+# --------------------------------------------------------------------------- #
+# ARGONAS live fallback (catalog MISS only)
+# --------------------------------------------------------------------------- #
+# A job's `repo` is an arbitrary string from the submitter, so the slug is
+# validated as hostile input before it is ever joined onto a path: no
+# separators, no traversal, no `.git` suffix (callers pass the bare name).
+_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+# Branches that must not be treated as repo state.
+_PSEUDO_BRANCHES = frozenset({"HEAD", "refs"})
+_POSITIVE_TTL = 60.0  # bare repos appear rarely; a minute is plenty
+_NEGATIVE_TTL = 10.0  # short: a repo created just now must not be denied long
+# (slug) -> (expires_at, entry-or-None); cleared wholesale past _FALLBACK_MAX.
+_FALLBACK_MAX = 256
+_FALLBACK: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_FALLBACK_LOCK = threading.Lock()
+
+
+def argonas_git_root() -> str:
+    """The ARGONAS bare-repo root as THIS host sees it (env override, else the NFS mount)."""
+    env = (os.environ.get("HIVE_ARGONAS_GIT_ROOT") or "").strip()
+    return env or os.path.dirname(argonas_nfs_path("x"))
+
+
+def _valid_slug(slug: str) -> bool:
+    if not _SLUG_RE.match(slug or ""):
+        return False
+    return not slug.endswith(".git") and ".." not in slug
+
+
+def _bare_head_branch(bare_dir: str) -> str:
+    """Default branch named by the bare repo's ``HEAD``, else ``"master"``.
+
+    Read as plain text (no git subprocess: the fallback must not block) and
+    validated as a branch name, because the file's content is remote state.
+    """
+    try:
+        head = Path(bare_dir, "HEAD").read_text(errors="replace").strip()
+    except OSError:
+        return "master"
+    prefix = "ref: refs/heads/"
+    if not head.startswith(prefix):
+        return "master"  # detached HEAD, garbage, or unreadable
+    name = head[len(prefix) :].strip()
+    if not name or len(name) > 200 or ".." in name or name in _PSEUDO_BRANCHES:
+        return "master"
+    for part in name.split("/"):
+        if part in ("", ".", "..") or part == "HEAD" or part.startswith(".") or part.endswith(".lock"):
+            return "master"
+        if any(ch.isspace() or ch in "~^:?*[\\" for ch in part):
+            return "master"
+    return name
+
+
+def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
+    """Synthesize a catalog-shaped entry for ``<root>/<slug>.git``, or None.
+
+    Never raises: an unreadable/absent mount (or a root that is not a directory)
+    answers None, exactly like a miss. Symlinks are refused when they resolve
+    outside the real root, so a planted link cannot make the bus advertise (and
+    have workers push to) a repository outside ARGONAS.
+    """
+    try:
+        # Leading/trailing space is a submitter typo, not a different repo; the
+        # slug is matched exactly otherwise (never lowercased -- ARGONAS paths
+        # are case-sensitive, and returning a name the caller did not ask for
+        # would hand a worker the wrong id).
+        slug = (slug or "").strip()
+        if not _valid_slug(slug):
+            return None
+        root = argonas_git_root()
+        bare = os.path.join(root, slug + ".git")
+        if not os.path.isdir(bare):
+            return None
+        # Never follow a link out of the root: a bare dir that resolves outside
+        # the (realpath'd) root is not an ARGONAS repo, so a planted link cannot
+        # make the bus advertise -- and workers push to -- anything else.
+        real_root = os.path.realpath(root)
+        real_bare = os.path.realpath(bare)
+        if real_bare != real_root and not real_bare.startswith(real_root + os.sep):
+            return None
+        if not os.path.isdir(real_bare):
+            return None
+        return {
+            "id": slug,
+            "display_name": slug,
+            "aliases": [],
+            "sources": [LIVE_SOURCE],
+            "argonas_bare": bare,
+            "clone_ssh": argonas_ssh_url(slug),
+            "clone_nfs": argonas_nfs_path(slug),
+            "default_branch": _bare_head_branch(bare),
+            "status": "active",
+        }
+    except Exception:  # noqa: BLE001 - a broken mount must never break a lookup
+        return None
+
+
+def _fallback_entry(slug: str) -> dict[str, Any] | None:
+    """Cached ARGONAS live lookup for one slug (positive 60 s, negative 10 s)."""
+    now = time.monotonic()
+    with _FALLBACK_LOCK:
+        hit = _FALLBACK.get(slug)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    entry = _probe_argonas_live(slug)  # one stat call, outside the lock
+    ttl = _POSITIVE_TTL if entry is not None else _NEGATIVE_TTL
+    with _FALLBACK_LOCK:
+        if len(_FALLBACK) >= _FALLBACK_MAX:  # job strings are hostile: never grow unbounded
+            _FALLBACK.clear()
+        _FALLBACK[slug] = (time.monotonic() + ttl, entry)
+    return entry
+
+
+def clear_fallback_cache() -> None:
+    """Drop cached ARGONAS live lookups (tests, and after creating a bare repo)."""
+    with _FALLBACK_LOCK:
+        _FALLBACK.clear()
+
+
 def _raw_entry(repo_id: str) -> dict[str, Any] | None:
-    """Raw cached catalog entry (not through to_dict). Exact id first, then alias."""
+    """Raw cached catalog entry (not through to_dict). Exact id first, then alias.
+
+    On a catalog MISS only, falls back to a synthesized entry for a bare
+    ``<slug>.git`` that exists on ARGONAS right now (:func:`_fallback_entry`).
+    """
     catalog = load_catalog()
     entry = catalog.get(repo_id)
-    if entry is None:
+    if entry is None and isinstance(repo_id, str):
         key = repo_id.strip().lower()
         for candidate in catalog.values():
             names = {candidate["id"].lower(), (candidate.get("display_name") or "").lower()}
             names |= {a.lower() for a in candidate.get("aliases", [])}
             if key in names:
                 return candidate
+    if entry is None:
+        return _fallback_entry(repo_id)
     return entry
 
 
@@ -181,6 +331,14 @@ def find_exact(repo_id: str) -> dict[str, Any] | None:
     by SUBSTRING -- callers that need "is this repo genuinely in the catalog"
     (e.g. the decline classifier) would wrongly treat an absent repo as
     present. This helper only ever returns rank-0 matches.
+
+    On a catalog MISS it falls back to the ARGONAS live entry (see
+    :func:`_fallback_entry`), so a repo created after the catalog build is
+    reported as present. That is the INTENDED effect on
+    ``hive.bus.domain.jobs.repo_in_catalog``: a ``no_repo_mapping`` decline for
+    such a repo is a STALE-CLIENT/deploy-drift signal (requeue and route), not
+    a genuinely-absent repo that should burn the dead-letter budget. Only a
+    slug with no bare repo on ARGONAS stays "absent".
     """
     key = (repo_id or "").strip()
     if not key:
@@ -195,7 +353,10 @@ def find_exact(repo_id: str) -> dict[str, Any] | None:
         names |= {a.lower() for a in (candidate.get("aliases") or [])}
         if lowered in names:
             return candidate
-    return None
+    # Catalog MISS only: a bare repo created on ARGONAS after the build is a
+    # real repo, and workers must be able to clone it. Exact slug only -- the
+    # fallback never fuzzy-matches.
+    return _fallback_entry(key)
 
 
 def resolve(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
@@ -203,6 +364,9 @@ def resolve(query: str, *, limit: int = 25) -> list[dict[str, Any]]:
 
     Result count is capped at ``limit`` so a short query cannot return the
     whole catalog.
+
+    Catalog-only ON PURPOSE (see :func:`list_repos`): the ARGONAS live fallback
+    is an exact-id answer, never a search index.
     """
     q = query.strip().lower()
     if not q:

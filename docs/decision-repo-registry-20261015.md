@@ -86,8 +86,51 @@ mirror to be regenerated.
 - Runtime state (last-seen commit, health) can layer on later if needed.
 - `PROJECT_LOCATIONS.md --format md` emitter.
 
+## Late-binding: repos created after the build (`hive/repos.py`)
+
+The catalog is an artifact, so a repo created on ARGONAS after a build has no
+row — and jobs for it failed with `no_repo_mapping` / `no_private_remote` at the
+worker. There is no add-repo API, and on the bus host `data/repos.json` is
+root-owned, so "just rebuild or edit it" is not available to the service. The
+bus therefore answers from ARGONAS itself on a **catalog MISS only**:
+
+- `_raw_entry` (behind `get_repo` → `GET /v1/repos/{id}`) and `find_exact` fall
+  back to a *synthesized* entry when the bare repo `<slug>.git` exists under the
+  ARGONAS git root **as the bus host sees it** (`HIVE_ARGONAS_GIT_ROOT`,
+  default `/mnt/argonas_git`). Fields: `id`/`display_name` = the slug,
+  `aliases: []`, `sources: ["argonas-live"]`, `argonas_bare`, `clone_ssh` and
+  `clone_nfs` built from the `hive/registry.py` constants (one spelling only —
+  never a second copy of the user/host/path), `status: "active"`, and
+  `default_branch` read from the bare repo's `HEAD`
+  (`ref: refs/heads/<name>`, validated) — `master` when it is unreadable,
+  detached or malformed.
+- The slug comes from a **job string**, so it is treated as hostile:
+  `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, no `.git` suffix, no `..`; the test is
+  `os.path.isdir(root/slug + ".git")` and a bare dir whose realpath escapes the
+  realpath of the root is refused (a planted symlink cannot redirect a worker's
+  push).
+- Results are cached in a small locked dict: positives 60 s, negatives 10 s. The
+  fallback never raises (an unreadable mount is a miss) and costs one `stat` call
+  per lookup; it runs lock-free so a stalled mount cannot serialize the bus.
+- **A catalog entry always wins** — the fallback is a MISS path, never an
+  override, so curated fields (forge facets, branch, commands, live host) can
+  never be replaced by synthesized ones.
+- `list_repos` and `resolve` stay **catalog-only**: they are an index over an
+  artifact, and enumerating the mount would turn a dashboard poll into a network
+  filesystem sweep. A late repo is reachable by id, not by listing.
+- `find_exact` feeds `hive.bus.domain.jobs.repo_in_catalog`, so a
+  `no_repo_mapping` decline for a late repo now counts as *stale client* drift
+  (requeue/route) instead of a genuinely-absent repo burning the dead-letter
+  budget. That is intended and noted in the docstring.
+- Error and no write path: the synthesized entry only advertises a repo that is
+  already there; nothing is created or edited.
+
+Tests: `test_repo_argonas_fallback.py` (hit/miss, hostile slugs, symlink escape,
+catalog-wins, unreadable root, negative-cache expiry, and a contrast run against
+the pre-fallback `hive/repos.py`).
+
 ## Refs
 
 - `hive/registry.py` (discovery + merge), `hive/repos.py` (load + query)
 - `scripts/build_repo_registry.py`, `data/repos_overlay.json`, `data/repos.json`
-- `test_repo_registry.py` (12 tests)
+- `test_repo_registry.py` (12 tests), `test_repo_argonas_fallback.py` (after-the-build repos)
