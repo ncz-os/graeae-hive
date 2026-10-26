@@ -95,7 +95,8 @@ cost_tier = "A"
 
 # ── per-MTok rates (USD input/output) + per-model routing facts ─────────────
 # `routes` names the consumers allowed to select the model:
-#   "knemon"          -> KNEMON_PROVIDERS (the bus's cost-aware router)
+#   "knemon"          -> [router.providers] in the generated zoder.toml (the bus
+#                        no longer routes on it; its /v1/knemon router was removed)
 #   "zoder.coder" / "zoder.reviewer" / "zoder.reviewer.backup"
 #   "zeroclaw.default"
 # `knemon_alias`/`knemon_tier` only apply when "knemon" is in routes.

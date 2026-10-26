@@ -889,31 +889,6 @@ async function refreshHosts(){
   }
 }
 
-let _capState=null;
-async function refreshCapBanner(){
-  try{const d=await api('GET','/v1/knemon/cap');_capState=d.capped?d:null;renderCapBanner();}catch(_){}
-}
-function renderCapBanner(){
-  const el=document.getElementById('cap-banner');if(!el)return;
-  const rem=Math.max(0,Math.round(((_capState&&_capState.capped_until)||0)-Date.now()/1000));
-  if(rem<=0){el.style.display='none';return;}
-  const h=Math.floor(rem/3600),m=Math.floor((rem%3600)/60),sc=rem%60;
-  // Build the static text ONCE per state change; the 1s tick only updates the
-  // countdown node (was: full innerHTML rebuild every second).
-  const key=(_capState&&_capState.capped_until)+'|'+(_capState&&_capState.model)+'|'+(_capState&&_capState.reporter)+'|'+(_capState&&_capState.hit_at);
-  if(el.dataset.capkey!==key){
-    const hit=_capState.hit_at?new Date(_capState.hit_at*1000).toLocaleTimeString():'unknown time';
-    const model=_capState.model?esc(_capState.model):'unknown model';
-    const reporter=_capState.reporter?(' by '+esc(_capState.reporter)):'';
-    el.innerHTML='\u23f3 <b>OpenAI OAuth cap reported, unverified</b> \u2014 '+model+reporter+' reported usage_limit at <b>'+esc(hit)+'</b>. Most jobs route fallback; ~5% are OAuth probes. Auto-clear in <b id="cap-countdown"></b> unless a success report clears it first.';
-    el.dataset.capkey=key;
-  }
-  const cd=document.getElementById('cap-countdown');
-  if(cd) cd.textContent=h+'h '+String(m).padStart(2,'0')+'m '+String(sc).padStart(2,'0')+'s';
-  el.style.display='block';
-}
-setInterval(renderCapBanner,1000);
-
 // ── refresh scheduling ────────────────────────────────────────────────
 // ONE in-flight refreshAll at a time; SSE events and the poll both funnel
 // through scheduleRefresh() which coalesces bursts into a single run.
@@ -928,7 +903,7 @@ async function refreshAll(){
   document.getElementById('meta-time').textContent=`last refresh ${new Date().toLocaleTimeString()} · auto 8s`;
   try{
     await Promise.all([
-      refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),refreshCapBanner(),
+      refreshRunning(),refreshAgents(),refreshJobs(),refreshResults(),
       refreshFailed(),refreshCosts(),refreshWorkers(),refreshSchedules(),
       refreshHosts(),refreshGPU(),
     ]);

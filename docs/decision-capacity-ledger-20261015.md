@@ -2,6 +2,10 @@
 
 **Status:** Proposed (2026-10-15) · **Owner:** opencode · **Phase 5 of** `docs/refactor-plan-20261015.md`
 
+> **Update 2026-10-26:** the bus's KNEMON router, its OAuth-cap breaker
+> (`oauth_cap_state`, `/v1/knemon/cap`) and the bus `KNEMON_PROVIDERS` table
+> were removed. References below are to the code as it was on 2026-10-15.
+
 ## Problem
 
 KNEMON bookkeeps *budget* per **agent** (`plan_cap_usd` / `plan_period_used_usd`)

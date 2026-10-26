@@ -3,6 +3,11 @@
 **Date:** 2026-10-16  **Status:** proposed (kickoff)  **Phase:** refactor-plan Phase 6
 **Owner:** opencode  **Depends on:** FleetOps `gitops/fleet/zoder-config/`, `gitops/zeroclaw/config.audited.toml`
 
+> **Update 2026-10-26:** the bus's KNEMON router (`hive/bus/routers/knemon.py`,
+> `/v1/knemon/*`) and the bus `KNEMON_PROVIDERS` table were removed. The
+> registry's `"knemon"` route data still generates the `[router.providers]`
+> section of each host's zoder.toml. The text below is the original record.
+
 ## Problem
 
 Model/provider routing facts live in **three** places that drift independently:
