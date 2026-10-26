@@ -243,6 +243,7 @@ function showJobModal(job){
     if(r.commits&&r.commits.length)texts.push('COMMITS\n'+r.commits.map(c=>(c&&c.sha)?(c.sha.slice(0,10)+' '+(c.subject||'')):c).join('\n'));
     if(r.review)texts.push('REVIEW: '+(r.review.verdict||'?')+(r.review.model?' ['+r.review.model+']':'')+'\n'+(r.review.text||''));
     if(r.models)texts.push('MODELS\n'+JSON.stringify(r.models));
+    if(r.review_evidence)texts.push('REVIEWERS\n'+reviewerText(r));
     if(r.unreviewed)texts.push('\u26a0 UNREVIEWED: '+r.unreviewed);
     if(r.pushed_branch)texts.push('PUSHED BRANCH\n'+r.pushed_branch+(r.pushed_remote?(' @ '+r.pushed_remote):''));
     if(r.failure_reason)texts.push('FAILURE\n'+r.failure_reason);
@@ -435,6 +436,57 @@ function claimedModelLabel(j){
   return cm;
 }
 
+// ── reviewer record ───────────────────────────────────────────────────
+// result.review_evidence is written by the worker (2026-10-26) from the zoder
+// review/loop JSON: one entry per reviewer attempt in order, plus the candidates
+// the chain skipped and any warning (no named reviewer, author-family reviewer).
+// The FIRST reviewer is shown prominently, the rest (escalations, second
+// reviewers) and the skipped candidates underneath, in order. The display name
+// is built from the requested role, never from the response model id (llama-server
+// answers with its first alias whatever was asked).
+function _revVerdictColor(v){
+  v=String(v||'').toLowerCase();
+  return (v==='approve'||v==='approved')?'#7ee787':(v?'#ffb454':'#8b949e');
+}
+function reviewerBlock(j){
+  const ev=((j&&j.result)||{}).review_evidence;
+  if(!ev||typeof ev!=='object')return '';
+  const rs=Array.isArray(ev.reviewers)?ev.reviewers:[];
+  const line=(r,primary)=>{
+    const f=r.findings||{};
+    const fc=f.total?` · ${f.total} finding${f.total===1?'':'s'}`:'';
+    const why=r.escalation_reason?` · escalated: ${esc(r.escalation_reason)}`:'';
+    const style=primary?'font-size:.8em;margin-top:.2em;font-weight:600':'font-size:.74em;margin-top:.1em;padding-left:1.1em';
+    return `<div style="${style}">`
+      +`<span title="served model ${esc(r.model||'')} \u00b7 family ${esc(r.family||'unknown')}">${primary?'\ud83d\udd0d ':'\u21b3 '}${esc(r.display||r.model||'(unnamed)')}</span> `
+      +`<span style="color:${_revVerdictColor(r.verdict)}">${esc(r.verdict||'no verdict')}</span>${fc}${why}</div>`;
+  };
+  let h=rs.length?line(rs[0],true)
+    :'<div style="font-size:.78em;margin-top:.2em;color:#f85149">\u26a0 no named reviewer recorded</div>';
+  for(const r of rs.slice(1))h+=line(r,false);
+  for(const s of (Array.isArray(ev.skipped)?ev.skipped:[])){
+    h+=`<div class="dim" style="font-size:.72em;padding-left:1.1em">\u2298 ${esc(s.candidate||'?')} skipped: ${esc(s.reason||'unavailable')}</div>`;
+  }
+  for(const w of (Array.isArray(ev.warnings)?ev.warnings:[])){
+    h+=`<div style="font-size:.74em;color:#f85149">\u26a0 ${esc(w)}</div>`;
+  }
+  return h;
+}
+function reviewerText(r){
+  const ev=(r&&r.review_evidence);
+  if(!ev||typeof ev!=='object')return '';
+  const rs=Array.isArray(ev.reviewers)?ev.reviewers:[];
+  const out=rs.map((x,i)=>`${i===0?'FIRST':'THEN '} ${x.display||x.model||'(unnamed)'} [${x.model||'?'}, ${x.family||'unknown family'}]: ${x.verdict||'no verdict'}`
+    +((x.findings&&x.findings.total)?` (${x.findings.total} findings)`:'')
+    +(x.escalation_reason?` \u00b7 escalated: ${x.escalation_reason}`:''));
+  for(const s of (ev.skipped||[]))out.push(`SKIPPED ${s.candidate||'?'}: ${s.reason||'unavailable'}`);
+  for(const w of (ev.warnings||[]))out.push(`\u26a0 ${w}`);
+  const ch=ev.chunking||{};
+  if(ch.mode||ch.diff_bytes)out.push(`review diff: ${ch.diff_bytes||'?'} bytes, ${ch.mode||'?'}`);
+  return out.join('\n');
+}
+// ── end reviewer record ───────────────────────────────────────────────
+
 async function refreshResults(){
   const d=await api('GET','/v1/jobs?status=done&limit=20');
   const jobs=(d.jobs||[]).sort((a,b)=>(b.ended_at||0)-(a.ended_at||0));
@@ -493,6 +545,7 @@ async function refreshResults(){
       <div class="dim" style="font-size:.78em;margin-bottom:.25em">${esc((j.description||'').slice(0,80))}</div>
       <div class="rc-body">${esc(String(preview).slice(0,200))}</div>
       ${buildChips}
+      ${reviewerBlock(j)}
       ${commits}
     `;
     card.onclick=()=>showJobModal(j);
