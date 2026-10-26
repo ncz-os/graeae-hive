@@ -36,6 +36,7 @@ from hive.bus.deps import (
     require_orchestrator_submitter,
     uuidv7,
 )
+from hive.bus.domain import branch_admission as _ba_mod
 from hive.bus.domain.branch_admission import branch_admission
 from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
@@ -395,7 +396,13 @@ async def create_job(req: JobCreate):
     # Gated on head_branch AND repo: with no head there is nothing to probe
     # or create, and with no repo there is no remote to probe — skip the
     # thread dispatch (and the branch_not_verified warning) entirely.
-    if req.head_branch and req.repo:
+    # Pre-check the resolver on the request thread: resolve_remote_url is a
+    # catalog read (no git, no network), so it cannot stall the event loop.
+    # When no remote can be resolved there is nothing to probe — skip the
+    # thread dispatch entirely (the in-thread 'unprobed' state would warn for
+    # a common shape with no actionable content).
+    _probeable_remote = req.head_branch and req.repo and _ba_mod.resolve_remote_url(req.repo) is not None
+    if _probeable_remote:
         _branches = await asyncio.to_thread(
             branch_admission,
             repo=req.repo,
@@ -700,6 +707,12 @@ async def dequeue_next_job(agent_urn: str):
             candidates = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW)
             # Only candidates that actually carry a depends_on column need the
             # evaluation: dep-free jobs (the common case) cost nothing here.
+            # Index 15 is the depends_on column of queued_candidates (id=0,
+            # submitter_urn=1, parent_job_id=2, kind=3, description=4,
+            # priority=5, deadline=6, required_capabilities=7,
+            # eligible_kinds=8, eligible_hosts=9, project=10, max_cost_tier=11,
+            # preferred_providers=12, preferred_models=13, mnemos_refs=14,
+            # depends_on=15) — the same index the loop unpacks below.
             _dep_candidates = [r for r in candidates if r[15]]
             _blocked_dep_jobs = (
                 await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[r[0] for r in _dep_candidates])
