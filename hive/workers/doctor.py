@@ -63,6 +63,7 @@ from collections import deque
 # container still runs this module standalone.
 from hive.workers import doctor_gates
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
+from hive.workers import doctor_v2
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
 # C1: bus transport auth bearer token (env-sourced). The doctor SUBMITS jobs
@@ -105,7 +106,7 @@ LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
 # HYDRA (.78) / ACHILLES (.11) expose ROCm llama-server — usable as a LIGHT
 # orchestration model via DOCTOR_TRIAGE_BASE_URL / DOCTOR_OPENWEIGHT_BASE_URL.
 # NEVER the retired :4100.
-DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "gemma4-31b").strip().lower()
+DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "deepseek-flash").strip().lower()
 DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "gemma4-31b").strip().lower()
 DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "gemma4-31b").strip().lower()
 _PHASE_MODELS = {
@@ -115,7 +116,7 @@ _PHASE_MODELS = {
 }
 # OpenAI-compatible local endpoint: CERBERUS gemma4-31b (the durable brain).
 DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get("DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
-DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "gemma4-31b")
+DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "deepseek-flash")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
 DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
 # Per-phase bases. All default to CERBERUS; override any phase to a LIGHT model
@@ -150,6 +151,17 @@ DOCTOR_FALLBACK_MODELS: list[str] = [
     for m in os.environ.get("DOCTOR_FALLBACK_MODELS", "gemma4-e2b,gemma4-e2b,gemma4-31b").split(",")
     if m.strip()
 ]
+
+# Doctor v2 runs beside the existing doctor first.  Enforcing it is an
+# explicit operator switch after the side-by-side report has been reviewed.
+DOCTOR_V2_MODE = os.environ.get("DOCTOR_V2_MODE", "shadow").strip().lower()
+DOCTOR_V2_RULES_PATH = os.environ.get(
+    "DOCTOR_V2_RULES_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs", "doctor_v2_rules.toml")
+)
+try:
+    DOCTOR_V2_RULES = doctor_v2.load_rules(DOCTOR_V2_RULES_PATH)
+except (OSError, RuntimeError, ValueError):
+    DOCTOR_V2_RULES = []
 
 
 def _phase_model(phase: str) -> str:
@@ -234,6 +246,8 @@ DLQ_MAX_ATTEMPTS_PER_CYCLE = max(DLQ_MAX_PER_CYCLE, int(os.environ.get("DLQ_MAX_
 # Once a dead-letter job has a logged decision, don't re-decide it every cycle.
 _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
+NEEDS_REVIEW_SCAN_INTERVAL = float(os.environ.get("NEEDS_REVIEW_SCAN_INTERVAL", "3600"))
+NEEDS_REVIEW_OLDER_HOURS = float(os.environ.get("NEEDS_REVIEW_OLDER_HOURS", "24"))
 # Owner-protected dead-letter jobs (2026-10-17): another orchestrator asked that
 # its jobs be reported, not remediated. A dead-letter job whose kind starts with
 # one of these prefixes, or whose project is listed, is logged and left alone
@@ -711,8 +725,10 @@ def fetch_agent_registry_summary() -> dict:
 # ───────────────────────── Doctor LLM prompt ─────────────────────────
 DOCTOR_SYSTEM = """You diagnose Hive job failures. Return one JSON object with
 "action_type" (release_to_queue, no_action, or escalate), "confidence" (0..1),
-"reason" (diagnosis), and optional "release_eligible_kinds" drawn only from
-zeroclaw, opencode, zoder, claude. Release requires confidence at least 0.7.
+"reason" (diagnosis), "evidence_quote" (a verbatim substring of the supplied
+failure evidence), and optional "release_eligible_kinds" drawn only from
+zeroclaw, opencode, zoder, claude. Release requires confidence at least 0.7;
+if no supplied line supports a transient diagnosis, do not release.
 Do not call tools. Purges, restarts and fix tasks require deterministic decisions
 and exact operator approvals; they are not model-selectable actions.
 """
@@ -737,9 +753,10 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry:
         if fj.get("result"):
             try:
                 rd = json.loads(fj["result"]) if isinstance(fj["result"], str) else fj["result"]
-                txt = (rd.get("stdout") or rd.get("error") or "")[:400]
+                txt = " | ".join(str(rd.get(key) or "")[-4096:] for key in
+                                  ("failure_reason", "error", "tail", "stderr", "stdout") if rd.get(key))
                 exit_code = rd.get("exit_code")
-                result_preview = f"exit={exit_code} | {txt}"
+                result_preview = f"exit={exit_code} retry_count={fj.get('retry_count', rd.get('retry_count', 0))} | {txt[-16384:]}"
             except Exception:
                 result_preview = str(fj["result"])[:400]
         msg.append(
@@ -750,8 +767,11 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry:
         )
         if result_preview:
             msg.append(f"    result: {result_preview}")
+        msg.append(f"    host={fj.get('host') or fj.get('claimed_host') or ''} head_branch={fj.get('head_branch') or ''}")
     msg.extend(
         [
+            "EVIDENCE RULE: A release_to_queue decision MUST include evidence_quote exactly as supplied below.",
+            "An invented or absent quote is invalid and will be escalated.",
             "",
             "AGENT REGISTRY SUMMARY:",
             f"  by_kind: {json.dumps(registry.get('by_kind', {}))}",
@@ -1130,7 +1150,7 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
         return f"SSH timeout to {host}"
 
 
-def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
+def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 2) -> str:
     if not base_kind:
         return "resubmit_jobs missing base_kind"
     code, resp = _http("GET", "/v1/jobs?status=failed&limit=200")
@@ -1140,7 +1160,7 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 20) -> str:
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
     target_ids = [
         j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind and not dlq_protected(j)
-    ][: max(0, min(20, int(max_resubmits)))]
+    ][: max(0, min(2, int(max_resubmits)))]
     if not target_ids:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
@@ -1865,6 +1885,35 @@ def execute_sop_decision(job: dict) -> dict:
         return {"exit_code": 1, "stdout": f"REFUSED: invalid SOP decision ({error})"}
 
 
+def _doctor_v2_decision(job: dict, base_kind: str, failed: list[dict]) -> doctor_v2.Decision | None:
+    """Return a deterministic v2 decision from the failed-job evidence.
+
+    The current doctor remains the shadow comparator and executor until the
+    operator sets DOCTOR_V2_MODE=enforce.  Prior triage results are included
+    only as evidence; the v2 module never writes queue state itself.
+    """
+    if not DOCTOR_V2_RULES:
+        return None
+    target = failed[0] if failed else job
+    prior = []
+    for item in failed:
+        result = doctor_v2._result(item)
+        if isinstance(result.get("signature"), str):
+            prior.append({"signature": result["signature"], "action": result.get("action")})
+    snapshot = doctor_v2.collect_evidence(target, prior_actions=prior)
+    decision = doctor_v2.decide_rules(snapshot, DOCTOR_V2_RULES)
+    if decision:
+        decision = doctor_v2.Decision(
+            decision.action, decision.rule_id,
+            f"{decision.reason}; quote={decision.evidence_quote!r}",
+            decision.signature, decision.max_retries, decision.retry_scope,
+            decision.evidence_quote,
+        )
+        log.info("doctor v2 mode=%s base_kind=%s rule=%s action=%s signature=%s", DOCTOR_V2_MODE, base_kind,
+                 decision.rule_id, decision.action, decision.signature[:12])
+    return decision
+
+
 def process_triage_job(job: dict) -> dict:
     """Process either an explicit triage:<base_kind> job OR any other job whose
     eligible_kinds includes 'doctor'.  The user's directive (2026-05-26):
@@ -1924,6 +1973,24 @@ def process_triage_job(job: dict) -> dict:
 
     failed = fetch_failed_jobs_for_kind(base_kind, limit=10)
     registry = fetch_agent_registry_summary()
+
+    # Deterministic rules are evaluated before any model call.  In shadow mode
+    # they are logged and returned as comparison metadata while the established
+    # doctor continues to act; enforce mode uses only the fixed action set.
+    v2 = _doctor_v2_decision(job, base_kind, failed)
+    if v2 and DOCTOR_V2_MODE == "enforce":
+        released = False
+        if v2.action == "release_to_queue":
+            text, released = apply_release(job_id, is_explicit_triage, base_kind, None)
+        else:
+            text = "escalated to human"
+        return {
+            "exit_code": 0, "stdout": f"action={v2.action}; rule={v2.rule_id}; {text}",
+            "action": {"action_type": v2.action, "rule_id": v2.rule_id, "reason": v2.reason,
+                       "evidence_quote": v2.evidence_quote, "signature": v2.signature},
+            "base_kind": base_kind, "released_to_queue": released,
+            "v2": {"rule_id": v2.rule_id, "signature": v2.signature, "model": None},
+        }
 
     # ── Check known failure signatures BEFORE LLM call ──
     # If we match a known auto-fixable pattern (e.g. token mismatch),
@@ -2005,6 +2072,17 @@ def process_triage_job(job: dict) -> dict:
             "action_type": "escalate",
         }
 
+    # Residual decisions must cite the actual snapshot.  This also enforces the
+    # global same-signature retry ceiling when a rule did not match.
+    if "evidence_quote" in action or "quote" in action:
+        residual = doctor_v2.validate_llm_decision(
+            action, doctor_v2.collect_evidence(failed[0] if failed else job),
+            rule_cap=2,
+        )
+        if residual.action == "escalate" and (action.get("action") or action.get("action_type")) != "escalate":
+            action = {"action_type": "escalate", "reason": residual.reason,
+                      "evidence_quote": residual.evidence_quote, "signature": residual.signature}
+
     a = action.get("action_type", "no_action")
     try:
         conf = float(action.get("confidence", 0.0) or 0.0)
@@ -2038,6 +2116,9 @@ def process_triage_job(job: dict) -> dict:
         "base_kind": base_kind,
         "failed_count_seen": len(failed),
         "released_to_queue": released,
+        "v2_shadow": ({"rule_id": v2.rule_id, "action": v2.action, "signature": v2.signature,
+                        "old_action": a, "agree": v2.action == a}
+                       if v2 else None),
     }
 
 
@@ -2223,6 +2304,24 @@ def handle_dead_letter_queue() -> dict:
     return summary
 
 
+def fetch_needs_review_jobs(limit: int = 200) -> list[dict]:
+    """Fetch review backlog for the report-only sweep."""
+    code, response = _http("GET", f"/v1/jobs?status=needs-review&limit={int(limit)}", timeout=15.0)
+    if code != 200 or not response:
+        log.warning("fetch_needs_review http=%s", code)
+        return []
+    return list(response.get("jobs", []) or [])
+
+
+def report_needs_review_sweep() -> dict:
+    """Classify old needs-review jobs without cancelling, deleting, or retagging."""
+    rows = doctor_v2.sweep_needs_review(fetch_needs_review_jobs(), older_than_hours=NEEDS_REVIEW_OLDER_HOURS)
+    for row in rows:
+        log.info("needs-review report-only: %s", row)
+        broadcast_doctor_message("doctor.needs_review", {"host": AGENT_HOST, **row})
+    return {"scanned": len(rows), "rows": rows}
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -2236,6 +2335,7 @@ def main():
     last_hb = time.time()
     last_scan = 0.0
     last_dlq = 0.0
+    last_needs_review = 0.0
 
     while _running:
         try:
@@ -2252,6 +2352,13 @@ def main():
                     log.info("dlq scan: %s (apply=%s)", s, DLQ_APPLY)
                 except Exception as e:
                     log.warning("dlq scan error: %s", e)
+
+            if now - last_needs_review >= NEEDS_REVIEW_SCAN_INTERVAL:
+                last_needs_review = now
+                try:
+                    log.info("needs-review sweep: %s", report_needs_review_sweep())
+                except Exception as e:
+                    log.warning("needs-review sweep error: %s", e)
 
             # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
             if now - last_scan >= SCAN_INTERVAL:
