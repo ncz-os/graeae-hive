@@ -1,0 +1,24 @@
+[Unit]
+Description=EIH standing probe (hourly latency/failure sample of permitted open-weight models)
+Documentation=https://github.com/graeae/hive/blob/main/docs/eih-probe.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jasonperlow
+WorkingDirectory=/home/jasonperlow/graeae-hive
+# The key is read at run time only -- EIH_API_KEY from the environment, else the
+# same nvapi- key zoder keeps under ~/.zoder (see docs/eih-probe.md).
+# It is never printed, logged, or written to a row.
+Environment=EIH_PROBE_DIR=/home/jasonperlow/Projects/eih-probe
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m hive.tools.eih_probe
+# Failures are data: the tool exits 0 even when every probe fails, and non-zero
+# only for a configuration error. Worst case is 4 models x 2 attempts x 300 s.
+TimeoutStartSec=2600
+Restart=no
+# Modest hardening; the tool needs no privileges beyond writing its output dir.
+NoNewPrivileges=yes
+PrivateTmp=yes
+Nice=10

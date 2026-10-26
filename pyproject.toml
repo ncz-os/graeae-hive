@@ -33,6 +33,7 @@ packages = [
     "hive.harness",
     "hive.persistence",
     "hive.workers",
+    "hive.tools",
 ]
 
 [tool.ruff]
