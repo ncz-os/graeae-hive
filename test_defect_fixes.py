@@ -491,14 +491,12 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             # window pre-scan reads every candidate in ONE call (and the
             # windowed candidate scan re-reads them in a second call when the
             # pre-scan finds nothing blocked, as here). N candidates must
-            # never produce N calls: at most 2 calls, each covering its whole
-            # candidate set.
+            # never produce N calls.
             self.assertLessEqual(len(dep_calls), 2, dep_calls)
-            self.assertTrue(dep_calls and all(n >= 1 for n in dep_calls), dep_calls)
-            # Every candidate id is resolved in a SINGLE call (batched), not
-            # once per candidate: each call's id list is the whole candidate
-            # set for that read (3+ here), never one id per candidate.
-            self.assertGreaterEqual(sum(dep_calls), 3, dep_calls)
+            # Each call covers the WHOLE candidate set of its read: the scan
+            # here sees 3 queued jobs (dep-pending, blocked, ready), so every
+            # call must carry >= 3 ids, never one id per candidate.
+            self.assertTrue(dep_calls and all(n >= 3 for n in dep_calls), dep_calls)
 
     async def test_fresh_sqlite_has_dedup_column_and_active_unique_index(self):
         with tempfile.TemporaryDirectory() as td:

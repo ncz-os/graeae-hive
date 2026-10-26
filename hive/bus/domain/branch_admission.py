@@ -113,12 +113,27 @@ def valid_branch_name(name: str) -> bool:
     return all(part and not part.endswith(".lock") for part in n.split("/"))
 
 
+# Bare absolute paths are the ARGONAS NFS mount spelling for the fleet's bare
+# repos (``/mnt/datapool/git/...``). This is a DELIBERATE local-filesystem
+# exception — the bus host mounts the fleet's git server as NFS and the
+# catalog entries use the mount path, not a hostname. The threat model: a
+# catalog entry is operator-managed data, so the acceptance surface is the
+# catalog's, and the guardrail is the prefix allowlist below (never arbitrary
+# paths). ``file://`` URLs remain rejected: those are submitter-shaped input,
+# and a submit is not an excuse to read the bus host's disk.
+_NFS_BARE_ROOTS: tuple[str, ...] = ("/mnt/datapool/git/",)
+
+
 def valid_remote_url(url: str) -> bool:
     """Whether ``url`` may be handed to ``git ls-remote`` as a remote.
 
     Accepts ``ssh://``, ``git@host:path`` scp-style, ``https?://`` and
     ``git://``; rejects git's helper transports (``ext::``, ``fd::``,
     ``file://``) and anything with shell metacharacters or whitespace.
+
+    Bare absolute paths are accepted ONLY under ``_NFS_BARE_ROOTS`` (the
+    ARGONAS NFS mount of the fleet's bare repos) — never arbitrary local
+    paths, which is what the ``file://`` rejection is protecting against.
     """
     u = (url or "").strip()
     if not u or u != url or len(u) > 2048:
@@ -134,7 +149,7 @@ def valid_remote_url(url: str) -> bool:
     if "://" in u:
         return urlparse(u).scheme.lower() in _ALLOWED_SCHEMES
     # A bare absolute path to a local bare repo (ARGONAS NFS mount spelling).
-    return u.startswith("/")
+    return u.startswith(_NFS_BARE_ROOTS)
 
 
 def clear_probe_cache() -> None:

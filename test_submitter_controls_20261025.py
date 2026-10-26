@@ -491,9 +491,20 @@ class BranchAdmissionTests(unittest.TestCase):
             "ssh://a b/c",
             "ssh://evil/; rm -rf /",
             "",
+            # 2026-10-25: bare absolute paths are accepted ONLY under the
+            # ARGONAS NFS mount prefix, never arbitrary local paths.
+            "/etc",
+            "/root/.ssh/known_hosts",
+            "/srv/git/hive.git",
+            "/tmp/hive.git",
         ):
             self.assertFalse(ba.valid_remote_url(bad), bad)
-        for good in ("ssh://argona@argonas/srv/git/hive.git", "git@argonas:hive.git", "/srv/git/hive.git"):
+        for good in (
+            "ssh://argona@argonas/srv/git/hive.git",
+            "git@argonas:hive.git",
+            "/mnt/datapool/git/hive.git",
+            "/mnt/datapool/git/graeae-hive.git",
+        ):
             self.assertTrue(ba.valid_remote_url(good), good)
 
     def test_probe_passes_argv_list_never_a_shell(self):

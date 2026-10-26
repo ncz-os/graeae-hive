@@ -392,16 +392,21 @@ async def create_job(req: JobCreate):
     # `git ls-remote` (up to PROBE_TIMEOUT per ref); a blocking call here would
     # stall EVERY concurrent request (including /v1/jobs/next claims) on the
     # single-threaded bus loop. to_thread runs it in the default executor.
-    _branches = await asyncio.to_thread(
-        branch_admission,
-        repo=req.repo,
-        head_branch=req.head_branch,
-        base_branch=req.base_branch,
-    )
-    warnings.extend(_branches["warnings"])
-    if not _branches["ok"]:
-        raise HTTPException(422, _branches["detail"])
-    _branch_created_from = _branches["branch_created_from"]
+    # Gated on head_branch: with no head there is nothing to probe or create,
+    # so skip the thread dispatch entirely.
+    if req.head_branch:
+        _branches = await asyncio.to_thread(
+            branch_admission,
+            repo=req.repo,
+            head_branch=req.head_branch,
+            base_branch=req.base_branch,
+        )
+        warnings.extend(_branches["warnings"])
+        if not _branches["ok"]:
+            raise HTTPException(422, _branches["detail"])
+        _branch_created_from = _branches["branch_created_from"]
+    else:
+        _branch_created_from = None
 
     # GRAEAE permanent logjam-fix: SUBMIT-TIME WORKSPACE ADMISSION (SHADOW / log-only).
     try:
@@ -755,13 +760,11 @@ async def dequeue_next_job(agent_urn: str):
                     j_base_branch,
                     j_pr_number,
                 ) = r
-                # Defensive re-check (cheap; fail open): the pre-scan above
-                # excluded unsatisfied deps from THIS read, so a hit here means
-                # the two reads saw different state — skip and let the next
-                # poll re-evaluate. The binding gate remains the
+                # No per-candidate query here (2026-10-25 review): the
+                # pre-scan above already excluded unsatisfied deps from THIS
+                # read, and a fresh DB read per candidate in the claim loop
+                # was N round-trips on the hot path. The binding gate is the
                 # in-transaction re-check inside claim_job.
-                if j_deps_json and await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[j_id]):
-                    continue
                 job = {
                     "id": j_id,
                     "kind": j_kind,
@@ -1545,13 +1548,32 @@ async def claim_job(job_id: str, by: str):
         # PRE-READ GATE (2026-10-25): fail CLOSED on any non-empty depends_on
         # whose entries are not all done — including malformed JSON and
         # references to unknown job ids (a dep that does not exist can never
-        # reach done). The in-transaction re-check in claim_job repeats this
-        # under the write lock; the pre-read exists so the caller gets a
-        # named 409 instead of the same refusal from inside the tx. Dep-free
-        # jobs (the common case) cost nothing here: the column is read in the
-        # context SELECT already, and NULL/empty means satisfied.
-        if j_deps_json and await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[job_id]):
-            raise HTTPException(409, f"job has unsatisfied DAG dependencies: {job_id}")
+        # reach done; the COUNT-based check answers 0 for a missing row, and
+        # 0 >= 1 is false, so the job stays blocked). The in-transaction
+        # re-check in claim_job repeats this under the write lock; the pre-read
+        # exists so the caller gets a named 409 naming the unsatisfied dep ids
+        # instead of the same refusal from inside the tx. Dep-free jobs (the
+        # common case) cost nothing here: the column is read in the context
+        # SELECT already, and NULL/empty means satisfied.
+        if j_deps_json:
+            _parsed_deps = None
+            try:
+                _parsed_deps = json.loads(j_deps_json)
+            except (TypeError, ValueError):
+                _parsed_deps = None
+            if not isinstance(_parsed_deps, list):
+                raise HTTPException(
+                    409, f"job has unsatisfied DAG dependencies: {job_id} (depends_on is not a list of job ids)"
+                )
+            _missing = sorted({str(d) for d in _parsed_deps if d is not None})
+            if _missing:
+                _done = await hive_repo().completed_job_ids(tx, ids=_missing)
+                _unsat = sorted(set(_missing) - _done)
+                if _unsat:
+                    raise HTTPException(
+                        409,
+                        f"job has unsatisfied DAG dependencies: {job_id} (not done: {_unsat})",
+                    )
 
         agent = {
             "urn": by,
