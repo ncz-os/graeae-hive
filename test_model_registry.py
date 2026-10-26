@@ -18,10 +18,8 @@ from pathlib import Path
 from hive.core import model_registry as mr
 from hive.core import models
 from hive.core.models import (
-    KNEMON_PROVIDERS,
     LLM_RATES,
     PROVIDER_COST_TIER,
-    knemon_candidates,
     rate_for,
 )
 
@@ -33,6 +31,15 @@ models._zoder_catalog.cache_clear()
 
 ROOT = Path(__file__).resolve().parent
 REGISTRY = mr.DEFAULT_REGISTRY
+
+
+def _router_providers(reg):
+    """The "knemon"-route models in order: the [router.providers] section of
+    the generated zoder.toml (the bus itself no longer routes on them)."""
+    return sorted(
+        (m for m in reg.models if "knemon" in m.routes),
+        key=lambda m: m.knemon_order or 0,
+    )
 
 
 def _write_registry(tmp: Path, text: str) -> Path:
@@ -77,19 +84,6 @@ class TestDrift(unittest.TestCase):
             if m.emit_rate
         }
         self.assertEqual(dict(LLM_RATES), want_rates)
-        want_knemon = [
-            {
-                "provider": m.provider,
-                "model": m.model,
-                "alias": m.knemon_alias,
-                "tier": m.knemon_tier,
-            }
-            for m in sorted(
-                (m for m in self.reg.models if "knemon" in m.routes),
-                key=lambda m: m.knemon_order or 0,
-            )
-        ]
-        self.assertEqual(KNEMON_PROVIDERS, want_knemon)
 
     def test_generated_fragments_committed_and_parseable(self):
         for host in self.reg.hosts:
@@ -107,32 +101,16 @@ class TestDrift(unittest.TestCase):
         self.assertEqual(LLM_RATES[("minimax", "minimax-m3")], (0.40, 1.20))
         self.assertEqual(LLM_RATES[("together", "deepseek-v4-pro")], (2.10, 4.40))
         self.assertEqual(rate_for("minimax", "minimax-m3"), (0.40, 1.20))
-        names = [k["alias"] for k in KNEMON_PROVIDERS]
+        # zoder.toml [router.providers] order is unchanged
+        names = [m.knemon_alias for m in _router_providers(self.reg)]
         self.assertEqual(
             names,
             ["hive_groq_1", "hive_gemini_1", "hive_minimax_1", "hive_xai_1", "hive_nova_1", "hive_nova_2"],
         )
-        # cheapest-acceptable-first ordering is preserved under a B ceiling
-        out = [(c["provider"], c["model"]) for c in knemon_candidates("B")]
-        self.assertEqual(
-            out,
-            [
-                ("bedrock", "amazon.nova-micro-v1:0"),   # 0.14 /MTok out
-                ("bedrock", "amazon.nova-lite-v1:0"),    # 0.24
-                ("groq", "gpt-oss-20b"),                 # 0.30
-                ("gemini", "gemini-2.5-flash-lite"),     # 0.40
-                ("xai", "grok-4.1-fast"),                # 0.50
-                ("minimax", "minimax-m3"),               # 1.20
-            ],
-        )
-        # a C ceiling adds nothing today (no tier-C knemon candidates)
-        self.assertEqual([(c["provider"], c["model"]) for c in knemon_candidates("C")], out)
-        # an A ceiling admits nothing (every knemon candidate is tier B)
-        self.assertEqual(knemon_candidates("A"), [])
 
     def test_deepseek_and_siliconflow_not_routed(self):
         """Operator 2026-09-07: deepseek/siliconflow never enter the pool."""
-        providers = {k["provider"] for k in KNEMON_PROVIDERS}
+        providers = {m.provider for m in _router_providers(self.reg)}
         self.assertNotIn("deepseek", providers)
         self.assertNotIn("deepseek-direct", providers)
         self.assertNotIn("siliconflow", providers)
@@ -187,7 +165,7 @@ class TestInvariants(unittest.TestCase):
                 self.assertNotIn("knemon", m.routes, m.key)
                 self.assertNotIn("zoder.coder", m.routes, m.key)
         self.assertNotIn(
-            "nemotron-3-ultra-550b-a55b", {k["model"] for k in KNEMON_PROVIDERS}
+            "nemotron-3-ultra-550b-a55b", {m.model for m in _router_providers(self.reg)}
         )
         # ...and no host may install ANY Nemotron as a coder
         for host, assigns in self.reg.hosts.items():

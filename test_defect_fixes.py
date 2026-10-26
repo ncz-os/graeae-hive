@@ -32,7 +32,6 @@ import hive.bus.app as hive_bus_app
 from hive import scheduler as sched
 from hive.bus.routers import admin as hive_admin_router
 from hive.bus.routers import jobs as hive_jobs_router
-from hive.bus.routers import knemon as hive_knemon_router
 from hive.bus.routers import system as hive_system_router
 from hive.persistence.db2 import DB2_DDL, Db2HiveRepository, _adapt_sql
 from hive.persistence.oracle import (
@@ -305,9 +304,6 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
             ("POST", "/v1/schedules"),
             ("PATCH", "/v1/schedules/sched-1"),
             ("DELETE", "/v1/schedules/sched-1"),
-            ("POST", "/v1/knemon/bypass"),
-            ("POST", "/v1/knemon/cap/clear"),
-            ("POST", "/v1/knemon/cap/probe-ok"),
         ]
         for method, path in paths:
             with self.subTest(method=method, path=path):
@@ -1848,20 +1844,6 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("EnvironmentFile=-", unit)
         self.assertIn("UMask=0077", unit)
 
-    def test_oauth_cap_parse_failure_fails_closed(self):
-        with tempfile.TemporaryDirectory() as td:
-            cap = Path(td) / "cap.json"
-            old = hive_knemon_router.KNEMON_CAP_FILE
-            hive_knemon_router.KNEMON_CAP_FILE = str(cap)
-            try:
-                self.assertFalse(hive_knemon_router.oauth_cap_state()["capped"])
-                cap.write_text("not-json")
-                state = hive_knemon_router.oauth_cap_state()
-                self.assertTrue(state["capped"])
-                self.assertIn("storage_error", state)
-            finally:
-                hive_knemon_router.KNEMON_CAP_FILE = old
-
     def test_oracle_migration_targets_physical_table(self):
         sql = (HERE / "migrations" / "2026-06-03-jobs-dedup.sql").read_text()
         oracle = sql.split("-- ── SQLite", 1)[0]
@@ -1915,47 +1897,6 @@ class ServiceTests(unittest.TestCase):
         ):
             runpy.run_path("bs_audit.py", run_name="bs_audit_under_test")
         self.assertEqual(seen["authorization"], "Bearer audit-token")
-
-    def test_worker_authorized_valid_oauth_probe_closes_breaker(self):
-        async def run():
-            body = json.dumps(
-                {
-                    "success": True,
-                    "model": "hive_codex",
-                    "reporter": "worker-1",
-                }
-            ).encode()
-            sent = False
-
-            async def receive():
-                nonlocal sent
-                if sent:
-                    return {"type": "http.disconnect"}
-                sent = True
-                return {"type": "http.request", "body": body, "more_body": False}
-
-            request = Request(
-                {
-                    "type": "http",
-                    "method": "POST",
-                    "path": "/v1/knemon/cap",
-                    "raw_path": b"/v1/knemon/cap",
-                    "query_string": b"",
-                    "headers": [],
-                    "scheme": "http",
-                    "server": ("test", 80),
-                },
-                receive,
-            )
-            request.state.auth_role = "worker"
-            with (
-                mock.patch.object(hive_knemon_router, "clear_oauth_cap", return_value=None),
-                mock.patch.object(hive_knemon_router, "oauth_cap_state", return_value={"capped": False}),
-            ):
-                return await hive_knemon_router.knemon_cap_set(request)
-
-        result = asyncio.run(run())
-        self.assertTrue(result["cleared"])
 
 
 class WorkerTests(unittest.TestCase):

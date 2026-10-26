@@ -39,9 +39,8 @@ from hive.core.models import LLM_RATES, cost_tier_for
 # Operator directives, kept in code (not config) so the vocabulary an
 # operator can act on never depends on an env var being set on one host:
 #
-#   * DeepSeek direct is forbidden FLEET-WIDE (operator 2026-09-07) and was
-#     struck from KNEMON_PROVIDERS (their aliases removed, not disabled) —
-#     see hive/core/models.py. A job may not request the route anyway.
+#   * DeepSeek direct is forbidden FLEET-WIDE (operator 2026-09-07). A job
+#     may not request the route.
 #   * NVIDIA EIH may serve ONLY Nemotron or an open-weight model (operator
 #     2026-10-17). Closed frontier models are forbidden on EIH, so the EIH
 #     gpt-5.5/grok/claude labels must never be requested as a route.
@@ -99,9 +98,9 @@ def forbidden_model(name: str) -> bool:
 def _served_by_provider(provider: str) -> set[str]:
     """Every model name the bus believes ``provider`` can serve for code work.
 
-    Built from the routing tables (``LLM_RATES`` keys, the KNEMON candidate
-    list) so it moves with the registry: a model added to the registry is a
-    served name here without a second list to maintain.
+    Built from the ``LLM_RATES`` keys so it moves with the registry: a model
+    added to the registry is a served name here without a second list to
+    maintain.
     """
     p = _norm_model(provider)
     if not p:
@@ -111,17 +110,6 @@ def _served_by_provider(provider: str) -> set[str]:
         if prov_key != p or model_key == "*":
             continue
         names.add(model_key)
-    try:
-        from hive.core.models import KNEMON_PROVIDERS
-
-        for entry in KNEMON_PROVIDERS:
-            if _norm_model(entry.get("provider")) == p:
-                names.add(_norm_model(entry.get("model")))
-                alias = entry.get("alias")
-                if isinstance(alias, str) and alias:
-                    names.add(_norm_model(alias))
-    except Exception:  # noqa: BLE001 - routing corpus is optional for this check
-        pass
     return names
 
 

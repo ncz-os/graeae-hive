@@ -446,23 +446,9 @@ def emit_bus_tables(registry: Registry) -> str:
         suffix = f"  # {m.notes}" if m.notes else ""
         lines.append(f'    ("{m.provider}", "{m.model}"): ({_fmt_rate(m.price_in)}, {_fmt_rate(m.price_out)}),{suffix}')
     lines.append("}")
-    lines.append("")
-    lines.append("# ── routing corpus (cheapest-acceptable ordering happens at call time) ─")
-    lines.append("KNEMON_PROVIDERS: list[dict[str, Any]] = [")
-    knemon = sorted(
-        (m for m in registry.models if "knemon" in m.routes),
-        key=lambda m: m.knemon_order or 0,
-    )
-    for m in knemon:
-        if m.notes:
-            lines.append(f"    # {m.notes}")
-        lines.append("    {")
-        lines.append(f'        "provider": "{m.provider}",')
-        lines.append(f'        "model": "{m.model}",')
-        lines.append(f'        "alias": "{m.knemon_alias}",')
-        lines.append(f'        "tier": "{m.knemon_tier}",')
-        lines.append("    },")
-    lines.append("]")
+    # The bus no longer gets a KNEMON_PROVIDERS table: its /v1/knemon router was
+    # removed. "knemon" routes still feed the [router.providers] section of the
+    # generated zoder.toml (see emit_zoder_toml).
     lines.append(BUS_END)
     return "\n".join(lines) + "\n"
 

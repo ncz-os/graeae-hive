@@ -32,7 +32,6 @@ from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export f
 from hive.bus.routers.admin import router as _admin_router
 from hive.bus.routers.agents import router as _agents_router
 from hive.bus.routers.events import router as _events_router
-from hive.bus.routers.knemon import router as _knemon_router
 from hive.bus.routers.mcp import router as _mcp_router
 from hive.bus.routers.system import router as _system_router
 from hive.bus.routers.jobs import (  # noqa: F401 (re-export)
@@ -53,14 +52,6 @@ from hive.bus.routers.stats import router as _stats_router
 # Compat re-exports — symbols moved into routers during Phase 1c, kept on the
 # agent_bus facade for tests + external callers that still import from here.
 from hive.bus.routers.agents import heartbeat, list_agents, register  # noqa: F401 (re-export)
-from hive.bus.routers.knemon import (  # noqa: F401 (re-export)
-    KNEMON_BYPASS_FILE,
-    KNEMON_CAP_FILE,
-    OAUTH_CAP_RESET_SEC,
-    clear_oauth_cap,
-    knemon_bypass_active,
-    oauth_cap_state,
-)
 from hive.bus.routers.mcp import mcp_rpc  # noqa: F401 (re-export)
 from hive.bus.routers.messages import list_messages, publish_message  # noqa: F401 (re-export)
 from hive.bus.routers.system import dashboard, health  # noqa: F401 (re-export)
@@ -453,7 +444,6 @@ app = FastAPI(title="GRAEAE Hive Mind", version="0.1.0", lifespan=lifespan)
 app.include_router(_repos_router)
 app.include_router(_stats_router)
 app.include_router(_events_router)
-app.include_router(_knemon_router)
 app.include_router(_system_router)
 app.include_router(_mcp_router)
 app.include_router(_messages_router)
@@ -496,7 +486,8 @@ app.include_router(_schedules_router)
 # /v1/stats/* routes moved to hive.bus.routers.stats (Phase 1c).
 
 
-# KNEMON router + OAuth-cap breaker moved to hive.bus.routers.knemon (Phase 1c).
+# The bus's KNEMON cost router (/v1/knemon/*) was removed 2026-10-26: zoder
+# picks models, and the router had no live traffic.
 
 # /v1/jobs/metrics moved to hive.bus.routers.jobs (Phase 1c).
 
