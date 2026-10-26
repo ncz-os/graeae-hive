@@ -98,6 +98,12 @@ via the **retired `:4100`**):
 - `_invoke_openweight(prompt, alias, base_url=…, model=…)`; local endpoints accept
   placeholder auth (a missing key is only fatal for a base that is explicitly remote)
 
+Amended 2026-10-26 (repo defaults now match the live PYTHIA doctor env):
+`DOCTOR_TRIAGE_MODEL` / `DOCTOR_REVIEW_MODEL` → `cerberus-reviewer` (CERBERUS
+role alias), `DOCTOR_OPENWEIGHT_MODEL` → `gpt-oss-20b` (CERBERUS alias),
+`DOCTOR_FIX_MODEL` → `qwen38` with `DOCTOR_FIX_BASE_URL` defaulting to TYDEUS
+`http://192.0.2.73:8006/v1`. Triage/review bases still default to CERBERUS.
+
 The codex CLI / gateway paths stay reachable via env override but are **no
 longer defaults**. DeepSeek/Anthropic/Together remain forbidden as the brain.
 

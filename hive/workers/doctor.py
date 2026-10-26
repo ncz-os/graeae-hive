@@ -32,12 +32,15 @@ Env:
   MAX_SSH_PER_HOUR           3
   MIN_HOST_COOLDOWN          1800 seconds
   DRY_RUN                    "1" to disable real actions (default 0)
-  DOCTOR_TRIAGE_MODEL        diagnose/classify phase model (default deepseek)
-  DOCTOR_REVIEW_MODEL        adversarial-review phase model (default codex)
-  DOCTOR_FIX_MODEL           in-doctor fix phase model (default codex)
-  DOCTOR_OPENWEIGHT_BASE_URL OpenAI-compatible base for non-codex phases
-                             (default https://api.deepseek.com/v1)
-  DOCTOR_OPENWEIGHT_MODEL    model id for the open-weight path (default deepseek-chat)
+  DOCTOR_TRIAGE_MODEL        diagnose/classify phase model (default cerberus-reviewer)
+  DOCTOR_REVIEW_MODEL        adversarial-review phase model (default cerberus-reviewer)
+  DOCTOR_FIX_MODEL           in-doctor fix phase model (default qwen38)
+  DOCTOR_OPENWEIGHT_BASE_URL OpenAI-compatible base for the triage/review phases
+                             and unknown phases (default CERBERUS
+                             http://192.0.2.96:8080/v1)
+  DOCTOR_FIX_BASE_URL        base for the fix phase (default TYDEUS
+                             http://192.0.2.73:8006/v1)
+  DOCTOR_OPENWEIGHT_MODEL    model id for the open-weight path (default gpt-oss-20b)
   DOCTOR_OPENWEIGHT_API_KEY  key for open-weight path (falls back to config.toml deepseek)
 """
 
@@ -93,38 +96,44 @@ LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
 
 # ── Per-phase model selection (2026-06-02) ──
 # The doctor runs in phases; each phase picks its model independently.
-#   triage  = diagnose/classify a failure cluster -> cheap open-weight (deepseek)
-#   review  = adversarial review/verify of a fix  -> codex (its strength)
-#   fix     = implement a code fix                -> codex by default, but the
-#             implementation is normally DISPATCHED to open-weight workers via
+#   triage  = diagnose/classify a failure cluster -> local open-weight reviewer
+#   review  = adversarial review/verify of a fix  -> local open-weight reviewer
+#   fix     = implement a code fix                -> local coder; the
+#             implementation is normally DISPATCHED to zoder workers via
 #             action_dispatch_codex_fix(eligible_kinds=["zeroclaw"]); this knob
 #             only governs any in-doctor model call labelled "fix".
-# Value is a model alias: "codex" -> local codex CLI; anything else -> the
-# OpenAI-compatible path (DOCTOR_<PHASE>_BASE_URL / DOCTOR_OPENWEIGHT_*).
+# Value is a model id sent to the OpenAI-compatible path
+# (DOCTOR_<PHASE>_BASE_URL / DOCTOR_OPENWEIGHT_*). A codex/gpt alias is a
+# config error (Codex never runs unattended) and uses DOCTOR_OPENWEIGHT_MODEL.
 # LOCAL brain (operator 2026-10-15): the orchestrator reasons on on-prem models.
-# Primary = CERBERUS gemma4-31b (RTX 4500 Ada, durable). TYDEUS (qwen38) is the
-# coder route but TYDEUS is NOT assumed long-term, so it is no longer a default.
+# Defaults (2026-10-26, matching the live PYTHIA quadlet env): triage + review
+# use the CERBERUS role id ``cerberus-reviewer``; the in-doctor fix phase uses
+# TYDEUS ``qwen38`` on its own base (DOCTOR_FIX_BASE_URL); the open-weight
+# fallback model id is ``gpt-oss-20b`` (a CERBERUS alias).
 # HYDRA (.78) / ACHILLES (.11) expose ROCm llama-server — usable as a LIGHT
 # orchestration model via DOCTOR_TRIAGE_BASE_URL / DOCTOR_OPENWEIGHT_BASE_URL.
 # NEVER the retired :4100.
-DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "deepseek-flash").strip().lower()
-DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "gemma4-31b").strip().lower()
-DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "gemma4-31b").strip().lower()
+DOCTOR_TRIAGE_MODEL = os.environ.get("DOCTOR_TRIAGE_MODEL", "cerberus-reviewer").strip().lower()
+DOCTOR_REVIEW_MODEL = os.environ.get("DOCTOR_REVIEW_MODEL", "cerberus-reviewer").strip().lower()
+DOCTOR_FIX_MODEL = os.environ.get("DOCTOR_FIX_MODEL", "qwen38").strip().lower()
 _PHASE_MODELS = {
     "triage": DOCTOR_TRIAGE_MODEL,
     "review": DOCTOR_REVIEW_MODEL,
     "fix": DOCTOR_FIX_MODEL,
 }
-# OpenAI-compatible local endpoint: CERBERUS gemma4-31b (the durable brain).
+# OpenAI-compatible local endpoint: CERBERUS llama-server (the durable brain).
 DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get("DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
-DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "deepseek-flash")
+DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "gpt-oss-20b")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
 DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
-# Per-phase bases. All default to CERBERUS; override any phase to a LIGHT model
-# on HYDRA/ACHILLES (e.g. DOCTOR_TRIAGE_BASE_URL=http://192.0.2.78:8080/v1).
+# Per-phase bases. Triage and review default to CERBERUS (DOCTOR_OPENWEIGHT_BASE_URL);
+# the fix phase defaults to TYDEUS, where qwen38 is served — a phase model id
+# is sent to its phase base, so the two must agree. Override any phase to a
+# LIGHT model on HYDRA/ACHILLES (e.g. DOCTOR_TRIAGE_BASE_URL=http://192.0.2.78:8080/v1).
+DOCTOR_FIX_DEFAULT_BASE_URL = "http://192.0.2.73:8006/v1"
 DOCTOR_TRIAGE_BASE_URL = os.environ.get("DOCTOR_TRIAGE_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 DOCTOR_REVIEW_BASE_URL = os.environ.get("DOCTOR_REVIEW_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
-DOCTOR_FIX_BASE_URL = os.environ.get("DOCTOR_FIX_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
+DOCTOR_FIX_BASE_URL = os.environ.get("DOCTOR_FIX_BASE_URL", DOCTOR_FIX_DEFAULT_BASE_URL).rstrip("/")
 _PHASE_BASE_URLS = {
     "triage": DOCTOR_TRIAGE_BASE_URL,
     "review": DOCTOR_REVIEW_BASE_URL,
@@ -875,7 +884,7 @@ def _invoke_openweight(
 ) -> tuple[bool, str]:
     """Run a non-codex phase via an OpenAI-compatible chat endpoint.
 
-    Defaults to the LOCAL brain (TYDEUS qwen38 / CERBERUS gemma4-31b) — pass
+    Defaults to the LOCAL brain (CERBERUS, DOCTOR_OPENWEIGHT_MODEL) — pass
     ``base_url``/``model`` for a specific phase. Anthropic + Together remain
     FORBIDDEN per CLAUDE.md. Local endpoints accept a placeholder auth, so a
     missing key is only fatal when a base is explicitly remote."""

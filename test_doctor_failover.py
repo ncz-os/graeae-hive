@@ -101,6 +101,80 @@ def _forbidden_gateway(prompt):  # pragma: no cover - must never run
     raise GatewayCalled("the unattended Codex/gateway path was invoked")
 
 
+TYDEUS = "http://192.0.2.73:8006/v1"
+
+_DEFAULT_ENV = (
+    "DOCTOR_TRIAGE_MODEL",
+    "DOCTOR_REVIEW_MODEL",
+    "DOCTOR_FIX_MODEL",
+    "DOCTOR_OPENWEIGHT_MODEL",
+    "DOCTOR_OPENWEIGHT_BASE_URL",
+    "DOCTOR_TRIAGE_BASE_URL",
+    "DOCTOR_REVIEW_BASE_URL",
+    "DOCTOR_FIX_BASE_URL",
+)
+
+
+@pytest.fixture
+def doctor_defaults(monkeypatch):
+    """Reload the doctor with no model/base env at all: the repo defaults."""
+    for name in _DEFAULT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    from hive.workers import doctor as _doctor
+
+    yield importlib.reload(_doctor)
+    # Leave the module as other tests in this process expect to find it.
+    monkeypatch.undo()
+    importlib.reload(_doctor)
+
+
+# ─────────────────────────── repo defaults ───────────────────────────
+def test_repo_default_models(doctor_defaults):
+    d = doctor_defaults
+    assert d.DOCTOR_TRIAGE_MODEL == "cerberus-reviewer"
+    assert d.DOCTOR_REVIEW_MODEL == "cerberus-reviewer"
+    assert d.DOCTOR_FIX_MODEL == "qwen38"
+    assert d.DOCTOR_OPENWEIGHT_MODEL == "gpt-oss-20b"
+
+
+def test_repo_default_bases_pair_each_model_with_its_server(doctor_defaults):
+    d = doctor_defaults
+    # cerberus-reviewer / gpt-oss-20b are CERBERUS aliases; qwen38 is served on TYDEUS.
+    assert d.DOCTOR_OPENWEIGHT_BASE_URL == CERBERUS
+    assert d.DOCTOR_TRIAGE_BASE_URL == CERBERUS
+    assert d.DOCTOR_REVIEW_BASE_URL == CERBERUS
+    assert d.DOCTOR_FIX_BASE_URL == TYDEUS
+
+
+def test_fix_phase_default_goes_to_tydeus_qwen38(doctor_defaults, monkeypatch):
+    rec = _install(doctor_defaults, monkeypatch, {TYDEUS: "patched"})
+    ok, text = doctor_defaults.invoke_doctor_agent("p", phase="fix")
+    assert ok and text == "patched"
+    assert rec.bases == [TYDEUS]
+    assert _wire_models(rec) == ["qwen38"]
+
+
+def test_triage_phase_default_goes_to_cerberus_reviewer(doctor_defaults, monkeypatch):
+    rec = _install(doctor_defaults, monkeypatch, {CERBERUS: "diagnosis"})
+    ok, text = doctor_defaults.invoke_doctor_agent("p", phase="triage")
+    assert ok and text == "diagnosis"
+    assert rec.bases == [CERBERUS]
+    assert _wire_models(rec) == ["cerberus-reviewer"]
+
+
+def test_fix_base_env_override_still_wins(monkeypatch):
+    for name in _DEFAULT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DOCTOR_FIX_BASE_URL", ACHILLES + "/")
+    from hive.workers import doctor as _doctor
+
+    try:
+        assert importlib.reload(_doctor).DOCTOR_FIX_BASE_URL == ACHILLES
+    finally:
+        monkeypatch.undo()
+        importlib.reload(_doctor)
+
+
 # ─────────────────────────── failover ───────────────────────────
 def test_default_chain_is_local_hydra_achilles_cerberus(doctor):
     assert doctor.DOCTOR_FALLBACK_BASE_URLS == [HYDRA, ACHILLES, CERBERUS]
