@@ -110,9 +110,13 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
 - The slug comes from a **job string**, so it is treated as hostile:
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, no `.git` suffix, no `..`; the test is
   ONE `os.lstat(root/slug + ".git")` and the answer must be a directory. A
-  symlink is refused even when it points *inside* the root: `isdir` follows
-  links, so a planted `<slug>.git -> /elsewhere/x.git` would otherwise be
-  advertised and workers told to push there. Containment is
+  symlink is refused even when it points *inside* the root, and the test is
+  `lstat` **on purpose**: both `lstat` and `isdir` reject a link pointing
+  outside, but `isdir` would accept a link whose target is a directory — so
+  the bus would read that target's `HEAD` and tell workers to push there.
+  `lstat` returns the link's own mode, `S_ISDIR` is false for every symlink,
+  and the rule does not depend on where the link points. Do not "simplify"
+  this to `os.path.isdir`. Containment is
   `os.path.commonpath([root, path]) == root` (not `startswith(root + os.sep)`,
   which turns a root of `/` into `//` and declares everything contained). The
   root itself may legitimately be a symlink — the NFS mount is one on some
@@ -140,8 +144,10 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
   mount with re-probes — one entry per insert, never a full clear. The cache
   hands back entries, never its internal `(expires_at, entry)` bookkeeping.
   The post-probe write is **store-if-absent** (compare-and-swap under the same
-  lock): a NEGATIVE answer computed before a repo existed cannot overwrite the
-  fresher POSITIVE answer another thread already cached.
+  lock), and the rule is asymmetric: a NEGATIVE answer never displaces a live
+  POSITIVE one, while a POSITIVE answer *does* upgrade a live NEGATIVE one — a
+  repo that appeared while a thread was inside the mount is served at once,
+  not after the negative TTL expires.
 - Containment is `os.path.commonpath([root, path]) == root`, not a `startswith`
   of `root + os.sep` — the string form turns a root of `/` into `//` and would
   have declared every absolute path contained.

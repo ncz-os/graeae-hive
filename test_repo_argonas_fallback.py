@@ -490,6 +490,78 @@ class ProbeSyscallAndHeadTests(_FallbackCase):
             )
 
 
+class IdContractTests(_FallbackCase):
+    """What id a caller gets back: the normalized slug, and padding is the only tolerance."""
+
+    def test_padded_lookup_returns_the_normalized_id(self):
+        _make_bare(self.root, "normal-id")
+        entry = repos.find_exact("  normal-id  ")
+        self.assertEqual(entry["id"], "normal-id")
+        # and that id is what get_repo/the router can resolve again
+        self.assertEqual(repos.get_repo(entry["id"])["id"], "normal-id")
+        self.assertEqual(repos.get_repo("  normal-id  ")["id"], "normal-id")
+
+    def test_case_is_not_a_tolerance_for_the_fallback(self):
+        # Catalog lookups are case-insensitive; the filesystem is NOT, so the
+        # fallback must not silently answer for a differently-cased name.
+        _make_bare(self.root, "lowercase")
+        self.assertIsNone(repos.find_exact("LowerCase"))
+        self.assertIsNone(repos.get_repo("LOWERCASE"))
+        self.assertIsNotNone(repos.find_exact("lowercase"))
+
+    def test_padded_value_still_reports_as_in_catalog_for_jobs(self):
+        # Documented effect: repo_in_catalog sees the fallback, padded spelling
+        # included, which is what makes a no_repo_mapping decline drift, not rot.
+        from hive.bus.domain import jobs
+
+        _make_bare(self.root, "late-for-jobs")
+        self.assertTrue(jobs.repo_in_catalog("late-for-jobs"))
+        self.assertTrue(jobs.repo_in_catalog("  late-for-jobs  "))
+        self.assertFalse(jobs.repo_in_catalog("never-existed"))
+
+
+class SymlinkEscapeTests(_FallbackCase):
+    """A planted link must never make the bus advertise an outside repo."""
+
+    def _plant(self, name: str, inside: bool) -> Path:
+        target = (self.root if inside else self.outside) / "victim.git"
+        (target / "refs" / "heads").mkdir(parents=True, exist_ok=True)
+        (target / "HEAD").write_text("ref: refs/heads/evil\n")
+        os.symlink(target, self.root / f"{name}.git")
+        return target
+
+    def test_out_of_root_link_is_never_advertised(self):
+        self._plant("escapee", inside=False)
+        self.assertIsNone(repos._probe_argonas_live("escapee"))
+        self.assertIsNone(repos.find_exact("escapee"))
+        self.assertIsNone(repos.get_repo("escapee"))
+        # nothing was cached as a hit, and no ARGONAS URL was ever produced
+        self.assertNotIn("escapee", [k for k, item in repos._FALLBACK._entries.items() if item[1] is not None])
+
+    def test_in_root_link_is_never_advertised(self):
+        self._plant("inside-link", inside=True)
+        self.assertIsNone(repos._probe_argonas_live("inside-link"))
+        self.assertIsNone(repos.find_exact("inside-link"))
+
+    def test_link_to_a_directory_stack_is_still_refused(self):
+        # link -> link -> real dir: lstat only ever sees the first link.
+        real = self.root / "deep-real.git"
+        (real / "refs" / "heads").mkdir(parents=True)
+        (real / "HEAD").write_text("ref: refs/heads/trunk\n")
+        os.symlink(self.root / "deep-link.git", self.root / "deep-hop.git")
+        os.symlink(real, self.root / "deep-link.git")
+        self.assertIsNone(repos._probe_argonas_live("deep-hop"))
+        self.assertIsNone(repos._probe_argonas_live("deep-link"))
+        self.assertIsNotNone(repos._probe_argonas_live("deep-real"))
+
+    def test_probe_never_reads_through_a_link(self):
+        calls: list[str] = []
+        self._plant("noread", inside=False)
+        with mock.patch("hive.repos._read_text", side_effect=lambda p: calls.append(p)):
+            self.assertIsNone(repos._probe_argonas_live("noread"))
+        self.assertEqual(calls, [])  # rejected before any open()
+
+
 class StoreIfAbsentTests(unittest.TestCase):
     def test_a_stale_negative_never_overwrites_a_fresh_answer(self):
         cache = repos._FallbackCache()
@@ -497,6 +569,28 @@ class StoreIfAbsentTests(unittest.TestCase):
         stored = cache.store("slug", 10, None, only_if_absent=True)
         self.assertFalse(stored)
         self.assertEqual(cache.lookup("slug"), (True, {"id": "fresh"}))
+
+    def test_a_positive_answer_upgrades_a_live_negative(self):
+        # The Negative->Positive direction is allowed: a repo that appeared
+        # while this thread was inside the mount is served at once, instead of
+        # being denied until the negative TTL runs out.
+        cache = repos._FallbackCache()
+        cache.store("slug", 10, None)
+        self.assertTrue(cache.store("slug", 60, {"id": "slug"}, only_if_absent=True))
+        self.assertEqual(cache.lookup("slug"), (True, {"id": "slug"}))
+
+    def test_a_negative_answer_never_displaces_a_live_positive(self):
+        cache = repos._FallbackCache()
+        cache.store("slug", 60, {"id": "slug"})
+        self.assertFalse(cache.store("slug", 10, None, only_if_absent=True))
+        self.assertEqual(cache.lookup("slug"), (True, {"id": "slug"}))
+
+    def test_identical_answers_are_a_noop(self):
+        cache = repos._FallbackCache()
+        cache.store("pos", 60, {"id": "pos"})
+        self.assertFalse(cache.store("pos", 60, {"id": "pos"}, only_if_absent=True))
+        cache.store("neg", 10, None)
+        self.assertFalse(cache.store("neg", 10, None, only_if_absent=True))
 
     def test_an_expired_entry_is_replaced(self):
         cache = repos._FallbackCache()

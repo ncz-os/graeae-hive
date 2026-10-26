@@ -245,19 +245,28 @@ class _FallbackCache:
 
         ``only_if_absent`` is the compare-and-swap the probe needs: the probe
         runs with no lock held, so between a miss and this call another thread
-        may already have answered -- and a NEGATIVE answer computed before the
-        repo existed must never overwrite that fresher POSITIVE one. The check
-        and the insert happen under the same lock, so the decision is atomic.
+        may already have answered. The rule is deliberately ASYMMETRIC:
+
+          * a NEGATIVE answer never displaces a live POSITIVE one (the repo
+            exists; this thread's probe simply ran before it did), and
+          * a POSITIVE answer DOES displace a live NEGATIVE one -- a repo that
+            was absent when this thread probed is served the moment it is
+            found, instead of waiting out the negative TTL.
+
+        Identical answers are a no-op either way. The check and the insert
+        happen under the same lock, so the decision is atomic.
 
         At most ONE entry is evicted per insert (the LRU end), so concurrent
         inserts at capacity cannot evict N entries for N inserts.
         """
         with self._lock:
             if only_if_absent and slug in self._entries:
-                expires_at, _ = self._entries[slug]
+                expires_at, existing = self._entries[slug]
                 if expires_at > time.monotonic():  # a LIVE answer already exists
-                    return False
-                # expired: fall through and replace it
+                    replaces_negative = existing is None and entry is not None
+                    if not replaces_negative:  # anything else keeps the live answer
+                        return False
+                # otherwise (expired, or upgrading a negative) replace it
             self._entries[slug] = (time.monotonic() + ttl, entry)
             self._entries.move_to_end(slug)
             while len(self._entries) > self._max:
@@ -375,9 +384,12 @@ def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
         bare = os.path.join(root, slug + ".git")
         if not _contained(bare, root):  # belt and braces: the slug is already safe
             return None
-        # THE one stat call. lstat, not isdir: isdir follows a symlink, so a
-        # planted `<slug>.git -> /elsewhere/x.git` would be reported as an
-        # ARGONAS repo and workers would be told to push there.
+        # THE one stat call. lstat, NOT os.path.isdir: both reject
+        # `<slug>.git -> /elsewhere/x.git` today, but isdir would ACCEPT a link
+        # whose target is a directory (in-root links included) -- the bus would
+        # then read that target's HEAD and tell workers to push there. lstat
+        # returns the link's own mode, so S_ISDIR is False for EVERY symlink and
+        # the rule does not depend on where the link points.
         try:
             st = os.lstat(bare)
         except OSError:  # absent, or an unreadable/stalled mount
@@ -449,6 +461,8 @@ def _raw_entry(repo_id: str) -> dict[str, Any] | None:
 
     On a catalog MISS only, falls back to a synthesized entry for a bare
     ``<slug>.git`` that exists on ARGONAS right now (:func:`_fallback_entry`).
+    The synthesized entry's ``id`` is the NORMALIZED slug (outer whitespace
+    stripped), which is the key it was cached and probed under.
     """
     catalog = load_catalog()
     entry = catalog.get(repo_id)
@@ -480,7 +494,10 @@ def find_exact(repo_id: str) -> dict[str, Any] | None:
 
     On a catalog MISS it falls back to the ARGONAS live entry (see
     :func:`_fallback_entry`), so a repo created after the catalog build is
-    reported as present. That is the INTENDED effect on
+    reported as present. Padding is the one tolerance: ``" x "`` is looked up as
+    ``"x"`` and the entry carries ``id == "x"`` -- the caller never asked for a
+    repo whose name has spaces around it, and returning an entry under the
+    padded spelling would hand a worker an id that ``get_repo`` cannot resolve. That is the INTENDED effect on
     ``hive.bus.domain.jobs.repo_in_catalog``: a ``no_repo_mapping`` decline for
     such a repo is a STALE-CLIENT/deploy-drift signal (requeue and route), not
     a genuinely-absent repo that should burn the dead-letter budget. Only a
