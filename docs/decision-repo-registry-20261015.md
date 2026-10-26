@@ -97,21 +97,29 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
 - `_raw_entry` (behind `get_repo` → `GET /v1/repos/{id}`) and `find_exact` fall
   back to a *synthesized* entry when the bare repo `<slug>.git` exists under the
   ARGONAS git root **as the bus host sees it** (`HIVE_ARGONAS_GIT_ROOT`,
-  default `/mnt/argonas_git`). Fields: `id`/`display_name` = the slug,
+  default `hive.registry.ARGONAS_GIT_PATH_NFS`, i.e. `/mnt/argonas_git` — the
+  constant itself, not a path re-derived from a formatted slug). Fields:
+  `id`/`display_name` = the slug,
   `aliases: []`, `sources: ["argonas-live"]`, `argonas_bare`, `clone_ssh` and
   `clone_nfs` built from the `hive/registry.py` constants (one spelling only —
   never a second copy of the user/host/path), `status: "active"`, and
   `default_branch` read from the bare repo's `HEAD`
-  (`ref: refs/heads/<name>`, validated) — `master` when it is unreadable,
-  detached or malformed.
+  (`ref: refs/heads/<name>`, validated against a spelled-out set of the ref
+  characters git refuses — the backslash included, so a quoting slip cannot
+  widen it) — `master` when it is unreadable, detached or malformed.
 - The slug comes from a **job string**, so it is treated as hostile:
   `^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`, no `.git` suffix, no `..`; the test is
   `os.path.isdir(root/slug + ".git")` and a bare dir whose realpath escapes the
   realpath of the root is refused (a planted symlink cannot redirect a worker's
   push).
-- Results are cached in a small locked dict: positives 60 s, negatives 10 s. The
+- Results are cached in a small TTL dict: positives 60 s, negatives 10 s. The
   fallback never raises (an unreadable mount is a miss) and costs one `stat` call
-  per lookup; it runs lock-free so a stalled mount cannot serialize the bus.
+  per lookup. The lock covers the dict read and the dict write **only** — the
+  probe runs with no lock held at all, so a stalled mount delays just the
+  caller that touched it, never another slug and never the bus (both properties
+  have regression tests). On overflow exactly one entry (the oldest insertion)
+  is evicted, so a flood of hostile job strings cannot erase every warm entry
+  and stampede the mount with re-probes.
 - **A catalog entry always wins** — the fallback is a MISS path, never an
   override, so curated fields (forge facets, branch, commands, live host) can
   never be replaced by synthesized ones.
@@ -122,7 +130,7 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
   `no_repo_mapping` decline for a late repo now counts as *stale client* drift
   (requeue/route) instead of a genuinely-absent repo burning the dead-letter
   budget. That is intended and noted in the docstring.
-- Error and no write path: the synthesized entry only advertises a repo that is
+- Read-only: the synthesized entry only advertises a repo that is
   already there; nothing is created or edited.
 
 Tests: `test_repo_argonas_fallback.py` (hit/miss, hostile slugs, symlink escape,

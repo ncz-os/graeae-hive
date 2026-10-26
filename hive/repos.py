@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from hive.registry import argonas_nfs_path, argonas_ssh_url
+from hive.registry import ARGONAS_GIT_PATH_NFS, argonas_nfs_path, argonas_ssh_url
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CATALOG_PATH = _REPO_ROOT / "data" / "repos.json"
@@ -188,18 +188,77 @@ def list_repos(
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 # Branches that must not be treated as repo state.
 _PSEUDO_BRANCHES = frozenset({"HEAD", "refs"})
+# Characters git refuses in a ref name (git-check-ref-format). Spelled out as a
+# set, one entry per character, so there is no escape sequence to get wrong --
+# the backslash included.
+_FORBIDDEN_REF_CHARS = frozenset("~^:?*[\\\x7f") | frozenset(" \t\n\r\v\f")
 _POSITIVE_TTL = 60.0  # bare repos appear rarely; a minute is plenty
 _NEGATIVE_TTL = 10.0  # short: a repo created just now must not be denied long
-# (slug) -> (expires_at, entry-or-None); cleared wholesale past _FALLBACK_MAX.
 _FALLBACK_MAX = 256
-_FALLBACK: dict[str, tuple[float, dict[str, Any] | None]] = {}
-_FALLBACK_LOCK = threading.Lock()
+
+
+class _FallbackCache:
+    """Tiny TTL cache for ARGONAS live lookups: ``slug -> (expires_at, entry|None, seq)``.
+
+    The lock guards the dict MUTATIONS only. A lookup reads and writes the dict
+    under the lock and does its filesystem probe in between, with no lock held,
+    so a stalled NFS mount blocks at most the thread that touched it -- never
+    the bus, and never another slug. On overflow exactly ONE entry is evicted
+    (the oldest insertion, by sequence number), so a flood of hostile job
+    strings cannot erase every warm entry and stampede the mount with re-probes.
+    """
+
+    def __init__(self, max_entries: int = _FALLBACK_MAX) -> None:
+        self._entries: dict[str, tuple[float, dict[str, Any] | None, int]] = {}
+        # At least one slot, so the eviction loop always terminates.
+        self._max = max(1, max_entries)
+        self._lock = threading.Lock()
+        # A separate counter lock (always taken while holding ``_lock``, never
+        # the other way round) makes eviction EXACT: the victim is the oldest
+        # by insertion *sequence*, not by dict position.
+        self._order_lock = threading.Lock()
+        self._tick = 0
+
+    def get(self, slug: str) -> tuple[float, dict[str, Any] | None] | None:
+        with self._lock:
+            return self._entries.get(slug)
+
+    def put(self, slug: str, expires_at: float, entry: dict[str, Any] | None) -> None:
+        with self._lock:
+            while len(self._entries) >= self._max:
+                with self._order_lock:
+                    self._tick += 1
+                    oldest = min(self._entries, key=lambda k: self._entries[k][2])
+                self._entries.pop(oldest, None)  # evict ONE entry, never all
+            with self._order_lock:
+                self._tick += 1
+                tick = self._tick
+            self._entries[slug] = (expires_at, entry, tick)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+    def __contains__(self, slug: object) -> bool:
+        with self._lock:
+            return slug in self._entries
+
+
+_FALLBACK = _FallbackCache()
 
 
 def argonas_git_root() -> str:
-    """The ARGONAS bare-repo root as THIS host sees it (env override, else the NFS mount)."""
+    """The ARGONAS bare-repo root as THIS host sees it (env override, else the NFS mount).
+
+    The default is the ``hive.registry`` mount CONSTANT itself -- the one place
+    the fleet spells it -- not a path re-derived from a formatted slug.
+    """
     env = (os.environ.get("HIVE_ARGONAS_GIT_ROOT") or "").strip()
-    return env or os.path.dirname(argonas_nfs_path("x"))
+    return env or ARGONAS_GIT_PATH_NFS
 
 
 def _valid_slug(slug: str) -> bool:
@@ -225,9 +284,11 @@ def _bare_head_branch(bare_dir: str) -> str:
     if not name or len(name) > 200 or ".." in name or name in _PSEUDO_BRANCHES:
         return "master"
     for part in name.split("/"):
-        if part in ("", ".", "..") or part == "HEAD" or part.startswith(".") or part.endswith(".lock"):
+        if part in ("", ".", "..", "HEAD") or part.startswith(".") or part.endswith(".lock"):
             return "master"
-        if any(ch.isspace() or ch in "~^:?*[\\" for ch in part):
+        if any(ch in _FORBIDDEN_REF_CHARS or ch.isspace() for ch in part):
+            return "master"
+        if part.endswith("."):
             return "master"
     return name
 
@@ -277,25 +338,24 @@ def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
 
 
 def _fallback_entry(slug: str) -> dict[str, Any] | None:
-    """Cached ARGONAS live lookup for one slug (positive 60 s, negative 10 s)."""
-    now = time.monotonic()
-    with _FALLBACK_LOCK:
-        hit = _FALLBACK.get(slug)
-    if hit is not None and hit[0] > now:
-        return hit[1]
-    entry = _probe_argonas_live(slug)  # one stat call, outside the lock
+    """Cached ARGONAS live lookup for one slug (positive 60 s, negative 10 s).
+
+    Three separate steps, so the lock is never held across filesystem I/O:
+    read the cache, probe (one stat, unlocked, no lock held at all), write the
+    cache. A stalled mount therefore delays only the caller that touched it.
+    """
+    cached = _FALLBACK.get(slug)
+    if cached is not None and cached[0] > time.monotonic():
+        return cached[1]
+    entry = _probe_argonas_live(slug)
     ttl = _POSITIVE_TTL if entry is not None else _NEGATIVE_TTL
-    with _FALLBACK_LOCK:
-        if len(_FALLBACK) >= _FALLBACK_MAX:  # job strings are hostile: never grow unbounded
-            _FALLBACK.clear()
-        _FALLBACK[slug] = (time.monotonic() + ttl, entry)
+    _FALLBACK.put(slug, time.monotonic() + ttl, entry)
     return entry
 
 
 def clear_fallback_cache() -> None:
     """Drop cached ARGONAS live lookups (tests, and after creating a bare repo)."""
-    with _FALLBACK_LOCK:
-        _FALLBACK.clear()
+    _FALLBACK.clear()
 
 
 def _raw_entry(repo_id: str) -> dict[str, Any] | None:

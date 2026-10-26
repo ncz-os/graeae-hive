@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -62,6 +63,10 @@ CATALOG = {
 def _make_bare(root: Path, slug: str, head: str | None = "ref: refs/heads/master\n") -> Path:
     """A minimal bare repo directory (no git needed: only HEAD is read)."""
     bare = Path(root, f"{slug}.git")
+    if bare.exists():  # re-render HEAD in place for a repeat call
+        if head is not None:
+            (bare / "HEAD").write_text(head)
+        return bare
     (bare / "refs" / "heads").mkdir(parents=True)
     (bare / "objects").mkdir()
     (bare / "config").write_text("[core]\n\tbare = true\n")
@@ -227,9 +232,38 @@ class HostileSlugTests(_FallbackCase):
         self.assertIsNone(repos._probe_argonas_live("escape"))
 
     def test_symlink_inside_the_root_still_works(self):
-        _make_bare(self.root, "real-one")
+        # A link that stays inside the root is followed and synthesized with
+        # the ID THE CALLER ASKED FOR -- never the link target's name.
+        _make_bare(self.root, "real-one", head="ref: refs/heads/main\n")
         os.symlink(self.root / "real-one.git", self.root / "alias-one.git")
-        self.assertIsNotNone(repos._probe_argonas_live("alias-one"))
+        entry = repos._probe_argonas_live("alias-one")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["id"], "alias-one")
+        self.assertEqual(entry["display_name"], "alias-one")
+        self.assertEqual(entry["argonas_bare"], str(self.root / "alias-one.git"))
+        self.assertEqual(
+            entry["clone_ssh"],
+            "ssh://jasonperlow@192.0.2.101/mnt/datapool/git/alias-one.git",
+        )
+        self.assertEqual(entry["default_branch"], "main")  # read through the link
+        self.assertEqual(entry["sources"], ["argonas-live"])
+        self.assertEqual(entry["status"], "active")
+
+    def test_forbidden_ref_chars_include_the_backslash(self):
+        # The ref-name character set is spelled out as a set: the backslash
+        # and the DEL byte must BOTH be rejected (a quoting mistake in a string
+        # literal silently dropped the backslash once already).
+        self.assertIn("\\", repos._FORBIDDEN_REF_CHARS)
+        self.assertIn("\x7f", repos._FORBIDDEN_REF_CHARS)
+        for bad in ("a\\b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\x7fb", "a b"):
+            _make_bare(self.root, "refcheck", head=f"ref: refs/heads/{bad}\n")
+            self.assertEqual(
+                repos._probe_argonas_live("refcheck")["default_branch"],
+                "master",
+                f"{bad!r} must not be accepted as a branch name",
+            )
+        _make_bare(self.root, "refcheck", head="ref: refs/heads/feat/fine-name_1\n")
+        self.assertEqual(repos._probe_argonas_live("refcheck")["default_branch"], "feat/fine-name_1")
 
     def test_symlinked_root_is_its_own_realpath(self):
         # A legitimately symlinked MOUNT is fine: containment is compared in
@@ -336,17 +370,74 @@ class CacheTests(_FallbackCase):
         with mock.patch("hive.repos.time.monotonic", lambda: real() + repos._POSITIVE_TTL + 0.01):
             self.assertIsNone(repos.find_exact("vanishing"))
 
-    def test_cache_is_bounded(self):
-        with mock.patch.object(repos, "_FALLBACK_MAX", 4):
+    def test_cache_evicts_one_entry_not_all(self):
+        cache = repos._FallbackCache(max_entries=3)
+        for i in range(3):
+            cache.put(f"slug-{i}", time.monotonic() + 60, {"id": f"slug-{i}"})
+        self.assertEqual(len(cache), 3)
+        cache.put("slug-3", time.monotonic() + 60, {"id": "slug-3"})
+        # ONE eviction (the oldest), not a wholesale clear that would stampede
+        self.assertEqual(len(cache), 3)
+        self.assertIn("slug-1", cache)
+        self.assertIn("slug-2", cache)
+        self.assertIn("slug-3", cache)
+        self.assertNotIn("slug-0", cache)
+
+    def test_eviction_keeps_warm_entries_within_bounds(self):
+        with mock.patch.object(repos, "_FALLBACK", repos._FallbackCache(max_entries=4)):
             for i in range(10):
                 repos.find_exact(f"miss-{i}")
-            self.assertLessEqual(len(repos._FALLBACK), 4)
+            self.assertEqual(len(repos._FALLBACK), 4)
 
     def test_clear_drops_everything(self):
         repos.find_exact("whatever")
-        self.assertTrue(repos._FALLBACK)
+        self.assertTrue(len(repos._FALLBACK))
         repos.clear_fallback_cache()
-        self.assertEqual(repos._FALLBACK, {})
+        self.assertEqual(len(repos._FALLBACK), 0)
+
+    def test_probe_runs_with_the_cache_lock_free(self):
+        """The mount I/O must happen with NO cache lock held.
+
+        A stalled NFS lookup parks inside the probe; if the cache lock were
+        held there, every other slug would queue behind it. Proven without
+        timing: the probe itself takes the lock (a second, independent thread
+        does it too) and must succeed immediately.
+        """
+        observed = {}
+
+        def probe(slug):
+            acquired = repos._FALLBACK._lock.acquire(timeout=1.0)
+            observed["lock_free"] = acquired
+            if acquired:
+                repos._FALLBACK._lock.release()
+            return None
+
+        with mock.patch("hive.repos._probe_argonas_live", side_effect=probe):
+            repos.find_exact("some-slug")
+        self.assertTrue(observed.get("lock_free"), "probe ran with the cache lock held")
+
+    def test_a_slow_probe_does_not_block_other_slugs(self):
+        """Concurrency proof: a parked probe on slug A leaves B's cache hit fast."""
+        _make_bare(self.root, "warm")
+        self.assertIsNotNone(repos.find_exact("warm"))  # cached positive
+        inside = threading.Event()
+        release = threading.Event()
+
+        def parked(slug):
+            inside.set()
+            release.wait(5)
+            return None
+
+        with mock.patch("hive.repos._probe_argonas_live", side_effect=parked):
+            slow = threading.Thread(target=repos.find_exact, args=("stalled",), daemon=True)
+            slow.start()
+            self.assertTrue(inside.wait(2), "probe never started")
+            # While A is parked inside the mount, B's cached answer is immediate.
+            started = time.monotonic()
+            self.assertIsNotNone(repos.find_exact("warm"))
+            self.assertLess(time.monotonic() - started, 1.0)
+            release.set()
+            slow.join(5)
 
 
 class OldCodeContrastTests(unittest.TestCase):
@@ -373,7 +464,9 @@ class OldCodeContrastTests(unittest.TestCase):
                 ["git", "-C", str(repo_root), "show", f"{self.BASELINE}:hive/repos.py"],
                 stderr=subprocess.DEVNULL,
             )
-        except (subprocess.CalledProcessError, FileNotFoundError):
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            # No git binary (FileNotFoundError/OSError) or no such revision
+            # (shallow clone, bare export): an environment gap, not a defect.
             self.skipTest(f"{self.BASELINE} not available")
         td = tempfile.TemporaryDirectory()
         try:
