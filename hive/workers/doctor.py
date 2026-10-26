@@ -1224,10 +1224,10 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
     ]
     # A job whose retry budget is spent (max_retries 0, or retry_count >= max_retries)
     # is never requeued by the doctor: it is reported for review, nothing else.
-    held = [j for j in candidates if retry_budget_exhausted(j)]
-    target_ids = [j["id"] for j in candidates if not retry_budget_exhausted(j)][
-        : max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))
-    ]
+    held, eligible = [], []
+    for j in candidates:
+        (held if retry_budget_exhausted(j) else eligible).append(j)
+    target_ids = [j["id"] for j in eligible][: max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))]
     held_note = ""
     if held:
         held_note = f"; held {len(held)} with no retry budget (needs-review): " + ", ".join(

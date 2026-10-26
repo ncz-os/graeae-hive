@@ -810,7 +810,8 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
             async def fetchone(self):
-                return ("failed",)
+                # status, max_retries, retry_count (retries left)
+                return ("failed", 2, 0)
 
         class _Tx:
             def execute(self, sql, params=None):

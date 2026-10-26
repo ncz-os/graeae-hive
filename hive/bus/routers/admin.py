@@ -34,10 +34,11 @@ log = logging.getLogger("hive.bus.admin")
 def _retry_budget_exhausted(max_retries: Any, retry_count: Any) -> bool:
     """max_retries 0, or retry_count >= max_retries: the submitter's retry budget is spent.
 
-    ``max_retries`` is NOT NULL in every backend schema; a row without it (only a
-    hand-built test double) is treated as having budget, as before this guard."""
-    if max_retries is None:
-        return False
+    Same rule as the doctor's ``retry_budget_exhausted``: an unreadable budget fails
+    closed. ``max_retries`` is NOT NULL in every backend schema, so a real row always
+    has it."""
+    if max_retries is None or isinstance(max_retries, bool):
+        return True
     try:
         mr = int(max_retries)
         rc = int(retry_count or 0)
