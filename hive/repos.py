@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -198,42 +199,50 @@ _FALLBACK_MAX = 256
 
 
 class _FallbackCache:
-    """Tiny TTL cache for ARGONAS live lookups: ``slug -> (expires_at, entry|None, seq)``.
+    """Tiny TTL cache for ARGONAS live lookups, ordered LRU-style.
 
-    The lock guards the dict MUTATIONS only. A lookup reads and writes the dict
-    under the lock and does its filesystem probe in between, with no lock held,
-    so a stalled NFS mount blocks at most the thread that touched it -- never
-    the bus, and never another slug. On overflow exactly ONE entry is evicted
-    (the oldest insertion, by sequence number), so a flood of hostile job
-    strings cannot erase every warm entry and stampede the mount with re-probes.
+    ONE lock guards the dict and the order together, so there is no second lock
+    to take in the wrong order, no eviction race between a lookup and a pop,
+    and no ``KeyError`` from a key that vanished mid-scan. The lock is held
+    ONLY for these constant-time dict operations: callers do their filesystem
+    probe between :meth:`lookup` and :meth:`store` with no lock held, so a
+    stalled mount delays the one thread that touched it -- never another slug
+    and never the bus.
+
+    Over ``max_entries`` the LEAST-RECENTLY-USED entry is evicted, one at a
+    time, so a flood of hostile job strings cannot erase every warm entry and
+    stampede the mount with re-probes. The public surface hands back entries,
+    never the internal ``(expires_at, entry)`` bookkeeping.
     """
 
     def __init__(self, max_entries: int = _FALLBACK_MAX) -> None:
-        self._entries: dict[str, tuple[float, dict[str, Any] | None, int]] = {}
+        # slug -> (expires_at, entry-or-None), oldest first (dicts keep order).
+        self._entries: OrderedDict[str, tuple[float, dict[str, Any] | None]] = OrderedDict()
         # At least one slot, so the eviction loop always terminates.
         self._max = max(1, max_entries)
         self._lock = threading.Lock()
-        # A separate counter lock (always taken while holding ``_lock``, never
-        # the other way round) makes eviction EXACT: the victim is the oldest
-        # by insertion *sequence*, not by dict position.
-        self._order_lock = threading.Lock()
-        self._tick = 0
 
-    def get(self, slug: str) -> tuple[float, dict[str, Any] | None] | None:
+    def lookup(self, slug: str) -> tuple[bool, dict[str, Any] | None]:
+        """``(hit, entry)`` for a live (unexpired) slug; an expired one is dropped."""
+        now = time.monotonic()
         with self._lock:
-            return self._entries.get(slug)
+            item = self._entries.get(slug)
+            if item is None:
+                return False, None
+            expires_at, entry = item
+            if expires_at <= now:
+                del self._entries[slug]
+                return False, None
+            self._entries.move_to_end(slug)
+            return True, entry
 
-    def put(self, slug: str, expires_at: float, entry: dict[str, Any] | None) -> None:
+    def store(self, slug: str, ttl: float, entry: dict[str, Any] | None) -> None:
+        """Cache ``entry`` (possibly None) for ``ttl`` seconds, evicting only as needed."""
         with self._lock:
-            while len(self._entries) >= self._max:
-                with self._order_lock:
-                    self._tick += 1
-                    oldest = min(self._entries, key=lambda k: self._entries[k][2])
-                self._entries.pop(oldest, None)  # evict ONE entry, never all
-            with self._order_lock:
-                self._tick += 1
-                tick = self._tick
-            self._entries[slug] = (expires_at, entry, tick)
+            self._entries[slug] = (time.monotonic() + ttl, entry)
+            self._entries.move_to_end(slug)
+            while len(self._entries) > self._max:
+                self._entries.popitem(last=False)  # the LRU end, one at a time
 
     def clear(self) -> None:
         with self._lock:
@@ -286,11 +295,24 @@ def _bare_head_branch(bare_dir: str) -> str:
     for part in name.split("/"):
         if part in ("", ".", "..", "HEAD") or part.startswith(".") or part.endswith(".lock"):
             return "master"
-        if any(ch in _FORBIDDEN_REF_CHARS or ch.isspace() for ch in part):
+        if any((ch in _FORBIDDEN_REF_CHARS) or ch.isspace() for ch in part):
             return "master"
         if part.endswith("."):
             return "master"
     return name
+
+
+def _contained(path: str, root: str) -> bool:
+    """Whether ``path`` is ``root`` or lies beneath it (both already realpath'd).
+
+    ``commonpath`` rather than ``startswith(root + os.sep)``: the string form
+    turns a root of ``"/"`` into ``"//"``, which no absolute path starts with,
+    so every candidate would have looked contained.
+    """
+    try:
+        return os.path.commonpath([root, path]) == root
+    except ValueError:  # different drives (Windows) or a mix of abs/rel
+        return False
 
 
 def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
@@ -318,7 +340,7 @@ def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
         # make the bus advertise -- and workers push to -- anything else.
         real_root = os.path.realpath(root)
         real_bare = os.path.realpath(bare)
-        if real_bare != real_root and not real_bare.startswith(real_root + os.sep):
+        if not _contained(real_bare, real_root):
             return None
         if not os.path.isdir(real_bare):
             return None
@@ -344,12 +366,11 @@ def _fallback_entry(slug: str) -> dict[str, Any] | None:
     read the cache, probe (one stat, unlocked, no lock held at all), write the
     cache. A stalled mount therefore delays only the caller that touched it.
     """
-    cached = _FALLBACK.get(slug)
-    if cached is not None and cached[0] > time.monotonic():
-        return cached[1]
+    hit, cached = _FALLBACK.lookup(slug)
+    if hit:
+        return cached
     entry = _probe_argonas_live(slug)
-    ttl = _POSITIVE_TTL if entry is not None else _NEGATIVE_TTL
-    _FALLBACK.put(slug, time.monotonic() + ttl, entry)
+    _FALLBACK.store(slug, _POSITIVE_TTL if entry is not None else _NEGATIVE_TTL, entry)
     return entry
 
 

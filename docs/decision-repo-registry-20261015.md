@@ -112,14 +112,21 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
   `os.path.isdir(root/slug + ".git")` and a bare dir whose realpath escapes the
   realpath of the root is refused (a planted symlink cannot redirect a worker's
   push).
-- Results are cached in a small TTL dict: positives 60 s, negatives 10 s. The
-  fallback never raises (an unreadable mount is a miss) and costs one `stat` call
-  per lookup. The lock covers the dict read and the dict write **only** — the
-  probe runs with no lock held at all, so a stalled mount delays just the
-  caller that touched it, never another slug and never the bus (both properties
-  have regression tests). On overflow exactly one entry (the oldest insertion)
-  is evicted, so a flood of hostile job strings cannot erase every warm entry
-  and stampede the mount with re-probes.
+- Results are cached in a small TTL cache (`_FallbackCache`): positives 60 s,
+  negatives 10 s. The fallback never raises (an unreadable mount is a miss) and
+  costs one `stat` call per lookup. **One** lock guards the cache's ordered dict
+  and its order together — a single lock means no lock-order hazard and no
+  eviction race, and it is held only for constant-time dict operations, so the
+  probe runs with no lock held at all: a stalled mount delays just the caller
+  that touched it, never another slug and never the bus. All three properties
+  (single lock, unlocked probe, no race under 8 threads) have regression tests.
+  On overflow the least-recently-used entry is evicted **one at a time**, so a
+  flood of hostile job strings cannot erase every warm entry and stampede the
+  mount with re-probes. The cache hands back entries, never its internal
+  `(expires_at, entry)` bookkeeping.
+- Containment is `os.path.commonpath([root, path]) == root`, not a `startswith`
+  of `root + os.sep` — the string form turns a root of `/` into `//` and would
+  have declared every absolute path contained.
 - **A catalog entry always wins** — the fallback is a MISS path, never an
   override, so curated fields (forge facets, branch, commands, live host) can
   never be replaced by synthesized ones.

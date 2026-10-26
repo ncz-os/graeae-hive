@@ -249,6 +249,15 @@ class HostileSlugTests(_FallbackCase):
         self.assertEqual(entry["sources"], ["argonas-live"])
         self.assertEqual(entry["status"], "active")
 
+    def test_whitespace_branch_names_are_rejected_through_the_probe(self):
+        # Exercises the full _probe_argonas_live path (not just the helper), so
+        # a mistake in the boolean expression cannot hide behind a unit call.
+        for bad in ("a b", "a\tb"):
+            _make_bare(self.root, "wscheck", head=f"ref: refs/heads/{bad}\n")
+            self.assertEqual(repos._probe_argonas_live("wscheck")["default_branch"], "master")
+        _make_bare(self.root, "wscheck", head="ref: refs/heads/feature/ok-1\n")
+        self.assertEqual(repos._probe_argonas_live("wscheck")["default_branch"], "feature/ok-1")
+
     def test_forbidden_ref_chars_include_the_backslash(self):
         # The ref-name character set is spelled out as a set: the backslash
         # and the DEL byte must BOTH be rejected (a quoting mistake in a string
@@ -272,6 +281,40 @@ class HostileSlugTests(_FallbackCase):
         link.symlink_to(self.root)
         with mock.patch.dict(os.environ, {"HIVE_ARGONAS_GIT_ROOT": str(link)}):
             self.assertIsNotNone(repos._probe_argonas_live("legit"))
+
+
+class ContainmentTests(_FallbackCase):
+    """The root may be ``/`` (or a symlinked mount): containment must still hold."""
+
+    def test_containment_helper(self):
+        self.assertTrue(repos._contained("/srv/git/a.git", "/srv/git"))
+        self.assertTrue(repos._contained("/srv/git", "/srv/git"))
+        self.assertFalse(repos._contained("/srv/git-other/a.git", "/srv/git"))  # prefix, not child
+        self.assertFalse(repos._contained("/etc/passwd", "/srv/git"))
+        # The string form `startswith(root + os.sep)` turns "/" into "//" and
+        # would have declared EVERY absolute path contained.
+        self.assertTrue(repos._contained("/foo.git", "/"))
+        self.assertTrue(repos._contained("/a/b/c.git", "/"))
+
+    def test_root_of_slash_does_not_accept_any_absolute_path(self):
+        # With the root at "/", `real_bare` is whatever came back from
+        # realpath -- including a path OUTSIDE the root's namespace on another
+        # mount. The string form compared against "//" and passed everything;
+        # the real containment check must still refuse.
+        with (
+            mock.patch.dict(os.environ, {"HIVE_ARGONAS_GIT_ROOT": "/"}),
+            mock.patch("hive.repos.os.path.realpath", return_value="/elsewhere/x.git"),
+        ):
+            self.assertIsNone(repos._probe_argonas_live("x"))
+
+    def test_bare_dir_that_is_the_root_itself_is_not_a_repo(self):
+        # root intentionally points at a directory whose name ends in `.git`
+        # via a slug of nothing -- only the real child path counts.
+        inner = self.root / "nested"
+        inner.mkdir()
+        _make_bare(inner, "realdir")
+        with mock.patch.dict(os.environ, {"HIVE_ARGONAS_GIT_ROOT": str(self.root)}):
+            self.assertIsNone(repos._probe_argonas_live("nested"))
 
 
 class CatalogWinsTests(_FallbackCase):
@@ -370,25 +413,6 @@ class CacheTests(_FallbackCase):
         with mock.patch("hive.repos.time.monotonic", lambda: real() + repos._POSITIVE_TTL + 0.01):
             self.assertIsNone(repos.find_exact("vanishing"))
 
-    def test_cache_evicts_one_entry_not_all(self):
-        cache = repos._FallbackCache(max_entries=3)
-        for i in range(3):
-            cache.put(f"slug-{i}", time.monotonic() + 60, {"id": f"slug-{i}"})
-        self.assertEqual(len(cache), 3)
-        cache.put("slug-3", time.monotonic() + 60, {"id": "slug-3"})
-        # ONE eviction (the oldest), not a wholesale clear that would stampede
-        self.assertEqual(len(cache), 3)
-        self.assertIn("slug-1", cache)
-        self.assertIn("slug-2", cache)
-        self.assertIn("slug-3", cache)
-        self.assertNotIn("slug-0", cache)
-
-    def test_eviction_keeps_warm_entries_within_bounds(self):
-        with mock.patch.object(repos, "_FALLBACK", repos._FallbackCache(max_entries=4)):
-            for i in range(10):
-                repos.find_exact(f"miss-{i}")
-            self.assertEqual(len(repos._FALLBACK), 4)
-
     def test_clear_drops_everything(self):
         repos.find_exact("whatever")
         self.assertTrue(len(repos._FALLBACK))
@@ -400,8 +424,7 @@ class CacheTests(_FallbackCase):
 
         A stalled NFS lookup parks inside the probe; if the cache lock were
         held there, every other slug would queue behind it. Proven without
-        timing: the probe itself takes the lock (a second, independent thread
-        does it too) and must succeed immediately.
+        timing: the probe takes the cache lock itself and must get it at once.
         """
         observed = {}
 
@@ -417,7 +440,7 @@ class CacheTests(_FallbackCase):
         self.assertTrue(observed.get("lock_free"), "probe ran with the cache lock held")
 
     def test_a_slow_probe_does_not_block_other_slugs(self):
-        """Concurrency proof: a parked probe on slug A leaves B's cache hit fast."""
+        """A parked probe on slug A leaves B's cached hit immediate."""
         _make_bare(self.root, "warm")
         self.assertIsNotNone(repos.find_exact("warm"))  # cached positive
         inside = threading.Event()
@@ -432,12 +455,88 @@ class CacheTests(_FallbackCase):
             slow = threading.Thread(target=repos.find_exact, args=("stalled",), daemon=True)
             slow.start()
             self.assertTrue(inside.wait(2), "probe never started")
-            # While A is parked inside the mount, B's cached answer is immediate.
             started = time.monotonic()
             self.assertIsNotNone(repos.find_exact("warm"))
             self.assertLess(time.monotonic() - started, 1.0)
             release.set()
             slow.join(5)
+
+
+class FallbackCacheTests(unittest.TestCase):
+    """The cache is one lock over an ordered dict: no second lock, no race."""
+
+    def test_lookup_returns_the_entry_not_the_bookkeeping(self):
+        cache = repos._FallbackCache()
+        self.assertEqual(cache.lookup("nope"), (False, None))
+        cache.store("hit", 60, {"id": "hit"})
+        self.assertEqual(cache.lookup("hit"), (True, {"id": "hit"}))
+        cache.store("miss", 10, None)  # a NEGATIVE result is cached too
+        self.assertEqual(cache.lookup("miss"), (True, None))  # hit, answer is None
+        self.assertEqual(cache.lookup("hit"), (True, {"id": "hit"}))  # still a hit
+
+    def test_expiry_is_dropped_on_read(self):
+        cache = repos._FallbackCache()
+        cache.store("soon", 10, {"id": "soon"})
+        real = time.monotonic
+        with mock.patch("hive.repos.time.monotonic", lambda: real() + 10.01):
+            self.assertEqual(cache.lookup("soon"), (False, None))
+        self.assertEqual(len(cache), 0)
+
+    def test_one_lock_only(self):
+        # A second lock is exactly what allowed the eviction race; there must be
+        # no lock on the cache other than the one guarding the dict.
+        cache = repos._FallbackCache()
+        locks = [n for n, v in vars(cache).items() if isinstance(v, type(threading.Lock()))]
+        self.assertEqual(locks, ["_lock"])
+
+    def test_evicts_exactly_one_lru_entry(self):
+        cache = repos._FallbackCache(max_entries=3)
+        for i in range(3):
+            cache.store(f"slug-{i}", 60, {"id": f"slug-{i}"})
+        self.assertEqual(len(cache), 3)
+        cache.lookup("slug-0")  # touch the oldest: it is now the most recent
+        cache.store("slug-3", 60, {"id": "slug-3"})
+        self.assertEqual(len(cache), 3)
+        self.assertTrue(cache.lookup("slug-0")[0])
+        self.assertTrue(cache.lookup("slug-3")[0])
+        self.assertFalse(cache.lookup("slug-1")[0])  # only the LRU end went
+        self.assertTrue(cache.lookup("slug-2")[0])
+
+    def test_eviction_keeps_warm_entries_within_bounds(self):
+        cache = repos._FallbackCache(max_entries=4)
+        for i in range(10):
+            cache.store(f"slug-{i}", 60, {"id": f"slug-{i}"})
+        self.assertEqual(len(cache), 4)
+        for i in (6, 7, 8, 9):  # the survivors are still warm
+            self.assertTrue(cache.lookup(f"slug-{i}")[0])
+
+    def test_concurrent_store_and_lookup_never_raise(self):
+        """Regression for the two-lock eviction race (KeyError / wrong victim)."""
+        cache = repos._FallbackCache(max_entries=8)
+        errors: list[str] = []
+
+        def hammer(worker: int) -> None:
+            try:
+                for i in range(3000):
+                    cache.store(f"slug-{i % 23}", 60, {"worker": worker, "i": i})
+                    cache.lookup(f"slug-{(i * 7) % 23}")
+                    len(cache)
+            except Exception as exc:  # noqa: BLE001 - the point is that nothing raises
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=hammer, args=(w,)) for w in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+        self.assertEqual(errors, [])
+        self.assertLessEqual(len(cache), 8)
+
+    def test_through_the_public_lookup_path_is_bounded(self):
+        with mock.patch.object(repos, "_FALLBACK", repos._FallbackCache(max_entries=4)):
+            for i in range(10):
+                repos.find_exact(f"miss-{i}")
+            self.assertEqual(len(repos._FALLBACK), 4)
 
 
 class OldCodeContrastTests(unittest.TestCase):
