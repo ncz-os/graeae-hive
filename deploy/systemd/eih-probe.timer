@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the EIH standing probe hourly at minute 07 UTC
+
+[Timer]
+# Hourly at :07 past, off the :00/:05 herd. Persistent=false on purpose: a
+# missed hourly sample is stale the moment the host comes back, and a catch-up
+# burst would measure the wrong hour -- the point is a sample per hour, not a
+# guaranteed count of samples.
+OnCalendar=*-*-* 00..23:07:00 UTC
+Persistent=false
+AccuracySec=30s
+Unit=eih-probe.service
+
+[Install]
+WantedBy=timers.target

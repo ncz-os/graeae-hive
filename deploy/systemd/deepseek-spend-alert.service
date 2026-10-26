@@ -1,0 +1,21 @@
+[Unit]
+Description=DeepSeek month-to-date spend alert (alert only, never blocks API calls)
+Documentation=https://github.com/graeae/hive/blob/main/docs/deepseek-spend-alert.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jasonperlow
+WorkingDirectory=/home/jasonperlow/graeae-hive
+# The DeepSeek key is read from the environment at run time only; it is never
+# printed, logged, or written to the snapshot file. Keep this file mode 600.
+EnvironmentFile=/etc/graeae-hive/deepseek-spend-alert.env
+ExecStart=/usr/bin/python3 -m hive.tools.deepseek_spend_alert
+# A failed fetch exits non-zero so the operator (and systemd) can see it; the
+# hourly timer simply retries. Never restart-loop on a metering failure.
+Restart=no
+TimeoutStartSec=120
+# Modest hardening; the tool needs no privileges beyond writing its state dir.
+NoNewPrivileges=yes
+PrivateTmp=yes
