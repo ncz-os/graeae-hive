@@ -1,0 +1,86 @@
+# Ordered deterministic rules.  The reconciler stops at the first match.
+[[rule]]
+id = "R1"
+failure_reason_regex = "clone_failed|branch_not_found"
+evidence_regex = "Remote branch .* not found"
+action = "escalate"
+max_retries = 0
+retry_scope = "same_host"
+note = "bad brief: branch or clone target is unavailable; escalate to submitter"
+
+[[rule]]
+id = "R2"
+failure_reason_regex = "429|502|503|504|connect.*timeout|dns"
+action = "release_to_queue"
+max_retries = 3
+retry_scope = "other_host"
+note = "provider transport failure; release with backoff and prefer another host or route"
+
+[[rule]]
+id = "R3"
+failure_reason_regex = "codex_delivery_failed|delivery_integrity_check_failed|completion_evidence_missing"
+action = "escalate"
+max_retries = 0
+retry_scope = "same_host"
+note = "delivery evidence is incomplete or invalid; include verdict text for submitter"
+
+[[rule]]
+id = "R4"
+failure_reason_regex = "unhandled_exception"
+action = "release_to_queue"
+max_retries = 1
+retry_scope = "same_host"
+note = "new exception signature may be retried once; repeated signature becomes a doctor defect"
+
+[[rule]]
+id = "R5"
+evidence_regex = "^$"
+action = "escalate"
+max_retries = 0
+retry_scope = "same_host"
+note = "insufficient evidence; never retry"
+
+[[rule]]
+id = "R6"
+match_all = true
+failure_reason_regex = "loop_unresolved"
+evidence_regex = "session-cancel|daemon.sock is unreachable|review.*timeout|author.*timeout"
+action = "release_to_queue"
+max_retries = 1
+retry_scope = "other_host"
+note = "zoder infrastructure fault; retry once on a different host, then escalate"
+
+[[rule]]
+id = "R7"
+match_all = true
+failure_reason_regex = "loop_unresolved"
+evidence_regex = "(?:failed tests|test failures|pytest.*failed)"
+action = "escalate"
+max_retries = 0
+retry_scope = "same_host"
+note = "loop record contains failing tests; escalate with test names"
+
+[[rule]]
+id = "R8"
+evidence_regex = "OOM-killed|ENOSPC|disk full|lost lease|worker restart"
+action = "release_to_queue"
+max_retries = 2
+retry_scope = "other_host"
+note = "host fault; requeue elsewhere and record a host health note"
+
+[[rule]]
+id = "R9"
+failure_reason_regex = "budget_exceeded"
+evidence_regex = "Budget exceeded: \\$[0-9.]+ of \\$[0-9.]+ Day limit"
+action = "escalate"
+max_retries = 0
+retry_scope = "same_host"
+note = "engine spend cap exceeded; never retry this host until reset"
+
+[[rule]]
+id = "R10"
+evidence_regex = "bs_audit: BS:(?:empty|confab|nocommit)"
+action = "escalate"
+max_retries = 0
+retry_scope = "same_host"
+note = "bs_audit found missing or confabulated completion evidence; human review required"
