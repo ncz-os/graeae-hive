@@ -416,11 +416,26 @@ async function refreshRunning(){
 // else the author_model/reviewer_model entries of the zoder loop record in
 // result.tail. Ordered + de-duplicated, so an escalated job reads
 // "deepseek-flash → MiniMax-M3".
+// Reviewers come from the ONE reviewer record (2026-10-26): result.reviewer,
+// else the structured verdict in result.review_evidence, else models.reviewers
+// (rows written before the record existed), so the card and the reviewer block
+// can never name different models.
+function jobReviewers(r){
+  const rec=r&&r.reviewer;
+  if(rec&&Array.isArray(rec.models)&&rec.models.length)return rec.models.map(String);
+  const ev=r&&r.review_evidence;
+  if(ev&&Array.isArray(ev.reviewers)){
+    const n=[...new Set(ev.reviewers.map(x=>String((x&&(x.model||x.role))||'')).filter(Boolean))];
+    if(n.length)return n;
+  }
+  return null;
+}
 function jobModels(j){
   const r=(j&&j.result)||{};
   const m=r.models;
-  if(m&&(m.author||m.reviewers)){
-    return {author:String(m.author||''),reviewers:[].concat(m.reviewers||[]).map(String)};
+  const revs=jobReviewers(r);
+  if((m&&(m.author||m.reviewers))||revs){
+    return {author:String((m&&m.author)||''),reviewers:revs||[].concat((m&&m.reviewers)||[]).map(String)};
   }
   const t=String(r.tail||'');
   const uniq=a=>[...new Set(a)];

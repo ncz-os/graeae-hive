@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
@@ -22,6 +23,7 @@ try:
 except ModuleNotFoundError:
     from hive.persistence import _sqlite_async as aiosqlite
 
+from hive import review_record
 from hive import scheduler as sched
 from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
@@ -76,6 +78,28 @@ from hive.core.models import COST_TIERS
 from hive.persistence.sqlite import DependencyNotReady, SqlExpr
 
 router = APIRouter()
+log = logging.getLogger("hive.bus.jobs")
+
+
+def _reconcile_reviewer_record(job_id: str, result: Any) -> None:
+    """One reviewer record per job (2026-10-26).
+
+    Warn when a submitted result names different reviewers in its reviewer
+    fields, then derive them all from the structured verdict (see
+    hive/review_record.py) and add the ``hive_reviews`` delivery entry. A result
+    with neither a review_evidence record nor a ``reviewer`` record (an older
+    worker) is only checked, never rewritten. Never raises."""
+    if not isinstance(result, dict):
+        return
+    try:
+        disagree = review_record.disagreements(result)
+        if disagree:
+            log.warning("job %s submitted disagreeing reviewer fields: %s", job_id, ", ".join(disagree))
+        if isinstance(result.get("review_evidence"), dict) or isinstance(result.get("reviewer"), dict):
+            review_record.apply(result, hive_reviews=True)
+    except Exception:  # noqa: BLE001 -- a record problem must never fail a result write
+        log.exception("job %s: reviewer record reconciliation failed", job_id)
+
 
 _JOB_COLUMNS = (
     "id, submitter_urn, parent_job_id, kind, description, priority, status, "
@@ -974,6 +998,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 for _rk in ("hive_reviews", "deepseek_reviews"):
                     if _prev.get(_rk) and not req.result.get(_rk):
                         req.result[_rk] = _prev[_rk]
+            _reconcile_reviewer_record(job_id, req.result)
 
         # ---- SUBMITTER CANCELLATION (2026-10-25) -------------------------
         # A submitter could not cancel or supersede its OWN claimed job: the
