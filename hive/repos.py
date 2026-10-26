@@ -312,10 +312,9 @@ def _bare_head_branch(bare_dir: str, head_text: str | None) -> str:
     single open() its budget allows. It is nothing but text from the mount and
     is validated as a branch name because of that.
     """
-    try:
-        head = (head_text or "").strip()
-    except Exception:  # noqa: BLE001 - defensive: never let a read break a lookup
-        return "master"
+    if not isinstance(head_text, str):
+        return "master"  # only the caller's text is ever accepted
+    head = head_text.strip()
     prefix = "ref: refs/heads/"
     if not head.startswith(prefix):
         return "master"  # detached HEAD, garbage, or unreadable
