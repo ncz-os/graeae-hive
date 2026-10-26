@@ -698,7 +698,14 @@ async def dequeue_next_job(agent_urn: str):
             # time, or a stale pre-read) is still refused at the
             # compare-and-set.
             candidates = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW)
-            _blocked_dep_jobs = await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[r[0] for r in candidates])
+            # Only candidates that actually carry a depends_on column need the
+            # evaluation: dep-free jobs (the common case) cost nothing here.
+            _dep_candidates = [r for r in candidates if r[15]]
+            _blocked_dep_jobs = (
+                await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[r[0] for r in _dep_candidates])
+                if _dep_candidates
+                else set()
+            )
             if _blocked_dep_jobs:
                 candidates = [r for r in candidates if r[0] not in _blocked_dep_jobs]
             # Role-aware ordering (hive.scheduler is the single source of truth).
@@ -1000,7 +1007,8 @@ async def update_job(job_id: str, req: JobUpdate):
             if _extra_fields:
                 raise HTTPException(
                     403,
-                    "a submitter/orchestrator cancel may set only status, reason and cancel_actor; "
+                    "a submitter/orchestrator cancel may set only status, reason and cancel_actor "
+                    "(a cancellation note belongs in reason; a result is the claimant's to write); "
                     f"refusing to also update {_extra_fields}",
                 )
             # The actor is the caller-declared principal, but it is only an

@@ -171,9 +171,11 @@ class HiveMindRepository(ABC):
     async def jobs_with_unsatisfied_deps(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]:
         """Of ``ids``, which jobs have a ``depends_on`` entry not all ``done``?
 
-        Fail-closed: malformed ``depends_on`` (non-JSON, or JSON that is not an
-        array) counts as unsatisfied, and a reference to a job id that does not
-        exist also counts as unsatisfied (such a dep can never reach done).
+        Fail-closed on the depends_on COLUMN: malformed JSON or a non-array
+        counts as unsatisfied, and a reference to a job id that does not exist
+        counts as unsatisfied (such a dep can never reach done). Only ids that
+        exist in the jobs table are evaluated; an id with no row produces no
+        row (callers pass candidate ids just read from the same table).
         """
         ...
 

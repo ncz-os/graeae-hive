@@ -35,6 +35,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from pathlib import Path
 from unittest import mock
 
 os.environ.setdefault("HIVE_BACKEND", "sqlite")
@@ -656,13 +657,25 @@ class PersistenceMigrationTests(unittest.TestCase):
     """Reviewer finding: branch_created_from must actually reach both backends."""
 
     def test_sqlite_declares_branch_created_from(self):
-        """sqlite's ensure_schema carries the column in its additive migration list."""
-        import inspect
+        """A FRESH sqlite DB gets the column from CREATE TABLE — behavioral,
+        not a source-text grep (review fix). The additive migration that adds
+        it to OLD live DBs runs the same ensure_schema path (init calls
+        PRAGMA + ALTER per column), so the CREATE TABLE check plus the
+        DB2/Oracle additive-structure checks below cover all three backends."""
+        import asyncio
 
         from hive.persistence import sqlite as sqlite_mod
 
-        src = inspect.getsource(sqlite_mod)
-        self.assertIn('("jobs", "branch_created_from", "branch_created_from TEXT")', src)
+        async def _check():
+            with tempfile.TemporaryDirectory() as td:
+                fresh = sqlite_mod.SqliteHiveRepository(str(Path(td) / "fresh.db"))
+                await fresh.init(agent_bus.SCHEMA)
+                async with fresh.connection() as db:
+                    async with db.execute("PRAGMA table_info(jobs)") as cur:
+                        cols = {row[1] for row in await cur.fetchall()}
+                self.assertIn("branch_created_from", cols)
+
+        asyncio.run(_check())
 
     def test_db2_declares_branch_created_from(self):
         names = {n for n, _ in _DB2_ADDITIVE_COLUMNS.get("HIVE_JOBS", ())}

@@ -487,16 +487,13 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             # ONE batched dependency resolution per pre-scan read via the ABC
             # (not N per-candidate). 2026-10-25: the resolution moved from
             # completed_job_ids (per dep id) to jobs_with_unsatisfied_deps
-            # (per candidate job) — same property, batched on the ABC. The
-            # window pre-scan reads every candidate in ONE call (and the
-            # windowed candidate scan re-reads them in a second call when the
-            # pre-scan finds nothing blocked, as here). N candidates must
-            # never produce N calls.
-            self.assertLessEqual(len(dep_calls), 2, dep_calls)
-            # Each call covers the WHOLE candidate set of its read: the scan
-            # here sees 3 queued jobs (dep-pending, blocked, ready), so every
-            # call must carry >= 3 ids, never one id per candidate.
-            self.assertTrue(dep_calls and all(n >= 3 for n in dep_calls), dep_calls)
+            # (per candidate job) — same property, batched on the ABC. This
+            # setup has exactly 3 candidates WITH depends_on (blocked, ready;
+            # dep-pending has none), so the pre-scan makes EXACTLY ONE call
+            # carrying those ids — never one call per candidate.
+            self.assertEqual(len(dep_calls), 1, dep_calls)
+            # The single call covers the whole dep-carrying candidate set.
+            self.assertGreaterEqual(dep_calls[0], 2, dep_calls)
 
     async def test_fresh_sqlite_has_dedup_column_and_active_unique_index(self):
         with tempfile.TemporaryDirectory() as td:
