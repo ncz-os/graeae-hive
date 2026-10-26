@@ -193,7 +193,10 @@ _PSEUDO_BRANCHES = frozenset({"HEAD", "refs"})
 # Characters git refuses in a ref name (git-check-ref-format). Spelled out as a
 # set, one entry per character, so there is no escape sequence to get wrong --
 # the backslash included.
-_FORBIDDEN_REF_CHARS = frozenset("~^:?*[\\\x7f") | frozenset(" \t\n\r\v\f")
+# Control characters are refused too: git forbids any byte below 0x20 (or 0x7f)
+# in a ref, and a NUL read out of a HEAD file would otherwise reach a worker as
+# a branch name.
+_FORBIDDEN_REF_CHARS = frozenset("~^:?*[\\\x7f") | frozenset(" \t\n\r\v\f") | frozenset(chr(c) for c in range(0x20))
 _POSITIVE_TTL = 60.0  # bare repos appear rarely; a minute is plenty
 _NEGATIVE_TTL = 10.0  # short: a repo created just now must not be denied long
 _FALLBACK_MAX = 256

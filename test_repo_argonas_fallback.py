@@ -261,7 +261,7 @@ class HostileSlugTests(_FallbackCase):
         # literal silently dropped the backslash once already).
         self.assertIn("\\", repos._FORBIDDEN_REF_CHARS)
         self.assertIn("\x7f", repos._FORBIDDEN_REF_CHARS)
-        for bad in ("a\\b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\x7fb", "a b"):
+        for bad in ("a\\b", "a~b", "a^b", "a:b", "a?b", "a*b", "a[b", "a\x7fb", "a b", "a\x00b", "a\x01b"):
             _make_bare(self.root, "refcheck", head=f"ref: refs/heads/{bad}\n")
             self.assertEqual(
                 repos._probe_argonas_live("refcheck")["default_branch"],
@@ -410,6 +410,84 @@ class NormalizationTests(_FallbackCase):
         # Case and inner characters are ARGONAS-significant: never rewritten.
         self.assertEqual(repos._normalize_slug("  Mixed.Case-1  "), "Mixed.Case-1")
         self.assertEqual(repos._normalize_slug("x"), "x")
+
+
+class NormalizationBeforeValidationTests(_FallbackCase):
+    """Validation must see the NORMALIZED slug: one key, one decision."""
+
+    def test_hostile_slug_is_validated_after_stripping(self):
+        with mock.patch("hive.repos._probe_argonas_live", wraps=repos._probe_argonas_live) as probe:
+            self.assertIsNone(repos.find_exact("  ../etc/passwd  "))
+            # the probe received the STRIPPED string, so validation judged it
+            self.assertEqual(probe.call_args.args, ("../etc/passwd",))
+        self.assertEqual(list(repos._FALLBACK._entries), ["../etc/passwd"])
+
+    def test_padded_hostile_and_bare_hostile_share_one_negative_entry(self):
+        with mock.patch("hive.repos._probe_argonas_live", wraps=repos._probe_argonas_live) as probe:
+            self.assertIsNone(repos.find_exact("  ../etc/passwd  "))
+            self.assertIsNone(repos.find_exact("../etc/passwd"))
+            self.assertIsNone(repos.find_exact(" ../etc/passwd"))
+            self.assertEqual(probe.call_count, 1)  # cached once, under one key
+        self.assertEqual(list(repos._FALLBACK._entries), ["../etc/passwd"])
+
+    def test_a_hostile_name_cannot_be_smuggled_past_validation(self):
+        # Whatever the padding, a separator / traversal / .git suffix still
+        # fails: the normalized form is what the regex and the folder test see.
+        for hostile in ("  a/b  ", "  ../x  ", "  x.git  ", "\t../x\t", "  .hidden  "):
+            self.assertIsNone(repos.find_exact(hostile), hostile)
+        self.assertEqual([k for k in repos._FALLBACK._entries if k == "legit"], [])
+
+
+class ProbeSyscallAndHeadTests(_FallbackCase):
+    def test_realpath_is_never_called_by_the_probe(self):
+        """Containment is decided on the exact path that was stat'ed."""
+        _make_bare(self.root, "statme")
+        with mock.patch("hive.repos.os.path.realpath", side_effect=AssertionError("realpath in probe")):
+            self.assertIsNotNone(repos._probe_argonas_live("statme"))
+
+    def test_symlink_target_is_never_resolved(self):
+        calls: list[tuple[str, str]] = []
+        real_lstat, real_realpath = os.lstat, os.path.realpath
+        _make_bare(self.root, "target")
+        os.symlink(self.outside / "escaped.git", self.root / "link.git")
+        os.symlink(self.root / "target.git", self.root / "inner-link.git")
+        with (
+            mock.patch(
+                "hive.repos.os.lstat",
+                side_effect=lambda p: (calls.append(("lstat", p)), real_lstat(p))[1],
+            ),
+            mock.patch(
+                "hive.repos.os.path.realpath",
+                side_effect=lambda p: (calls.append(("realpath", p)), real_realpath(p))[1],
+            ),
+        ):
+            self.assertIsNone(repos._probe_argonas_live("link"))
+            self.assertIsNone(repos._probe_argonas_live("inner-link"))
+        self.assertEqual([kind for kind, _ in calls], ["lstat", "lstat"])
+
+    def test_head_is_parsed_not_split(self):
+        cases = {
+            "ref: refs/heads/ok-1\n": "ok-1",
+            "ref: refs/heads/feature/sub_2\n": "feature/sub_2",
+            "HEAD detached at abc1234\n": "master",
+            "ref: refs/tags/v1\n": "master",  # not a branch ref
+            "ref: refs/heads/..\n": "master",
+            "ref: refs/heads/a..b\n": "master",
+            "ref: refs/heads/.hidden\n": "master",
+            "ref: refs/heads/x.lock\n": "master",
+            "ref: refs/heads/HEAD\n": "master",
+            "ref: refs/heads/a\x00b\n": "master",
+            "ref: refs/heads/a b\n": "master",
+            "ref: refs/heads/trailing.\n": "master",
+            "": "master",
+        }
+        for head, expected in cases.items():
+            _make_bare(self.root, "headcase", head=head)
+            self.assertEqual(
+                repos._probe_argonas_live("headcase")["default_branch"],
+                expected,
+                f"HEAD {head!r}",
+            )
 
 
 class StoreIfAbsentTests(unittest.TestCase):

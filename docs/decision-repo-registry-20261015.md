@@ -118,8 +118,12 @@ bus therefore answers from ARGONAS itself on a **catalog MISS only**:
   root itself may legitimately be a symlink — the NFS mount is one on some
   hosts — and is used as given, so the child path is inside it by construction.
   The slug is **normalized once** (leading/trailing space only; ARGONAS paths
-  are case-sensitive) before it is used as the cache key, the probed path and
-  the returned id, so `" x "` and `"x"` share one entry.
+  are case-sensitive) and **validation runs on the normalized value**, which is
+  then used as the cache key, the probed path and the returned id — so `" x "`
+  and `"x"` share one entry, and a padded hostile name is judged (and cached as
+  a negative) exactly as its bare form would be. Branch names taken from `HEAD`
+  are parsed (`ref: refs/heads/<name>` only) and every part is checked against
+  git's ref rules, control characters included.
 - Results are cached in a small TTL cache (`_FallbackCache`): positives 60 s,
   negatives 10 s. The fallback never raises (an unreadable mount is a miss) and
   costs **one `lstat` plus one `open`** of the bare repo's `HEAD` — no
