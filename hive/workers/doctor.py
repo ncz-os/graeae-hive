@@ -2139,23 +2139,39 @@ def process_triage_job(job: dict) -> dict:
         parts = [f"action={a}", f"conf={known_action.get('confidence', 1.0):.2f}", f"reason={reason}"]
         released = False
         if a == "dispatch_codex_fix":
-            parts.append(action_dispatch_codex_fix(known_action.get("codex_task"), job_id))
-            broadcast_doctor_message(
-                "doctor.fix.token_mismatch",
-                {
-                    "host": AGENT_HOST,
-                    "job_id": job_id,
-                    "target_host": known_action.get("target_host"),
-                    "signature": known_action.get("signature"),
-                    "base_kind": base_kind,
-                },
-            )
-            # Re-run the failed work now the offending host is fixed (the
-            # original jobs for a triage wrapper, else this job itself).
-            text, released = apply_release(
-                job_id, is_explicit_triage, base_kind, known_action.get("release_eligible_kinds")
-            )
-            parts.append(text)
+            dispatch_text = action_dispatch_codex_fix(known_action.get("codex_task"), job_id)
+            parts.append(dispatch_text)
+            if dispatch_text.startswith(("REFUSED", "codex submit FAILED", "dispatch_codex_fix missing")):
+                # The fix was NOT dispatched (approval gate, submit failure or
+                # no task): do not announce it and do not re-run the failed
+                # work against a host that was never fixed. Leave it for a human.
+                broadcast_doctor_message(
+                    "doctor.escalate.token_mismatch",
+                    {
+                        "host": AGENT_HOST,
+                        "job_id": job_id,
+                        "reason": f"fix not dispatched: {dispatch_text[:200]}",
+                        "base_kind": base_kind,
+                    },
+                )
+                parts.append("fix not dispatched; escalated to human, no release")
+            else:
+                broadcast_doctor_message(
+                    "doctor.fix.token_mismatch",
+                    {
+                        "host": AGENT_HOST,
+                        "job_id": job_id,
+                        "target_host": known_action.get("target_host"),
+                        "signature": known_action.get("signature"),
+                        "base_kind": base_kind,
+                    },
+                )
+                # Re-run the failed work now the offending host is fixed (the
+                # original jobs for a triage wrapper, else this job itself).
+                text, released = apply_release(
+                    job_id, is_explicit_triage, base_kind, known_action.get("release_eligible_kinds")
+                )
+                parts.append(text)
         elif a == "release_to_queue":
             text, released = apply_release(
                 job_id, is_explicit_triage, base_kind, known_action.get("release_eligible_kinds")

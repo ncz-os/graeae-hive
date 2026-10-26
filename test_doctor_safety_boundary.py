@@ -320,3 +320,48 @@ def test_import_does_not_install_signal_handlers():
         text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def _signature_match(monkeypatch):
+    monkeypatch.setattr(doctor, "fetch_failed_jobs_for_kind", lambda *a, **k: [])
+    monkeypatch.setattr(doctor, "fetch_agent_registry_summary", lambda: {})
+    monkeypatch.setattr(doctor, "_doctor_v2_decision", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        doctor,
+        "_match_known_signature",
+        lambda *a: {
+            "action_type": "dispatch_codex_fix",
+            "confidence": 1.0,
+            "reason": "token mismatch",
+            "codex_task": "repair the pairing",
+            "target_host": "hydra",
+            "signature": "token_mismatch",
+            "release_eligible_kinds": None,
+        },
+    )
+
+
+@pytest.mark.parametrize("dispatch_result", ["REFUSED: approval required", "codex submit FAILED code=500 resp=x"])
+def test_known_signature_fix_not_dispatched_is_neither_announced_nor_released(monkeypatch, dispatch_result):
+    _signature_match(monkeypatch)
+    monkeypatch.setattr(doctor, "action_dispatch_codex_fix", lambda *a, **k: dispatch_result)
+    release = Mock(return_value=("released", True))
+    monkeypatch.setattr(doctor, "apply_release", release)
+    sent = []
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda topic, payload, *a, **k: sent.append(topic))
+    doctor.process_triage_job({"id": "j", "kind": "triage:zeroclaw"})
+    release.assert_not_called()
+    assert "doctor.fix.token_mismatch" not in sent
+    assert "doctor.escalate.token_mismatch" in sent
+
+
+def test_known_signature_fix_dispatched_is_announced_and_released(monkeypatch):
+    _signature_match(monkeypatch)
+    monkeypatch.setattr(doctor, "action_dispatch_codex_fix", lambda *a, **k: "codex sub-job submitted id=abc")
+    release = Mock(return_value=("released", True))
+    monkeypatch.setattr(doctor, "apply_release", release)
+    sent = []
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda topic, payload, *a, **k: sent.append(topic))
+    doctor.process_triage_job({"id": "j", "kind": "triage:zeroclaw"})
+    release.assert_called_once()
+    assert "doctor.fix.token_mismatch" in sent
