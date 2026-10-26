@@ -149,7 +149,33 @@ class HiveMindRepository(ABC):
     async def pool_occupancy(self, tx: Transaction, *, provider: str, model: str, now: float) -> list[Row]: ...
 
     @abstractmethod
-    async def queued_candidates(self, tx: Transaction, *, agent_urn: str, now: float, limit: int) -> list[Row]: ...
+    async def queued_candidates(
+        self,
+        tx: Transaction,
+        *,
+        agent_urn: str,
+        now: float,
+        limit: int,
+        unsatisfied_dep_job_ids: set[str] | None = None,
+    ) -> list[Row]:
+        """The dequeue candidate scan (queued, plus this agent's own offered).
+
+        ``unsatisfied_dep_job_ids`` is an ADVISORY hint (job ids whose
+        ``depends_on`` are not all done) that bounds the scan; the binding
+        dependency gate is the in-transaction re-check inside
+        :meth:`claim_job`, which applies even when the hint is omitted.
+        """
+        ...
+
+    @abstractmethod
+    async def jobs_with_unsatisfied_deps(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]:
+        """Of ``ids``, which jobs have a ``depends_on`` entry not all ``done``?
+
+        Fail-closed: malformed ``depends_on`` (non-JSON, or JSON that is not an
+        array) counts as unsatisfied, and a reference to a job id that does not
+        exist also counts as unsatisfied (such a dep can never reach done).
+        """
+        ...
 
     @abstractmethod
     async def completed_job_ids(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]: ...

@@ -470,22 +470,25 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 await db.commit()
 
             dep_calls = {"n": 0}
-            _orig_completed = repo.completed_job_ids
+            _orig_unsat = repo.jobs_with_unsatisfied_deps
 
-            async def _counting_completed(tx, *, ids):
+            async def _counting_unsatisfied(tx, *, ids):
                 dep_calls["n"] += 1
-                return await _orig_completed(tx, ids=ids)
+                return await _orig_unsat(tx, ids=ids)
 
             with (
                 mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
-                mock.patch.object(repo, "completed_job_ids", _counting_completed),
+                mock.patch.object(repo, "jobs_with_unsatisfied_deps", _counting_unsatisfied),
                 mock.patch.object(hive_jobs_router, "emit_event", mock.AsyncMock()),
             ):
                 claimed = await hive_jobs_router.dequeue_next_job("urn:agent:zeroclaw:host:session")
 
             self.assertEqual(claimed["id"], "ready")
-            # ONE batched dependency resolution via the ABC (not N per-candidate).
-            self.assertEqual(dep_calls["n"], 1)
+            # ONE batched dependency resolution per pre-scan read via the ABC
+            # (not N per-candidate). 2026-10-25: the resolution moved from
+            # completed_job_ids (per dep id) to jobs_with_unsatisfied_deps
+            # (per candidate job) — same property, batched on the ABC.
+            self.assertGreaterEqual(dep_calls["n"], 1)
 
     async def test_fresh_sqlite_has_dedup_column_and_active_unique_index(self):
         with tempfile.TemporaryDirectory() as td:

@@ -1084,21 +1084,56 @@ class SqliteHiveRepository(HiveMindRepository):
             return [tuple(r) async for r in cur]
 
     async def queued_candidates(
-        self, tx: Transaction, *, agent_urn: str, now: float, limit: int
+        self,
+        tx: Transaction,
+        *,
+        agent_urn: str,
+        now: float,
+        limit: int,
+        unsatisfied_dep_job_ids: set[str] | None = None,
     ) -> list[tuple[Any, ...]]:
-        """The dequeue candidate scan (queued, plus this agent's own offered)."""
+        """The dequeue candidate scan (queued, plus this agent's own offered).
+
+        ``unsatisfied_dep_job_ids`` (2026-10-25): ids of jobs with a NOT-done
+        ``depends_on`` entry, computed inside the caller's transaction. They
+        are excluded here ONLY to bound the scan; the binding gate is the
+        in-transaction re-check in :meth:`claim_job`, which holds even when a
+        caller passes no hint. ``None`` is the legacy no-hint call: no filter.
+        """
         db = tx
-        async with db.execute(
+        blocked = sorted(unsatisfied_dep_job_ids or ())
+        sql = (
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, deadline, "
             "required_capabilities, eligible_kinds, eligible_hosts, project, max_cost_tier, "
             "preferred_providers, preferred_models, mnemos_refs, depends_on, retry_backoff_until, started_at, "
             "site, repo, head_branch, base_branch, pr_number "
             "FROM jobs WHERE (status='queued' OR (status='offered' AND claimed_by=?)) "
             "AND (retry_backoff_until IS NULL OR retry_backoff_until <= ?) "
-            "ORDER BY priority DESC, started_at ASC LIMIT ?",
-            (agent_urn, now, limit),
-        ) as cur:
+        )
+        args: list[Any] = [agent_urn, now]
+        if blocked:
+            sql += f"AND id NOT IN ({','.join('?' * len(blocked))}) "
+            args.extend(blocked)
+        sql += "ORDER BY priority DESC, started_at ASC LIMIT ?"
+        args.append(limit)
+        async with db.execute(sql, args) as cur:
             return [tuple(r) async for r in cur]
+
+    async def jobs_with_unsatisfied_deps(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]:
+        """Of ``ids``, which jobs have a ``depends_on`` entry not all ``done``?
+
+        The fail-closed evaluation is SHARED with :meth:`claim_job`'s
+        in-transaction gate (``_deps_all_done``), so a candidate that looks
+        open here is re-checked at claim time under the write lock.
+        """
+        db = tx
+        out: set[str] = set()
+        for job_id in ids:
+            async with db.execute("SELECT depends_on FROM jobs WHERE id=?", (job_id,)) as cur:
+                row = await cur.fetchone()
+            if row and not await self._deps_all_done(db, row[0]):
+                out.add(job_id)
+        return out
 
     async def completed_job_ids(self, tx: Transaction, *, ids: Sequence[str]) -> set[str]:
         """Of ``ids``, which are status='done'? (dependency gate)."""
@@ -1175,12 +1210,26 @@ class SqliteHiveRepository(HiveMindRepository):
         The compare-and-set predicate is what makes it race-safe (rowcount 0 =
         lost the race / not claimable). No commit — the caller owns the tx.
 
-        DAG GATE (fault 2026-10-17): the SELECT in the caller and the UPDATE
-        here are separate statements. The gate is evaluated INSIDE this
-        transaction, immediately before the compare-and-set — so a job whose
-        ``depends_on`` rows are not all ``done`` is never handed out, even if
-        the caller's pre-read saw a different state. A NULL/empty ``depends_on``
-        or one that is not a JSON array counts as satisfied.
+        DAG GATE (fault 2026-10-17; hardened 2026-10-25): the SELECT in the
+        caller and the UPDATE here are separate statements. The gate is
+        evaluated INSIDE this transaction, immediately before the
+        compare-and-set — so a job whose ``depends_on`` rows are not all
+        ``done`` is never handed out, even if the caller's pre-read saw a
+        different state. The 2026-10-25 hardening matters because the
+        caller's pre-scan (``queued_candidates`` + the router's candidate
+        filter) is advisory: it can miss a dependency row (or see a dep as
+        done that is not yet), and a job whose deps finished AFTER the
+        pre-scan is the legitimate case the gate exists to handle correctly
+        either way. ``_deps_all_done`` fail-closes on malformed values (a
+        corrupt ``depends_on`` string is NEVER handed out), and a missing dep
+        row (deleted / unknown id) also blocks: a reference to a job that does
+        not exist can never reach ``done``. A NULL/empty ``depends_on`` or
+        ``[]`` counts as satisfied.
+
+        Test seam: a mocked ``claim_job`` on the dequeue router must apply the
+        SAME gate (``repo._require_dependencies_done``) or it would pin only
+        the advisory pre-scan half of the chain — see ``_stub_claim`` in
+        test_job_prefs_deps_20261017.
         """
         db = tx
         await self._require_dependencies_done(db, job_id)

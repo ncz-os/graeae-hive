@@ -29,8 +29,10 @@ so the suite never touches ARGONAS and never needs ssh.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -40,6 +42,7 @@ os.environ.setdefault("HIVE_BUS_TOKEN", "test-bus-token")
 os.environ.setdefault("HIVE_BUS_ADMIN_TOKEN", "test-admin-token")
 
 import httpx  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 
 import agent_bus  # noqa: E402
 from hive.bus import deps  # noqa: E402
@@ -51,8 +54,11 @@ from hive.bus.domain.model_admission import (  # noqa: E402
     admission_warnings,
     forbidden_model,
 )
+from hive.bus.routers import jobs as routers_jobs  # noqa: E402
+from hive.persistence import sqlite as sqlite_mod  # noqa: E402
 from hive.persistence.db2 import _DB2_ADDITIVE_COLUMNS  # noqa: E402
 from hive.persistence.oracle import _ORACLE_JOB_ADDITIONS  # noqa: E402
+from hive.persistence.sqlite import DependencyNotReady  # noqa: E402
 
 
 class _BusCase(unittest.IsolatedAsyncioTestCase):
@@ -639,5 +645,273 @@ class PersistenceMigrationTests(unittest.TestCase):
         self.assertIn("BRANCH_CREATED_FROM", _ORACLE_JOB_ADDITIONS)
 
 
+class ClaimDependencyGateTests(unittest.IsolatedAsyncioTestCase):
+    """depends_on is enforced at CLAIM time (fault 2026-10-25).
+
+    Two jobs whose dependency had not finished were claimed anyway. The
+    dequeue path's candidate pre-read was advisory only, and the targeted
+    claim's pre-read was fail-OPEN on malformed ``depends_on`` (the router's
+    ``json_list`` swallows bad JSON to []). Now:
+
+      * the pre-scan excludes jobs with unsatisfied deps BEFORE the
+        LIMIT-bound window, so a high-priority blocked job cannot crowd
+        eligible ones out of the window and take the claim slot;
+      * ``claim_job``'s in-transaction re-check (fail-closed) is the binding
+        gate on BOTH claim paths;
+      * the targeted claim answers 409 for an unmet, malformed, or missing
+        dep instead of handing out the job.
+
+    The repo is constructed directly (same pattern as
+    test_job_prefs_deps_20261017) so no live DB is touched; the router half
+    is covered by the targeted-claim tests, which drive the real
+    ``claim_job``.
+    """
+
+    async def _tmp_repo(self):
+        import tempfile as _tf
+        from pathlib import Path as _P
+
+        td = _tf.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        repo = sqlite_mod.SqliteHiveRepository(str(_P(td.name) / "claimdeps.db"))
+        await repo.init(agent_bus.SCHEMA)
+        return repo
+
+    async def _mk(self, repo, case, *rows):
+        """rows: (id, status, deps_json)"""
+        for job_id, status, deps_json in rows:
+            await case._insert(repo, job_id, status=status)
+            if deps_json is not None:
+                async with repo.connection() as db:
+                    await db.execute("UPDATE jobs SET depends_on=? WHERE id=?", (deps_json, job_id))
+                    await db.commit()
+
+    async def test_dequeue_pref_scan_excludes_blocked_high_priority(self):
+        """A blocked job with HIGHER priority must not consume the claim slot.
+
+        Regression for the 2026-10-25 incident: the pre-scan ran
+        LIMIT-bounded and the blocked job was only filtered in the router
+        loop, so if more blocked/high-priority jobs than the window could
+        absorb sat ahead of it, an eligible job fell out of the window
+        entirely. The pre-scan must exclude unsatisfied deps BEFORE the LIMIT.
+        """
+        repo = await self._tmp_repo()
+        case = _RepoCaseShim(self)
+        await self._mk(
+            repo,
+            case,
+            ("dep", "queued", None),
+            ("blocked", "queued", json.dumps(["dep"])),
+            ("ready", "queued", None),
+        )
+        # blocked is highest priority, ready lowest.
+        async with repo.connection() as db:
+            await db.execute("UPDATE jobs SET priority=10 WHERE id='blocked'")
+            await db.execute("UPDATE jobs SET priority=-1 WHERE id='ready'")
+            await db.commit()
+
+        now = 1_000_000.0
+        async with repo.connection() as tx:
+            blocked = await repo.jobs_with_unsatisfied_deps(tx, ids=["dep", "blocked", "ready"])
+            self.assertEqual(blocked, {"blocked"}, blocked)
+            # With the hint: blocked is gone, dep and ready are returned.
+            cands = await repo.queued_candidates(
+                tx,
+                agent_urn="urn:agent:zeroclaw:studio:claimdeps",
+                now=now,
+                limit=10,
+                unsatisfied_dep_job_ids=blocked,
+            )
+            # 'dep' itself has no depends_on, so it stays a candidate; the
+            # point of the test is that the HIGH-PRIORITY blocked job is out.
+            self.assertEqual([r[0] for r in cands], ["dep", "ready"], [r[0] for r in cands])
+            # Without the hint (legacy call): blocked is present -- the
+            # advisory nature is documented, the binding gate is claim_job.
+            cands_unhinted = await repo.queued_candidates(
+                tx,
+                agent_urn="urn:agent:zeroclaw:studio:claimdeps",
+                now=now,
+                limit=10,
+            )
+            self.assertIn("blocked", [r[0] for r in cands_unhinted])
+
+    async def test_claim_job_refuses_unmet_dependency_in_transaction(self):
+        """The binding gate: claim_job refuses even when the caller pre-read said OK."""
+        repo = await self._tmp_repo()
+        case = _RepoCaseShim(self)
+        await self._mk(repo, case, ("dep", "queued", None), ("blocked", "queued", None))
+        async with repo.connection() as db:
+            await db.execute(
+                "UPDATE jobs SET depends_on=? WHERE id='blocked'",
+                (json.dumps(["dep"]),),
+            )
+            await db.commit()
+
+        now = time.time()
+        async with repo.connection() as tx:
+            with self.assertRaises(DependencyNotReady):
+                await repo.claim_job(
+                    tx,
+                    job_id="blocked",
+                    agent_urn="urn:agent:zeroclaw:studio:claimdeps",
+                    now=now,
+                    lease_expires_at=now + 60,
+                    runtime="zeroclaw",
+                    model="qwen38",
+                    provider="local",
+                    cost_tier="B",
+                )
+            async with tx.execute("SELECT status FROM jobs WHERE id='blocked'") as cur:
+                self.assertEqual((await cur.fetchone())[0], "queued")
+
+    async def test_claim_job_refuses_dependency_finished_between_preread_and_claim(self):
+        """The dep was done at pre-scan time, then re-queued: claim still fails."""
+        repo = await self._tmp_repo()
+        case = _RepoCaseShim(self)
+        await self._mk(repo, case, ("dep", "done", None), ("blocked", "queued", json.dumps(["dep"])))
+        now = time.time()
+        async with repo.connection() as tx:
+            # Pre-scan would see the dep as done ...
+            pre = await repo.jobs_with_unsatisfied_deps(tx, ids=["blocked"])
+            self.assertEqual(pre, set(), pre)
+            # ... then the dep is re-queued (operator retry, a failed dep, etc.)
+            await tx.execute("UPDATE jobs SET status='queued' WHERE id='dep'")
+            # ... and the in-transaction gate must still refuse.
+            with self.assertRaises(DependencyNotReady):
+                await repo.claim_job(
+                    tx,
+                    job_id="blocked",
+                    agent_urn="urn:agent:zeroclaw:studio:claimdeps",
+                    now=now,
+                    lease_expires_at=now + 60,
+                    runtime="zeroclaw",
+                    model="qwen38",
+                    provider="local",
+                    cost_tier="B",
+                )
+
+    async def test_jobs_with_unsatisfied_deps_fails_closed(self):
+        """Malformed JSON and missing dep rows are unsatisfied, not open."""
+        repo = await self._tmp_repo()
+        case = _RepoCaseShim(self)
+        await self._mk(
+            repo,
+            case,
+            ("open", "queued", None),
+            ("bad-json", "queued", None),
+            ("not-list", "queued", None),
+            ("missing-dep", "queued", json.dumps(["ghost"])),
+            ("dep", "queued", None),
+            ("open2", "queued", None),
+            ("dup-open", "queued", json.dumps(["dep", "open2"])),
+        )
+        async with repo.connection() as db:
+            await db.execute("UPDATE jobs SET depends_on='{not json' WHERE id='bad-json'")
+            await db.execute(
+                "UPDATE jobs SET depends_on=? WHERE id=?",
+                ('{"a": 1}', "not-list"),
+            )
+            await db.commit()
+        async with repo.connection() as tx:
+            unsat = await repo.jobs_with_unsatisfied_deps(
+                tx,
+                ids=["open", "bad-json", "not-list", "missing-dep", "dup-open"],
+            )
+        # open (no deps) is the only open case; malformed JSON, a missing dep
+        # row, and a well-formed list of not-yet-done deps are all unsatisfied.
+        self.assertEqual(unsat, {"bad-json", "not-list", "missing-dep", "dup-open"}, unsat)
+
+    async def test_jobs_with_unsatisfied_deps_empty_or_null_is_open(self):
+        """NULL/empty depends_on is satisfied (negative control)."""
+        repo = await self._tmp_repo()
+        case = _RepoCaseShim(self)
+        await self._mk(
+            repo,
+            case,
+            ("no-deps", "queued", None),
+            ("empty-list", "queued", "[]"),
+            ("done-dep", "done", None),
+            ("satisfied", "queued", None),
+        )
+        async with repo.connection() as db:
+            await db.execute(
+                "UPDATE jobs SET depends_on=? WHERE id='satisfied'",
+                (json.dumps(["done-dep"]),),
+            )
+            await db.commit()
+        async with repo.connection() as tx:
+            unsat = await repo.jobs_with_unsatisfied_deps(tx, ids=["no-deps", "empty-list", "satisfied"])
+        self.assertEqual(unsat, set(), unsat)
+
+    async def test_targeted_claim_409_for_unmet_dependency(self):
+        """The real router path: /v1/jobs/{id}/claim -> 409 when the dep is not done."""
+        repo = await self._tmp_repo()
+        case = _RepoCaseShim(self)
+        await self._mk(repo, case, ("dep", "queued", None), ("blocked", "queued", json.dumps(["dep"])))
+        urn = "urn:agent:zeroclaw:studio:claimdeps"
+        now = 1_000_000.0
+        async with repo.connection() as db:
+            await db.execute(
+                "INSERT INTO agents (urn, kind, host, session_id, capabilities, started_at, "
+                "last_heartbeat, status, runtime, cost_tier) "
+                "VALUES (?, 'zeroclaw', 'studio', 'claimdeps', '[]', ?, ?, 'online', 'zeroclaw', 'B')",
+                (urn, now, now),
+            )
+            await db.commit()
+
+        with (
+            mock.patch.object(routers_jobs, "hive_repo", lambda: repo),
+            mock.patch.object(routers_jobs, "emit_event", mock.AsyncMock()),
+            mock.patch.object(routers_jobs, "job_agent_eligible", lambda job, agent: (True, "")),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await routers_jobs.claim_job("blocked", by=urn)
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn("DAG dependencies", str(ctx.exception.detail))
+
+    async def test_targeted_claim_negative_control_open_dependency(self):
+        """Negative control: a done dep -> the claim goes through (200)."""
+        repo = await self._tmp_repo()
+        case = _RepoCaseShim(self)
+        await self._mk(repo, case, ("dep", "done", None), ("ready", "queued", json.dumps(["dep"])))
+        urn = "urn:agent:zeroclaw:studio:claimdeps"
+        now = time.time()
+        async with repo.connection() as db:
+            await db.execute(
+                "INSERT INTO agents (urn, kind, host, session_id, capabilities, started_at, "
+                "last_heartbeat, status, runtime, cost_tier) "
+                "VALUES (?, 'zeroclaw', 'studio', 'claimdeps', '[]', ?, ?, 'online', 'zeroclaw', 'B')",
+                (urn, now, now),
+            )
+            await db.commit()
+
+        with (
+            mock.patch.object(routers_jobs, "hive_repo", lambda: repo),
+            mock.patch.object(routers_jobs, "emit_event", mock.AsyncMock()),
+            mock.patch.object(routers_jobs, "job_agent_eligible", lambda job, agent: (True, "")),
+        ):
+            out = await routers_jobs.claim_job("ready", by=urn)
+        self.assertTrue(out["claimed"])
+
+
+class _RepoCaseShim:
+    """Minimal stand-in for test_job_prefs_deps_20261017's _RepoCase helpers."""
+
+    def __init__(self, case):
+        self._case = case
+
+    async def _insert(self, repo, job_id, *, status="queued", **_kw):
+        now = time.time()
+        async with repo.connection() as db:
+            await db.execute(
+                "INSERT INTO jobs (id, submitter_urn, kind, priority, status, started_at) "
+                "VALUES (?, 'urn:submitter', 'build', 0, ?, ?)",
+                (job_id, status, now),
+            )
+            await db.commit()
+
+
+if __name__ == "__main__":
+    unittest.main()
 if __name__ == "__main__":
     unittest.main()

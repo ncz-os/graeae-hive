@@ -37,6 +37,8 @@ from hive.bus.schemas import JobCreate, JobOut
 from hive.persistence.sqlite import DependencyNotReady, SqliteHiveRepository
 
 HERE = Path(__file__).resolve().parent
+
+
 class JobOutResponseModelTests(unittest.TestCase):
     def test_response_model_declares_preference_and_dependency_fields(self):
         fields = JobOut.model_fields
@@ -183,8 +185,17 @@ class PreferencePersistenceTests(_RepoCase):
             self.assertIn(column, _ORACLE_JOB_ADDITIONS)
 
 
-def _stub_claim(blocked_ids):
+def _stub_claim(blocked_ids, repo):
+    """claim_job stub that still runs the in-transaction dependency gate.
+
+    2026-10-25: the dequeue router's pre-scan filter is ADVISORY; the binding
+    gate is the re-check inside claim_job. The stub applies that SAME gate
+    (``repo._require_dependencies_done`` — the exact call the real body makes)
+    so the tests pin the whole chain instead of just the pre-scan half.
+    """
+
     async def _claim(tx, **kw):
+        await repo._require_dependencies_done(tx, kw["job_id"])
         return 0 if kw["job_id"] in blocked_ids else 1
 
     return _claim
@@ -365,7 +376,7 @@ class DependencyGatingTests(_RepoCase):
             # Keep the gate as the only filter: eligibility/cost-tier policy is
             # covered elsewhere and would otherwise mask it.
             mock.patch.object(hive_jobs_router, "job_agent_eligible", lambda job, agent: (True, "")),
-            mock.patch.object(repo, "claim_job", side_effect=_stub_claim(blocked_ids)),
+            mock.patch.object(repo, "claim_job", side_effect=_stub_claim(blocked_ids, repo)),
         ):
             claimed = await hive_jobs_router.dequeue_next_job(urn)
         self.assertEqual(claimed["id"], "ready")

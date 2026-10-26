@@ -581,8 +581,10 @@ async def dequeue_next_job(agent_urn: str):
 
     Algorithm (eligibility / MiniMax pool / role-aware ordering) lives here in the
     router; every storage op goes through the HiveMindRepository ABC on ONE
-    transaction (agent_claim_context -> pool_occupancy -> queued_candidates ->
-    completed_job_ids -> claim_job -> emit_event).
+    transaction (agent_claim_context -> pool_occupancy ->
+    jobs_with_unsatisfied_deps -> queued_candidates -> claim_job -> emit_event).
+    The candidate filter is advisory only; the binding depends_on gate is the
+    in-transaction re-check inside claim_job.
     """
     now = time.time()
     urn_parts = agent_urn.split(":")
@@ -675,7 +677,22 @@ async def dequeue_next_job(agent_urn: str):
                         },
                     )
 
-            candidates = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW)
+            # DEPENDENCY ADMISSION (fault 2026-10-25): scan BEFORE the
+            # LIMIT-bounded candidate read, so a high-priority job whose deps
+            # are not done is excluded instead of merely pushed past the
+            # window's tail. The exclusion is ADVISORY here — the binding gate
+            # is the in-transaction re-check inside claim_job, so a candidate
+            # that slips through (deps not yet done at scan time, or a stale
+            # pre-read) is still refused at the compare-and-set.
+            _pre = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=2000)
+            _blocked_dep_jobs = await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[r[0] for r in _pre])
+            candidates = await hive_repo().queued_candidates(
+                tx,
+                agent_urn=agent_urn,
+                now=now,
+                limit=CLAIM_SCAN_WINDOW,
+                unsatisfied_dep_job_ids=_blocked_dep_jobs,
+            )
             # Role-aware ordering (hive.scheduler is the single source of truth).
             worker_profile = sched.worker_profile_from_metadata(
                 urn=agent_urn,
@@ -696,13 +713,6 @@ async def dequeue_next_job(agent_urn: str):
             _ordered = sched.order_candidates_for_worker(candidates=_job_dicts, worker=worker_profile, now=now)
             _by_id = {r[0]: r for r in candidates}
             candidates = [_by_id[d["id"]] for d in _ordered]
-
-            # Resolve ALL candidate dependencies in ONE ABC query (depends_on is
-            # tuple index 15).
-            _all_deps: set[str] = set()
-            for _r in candidates:
-                _all_deps.update(json_list(_r[15]))
-            done_dep_ids = await hive_repo().completed_job_ids(tx, ids=list(_all_deps)) if _all_deps else set()
 
             # Canonical pool key for MiniMax-routed claims only.
             if sched.is_minimax_route(a_provider, a_model):
@@ -737,9 +747,9 @@ async def dequeue_next_job(agent_urn: str):
                     j_base_branch,
                     j_pr_number,
                 ) = r
-                deps = json_list(j_deps_json)
-                if deps and not set(deps).issubset(done_dep_ids):
-                    continue
+                # The depends_on column (j_deps_json) is not filtered here any
+                # more: the pre-scan excluded unsatisfied jobs, and the
+                # in-transaction re-check in claim_job is the gate.
                 job = {
                     "id": j_id,
                     "kind": j_kind,
@@ -1520,12 +1530,15 @@ async def claim_job(job_id: str, by: str):
         if j_retry_backoff_until is not None and j_retry_backoff_until > now:
             raise HTTPException(409, f"job is in retry backoff until {j_retry_backoff_until} (now={now})")
 
-        if j_deps_json:
-            deps = list(dict.fromkeys(json_list(j_deps_json)))
-            if deps:
-                done_ids = await hive_repo().completed_job_ids(tx, ids=list(deps))
-                if len(done_ids) < len(deps):
-                    raise HTTPException(409, f"job has unsatisfied DAG dependencies ({len(done_ids)}/{len(deps)} done)")
+        # PRE-READ GATE (2026-10-25): fail CLOSED on any non-empty depends_on
+        # whose entries are not all done — including malformed JSON and
+        # references to unknown job ids (a dep that does not exist can never
+        # reach done). The in-transaction re-check in claim_job repeats this
+        # under the write lock; the pre-read exists so the caller gets a
+        # named 409 instead of the same refusal from inside the tx.
+        _blocked_target = await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[job_id])
+        if _blocked_target:
+            raise HTTPException(409, f"job has unsatisfied DAG dependencies: {job_id}")
 
         agent = {
             "urn": by,
