@@ -6,6 +6,7 @@ routes (submit/next/patch/claim/release/auto-retry) migrate here next.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any
@@ -387,7 +388,12 @@ async def create_job(req: JobCreate):
             _agent_models = await hive_repo().active_agent_models(tx)
         warnings.extend(admission_warnings(req.preferred_models, served_model_names(_agent_models)))
 
-    _branches = branch_admission(
+    # Off the event loop (2026-10-25 review): branch_admission shells out to
+    # `git ls-remote` (up to PROBE_TIMEOUT per ref); a blocking call here would
+    # stall EVERY concurrent request (including /v1/jobs/next claims) on the
+    # single-threaded bus loop. to_thread runs it in the default executor.
+    _branches = await asyncio.to_thread(
+        branch_admission,
         repo=req.repo,
         head_branch=req.head_branch,
         base_branch=req.base_branch,
@@ -677,14 +683,16 @@ async def dequeue_next_job(agent_urn: str):
                         },
                     )
 
-            # DEPENDENCY ADMISSION (fault 2026-10-25): scan BEFORE the
-            # LIMIT-bounded candidate read, so a high-priority job whose deps
-            # are not done is excluded instead of merely pushed past the
-            # window's tail. The exclusion is ADVISORY here — the binding gate
-            # is the in-transaction re-check inside claim_job, so a candidate
-            # that slips through (deps not yet done at scan time, or a stale
-            # pre-read) is still refused at the compare-and-set.
-            _pre = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=2000)
+            # DEPENDENCY ADMISSION (fault 2026-10-25): compute the blocked set
+            # over the SAME window the claim reads, so the exclusion cannot
+            # diverge from the candidate set. The exclusion is ADVISORY here —
+            # the binding gate is the in-transaction re-check inside
+            # claim_job, so a candidate that slips through (deps not yet done
+            # at scan time, or a stale pre-read) is still refused at the
+            # compare-and-set. The loop below re-checks every candidate's
+            # deps as a cheap, visible backstop (fail open: a candidate the
+            # pre-scan already excluded cannot reappear in the same read).
+            _pre = await hive_repo().queued_candidates(tx, agent_urn=agent_urn, now=now, limit=CLAIM_SCAN_WINDOW)
             _blocked_dep_jobs = await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[r[0] for r in _pre])
             candidates = await hive_repo().queued_candidates(
                 tx,
@@ -747,9 +755,13 @@ async def dequeue_next_job(agent_urn: str):
                     j_base_branch,
                     j_pr_number,
                 ) = r
-                # The depends_on column (j_deps_json) is not filtered here any
-                # more: the pre-scan excluded unsatisfied jobs, and the
-                # in-transaction re-check in claim_job is the gate.
+                # Defensive re-check (cheap; fail open): the pre-scan above
+                # excluded unsatisfied deps from THIS read, so a hit here means
+                # the two reads saw different state — skip and let the next
+                # poll re-evaluate. The binding gate remains the
+                # in-transaction re-check inside claim_job.
+                if j_deps_json and await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[j_id]):
+                    continue
                 job = {
                     "id": j_id,
                     "kind": j_kind,
