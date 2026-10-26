@@ -44,17 +44,21 @@ def test_release_on_a_triage_wrapper_requeues_the_original_failed_jobs(monkeypat
     _llm_decides(
         monkeypatch,
         calls,
-        {"action_type": "release_to_queue", "confidence": 0.9, "release_eligible_kinds": ["fix:hive-one"]},
+        {"action_type": "release_to_queue", "confidence": 0.9, "evidence_quote": "HTTP 503",
+         "release_eligible_kinds": ["fix:hive-one"]},
     )
-    out = doctor.process_triage_job({"id": "t1", "kind": "triage:fix:hive-one", "description": ""})
+    out = doctor.process_triage_job({"id": "t1", "kind": "triage:fix:hive-one", "description": "",
+                                     "failure_reason": "provider 503", "error": "HTTP 503"})
     assert calls["resubmit"] == ["fix:hive-one"]
     assert calls["release"] == []
     assert out["released_to_queue"] is False
 
 
 def test_release_on_a_directly_claimed_job_hands_that_job_back(monkeypatch, calls):
-    _llm_decides(monkeypatch, calls, {"action_type": "release_to_queue", "confidence": 0.9})
-    out = doctor.process_triage_job({"id": "j1", "kind": "fix:hive-one", "description": ""})
+    _llm_decides(monkeypatch, calls, {"action_type": "release_to_queue", "confidence": 0.9,
+                                      "evidence_quote": "HTTP 503"})
+    out = doctor.process_triage_job({"id": "j1", "kind": "fix:hive-one", "description": "",
+                                     "failure_reason": "provider 503", "error": "HTTP 503"})
     assert calls["release"] == [("j1", None)]
     assert out["released_to_queue"] is True
 
@@ -91,7 +95,8 @@ def test_no_repo_mapping_on_a_catalog_present_repo_is_not_unschedulable(monkeypa
     failed = [
         {"id": "f1", "kind": "fix:hive-one", "repo": "graeae-hive", "result": {"worker_error": "no_repo_mapping"}},
     ]
-    _llm_decides(monkeypatch, calls, {"action_type": "release_to_queue", "confidence": 0.9}, failed)
+    _llm_decides(monkeypatch, calls, {"action_type": "release_to_queue", "confidence": 0.9,
+                                      "evidence_quote": "no_repo_mapping"}, failed)
     out = doctor.process_triage_job({"id": "t1", "kind": "triage:fix:hive-one", "description": ""})
     assert calls["llm"] == 1, "catalog-present repo must fall through, not escalate"
     assert out["action"]["action_type"] == "release_to_queue"
@@ -112,6 +117,22 @@ def test_no_repo_mapping_on_a_catalog_absent_repo_is_unschedulable(monkeypatch, 
     out = doctor.process_triage_job({"id": "t1", "kind": "triage:fix:hive-one", "description": ""})
     assert calls["llm"] == 0
     assert out["action"]["action_type"] == "escalate"
+    assert calls["resubmit"] == [] and calls["release"] == []
+
+
+def test_retry_cap_escalates_to_needs_review_with_orchestrator_note(monkeypatch, calls):
+    monkeypatch.setattr(doctor, "DOCTOR_V2_MODE", "enforce")
+    monkeypatch.setattr(doctor, "DOCTOR_V2_RULES", [{
+        "id": "R2", "failure_reason_regex": "503", "action": "release_to_queue",
+        "max_retries": 3, "retry_scope": "other_host", "note": "provider retry",
+    }])
+    monkeypatch.setattr(doctor, "_max_same_signature_resubmits", lambda: 0)
+    monkeypatch.setattr(doctor, "fetch_failed_jobs_for_kind", lambda *a, **k: [])
+    result = doctor.process_triage_job({"id": "t-cap", "kind": "triage:fix:hive-one",
+                                        "failure_reason": "provider 503", "error": "HTTP 503"})
+    assert result["action"]["action_type"] == "escalate"
+    assert result["needs_review"] is True
+    assert result["action"]["orchestrator_note"]
     assert calls["resubmit"] == [] and calls["release"] == []
 
 

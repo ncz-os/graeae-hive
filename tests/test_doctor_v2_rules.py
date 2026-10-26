@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from hive.workers import doctor_v2
 from hive.workers.doctor_v2 import (
     bs_audit_signal,
     collect_evidence,
@@ -32,6 +33,7 @@ def test_rule_table_covers_initial_rules_and_is_deterministic():
         ("loop_unresolved", "pytest failed tests: test_x", "R7"),
         ("host", "OOM-killed worker", "R8"),
         ("engine", "Budget exceeded: $25 of $25 Day limit", "R9"),
+        ("budget_exceeded", "usage ledger rejected", "R9"),
     ]
     for reason, text, rule_id in cases:
         item = evidence(reason, text)
@@ -42,14 +44,28 @@ def test_rule_table_covers_initial_rules_and_is_deterministic():
         assert first.signature == item.signature
 
 
-def test_same_signature_is_never_requeued_more_than_twice():
-    item = evidence("provider 503", "HTTP 503", prior=({"signature": "x"},))
-    # Use the actual signature as the prior lineage record.
+def test_same_signature_is_requeued_twice_then_escalated():
     item = evidence("provider 503", "HTTP 503")
-    repeated = evidence("provider 503", "HTTP 503", prior=({"signature": item.signature}, {"signature": item.signature}))
-    decision = decide_rules(repeated, RULES)
+    one_prior = evidence("provider 503", "HTTP 503", prior=({"signature": item.signature},))
+    two_prior = evidence("provider 503", "HTTP 503", prior=({"signature": item.signature}, {"signature": item.signature}))
+    assert decide_rules(item, RULES).action == "release_to_queue"
+    assert decide_rules(one_prior, RULES).action == "release_to_queue"
+    decision = decide_rules(two_prior, RULES)
     assert decision.action == "escalate"
-    assert decision.reason == "same signature reached global retry cap"
+    assert decision.reason == "same signature reached configured retry cap"
+
+
+def test_different_signature_is_not_blocked_by_same_signature_cap():
+    item = evidence("provider 503", "HTTP 503", prior=({"signature": "different"},) * 8)
+    assert decide_rules(item, RULES).action == "release_to_queue"
+
+
+def test_retry_cap_environment_override(monkeypatch):
+    monkeypatch.setenv("DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS", "1")
+    assert doctor_v2.max_same_signature_resubmits() == 1
+    item = evidence("provider 503", "HTTP 503")
+    repeated = evidence("provider 503", "HTTP 503", prior=({"signature": item.signature},))
+    assert decide_rules(repeated, RULES).action == "escalate"
 
 
 def test_r9_is_host_terminal_and_evidence_quote_is_verbatim():
@@ -69,12 +85,26 @@ def test_llm_quote_must_be_a_substring():
     assert good.max_retries == 2
 
 
+def test_llm_quote_checks_original_evidence_while_signature_uses_normalized_text():
+    first = evidence("unknown", "request 42 failed with id deadbeef1234")
+    second = evidence("unknown", "request 91 failed with id cafe1234abcd")
+    quote = "request 42 failed with id deadbeef1234"
+    valid = validate_llm_decision({"action": "release_to_queue", "evidence_quote": quote}, first)
+    assert valid.action == "release_to_queue"
+    assert valid.evidence_quote == quote
+    assert first.signature == second.signature
+
+
 def test_normalization_removes_volatile_parts():
     assert normalize("id deadbeef1234 at /var/lib/hive/42 2026-10-25T12:00:00Z") == "id <hex> at <path> <time>"
 
 
 def test_bs_audit_is_a_rule_input_and_sweep_is_report_only():
-    assert bs_audit_signal({"kind": "fix:x", "description": "implement auth", "result": {"output": "done"}}) == "BS:empty+nocommit"
+    job = {"kind": "fix:x", "description": "implement auth", "result": {"output": "done"}}
+    assert bs_audit_signal(job) == "BS:empty+nocommit"
+    snapshot = collect_evidence(job)
+    assert "bs_audit: BS:empty+nocommit" in snapshot.evidence_text
+    assert decide_rules(snapshot, RULES).rule_id == "R10"
     jobs = [
         {"id": "old", "kind": "build:x", "status": "needs-review", "updated_at": 1, "head_branch": "fix/x"},
         {"id": "new", "kind": "build:x", "status": "done", "updated_at": 2},

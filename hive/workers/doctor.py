@@ -44,6 +44,7 @@ Env:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -248,6 +249,13 @@ _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
 NEEDS_REVIEW_SCAN_INTERVAL = float(os.environ.get("NEEDS_REVIEW_SCAN_INTERVAL", "3600"))
 NEEDS_REVIEW_OLDER_HOURS = float(os.environ.get("NEEDS_REVIEW_OLDER_HOURS", "24"))
+MAX_BULK_RESUBMITS_PER_ACTION = 20
+DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS = doctor_v2.max_same_signature_resubmits()
+SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
+
+
+def _max_same_signature_resubmits() -> int:
+    return doctor_v2.max_same_signature_resubmits()
 # Owner-protected dead-letter jobs (2026-10-17): another orchestrator asked that
 # its jobs be reported, not remediated. A dead-letter job whose kind starts with
 # one of these prefixes, or whose project is listed, is logged and left alone
@@ -726,8 +734,9 @@ def fetch_agent_registry_summary() -> dict:
 DOCTOR_SYSTEM = """You diagnose Hive job failures. Return one JSON object with
 "action_type" (release_to_queue, no_action, or escalate), "confidence" (0..1),
 "reason" (diagnosis), "evidence_quote" (a verbatim substring of the supplied
-failure evidence), and optional "release_eligible_kinds" drawn only from
-zeroclaw, opencode, zoder, claude. Release requires confidence at least 0.7;
+failure evidence), "max_retries" (default 2, never above the configured
+same-signature retry cap), and optional "release_eligible_kinds" drawn only
+from zeroclaw, opencode, zoder, claude. Release requires confidence at least 0.7;
 if no supplied line supports a transient diagnosis, do not release.
 Do not call tools. Purges, restarts and fix tasks require deterministic decisions
 and exact operator approvals; they are not model-selectable actions.
@@ -1150,7 +1159,7 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
         return f"SSH timeout to {host}"
 
 
-def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 2) -> str:
+def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RESUBMITS_PER_ACTION) -> str:
     if not base_kind:
         return "resubmit_jobs missing base_kind"
     code, resp = _http("GET", "/v1/jobs?status=failed&limit=200")
@@ -1160,7 +1169,7 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = 2) -> str:
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
     target_ids = [
         j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind and not dlq_protected(j)
-    ][: max(0, min(2, int(max_resubmits)))]
+    ][: max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))]
     if not target_ids:
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
@@ -1901,7 +1910,11 @@ def _doctor_v2_decision(job: dict, base_kind: str, failed: list[dict]) -> doctor
         if isinstance(result.get("signature"), str):
             prior.append({"signature": result["signature"], "action": result.get("action")})
     snapshot = doctor_v2.collect_evidence(target, prior_actions=prior)
-    decision = doctor_v2.decide_rules(snapshot, DOCTOR_V2_RULES)
+    retry_key = _same_signature_retry_key(base_kind, snapshot.signature)
+    prior_resubmits = STATE.timestamps(retry_key, SAME_SIGNATURE_RETRY_TTL)
+    prior.extend({"signature": snapshot.signature, "action": "release_to_queue"} for _ in prior_resubmits)
+    snapshot = doctor_v2.collect_evidence(target, prior_actions=prior)
+    decision = doctor_v2.decide_rules(snapshot, DOCTOR_V2_RULES, retry_cap=_max_same_signature_resubmits())
     if decision:
         decision = doctor_v2.Decision(
             decision.action, decision.rule_id,
@@ -1912,6 +1925,16 @@ def _doctor_v2_decision(job: dict, base_kind: str, failed: list[dict]) -> doctor
         log.info("doctor v2 mode=%s base_kind=%s rule=%s action=%s signature=%s", DOCTOR_V2_MODE, base_kind,
                  decision.rule_id, decision.action, decision.signature[:12])
     return decision
+
+
+def _same_signature_retry_key(base_kind: str, signature: str) -> str:
+    digest = hashlib.sha256(base_kind.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"failures:doctor_v2_resubmit:{digest}:{signature}"
+
+
+def _record_signature_resubmit(base_kind: str, signature: str) -> None:
+    """Persist one successful resubmission against its failure signature."""
+    STATE.touch(_same_signature_retry_key(base_kind, signature), SAME_SIGNATURE_RETRY_TTL)
 
 
 def process_triage_job(job: dict) -> dict:
@@ -1980,15 +2003,19 @@ def process_triage_job(job: dict) -> dict:
     v2 = _doctor_v2_decision(job, base_kind, failed)
     if v2 and DOCTOR_V2_MODE == "enforce":
         released = False
+        text = "escalated to human"
         if v2.action == "release_to_queue":
             text, released = apply_release(job_id, is_explicit_triage, base_kind, None)
-        else:
-            text = "escalated to human"
+            if released or re.search(r"requeued [1-9]\d* jobs .*\(api=20[01]\)", text):
+                _record_signature_resubmit(base_kind, v2.signature)
+        note = v2.reason if v2.action == "escalate" else None
         return {
             "exit_code": 0, "stdout": f"action={v2.action}; rule={v2.rule_id}; {text}",
             "action": {"action_type": v2.action, "rule_id": v2.rule_id, "reason": v2.reason,
-                       "evidence_quote": v2.evidence_quote, "signature": v2.signature},
+                       "evidence_quote": v2.evidence_quote, "signature": v2.signature,
+                       **({"orchestrator_note": note} if note else {})},
             "base_kind": base_kind, "released_to_queue": released,
+            "needs_review": v2.action == "escalate",
             "v2": {"rule_id": v2.rule_id, "signature": v2.signature, "model": None},
         }
 
@@ -2072,16 +2099,21 @@ def process_triage_job(job: dict) -> dict:
             "action_type": "escalate",
         }
 
-    # Residual decisions must cite the actual snapshot.  This also enforces the
-    # global same-signature retry ceiling when a rule did not match.
-    if "evidence_quote" in action or "quote" in action:
+    # Residual release decisions must cite the original evidence and obey the
+    # same durable per-signature retry ceiling as deterministic rules.
+    residual_evidence = doctor_v2.collect_evidence(failed[0] if failed else job)
+    retry_key = _same_signature_retry_key(base_kind, residual_evidence.signature)
+    used_retries = len(STATE.timestamps(retry_key, SAME_SIGNATURE_RETRY_TTL))
+    if "evidence_quote" in action or "quote" in action or action.get("action_type") == "release_to_queue":
         residual = doctor_v2.validate_llm_decision(
-            action, doctor_v2.collect_evidence(failed[0] if failed else job),
-            rule_cap=2,
+            action, residual_evidence,
+            rule_cap=_max_same_signature_resubmits(), used_retries=used_retries,
         )
-        if residual.action == "escalate" and (action.get("action") or action.get("action_type")) != "escalate":
+        if residual.action == "escalate" and action.get("action_type") != "escalate":
             action = {"action_type": "escalate", "reason": residual.reason,
-                      "evidence_quote": residual.evidence_quote, "signature": residual.signature}
+                      "evidence_quote": residual.evidence_quote, "signature": residual.signature,
+                      "orchestrator_note": f"{residual.reason}; manual review required",
+                      "needs_review": True}
 
     a = action.get("action_type", "no_action")
     try:
@@ -2102,6 +2134,8 @@ def process_triage_job(job: dict) -> dict:
         rk_clean = [k for k in rk if isinstance(k, str) and k] if isinstance(rk, list) else None
         text, released = apply_release(job_id, is_explicit_triage, base_kind, rk_clean)
         parts.append(text)
+        if released or re.search(r"requeued [1-9]\d* jobs .*\(api=20[01]\)", text):
+            _record_signature_resubmit(base_kind, residual_evidence.signature)
     elif a == "no_action":
         parts.append("no action — triage cleared")
     elif a == "escalate":
@@ -2116,6 +2150,7 @@ def process_triage_job(job: dict) -> dict:
         "base_kind": base_kind,
         "failed_count_seen": len(failed),
         "released_to_queue": released,
+        "needs_review": bool(action.get("needs_review")),
         "v2_shadow": ({"rule_id": v2.rule_id, "action": v2.action, "signature": v2.signature,
                         "old_action": a, "agree": v2.action == a}
                        if v2 else None),
@@ -2408,6 +2443,9 @@ def main():
                     # Doctor already patched job back to queued via the action.
                     # Don't overwrite with done/failed; just log + broadcast.
                     status = "released"
+                elif result.get("needs_review"):
+                    status = "needs-review"
+                    patch_job(job_id, status, result)
                 else:
                     # Covers a release that reported False because the bus
                     # rejected it: without this PATCH the job would sit in

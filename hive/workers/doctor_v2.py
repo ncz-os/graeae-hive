@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -26,7 +27,15 @@ _VOLATILE = (
     (re.compile(r"\b[0-9a-f]{8,}\b", re.I), "<hex>"),
     (re.compile(r"\b\d+(?:\.\d+)?\b"), "<n>"),
 )
-_EVIDENCE_KEYS = ("failure_reason", "error", "tail", "stderr", "stdout", "stack", "note")
+_EVIDENCE_KEYS = ("failure_reason", "error", "worker_error", "tail", "stderr", "stdout", "stack", "note")
+
+
+def max_same_signature_resubmits() -> int:
+    """Configured retry-storm ceiling for one failure signature."""
+    try:
+        return max(0, int(os.environ.get("DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS", "2")))
+    except (TypeError, ValueError):
+        return 2
 
 
 def _result(job: dict[str, Any]) -> dict[str, Any]:
@@ -104,6 +113,9 @@ def collect_evidence(job: dict[str, Any], *, prior_actions: Iterable[dict[str, A
         if value:
             text = str(value)[-tail_limit:]
             lines.extend(line.strip() for line in text.splitlines() if line.strip())
+    audit = bs_audit_signal(job)
+    if audit not in {"ok-committed", "ok-noncommit"}:
+        lines.append(f"bs_audit: {audit}")
     # The first matching line is stable, and avoids making a volatile tail
     # position part of the signature.
     if not lines and error:
@@ -156,14 +168,15 @@ def _same_signature_count(evidence: Evidence) -> int:
     return sum(1 for action in evidence.prior_actions if action.get("signature") == evidence.signature)
 
 
-def decide_rules(evidence: Evidence, rules: list[dict[str, Any]]) -> Decision | None:
-    """First-match deterministic decision, with the global two-retry guard."""
+def decide_rules(evidence: Evidence, rules: list[dict[str, Any]], *, retry_cap: int | None = None) -> Decision | None:
+    """First-match deterministic decision, with a per-signature retry guard."""
+    retry_cap = max_same_signature_resubmits() if retry_cap is None else max(0, int(retry_cap))
     for rule in rules:
         if not _matches(rule, evidence):
             continue
-        retries = int(rule.get("max_retries", 0))
-        if retries and _same_signature_count(evidence) >= 2:
-            return Decision("escalate", rule["id"], "same signature reached global retry cap", evidence.signature,
+        retries = min(max(0, int(rule.get("max_retries", 0))), retry_cap)
+        if rule.get("action") == "release_to_queue" and _same_signature_count(evidence) >= retry_cap:
+            return Decision("escalate", rule["id"], "same signature reached configured retry cap", evidence.signature,
                             retries, str(rule.get("retry_scope", "same_host")), evidence_lines(evidence))
         quote = evidence_lines(evidence)
         reason = str(rule.get("note", "")).replace("{signature}", evidence.signature)
@@ -179,7 +192,7 @@ def evidence_lines(evidence: Evidence) -> str:
     return evidence.evidence_lines[0] if evidence.evidence_lines else ""
 
 
-def validate_llm_decision(raw: dict[str, Any], evidence: Evidence, *, rule_cap: int = 2,
+def validate_llm_decision(raw: dict[str, Any], evidence: Evidence, *, rule_cap: int | None = None,
                           used_retries: int = 0) -> Decision:
     """Validate residual JSON, especially the verbatim evidence quote."""
     allowed = {"release_to_queue", "escalate", "needs_review", "no_action"}
@@ -188,8 +201,12 @@ def validate_llm_decision(raw: dict[str, Any], evidence: Evidence, *, rule_cap: 
     if action not in allowed or not quote or quote not in evidence.evidence_text:
         return Decision("escalate", "llm", "invalid residual decision or evidence quote", evidence.signature,
                         0, "same_host", quote, str(raw.get("model") or "llm"))
-    requested = int(raw.get("max_retries", 0) or 0)
-    permitted = max(0, min(requested, rule_cap, 2 - used_retries))
+    requested = int(raw.get("max_retries", 2) or 0)
+    rule_cap = max_same_signature_resubmits() if rule_cap is None else max(0, int(rule_cap))
+    permitted = max(0, min(requested, rule_cap, rule_cap - used_retries))
+    if action == "release_to_queue" and permitted == 0:
+        return Decision("escalate", "llm", "same signature reached configured retry cap", evidence.signature,
+                        0, str(raw.get("retry_scope") or "same_host"), quote, str(raw.get("model") or "llm"))
     return Decision(str(action), "llm", str(raw.get("reason") or ""), evidence.signature, permitted,
                     str(raw.get("retry_scope") or "same_host"), quote, str(raw.get("model") or "llm"))
 

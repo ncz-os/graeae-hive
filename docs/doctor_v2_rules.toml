@@ -70,8 +70,17 @@ note = "host fault; requeue elsewhere and record a host health note"
 
 [[rule]]
 id = "R9"
+failure_reason_regex = "budget_exceeded"
 evidence_regex = "Budget exceeded: \\$[0-9.]+ of \\$[0-9.]+ Day limit"
 action = "escalate"
 max_retries = 0
 retry_scope = "same_host"
 note = "engine spend cap exceeded; never retry this host until reset"
+
+[[rule]]
+id = "R10"
+evidence_regex = "bs_audit: BS:(?:empty|confab|nocommit)"
+action = "escalate"
+max_retries = 0
+retry_scope = "same_host"
+note = "bs_audit found missing or confabulated completion evidence; human review required"
