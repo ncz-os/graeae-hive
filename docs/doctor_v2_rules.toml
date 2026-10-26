@@ -1,4 +1,7 @@
 # Ordered deterministic rules.  The reconciler stops at the first match.
+# A rule's max_retries caps the doctor's own resubmits of a signature; it never
+# extends a job's budget. A job with max_retries 0, or retry_count >= max_retries,
+# is never requeued by the doctor (reported as needs-review instead).
 [[rule]]
 id = "R1"
 failure_reason_regex = "clone_failed|branch_not_found"

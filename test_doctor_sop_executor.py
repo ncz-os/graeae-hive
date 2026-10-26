@@ -735,7 +735,11 @@ def test_a_job_cut_off_by_the_per_cycle_cap_is_not_marked_decided(monkeypatch, d
     never reached was marked decided and then never remediated for the whole seen
     window — the base commit marked at the END of the loop, which is the order
     that matters."""
-    jobs = [{"id": f"dead-{n}", "kind": "zeroclaw", "result": {"error": "timeout"}} for n in range(5)]
+    # Bus job records always carry the retry budget; these still have retries left.
+    jobs = [
+        {"id": f"dead-{n}", "kind": "zeroclaw", "result": {"error": "timeout"}, "max_retries": 2, "retry_count": 0}
+        for n in range(5)
+    ]
     monkeypatch.setattr(doctor, "fetch_dead_letter_jobs", lambda: list(jobs))
     monkeypatch.setattr(doctor, "DLQ_APPLY", False)
     monkeypatch.setattr(doctor, "DLQ_MAX_PER_CYCLE", 2)
@@ -835,7 +839,9 @@ def test_a_dry_run_is_a_decision_and_is_recorded(monkeypatch, doctor_state):
     monkeypatch.setattr(
         doctor,
         "fetch_dead_letter_jobs",
-        lambda: [{"id": "dead-d", "kind": "zeroclaw", "result": {"error": "timeout"}}],
+        lambda: [
+            {"id": "dead-d", "kind": "zeroclaw", "result": {"error": "timeout"}, "max_retries": 2, "retry_count": 0}
+        ],
     )
     monkeypatch.setattr(doctor, "DLQ_APPLY", False)
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)

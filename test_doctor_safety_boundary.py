@@ -256,7 +256,11 @@ def test_known_fix_task_also_needs_scoped_approval(monkeypatch):
 
 
 def test_bulk_executor_caps_and_excludes_protected_jobs(monkeypatch):
-    jobs = [{"id": str(i), "kind": "z", "project": "protected" if i < 2 else "normal"} for i in range(50)]
+    # Bus job records always carry the retry budget; these still have retries left.
+    jobs = [
+        {"id": str(i), "kind": "z", "project": "protected" if i < 2 else "normal", "max_retries": 2, "retry_count": 0}
+        for i in range(50)
+    ]
     monkeypatch.setattr(doctor, "DLQ_PROTECT_PROJECTS", {"protected"})
     monkeypatch.setattr(doctor, "DRY_RUN", False)
     http = Mock(side_effect=[(200, {"jobs": jobs}), (200, {})])

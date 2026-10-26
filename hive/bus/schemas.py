@@ -242,6 +242,11 @@ class MessagePublish(BaseModel):
 class RequeueRequest(BaseModel):
     job_ids: list[str]
     reason: str = "manual-requeue"
+    # Operator override (2026-10-26): a job with no retry budget left (max_retries 0,
+    # or retry_count >= max_retries) is only requeued when the caller sets this AND
+    # gives a non-empty reason. Every override is logged and emitted as an event.
+    override_max_retries: bool = False
+    override_reason: str | None = None
 
 
 class PurgeRequest(BaseModel):
@@ -265,3 +270,6 @@ class ReclassifyRequest(BaseModel):
     job_ids: list[str]
     status: str
     reason: str = "doctor-dlq-reclassify"
+    # Same operator override as RequeueRequest; only consulted for status="queued".
+    override_max_retries: bool = False
+    override_reason: str | None = None

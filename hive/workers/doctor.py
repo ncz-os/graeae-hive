@@ -295,6 +295,30 @@ def dlq_protected(job: dict) -> bool:
     return str(job.get("project") or "") in DLQ_PROTECT_PROJECTS
 
 
+def retry_budget_exhausted(job: dict) -> bool:
+    """True when the doctor must never requeue this job on its own (operator 2026-10-26).
+
+    A job submitted with ``max_retries`` 0, or whose ``retry_count`` has reached
+    ``max_retries``, is not the doctor's to re-run: the submitter said how many
+    attempts it gets. The doctor reports it (needs-review) instead. An unreadable
+    budget fails closed -- every job record the bus returns carries both fields, so
+    a record without them is not one the doctor can safely act on."""
+    max_retries = job.get("max_retries")
+    retry_count = job.get("retry_count")
+    if isinstance(max_retries, bool) or isinstance(retry_count, bool):
+        return True
+    try:
+        max_retries = int(max_retries)
+        retry_count = 0 if retry_count is None else int(retry_count)
+    except (TypeError, ValueError):
+        return True
+    return max_retries <= 0 or retry_count >= max_retries
+
+
+def _retry_budget_note(job: dict) -> str:
+    return f"max_retries={job.get('max_retries')} retry_count={job.get('retry_count')}"
+
+
 # Job-level "permanently unschedulable" decline reasons -> remove. Mirrors
 # hive.bus.domain.jobs.DECLINE_REASON_PREFIXES (kept literal: this module is
 # stdlib-only so it can run in the container without the hive package).
@@ -1195,13 +1219,36 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
         return f"could not fetch failed jobs (code={code})"
     failed = resp.get("jobs", [])
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
-    target_ids = [
-        j["id"] for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind and not dlq_protected(j)
-    ][: max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))]
+    candidates = [
+        j for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind and not dlq_protected(j)
+    ]
+    # A job whose retry budget is spent (max_retries 0, or retry_count >= max_retries)
+    # is never requeued by the doctor: it is reported for review, nothing else.
+    held = [j for j in candidates if retry_budget_exhausted(j)]
+    target_ids = [j["id"] for j in candidates if not retry_budget_exhausted(j)][
+        : max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))
+    ]
+    held_note = ""
+    if held:
+        held_note = f"; held {len(held)} with no retry budget (needs-review): " + ", ".join(
+            f"{j.get('id', '?')[:12]} ({_retry_budget_note(j)})" for j in held[:10]
+        )
+        log.warning("resubmit %s: not requeueing %d job(s) with no retry budget%s", base_kind, len(held), held_note)
+        broadcast_doctor_message(
+            "doctor.needs-review",
+            {
+                "host": AGENT_HOST,
+                "base_kind": base_kind,
+                "reason": "retry-budget-exhausted",
+                "job_ids": [j.get("id") for j in held],
+            },
+        )
     if not target_ids:
+        if held:
+            return f"no requeueable failed jobs of base_kind={base_kind}{held_note}"
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
-        return f"DRY_RUN: would requeue {len(target_ids)} jobs of {base_kind}"
+        return f"DRY_RUN: would requeue {len(target_ids)} jobs of {base_kind}{held_note}"
     code2, resp2 = _http(
         "POST",
         "/v1/admin/jobs/requeue",
@@ -1210,7 +1257,7 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
             "reason": f"doctor-resubmit:{base_kind}",
         },
     )
-    return f"requeued {len(target_ids)} jobs of {base_kind} (api={code2})"
+    return f"requeued {len(target_ids)} jobs of {base_kind} (api={code2}){held_note}"
 
 
 def _children_of(parent_ids: list[str], limit: int = 200) -> list[str]:
@@ -1909,7 +1956,10 @@ def execute_sop_decision(job: dict) -> dict:
             code, current = _http("GET", f"/v1/jobs/{quote(target, safe='')}")
             if code != 200 or not isinstance(current, dict) or dlq_protected(current):
                 raise ValueError("original job unavailable or protected")
-            if kind == "release_to_queue":
+            if kind == "release_to_queue" and retry_budget_exhausted(current):
+                text = f"needs-review {target[:12]}: no retry budget ({_retry_budget_note(current)}), not released"
+                log.warning("sop release refused: %s", text)
+            elif kind == "release_to_queue":
                 text = action_release_to_queue(target, action["release_eligible_kinds"])
             else:
                 text = remediate_dead_letter(current, "remove", "sop-decision")
@@ -2268,6 +2318,8 @@ def classify_dead_letter(job: dict) -> tuple[str, str]:
     blob = " ".join(str(res.get(k) or "") for k in ("error", "note", "stderr", "stdout", "last_decline_reason", "raw"))
     blob += " " + json.dumps(res.get("last_decline_result") or "")
     if DLQ_TRANSIENT_RE.search(blob):
+        if retry_budget_exhausted(job):
+            return "needs-review", f"retry-budget-exhausted ({_retry_budget_note(job)})"
         return "resubmit", "transient-infra-failure"
     return "needs-review", "unclassified"
 
@@ -2279,6 +2331,10 @@ def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
     if not STATE.loaded_ok or not STATE.persist_ok:
         return "REFUSED: safety state unavailable"
     jid = job.get("id", "")
+    if decision == "resubmit" and retry_budget_exhausted(job):
+        # Second line of defence behind classify_dead_letter: whatever decided
+        # "resubmit", a job with no retry budget is only tagged for review.
+        decision, reason = "needs-review", f"retry-budget-exhausted ({_retry_budget_note(job)})"
     if not DLQ_APPLY:
         return f"DLQ_DRY_RUN: would {decision} {jid[:12]} ({reason})"
     if decision == "resubmit":
