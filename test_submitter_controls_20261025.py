@@ -53,6 +53,7 @@ from hive.bus.domain.model_admission import (  # noqa: E402
     FORBIDDEN_MODELS,
     admission_warnings,
     forbidden_model,
+    served_model_names,
 )
 from hive.bus.routers import jobs as routers_jobs  # noqa: E402
 from hive.persistence import sqlite as sqlite_mod  # noqa: E402
@@ -354,6 +355,21 @@ class PreferredModelTests(_BusCase):
         # A provider-qualified key the fleet really serves stays warning-free.
         self.assertEqual(admission_warnings(["siliconflow/x"], {"siliconflow/x"}), [])
 
+    def test_served_model_names_carries_qualified_keys(self):
+        """Regression: a worker's (provider, model) pair must produce the
+        QUALIFIED key in the served set, or a `provider/model` preference the
+        fleet really serves would warn (the _is_served qualified branch is
+        dead code without it)."""
+        agents = [{"model": "qwen38", "provider": "tydeus"}]
+        served = served_model_names(agents)
+        self.assertIn("qwen38", served)
+        self.assertIn("tydeus/qwen38", served, served)
+        # The qualified preference matches its exact provider, no warning.
+        self.assertEqual(admission_warnings(["tydeus/qwen38"], served), [])
+        # ... but a DIFFERENT provider's qualified key for the same leaf does
+        # not silently match.
+        self.assertEqual(len(admission_warnings(["someother/qwen38"], served)), 1)
+
     def test_warnings_dedupe_on_normalized_key(self):
         out = admission_warnings(["MiniMax-M3", "minimax-m3"], set())
         self.assertEqual(len(out), 1, out)
@@ -467,7 +483,7 @@ class BranchAdmissionTests(unittest.TestCase):
         self.assertEqual(out["state"], "unprobed")
 
     def test_invalid_branch_name_is_rejected_before_git(self):
-        for bad in ("-rf", "a b", "a;rm", "x..y", "a@{b", "../etc", "a.lock", "/abs"):
+        for bad in ("-rf", "a b", "a;rm", "x..y", "a@{b", "../etc", "a.lock", "/abs", "@", "@main"):
             out = ba.branch_admission(
                 repo="graeae-hive",
                 head_branch=bad,

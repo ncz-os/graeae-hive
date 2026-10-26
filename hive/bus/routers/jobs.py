@@ -808,6 +808,12 @@ async def dequeue_next_job(agent_urn: str):
                     "preferred_providers": json_list(j_pref_providers),
                     "preferred_models": json_list(j_pref_models),
                     "mnemos_refs": json_list(j_mnemos_refs),
+                    # Carried for the worker: depends_on is already enforced
+                    # at claim time (the pre-scan above + the in-transaction
+                    # re-check in claim_job), so a claimed job's deps are done
+                    # by construction; the field lets the worker/log see the
+                    # DAG edge.
+                    "depends_on": json_list(j_deps_json),
                     "site": j_site,
                     "repo": j_repo,
                     "head_branch": j_head_branch,

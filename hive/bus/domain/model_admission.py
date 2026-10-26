@@ -145,17 +145,24 @@ def served_model_names(agents: list[dict[str, Any]] | None = None) -> set[str]:
     """
     served: set[str] = set(local_model_names())
     for agent in agents or []:
+        provider = _norm_model(agent.get("provider") or "")
         model = _norm_model(agent.get("model") or "")
         if model and model != "unknown":
             served.add(model)
-            # `provider/model` keys: the leaf is the name a submitter writes.
+            # `provider/model` keys: the leaf is the name a submitter writes,
+            # and the QUALIFIED key must stay in the set too — otherwise
+            # `_is_served` can never match a `provider/model` preference the
+            # fleet really serves (the qualified branch would be dead code).
             if "/" in model:
                 served.add(model.rsplit("/", 1)[1])
-        provider = agent.get("provider") or ""
-        for name in _served_by_provider(provider):
+            elif provider:
+                served.add(f"{provider}/{model}")
+        for name in _served_by_provider(agent.get("provider") or ""):
             served.add(name)
             if "/" in name:
                 served.add(name.rsplit("/", 1)[1])
+            elif provider:
+                served.add(f"{provider}/{name}")
     served.discard("")
     served.discard("*")
     served.discard("unknown")

@@ -104,6 +104,10 @@ def valid_branch_name(name: str) -> bool:
         return False
     if not _BRANCH_ALLOWED.match(n):
         return False
+    # `@` is a git synonym for HEAD (not a branch name); `@{` is already
+    # rejected below as reflog syntax.
+    if n == "@" or n.startswith("@"):
+        return False
     if n.startswith(("/", ".", "-")) or n.endswith(("/", ".")):
         return False
     if ".." in n or "@{" in n or "//" in n:
@@ -265,7 +269,7 @@ def resolve_remote_url(repo: str | None) -> str | None:
             for candidate in catalog.values()
             if lowered
             in {
-                candidate["id"].lower(),
+                (candidate.get("id") or "").lower(),
                 (candidate.get("display_name") or "").lower(),
                 *[a.lower() for a in (candidate.get("aliases") or [])],
             }
