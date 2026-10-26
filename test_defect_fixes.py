@@ -469,11 +469,11 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 await db.commit()
 
-            dep_calls = {"n": 0}
+            dep_calls = []
             _orig_unsat = repo.jobs_with_unsatisfied_deps
 
             async def _counting_unsatisfied(tx, *, ids):
-                dep_calls["n"] += 1
+                dep_calls.append(len(ids))
                 return await _orig_unsat(tx, ids=ids)
 
             with (
@@ -487,8 +487,18 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
             # ONE batched dependency resolution per pre-scan read via the ABC
             # (not N per-candidate). 2026-10-25: the resolution moved from
             # completed_job_ids (per dep id) to jobs_with_unsatisfied_deps
-            # (per candidate job) — same property, batched on the ABC.
-            self.assertGreaterEqual(dep_calls["n"], 1)
+            # (per candidate job) — same property, batched on the ABC. The
+            # window pre-scan reads every candidate in ONE call (and the
+            # windowed candidate scan re-reads them in a second call when the
+            # pre-scan finds nothing blocked, as here). N candidates must
+            # never produce N calls: at most 2 calls, each covering its whole
+            # candidate set.
+            self.assertLessEqual(len(dep_calls), 2, dep_calls)
+            self.assertTrue(dep_calls and all(n >= 1 for n in dep_calls), dep_calls)
+            # Every candidate id is resolved in a SINGLE call (batched), not
+            # once per candidate: each call's id list is the whole candidate
+            # set for that read (3+ here), never one id per candidate.
+            self.assertGreaterEqual(sum(dep_calls), 3, dep_calls)
 
     async def test_fresh_sqlite_has_dedup_column_and_active_unique_index(self):
         with tempfile.TemporaryDirectory() as td:

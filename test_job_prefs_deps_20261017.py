@@ -189,13 +189,15 @@ def _stub_claim(blocked_ids, repo):
     """claim_job stub that still runs the in-transaction dependency gate.
 
     2026-10-25: the dequeue router's pre-scan filter is ADVISORY; the binding
-    gate is the re-check inside claim_job. The stub applies that SAME gate
-    (``repo._require_dependencies_done`` — the exact call the real body makes)
-    so the tests pin the whole chain instead of just the pre-scan half.
+    gate is the re-check inside claim_job. The stub applies that SAME gate —
+    the same public ``jobs_with_unsatisfied_deps`` call the real gate uses,
+    raising the same ``DependencyNotReady`` — so the tests pin the whole
+    chain instead of just the pre-scan half.
     """
 
     async def _claim(tx, **kw):
-        await repo._require_dependencies_done(tx, kw["job_id"])
+        if await repo.jobs_with_unsatisfied_deps(tx, ids=[kw["job_id"]]):
+            raise DependencyNotReady(kw["job_id"])
         return 0 if kw["job_id"] in blocked_ids else 1
 
     return _claim

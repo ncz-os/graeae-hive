@@ -1535,9 +1535,10 @@ async def claim_job(job_id: str, by: str):
         # references to unknown job ids (a dep that does not exist can never
         # reach done). The in-transaction re-check in claim_job repeats this
         # under the write lock; the pre-read exists so the caller gets a
-        # named 409 instead of the same refusal from inside the tx.
-        _blocked_target = await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[job_id])
-        if _blocked_target:
+        # named 409 instead of the same refusal from inside the tx. Dep-free
+        # jobs (the common case) cost nothing here: the column is read in the
+        # context SELECT already, and NULL/empty means satisfied.
+        if j_deps_json and await hive_repo().jobs_with_unsatisfied_deps(tx, ids=[job_id]):
             raise HTTPException(409, f"job has unsatisfied DAG dependencies: {job_id}")
 
         agent = {

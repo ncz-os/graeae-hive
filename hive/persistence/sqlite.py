@@ -1112,7 +1112,7 @@ class SqliteHiveRepository(HiveMindRepository):
         )
         args: list[Any] = [agent_urn, now]
         if blocked:
-            sql += f"AND id NOT IN ({','.join('?' * len(blocked))}) "
+            sql += f"AND id NOT IN ({','.join(['?'] * len(blocked))}) "
             args.extend(blocked)
         sql += "ORDER BY priority DESC, started_at ASC LIMIT ?"
         args.append(limit)
@@ -1125,13 +1125,27 @@ class SqliteHiveRepository(HiveMindRepository):
         The fail-closed evaluation is SHARED with :meth:`claim_job`'s
         in-transaction gate (``_deps_all_done``), so a candidate that looks
         open here is re-checked at claim time under the write lock.
+
+        Batched (2026-10-25 review fix): ONE ``SELECT ... WHERE id IN (...)``
+        fetches every ``depends_on`` value for the scan, then each row is
+        evaluated with the same fail-closed ``_deps_all_done`` the claim gate
+        uses. The previous per-id loop was an N+1 inside the claim
+        transaction — exactly the pattern the original ``completed_job_ids``
+        batching removed.
         """
         db = tx
+        dedup = list(dict.fromkeys(ids))
+        if not dedup:
+            return set()
+        placeholders = ",".join("?" * len(dedup))
+        async with db.execute(
+            f"SELECT id, depends_on FROM jobs WHERE id IN ({placeholders})",
+            dedup,
+        ) as cur:
+            rows = [(r[0], r[1]) async for r in cur]
         out: set[str] = set()
-        for job_id in ids:
-            async with db.execute("SELECT depends_on FROM jobs WHERE id=?", (job_id,)) as cur:
-                row = await cur.fetchone()
-            if row and not await self._deps_all_done(db, row[0]):
+        for job_id, depends_on in rows:
+            if not await self._deps_all_done(db, depends_on):
                 out.add(job_id)
         return out
 
