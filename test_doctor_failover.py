@@ -403,9 +403,7 @@ def test_blank_rung_model_falls_back_to_phase_model(doctor, monkeypatch):
 
 def test_fallback_bases_may_be_longer_or_shorter_than_models_via_env(monkeypatch):
     monkeypatch.setenv("DOCTOR_TRIAGE_MODEL", "gemma4-e2b")
-    monkeypatch.setenv(
-        "DOCTOR_FALLBACK_BASE_URLS", f"{HYDRA},{ACHILLES},{CERBERUS}"
-    )
+    monkeypatch.setenv("DOCTOR_FALLBACK_BASE_URLS", f"{HYDRA},{ACHILLES},{CERBERUS}")
     monkeypatch.setenv("DOCTOR_FALLBACK_MODELS", "gemma4-e2b")
     from hive.workers import doctor as _doctor
 

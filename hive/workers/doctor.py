@@ -46,8 +46,8 @@ Env:
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import os
 import re
@@ -65,9 +65,8 @@ from collections import deque
 # SOP phase 3 (2026-10-22): durable safety state and the destructive-action rails.
 # Both are stdlib-only siblings, importable without the hive package, so the
 # container still runs this module standalone.
-from hive.workers import doctor_gates
+from hive.workers import doctor_gates, doctor_v2
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
-from hive.workers import doctor_v2
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
 # C1: bus transport auth bearer token (env-sourced). The doctor SUBMITS jobs
@@ -166,7 +165,8 @@ DOCTOR_FALLBACK_MODELS: list[str] = [
 # explicit operator switch after the side-by-side report has been reviewed.
 DOCTOR_V2_MODE = os.environ.get("DOCTOR_V2_MODE", "shadow").strip().lower()
 DOCTOR_V2_RULES_PATH = os.environ.get(
-    "DOCTOR_V2_RULES_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs", "doctor_v2_rules.toml")
+    "DOCTOR_V2_RULES_PATH",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "docs", "doctor_v2_rules.toml"),
 )
 try:
     DOCTOR_V2_RULES = doctor_v2.load_rules(DOCTOR_V2_RULES_PATH)
@@ -265,6 +265,8 @@ SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
 
 def _max_same_signature_resubmits() -> int:
     return doctor_v2.max_same_signature_resubmits()
+
+
 # Owner-protected dead-letter jobs (2026-10-17): another orchestrator asked that
 # its jobs be reported, not remediated. A dead-letter job whose kind starts with
 # one of these prefixes, or whose project is listed, is logged and left alone
@@ -771,10 +773,15 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry:
         if fj.get("result"):
             try:
                 rd = json.loads(fj["result"]) if isinstance(fj["result"], str) else fj["result"]
-                txt = " | ".join(str(rd.get(key) or "")[-4096:] for key in
-                                  ("failure_reason", "error", "tail", "stderr", "stdout") if rd.get(key))
+                txt = " | ".join(
+                    str(rd.get(key) or "")[-4096:]
+                    for key in ("failure_reason", "error", "tail", "stderr", "stdout")
+                    if rd.get(key)
+                )
                 exit_code = rd.get("exit_code")
-                result_preview = f"exit={exit_code} retry_count={fj.get('retry_count', rd.get('retry_count', 0))} | {txt[-16384:]}"
+                result_preview = (
+                    f"exit={exit_code} retry_count={fj.get('retry_count', rd.get('retry_count', 0))} | {txt[-16384:]}"
+                )
             except Exception:
                 result_preview = str(fj["result"])[:400]
         msg.append(
@@ -785,7 +792,9 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry:
         )
         if result_preview:
             msg.append(f"    result: {result_preview}")
-        msg.append(f"    host={fj.get('host') or fj.get('claimed_host') or ''} head_branch={fj.get('head_branch') or ''}")
+        msg.append(
+            f"    host={fj.get('host') or fj.get('claimed_host') or ''} head_branch={fj.get('head_branch') or ''}"
+        )
     msg.extend(
         [
             "EVIDENCE RULE: A release_to_queue decision MUST include evidence_quote exactly as supplied below.",
@@ -1926,13 +1935,22 @@ def _doctor_v2_decision(job: dict, base_kind: str, failed: list[dict]) -> doctor
     decision = doctor_v2.decide_rules(snapshot, DOCTOR_V2_RULES, retry_cap=_max_same_signature_resubmits())
     if decision:
         decision = doctor_v2.Decision(
-            decision.action, decision.rule_id,
+            decision.action,
+            decision.rule_id,
             f"{decision.reason}; quote={decision.evidence_quote!r}",
-            decision.signature, decision.max_retries, decision.retry_scope,
+            decision.signature,
+            decision.max_retries,
+            decision.retry_scope,
             decision.evidence_quote,
         )
-        log.info("doctor v2 mode=%s base_kind=%s rule=%s action=%s signature=%s", DOCTOR_V2_MODE, base_kind,
-                 decision.rule_id, decision.action, decision.signature[:12])
+        log.info(
+            "doctor v2 mode=%s base_kind=%s rule=%s action=%s signature=%s",
+            DOCTOR_V2_MODE,
+            base_kind,
+            decision.rule_id,
+            decision.action,
+            decision.signature[:12],
+        )
     return decision
 
 
@@ -2019,11 +2037,18 @@ def process_triage_job(job: dict) -> dict:
                 _record_signature_resubmit(base_kind, v2.signature)
         note = v2.reason if v2.action == "escalate" else None
         return {
-            "exit_code": 0, "stdout": f"action={v2.action}; rule={v2.rule_id}; {text}",
-            "action": {"action_type": v2.action, "rule_id": v2.rule_id, "reason": v2.reason,
-                       "evidence_quote": v2.evidence_quote, "signature": v2.signature,
-                       **({"orchestrator_note": note} if note else {})},
-            "base_kind": base_kind, "released_to_queue": released,
+            "exit_code": 0,
+            "stdout": f"action={v2.action}; rule={v2.rule_id}; {text}",
+            "action": {
+                "action_type": v2.action,
+                "rule_id": v2.rule_id,
+                "reason": v2.reason,
+                "evidence_quote": v2.evidence_quote,
+                "signature": v2.signature,
+                **({"orchestrator_note": note} if note else {}),
+            },
+            "base_kind": base_kind,
+            "released_to_queue": released,
             "needs_review": v2.action == "escalate",
             "v2": {"rule_id": v2.rule_id, "signature": v2.signature, "model": None},
         }
@@ -2115,14 +2140,20 @@ def process_triage_job(job: dict) -> dict:
     used_retries = len(STATE.timestamps(retry_key, SAME_SIGNATURE_RETRY_TTL))
     if "evidence_quote" in action or "quote" in action or action.get("action_type") == "release_to_queue":
         residual = doctor_v2.validate_llm_decision(
-            action, residual_evidence,
-            rule_cap=_max_same_signature_resubmits(), used_retries=used_retries,
+            action,
+            residual_evidence,
+            rule_cap=_max_same_signature_resubmits(),
+            used_retries=used_retries,
         )
         if residual.action == "escalate" and action.get("action_type") != "escalate":
-            action = {"action_type": "escalate", "reason": residual.reason,
-                      "evidence_quote": residual.evidence_quote, "signature": residual.signature,
-                      "orchestrator_note": f"{residual.reason}; manual review required",
-                      "needs_review": True}
+            action = {
+                "action_type": "escalate",
+                "reason": residual.reason,
+                "evidence_quote": residual.evidence_quote,
+                "signature": residual.signature,
+                "orchestrator_note": f"{residual.reason}; manual review required",
+                "needs_review": True,
+            }
 
     a = action.get("action_type", "no_action")
     try:
@@ -2160,9 +2191,17 @@ def process_triage_job(job: dict) -> dict:
         "failed_count_seen": len(failed),
         "released_to_queue": released,
         "needs_review": bool(action.get("needs_review")),
-        "v2_shadow": ({"rule_id": v2.rule_id, "action": v2.action, "signature": v2.signature,
-                        "old_action": a, "agree": v2.action == a}
-                       if v2 else None),
+        "v2_shadow": (
+            {
+                "rule_id": v2.rule_id,
+                "action": v2.action,
+                "signature": v2.signature,
+                "old_action": a,
+                "agree": v2.action == a,
+            }
+            if v2
+            else None
+        ),
     }
 
 
