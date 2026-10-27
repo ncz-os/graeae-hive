@@ -16,8 +16,13 @@ This module covers the four guarantees the pass owes:
 * a row without a parseable verdict gets NO action (no PATCH, no purge, no
   retry) — it is left for the failure-matrix retry handler;
 * a row that already has ``result.verdict`` is skipped (idempotent);
-* at most one attempt per row per process, enforced by a durable marker in
-  the doctor's STATE store.
+* a successful completion is done exactly once, enforced by a durable
+  success marker in the doctor's STATE store, written only AFTER the bus
+  accepted the PATCH (so a restart never re-PATCHes a completed row);
+* a FAILED PATCH leaves only a short backoff marker, never the 24h
+  completion window, so the next sweep retries it — in the same process
+  once the backoff lapses, and in a fresh process reading the same durable
+  state.
 
 No live bus: every HTTP call is monkeypatched and recorded.
 """
@@ -25,6 +30,7 @@ No live bus: every HTTP call is monkeypatched and recorded.
 from __future__ import annotations
 
 import json
+import time
 
 from hive.workers import doctor
 
@@ -242,7 +248,7 @@ def test_other_rows_are_untouched(monkeypatch):
     assert messages == []
 
 
-# ── one attempt per row per process (durable marker) ───────────────────────
+# ── completion dedupe (durable success marker, written after the 200) ──────
 
 
 def test_at_most_one_attempt_per_row_per_process(monkeypatch):
@@ -250,7 +256,7 @@ def test_at_most_one_attempt_per_row_per_process(monkeypatch):
     summary, patches, _ = _sweep(monkeypatch, jobs)
     assert summary == {"scanned": 1, "completed": 1, "skipped": 0, "no_action": 0}
     assert len(patches) == 1
-    # The durable marker landed in STATE before the PATCH.
+    # The durable SUCCESS marker is in STATE after the bus accepted the PATCH.
     assert doctor.STATE.seen(doctor.KEY_VERDICT_COMPLETION + ":job-once", ttl=doctor.VERDICT_COMPLETION_TTL)
 
     # A second pass in the SAME process: marker seen -> zero further work.
@@ -261,12 +267,12 @@ def test_at_most_one_attempt_per_row_per_process(monkeypatch):
     assert messages2 == []
 
 
-def test_marker_blocks_second_attempt_even_if_first_patch_failed(monkeypatch):
-    """A failed PATCH still counts as the one attempt for this process.
+def test_failed_patch_gets_short_backoff_not_full_ttl(monkeypatch):
+    """A failed PATCH must NOT burn the 24h completion window.
 
-    The marker is recorded BEFORE the bus call, so a crash or 4xx between
-    marker and PATCH cannot produce a second PATCH in the same process; the
-    next process gets its own single attempt.
+    The durable completion marker is written only after a successful PATCH;
+    a failed one leaves only the short retry backoff, so the marker is not
+    ``seen`` under ``VERDICT_COMPLETION_TTL`` even in this same process.
     """
     calls = {"n": 0}
 
@@ -280,12 +286,159 @@ def test_marker_blocks_second_attempt_even_if_first_patch_failed(monkeypatch):
     summary = doctor.complete_stuck_verdict_jobs([job])
     assert summary["no_action"] == 1
     assert calls["n"] == 1
-    assert doctor.STATE.seen(doctor.KEY_VERDICT_COMPLETION + ":job-fail", ttl=doctor.VERDICT_COMPLETION_TTL)
+    success_key = doctor.KEY_VERDICT_COMPLETION + ":job-fail"
+    backoff_key = doctor.KEY_VERDICT_COMPLETION_RETRY + ":job-fail"
+    # Not completed: no full-TTL success marker, so the row is still live for
+    # the next sweep (this process, or a fresh one after a restart).
+    assert not doctor.STATE.seen(success_key, ttl=doctor.VERDICT_COMPLETION_TTL)
+    # ...but a short backoff marker WAS recorded so we do not hammer a down bus
+    # on every pass.
+    assert doctor.STATE.seen(backoff_key, ttl=doctor.VERDICT_COMPLETION_RETRY_TTL)
 
-    calls["n"] = 0
+    # Within the backoff the row is still skipped (no extra bus traffic):
     summary2 = doctor.complete_stuck_verdict_jobs([job])
     assert summary2["skipped"] == 1
-    assert calls["n"] == 0
+    assert calls["n"] == 1  # unchanged: the second pass made no new call
+
+    # Once the backoff has lapsed (simulated by advancing the store's clock),
+    # the same process retries the row.
+    store = doctor.STATE
+    real_time = store._time
+    store._time = lambda: real_time() + doctor.VERDICT_COMPLETION_RETRY_TTL + 1
+    try:
+        calls["n"] = 0
+        summary3 = doctor.complete_stuck_verdict_jobs([job])
+        assert summary3["no_action"] == 1
+        assert calls["n"] == 1  # retried after the backoff lapsed
+    finally:
+        store._time = real_time
+
+
+def test_failed_patch_is_retried_by_a_fresh_process_from_the_durable_store(
+    monkeypatch, tmp_path
+):
+    """A failed PATCH must not block recovery across a restart for the TTL.
+
+    Simulates a process restart by swapping in a brand-new in-memory store on
+    top of the SAME durable state the failed pass wrote. The row must still be
+    eligible for the next sweep (no live 24h completion marker), and a fresh
+    success completes it exactly once.
+    """
+    state_path = tmp_path / "durable-state.json"
+    from hive.workers.doctor_state import DurableStateStore, FileBackend, MemoryBackend
+
+    # Process 1: file-backed durable store.
+    monkeypatch.setattr(
+        doctor, "STATE", DurableStateStore(FileBackend(str(state_path)), refresh_secs=0.0)
+    )
+    calls = {"n": 0}
+
+    def _http(method, path, body=None, timeout=15.0):
+        calls["n"] += 1
+        return 500, {"error": "internal server error"}
+
+    monkeypatch.setattr(doctor, "_http", _http)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    job = _job(jid="job-r")
+    summary1 = doctor.complete_stuck_verdict_jobs([job])
+    assert summary1["no_action"] == 1
+    assert calls["n"] == 1
+
+    # A failed pass must leave only a SHORT backoff record in the durable store,
+    # never a live completion marker (which would block the next process for the
+    # whole TTL).
+    assert state_path.exists()
+    durable_ns = doctor.STATE.namespace
+    success_key = doctor.KEY_VERDICT_COMPLETION + ":job-r"
+    backoff_key = doctor.KEY_VERDICT_COMPLETION_RETRY + ":job-r"
+    with open(state_path) as fh:
+        blob = json.load(fh)
+    durable_records = blob.get(durable_ns, {})
+    # The backoff record IS durable; the success record is NOT.
+    assert backoff_key in durable_records
+    assert success_key not in durable_records
+    backoff_record = durable_records[backoff_key]
+    newest = max(
+        float(v)
+        for v in [backoff_record.get("at"), *backoff_record.get("timestamps", [])]
+        if v is not None
+    )
+    assert (time.time() - newest) <= doctor.VERDICT_COMPLETION_RETRY_TTL
+    assert not doctor.STATE.seen(success_key, ttl=doctor.VERDICT_COMPLETION_TTL)
+
+    # A row whose ONLY durable record is a backoff must NOT be treated as
+    # completed by the next process: a fresh file-backed store sees no success
+    # marker in the durable file.
+    fresh_probe = DurableStateStore(FileBackend(str(state_path)), refresh_secs=0.0)
+    assert not fresh_probe.seen(success_key, ttl=doctor.VERDICT_COMPLETION_TTL)
+
+    # Process 2: fresh store reading the SAME durable file, clock advanced past
+    # the backoff so the retry is due.
+    fresh = DurableStateStore(FileBackend(str(state_path)), refresh_secs=0.0)
+    real_time = fresh._time
+    fresh._time = lambda: real_time() + doctor.VERDICT_COMPLETION_RETRY_TTL + 5
+    monkeypatch.setattr(doctor, "STATE", fresh)
+
+    def _http_ok(method, path, body=None, timeout=15.0):
+        calls["n"] += 1
+        return 200, {}
+
+    monkeypatch.setattr(doctor, "_http", _http_ok)
+    messages: list = []
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda t, p: messages.append((t, p)))
+    summary2 = doctor.complete_stuck_verdict_jobs([job])
+    assert summary2["completed"] == 1
+    assert calls["n"] == 2  # exactly one retry after the failure
+    assert [m[0] for m in messages] == ["doctor.verdict_completed"]
+    # The success now left the full-TTL marker in the durable store.
+    assert doctor.STATE.seen(success_key, ttl=doctor.VERDICT_COMPLETION_TTL)
+    with open(state_path) as fh:
+        blob2 = json.load(fh)
+    record2 = blob2.get(durable_ns, {}).get(success_key, {})
+    newest2 = max(
+        float(v)
+        for v in [record2.get("at"), *record2.get("timestamps", [])]
+        if v is not None
+    )
+    assert (time.time() - newest2) <= doctor.VERDICT_COMPLETION_TTL
+
+
+def test_successful_completion_is_done_exactly_once_across_restarts(
+    monkeypatch, tmp_path
+):
+    """A successful completion must PATCH exactly once, including after a
+    restart: the durable success marker (written only after the 200) blocks
+    every later attempt in this and any fresh process."""
+    state_path = tmp_path / "durable-state.json"
+    from hive.workers.doctor_state import DurableStateStore, FileBackend, MemoryBackend
+
+    monkeypatch.setattr(
+        doctor, "STATE", DurableStateStore(FileBackend(str(state_path)), refresh_secs=0.0)
+    )
+    calls = {"n": 0}
+
+    def _http_ok(method, path, body=None, timeout=15.0):
+        calls["n"] += 1
+        return 200, {}
+
+    monkeypatch.setattr(doctor, "_http", _http_ok)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    job = _job(jid="job-once-r")
+    summary1 = doctor.complete_stuck_verdict_jobs([job])
+    assert summary1 == {"scanned": 1, "completed": 1, "skipped": 0, "no_action": 0}
+    assert calls["n"] == 1
+
+    # Same process, second pass: skipped, no second PATCH.
+    summary2 = doctor.complete_stuck_verdict_jobs([job])
+    assert summary2 == {"scanned": 1, "completed": 0, "skipped": 1, "no_action": 0}
+    assert calls["n"] == 1
+
+    # Fresh process on the same durable state: still skipped, still no PATCH.
+    fresh = DurableStateStore(FileBackend(str(state_path)), refresh_secs=0.0)
+    monkeypatch.setattr(doctor, "STATE", fresh)
+    summary3 = doctor.complete_stuck_verdict_jobs([job])
+    assert summary3 == {"scanned": 1, "completed": 0, "skipped": 1, "no_action": 0}
+    assert calls["n"] == 1  # exactly one PATCH total, across both processes
 
 
 def test_dry_run_completes_without_any_bus_traffic(monkeypatch):

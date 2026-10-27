@@ -494,6 +494,7 @@ def test_every_durable_counter_has_a_ttl():
         "protection",
         "review",
         "verdict_completion",
+        "verdict_completion_retry",
     }
     assert all(ttl > 0 for ttl in COUNTER_TTLS.values())
 
