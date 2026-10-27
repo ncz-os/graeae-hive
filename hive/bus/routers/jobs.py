@@ -144,6 +144,24 @@ def _result_model_author(result: Any) -> str | None:
 ORCHESTRATOR_CAPABILITY = "orchestrator"
 
 
+#: The reason keys that explain WHY a job left a worker (2026-10-27): the
+#: release fields written on every release-to-queued, and the dead-letter
+#: note written when a job burns its decline budget. A job's result carries
+#: whichever of these happened last to it.
+RESULT_REASON_KEYS = ("last_release_reason", "last_release_at", "last_released_by", "last_decline_reason", "note")
+
+
+def _result_reason_fields(result: Any) -> dict[str, Any]:
+    """The release/dead-letter reason fields present on a result payload.
+
+    GET /v1/jobs/{id} must always surface these when they are present (the
+    dead-letter rows of 2026-10-27 were invisible from the job detail
+    otherwise). Tolerant of str/None results: those carry no fields."""
+    if not isinstance(result, dict):
+        return {}
+    return {k: result[k] for k in RESULT_REASON_KEYS if k in result}
+
+
 async def _has_orchestrator_capability(actor_urn: str | None, tx=None) -> bool:
     """Whether ``actor_urn`` is REGISTERED and declares the orchestrator capability.
 
@@ -182,6 +200,28 @@ async def _has_orchestrator_capability(actor_urn: str | None, tx=None) -> bool:
     return ORCHESTRATOR_CAPABILITY in {_norm_str(c) for c in caps if isinstance(c, str)}
 
 
+def _reason_prefix_filter(rows: list[dict[str, Any]], reason_prefix: str) -> list[dict[str, Any]]:
+    """Backends without a SQL reason predicate filter here, in Python.
+
+    Case-insensitive prefix match on the job's result, across the deploy-line
+    reason fields: ``last_decline_reason`` (dead-letter), ``last_release_reason``
+    (release), ``failure_reason``, ``error`` and ``note``. ``result`` is JSON
+    on sqlite but may surface as a string on some backends — both tolerated.
+    """
+    prefix = reason_prefix.lower()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        payload = _result_as_dict(row.get("result"))
+        if not isinstance(payload, dict):
+            continue
+        for key in ("last_decline_reason", "last_release_reason", "failure_reason", "error", "note"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.lower().startswith(prefix):
+                out.append(row)
+                break
+    return out
+
+
 @router.get("/v1/jobs")
 async def list_jobs(
     status: str | None = None,
@@ -190,6 +230,7 @@ async def list_jobs(
     since: float | None = None,
     limit: int = 100,
     include_result: bool = True,
+    reason_prefix: str | None = None,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
     if status:
@@ -207,6 +248,14 @@ async def list_jobs(
                 f"unknown status {status!r}; valid: {sorted(VALID_JOB_STATUSES)}",
             )
     # Storage via the HiveMindRepository ABC on a transaction (EPIMONE shape).
+    # reason_prefix: expressed IN SQL on backends that can do it (sqlite,
+    # postgres, mysql — LIKE on the result JSON text); those also filter the
+    # COUNT in SQL. Backends whose dialect cannot express it (oracle, db2)
+    # filter in PYTHON over the fetched rows: the returned count is the
+    # post-filter count over the fetched window and `total` stays the
+    # pre-filter count (so `total > count` can hold there — the filter
+    # response is still correct, just less precise on total).
+    _sql_reason_filter = reason_prefix and reason_prefix.strip() != ""
     async with hive_repo().connection() as tx:
         total, rows = await hive_repo().list_jobs(
             tx,
@@ -216,8 +265,148 @@ async def list_jobs(
             since=since,
             limit=limit,
             include_result=include_result,
+            reason_prefix=reason_prefix if _sql_reason_filter else None,
         )
+    if _sql_reason_filter and not type(hive_repo()).list_jobs_sql_reason:
+        # Python-side filter for backends whose dialect cannot express it
+        # (oracle, db2): rows are filtered, but `total` is preserved as the
+        # PRE-FILTER count so callers can see `total > count` and know the
+        # filter ran client-side over the fetched window.
+        rows = _reason_prefix_filter(rows, reason_prefix)
     return {"count": len(rows), "total": total, "jobs": rows}
+
+
+# ---- job summary (2026-10-27): queue state + dead-letter reasons, one call ---
+#
+# The operator pain this exists for: 70+ dead rows and a dead-letter with no
+# visible reason were invisible from GET /v1/jobs. The reasons are now
+# persisted in the job result (last_release_reason / last_decline_reason /
+# failure_reason / error / note), and the summary surfaces them grouped.
+#
+# READ-ONLY BY CONSTRUCTION: it issues only SELECTs through the repository
+# (no commit on the transaction) and the zero-writes test pins that.
+
+
+def _result_as_dict(result: Any) -> dict[str, Any] | None:
+    """The job's result payload as a dict, or None when it is not one.
+
+    The repository already decodes result JSON on sqlite/postgres, but a
+    backend may surface it as a string — parse it here so reason extraction
+    works on both shapes."""
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _reason_prefix_key(result: Any) -> str | None:
+    """The job's normalised reason key for the summary's dead_by_reason.
+
+    First present of the deploy-line reason fields, truncated to 60 chars.
+    None means "no reason" — the caller buckets those under ``(none)``.
+    Tolerates str/None/other results (they count as no reason)."""
+    payload = _result_as_dict(result)
+    if not isinstance(payload, dict):
+        return None
+    for key in ("last_decline_reason", "last_release_reason", "failure_reason", "error", "note"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value:
+                return value[:60]
+    return None
+
+
+@router.get("/v1/jobs/summary")
+async def jobs_summary():
+    """Queue state + dead-letter reasons in one read-only call.
+
+    Shape::
+
+        {
+          "by_status": {<status>: n},
+          "dead": {"failed", "dead-letter", "cancelled", "total",
+                   "oldest_age_sec", "cap"},
+          "dead_by_reason": {<60-char reason prefix>: n, "other": n?, "(none)": n?},
+          "triage": {"queued", "done", "oldest_age_sec"},
+          "needs_review": {"n", "oldest_age_sec"},
+          "oldest_queued_sec"
+        }
+
+    * dead = the operator's dead set: failed + dead-letter + cancelled.
+    * dead_by_reason keys are the FIRST 60 CHARS of the reason (normalised);
+      the top 20 by count (ties: name) are listed and the rest roll into
+      ``other``; dead rows with no reason count under ``(none)``.
+    * triage = ``triage:*`` work orders: queued vs done/cancelled/failed/
+      dead-letter (a processed work order), aged from ended/last_update.
+    * ages are seconds at the caller's clock, null when no row carries a
+      usable timestamp.
+    """
+    import time as _time
+
+    from hive.workers import retention as _retention
+
+    now = _time.time()
+    async with hive_repo().connection() as tx:
+        total, rows = await hive_repo().list_jobs(tx, limit=100000, include_result=True)
+    by_status: dict[str, int] = {}
+    for row in rows:
+        by_status[row["status"]] = by_status.get(row["status"], 0) + 1
+
+    dead_rows = [r for r in rows if r["status"] in _retention.DEAD_STATUSES]
+    dead_ages = [_retention._age_at(r, now) for r in dead_rows]
+
+    reasons: dict[str, int] = {}
+    for row in dead_rows:
+        key = _reason_prefix_key(row.get("result")) or "(none)"
+        reasons[key] = reasons.get(key, 0) + 1
+    ranked = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+    dead_by_reason = dict(ranked[:20])
+    if len(ranked) > 20:
+        dead_by_reason["other"] = sum(n for _k, n in ranked[20:])
+
+    triage_queued = sum(1 for r in rows if r["status"] == "queued" and _retention.is_triage_job(r["kind"]))
+    triage_done = sum(
+        1 for r in rows if r["status"] in _retention.TRIAGE_PURGE_STATUSES and _retention.is_triage_job(r["kind"])
+    )
+    triage_ages = [
+        _retention._age_at(r, now)
+        for r in rows
+        if r["status"] in ("queued", *(_retention.TRIAGE_PURGE_STATUSES)) and _retention.is_triage_job(r["kind"])
+    ]
+
+    nr_rows = [r for r in rows if r["status"] == "needs-review"]
+    nr_ages = [_retention._age_at(r, now) for r in nr_rows]
+    queued_ages = [_retention._age_at(r, now) for r in rows if r["status"] == "queued"]
+
+    return {
+        "total": total,
+        "by_status": by_status,
+        "dead": {
+            "failed": by_status.get("failed", 0),
+            "dead_letter": by_status.get("dead-letter", 0),
+            "cancelled": by_status.get("cancelled", 0),
+            "total": len(dead_rows),
+            "oldest_age_sec": max((a for a in dead_ages if a is not None), default=None),
+            "cap": _retention.DEAD_CAP,
+        },
+        "dead_by_reason": dead_by_reason,
+        "triage": {
+            "queued": triage_queued,
+            "done": triage_done,
+            "oldest_age_sec": max((a for a in triage_ages if a is not None), default=None),
+        },
+        "needs_review": {
+            "n": len(nr_rows),
+            "oldest_age_sec": max((a for a in nr_ages if a is not None), default=None),
+        },
+        "oldest_queued_sec": max((a for a in queued_ages if a is not None), default=None),
+    }
 
 
 @router.get("/v1/jobs/{job_id}")
@@ -232,7 +421,13 @@ async def get_job(job_id: str):
             r = await cur.fetchone()
     if not r:
         raise HTTPException(404, f"job not found: {job_id}")
-    return {
+    _result = json.loads(r[10]) if r[10] else None
+    # The release-reason fields (last_release_reason/at/by on a release,
+    # last_decline_reason + note on a dead-letter) live INSIDE the result
+    # JSON (the column-based attempt was reverted: production runs on
+    # Oracle). GET must surface them at the top level whenever present, so
+    # an operator reads WHY from the job itself.
+    out = {
         "id": r[0],
         "submitter_urn": r[1],
         "parent_job_id": r[2],
@@ -243,7 +438,7 @@ async def get_job(job_id: str):
         "claimed_by": r[7],
         "started_at": r[8],
         "ended_at": r[9],
-        "result": json.loads(r[10]) if r[10] else None,
+        "result": _result,
         "estimated_cost_usd": r[11],
         "required_capabilities": json.loads(r[12]) if r[12] else None,
         "eligible_kinds": json.loads(r[13]) if r[13] else None,
@@ -270,6 +465,8 @@ async def get_job(job_id: str):
         "max_cost_tier": r[34],
         "mnemos_refs": json.loads(r[35]) if r[35] else None,
     }
+    out.update(_result_reason_fields(_result))
+    return out
 
 
 @router.get("/v1/jobs/metrics")
@@ -1280,7 +1477,7 @@ async def update_job(job_id: str, req: JobUpdate):
                     "dead_letter": True,
                     "decline_count": new_decline_count,
                     "last_decline_reason": decline_reason,
-                    "note": "thrash_guard:max_decline_requeues_exceeded",
+                    "note": f"dead_letter:thrash_guard:max_decline_requeues_exceeded after {new_decline_count} declines",
                     "last_decline_result": req.result,
                 }
                 rc_dl = await hive_repo().patch_job_status(

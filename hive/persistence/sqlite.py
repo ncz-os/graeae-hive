@@ -235,6 +235,11 @@ CREATE INDEX IF NOT EXISTS idx_cap_usage_service_ts ON capacity_usage(service, t
 
 
 class SqliteHiveRepository(HiveMindRepository):
+    #: The reference dialect can express the reason prefix filter: case-
+    #: insensitive prefix match on the result JSON text (LIKE is
+    #: case-insensitive for ASCII in sqlite, so LOWER is unneeded — the
+    #: postgres subclass adds its own explicit LOWER to be safe).
+    list_jobs_sql_reason = True
     #: Backend lock clause for the auto-retry row read. SQLite serialises via the
     #: connection; Oracle/Db2 override this to add FOR UPDATE. Kept as a class
     #: attr so the dialect lives in the backend, never in the router.
@@ -920,6 +925,16 @@ class SqliteHiveRepository(HiveMindRepository):
         cur = await tx.execute(f"UPDATE jobs SET {', '.join(assign_parts)} WHERE {where}", args)
         return cur.rowcount
 
+    def _reason_prefix_sql(self, pattern: str) -> str:
+        """The reason_prefix predicate, one WHERE fragment, one bound arg.
+
+        ``pattern`` already carries the trailing ``%`` (the caller builds it);
+        it is bound, never interpolated. sqlite's LIKE is already
+        case-insensitive for ASCII, so the reference is a bare
+        ``result LIKE ?``; subclasses may override to wrap the text in an
+        explicit LOWER() where LIKE is case-sensitive."""
+        return " AND result LIKE ?"
+
     async def get_job(self, tx: Transaction, *, job_id: str) -> tuple[Any, ...] | None:
         db = tx
         async with db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)) as cur:
@@ -942,6 +957,7 @@ class SqliteHiveRepository(HiveMindRepository):
         since = filters.get("since")
         limit = int(filters.get("limit") or 100)
         include_result = bool(filters.get("include_result", True))
+        reason_prefix = filters.get("reason_prefix")
         col_sql = (
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
@@ -974,6 +990,22 @@ class SqliteHiveRepository(HiveMindRepository):
             cnt_sql += " AND started_at >= ?"
             args.append(since)
             cnt_args.append(since)
+        if reason_prefix:
+            # reason_prefix (2026-10-27): case-insensitive prefix match on the
+            # deploy-line reason fields — result.last_decline_reason (dead-
+            # letter), result.last_release_reason (release), result.failure_reason
+            # and result.error, plus the dead-letter result.note (it starts
+            # with "dead_letter:" and must stay searchable). The match runs on
+            # the raw result JSON text: the field keys carry unique prefixes
+            # (no cross-field false positives, e.g. "dead_letter:" appears in
+            # "note":"dead_letter:..." and nowhere else) and the prefix is a
+            # bound parameter, so it is a pure text predicate the dialect can
+            # express. Combined with the status filter by AND (both in WHERE).
+            reason_sql = self._reason_prefix_sql(f"{reason_prefix}%")
+            col_sql += reason_sql
+            cnt_sql += reason_sql
+            args.append(f"{reason_prefix}%")
+            cnt_args.append(f"{reason_prefix}%")
         terminal = {"done", "failed", "cancelled", "dead-letter"}
         if status in terminal:
             col_sql += " ORDER BY COALESCE(ended_at, started_at) DESC LIMIT ?"
