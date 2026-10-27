@@ -28,6 +28,7 @@ from hive import scheduler as sched
 from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
     CLAIM_SCAN_WINDOW,
+    DEP_DEAD_STATUSES,
     HOST_DENYLIST,
     TERMINAL_JOB_STATUSES,
     VALID_JOB_STATUSES,
@@ -35,6 +36,7 @@ from hive.bus.deps import (
     connect_db,
     emit_event,
     hive_repo,
+    release_dependencies,
     require_orchestrator_submitter,
     uuidv7,
 )
