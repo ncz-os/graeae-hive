@@ -301,6 +301,13 @@ KEY_VERDICT_COMPLETION = "verdict_completion"
 # doctor_state.COUNTER_TTLS so its records carry this exact window (an
 # unlisted prefix would be pruned at the store's default TTL).
 VERDICT_COMPLETION_TTL = 24 * 3600
+# A FAILED PATCH must not burn the whole 24h window: it leaves a short backoff
+# marker so the next sweep retries (and a restart retries almost immediately),
+# while two sweeps within this window do not hammer a bus that is down.
+# A distinct key avoids the TTL ambiguity of `seen()` — the success marker and
+# the backoff marker are independent records.
+VERDICT_COMPLETION_RETRY_TTL = 600  # 10 min
+KEY_VERDICT_COMPLETION_RETRY = "verdict_completion_retry"
 MAX_BULK_RESUBMITS_PER_ACTION = 20
 DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS = doctor_v2.max_same_signature_resubmits()
 SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
@@ -3213,8 +3220,13 @@ def complete_verdict_job(job: dict, *, now: float | None = None) -> tuple[bool, 
 
     Returns ``(completed, detail)``. ``completed`` is True when the row was
     PATCHed (or, in dry-run, was eligible and the marker recorded). Never
-    retries and never purges: no parseable verdict means no action at all, and
-    a row that already has ``result.verdict`` is left alone (idempotent).
+    purges: no parseable verdict means no action at all, and a row that already
+    has ``result.verdict`` is left alone (idempotent).
+
+    The durable completion marker (full ``VERDICT_COMPLETION_TTL``) is written
+    only AFTER the bus accepted the PATCH; a failed PATCH leaves only the short
+    ``VERDICT_COMPLETION_RETRY_TTL`` backoff, so a transient bus error cannot
+    block recovery across restarts for the whole TTL.
     """
     jid = (job or {}).get("id", "")
     now = now if now is not None else time.time()
@@ -3231,11 +3243,6 @@ def complete_verdict_job(job: dict, *, now: float | None = None) -> tuple[bool, 
     verdict_obj = extract_verdict_from_tail(tail)
     if not isinstance(verdict_obj, dict):
         return False, "no parseable verdict object in tail"
-    # Durable marker: at most one attempt per row per process. Recorded BEFORE
-    # the PATCH so a crash between marker and PATCH cannot re-PATCH in this
-    # process, and a PATCH that 4xxes simply leaves the row for the next
-    # process (which gets its own one attempt).
-    STATE.mark(KEY_VERDICT_COMPLETION + ":" + jid, VERDICT_COMPLETION_TTL, at=now)
     claimed_by = job.get("claimed_by")
     body: dict = {
         "status": "done",
@@ -3247,10 +3254,18 @@ def complete_verdict_job(job: dict, *, now: float | None = None) -> tuple[bool, 
         # completed as-is.
         body["claimed_by"] = claimed_by
     if VERDICT_COMPLETION_DRY_RUN:
+        # Dry-run is a decision, not a bus outcome: the marker is still
+        # recorded (matching the DLQ dry-run semantics) so the row is not
+        # re-announced on every pass.
         log.info("verdict-completion DRY_RUN: would PATCH %s -> done", jid[:12])
+        STATE.mark(KEY_VERDICT_COMPLETION + ":" + jid, VERDICT_COMPLETION_TTL, at=now)
         return True, "dry-run"
     code, resp = _http("PATCH", f"/v1/jobs/{jid}", body, timeout=15.0)
     if code in (200, 201, 204):
+        # Durable SUCCESS marker, written only after the bus accepted the
+        # completion: this is what stops a second attempt in this process and
+        # any later process for the full TTL.
+        STATE.mark(KEY_VERDICT_COMPLETION + ":" + jid, VERDICT_COMPLETION_TTL, at=now)
         broadcast_doctor_message(
             "doctor.verdict_completed",
             {
@@ -3269,17 +3284,22 @@ def complete_verdict_job(job: dict, *, now: float | None = None) -> tuple[bool, 
         code,
         str(resp)[:200],
     )
+    # A failed PATCH leaves only a SHORT backoff marker under a SEPARATE key —
+    # never the success marker — so the next sweep (in this process or a fresh
+    # one) retries instead of skipping the row for the whole TTL.
+    STATE.mark(KEY_VERDICT_COMPLETION_RETRY + ":" + jid, VERDICT_COMPLETION_RETRY_TTL, at=now)
     return False, f"patch failed code={code}"
 
 
 def complete_stuck_verdict_jobs(jobs: list[dict]) -> dict:
     """One needs-review pass over the verdict-completion rows.
 
-    Each candidate is attempted AT MOST ONCE in this process: the attempt is
-    recorded durably in STATE before the PATCH, and a row whose marker already
-    exists is skipped without any further work (idempotency across passes
-    inside the process). The report-only classification sweep keeps running
-    over the same rows regardless.
+    A row whose durable completion marker is still live is skipped without any
+    further work (idempotency across passes and across restarts). The marker
+    itself is written by ``complete_verdict_job`` only after the bus accepted
+    the PATCH; a failed PATCH leaves only the short retry backoff, so the next
+    sweep retries. The report-only classification sweep keeps running over the
+    same rows regardless.
     """
     now = time.time()
     summary = {"scanned": len(jobs or []), "completed": 0, "skipped": 0, "no_action": 0}
@@ -3289,6 +3309,11 @@ def complete_stuck_verdict_jobs(jobs: list[dict]) -> dict:
             continue
         key = KEY_VERDICT_COMPLETION + ":" + jid
         if STATE.seen(key, ttl=VERDICT_COMPLETION_TTL):
+            summary["skipped"] += 1
+            continue
+        # A previous attempt failed and its backoff has not lapsed: skip for
+        # now, the next sweep (or a fresh process) will retry.
+        if STATE.seen(KEY_VERDICT_COMPLETION_RETRY + ":" + jid, ttl=VERDICT_COMPLETION_RETRY_TTL):
             summary["skipped"] += 1
             continue
         if not _is_verdict_completion_candidate(job):
