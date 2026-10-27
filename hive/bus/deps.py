@@ -77,13 +77,18 @@ async def connect_db():
         yield db
 
 
-async def emit_event(db, kind: str, payload: dict) -> None:
+async def emit_event(db, kind: str, payload: dict, *, commit: bool = True) -> None:
     ts = time.time()
     payload_json = json.dumps(payload, separators=(",", ":"))
     await db.execute(
         "INSERT INTO events (ts, kind, payload, agent_urn) VALUES (?, ?, ?, ?)",
         (ts, kind, payload_json, payload.get("urn") or payload.get("agent_urn")),
     )
+    if not commit:
+        # The caller owns this transaction. Publishing before its commit could
+        # advertise an event that later rolls back; durable SSE replay reads it
+        # after commit instead.
+        return
     await db.commit()
     # broadcast to live SSE subscribers
     for q in list(EVENT_QUEUE.values()):
@@ -248,7 +253,7 @@ async def release_dependencies(db, dep_id: str, dep_status: str, *, emit_event=N
         _module = sys.modules[__name__]
         _emit = _module.emit_event if _module is not None else emit_event
     for record in released:
-        await _emit(db, "job.dependency_released", record)
+        await _emit(db, "job.dependency_released", record, commit=False)
     return released
 
 

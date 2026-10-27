@@ -51,6 +51,7 @@ from hive.bus.domain.eligibility import (
     heavy_repo_required_for_kind,
     job_agent_eligible,
 )
+from hive.bus.domain.failure import engine_unavailable, infrastructure_failure
 from hive.bus.domain.jobs import (
     CACHE_TTL_SECONDS,
     CLAIM_LEASE_SECONDS,
@@ -76,6 +77,7 @@ from hive.bus.domain.jobs import (
     valid_readonly_completion_proof,
 )
 from hive.bus.domain.model_admission import admission_warnings, forbidden_model, served_model_names
+from hive.bus.domain.review_dispatch import dispatch_needs_review, reconcile_review_parent
 from hive.bus.domain.workspace import resolve_workspace_shadow
 from hive.bus.schemas import JobCreate, JobUpdate
 from hive.core.models import COST_TIERS
@@ -83,6 +85,28 @@ from hive.persistence.sqlite import DependencyNotReady, SqlExpr
 
 router = APIRouter()
 log = logging.getLogger("hive.bus.jobs")
+
+
+async def _claim_health(tx, job_id: str, urn: str) -> bool:
+    async with tx.execute("SELECT metadata FROM agents WHERE urn=?", (urn,)) as cur:
+        agent = await cur.fetchone()
+    if not agent or engine_unavailable(agent[0]):
+        return False
+    async with tx.execute("SELECT result FROM jobs WHERE id=?", (job_id,)) as cur:
+        row = await cur.fetchone()
+    try:
+        result = json.loads(row[0]) if row and isinstance(row[0], str) else (row[0] if row else {})
+    except (ValueError, TypeError):
+        return False
+    if not isinstance(result, dict):
+        return True
+    if result.get("infrastructure_parked"):
+        return False
+    previous = result.get("last_failed_claimant")
+    if result.get("failure_class") and previous:
+        # Re-registration on the same host must not defeat failover.
+        return str(previous).split(":")[3:4] != urn.split(":")[3:4]
+    return True
 
 
 def _reconcile_reviewer_record(job_id: str, result: Any) -> None:
@@ -589,6 +613,21 @@ async def create_job(req: JobCreate):
                 f"registered_agent_kinds={sorted(registered_aliases)!r}",
             )
 
+    # Match the complete routing contract, not independent kind/host sets.
+    async with hive_repo().connection() as tx:
+        candidates = await hive_repo().list_agents(tx, include_offline=True)
+    matching = []
+    for candidate in candidates:
+        if candidate.get("status") not in ACTIVE_AGENT_STATUSES:
+            continue
+        if candidate.get("host", "").lower() in HOST_DENYLIST:
+            continue
+        candidate["eligible_aliases"] = agent_kind_aliases(candidate["kind"], candidate.get("runtime"))
+        if job_agent_eligible(req.model_dump(), candidate)[0] and not engine_unavailable(candidate.get("metadata")):
+            matching.append(candidate)
+    if not matching:
+        raise HTTPException(422, "no_eligible_worker: no active healthy worker matches host, kind, capabilities and cost tier")
+
     # SUBMIT-TIME ADMISSION (2026-10-25): the two ways a job used to be
     # accepted in a state it could not start from.
     #
@@ -626,7 +665,12 @@ async def create_job(req: JobCreate):
     # When no remote can be resolved there is nothing to probe — skip the
     # thread dispatch entirely (the in-thread 'unprobed' state would warn for
     # a common shape with no actionable content).
+    for ref in (req.head_branch, req.base_branch):
+        if ref and not _ba_mod.valid_branch_name(ref):
+            raise HTTPException(422, "invalid_ref: branch name is invalid")
     _probeable_remote = req.head_branch and req.repo and _ba_mod.resolve_remote_url(req.repo) is not None
+    if req.head_branch and req.repo and not _probeable_remote and kind_requires_commit(req.kind, req.repo):
+        raise HTTPException(422, "branch_unverified: repository must resolve to a trusted catalog remote")
     if _probeable_remote:
         _branches = await asyncio.to_thread(
             branch_admission,
@@ -637,6 +681,10 @@ async def create_job(req: JobCreate):
         warnings.extend(_branches["warnings"])
         if not _branches["ok"]:
             raise HTTPException(422, _branches["detail"])
+        if _branches["state"] == "head_present" and kind_requires_commit(req.kind, req.repo):
+            raise HTTPException(422, "output_branch_exists: choose a fresh head_branch; published branches are read-only inputs")
+        if _branches["state"] in {"unreachable", "unprobed"}:
+            raise HTTPException(422, "branch_unverified: retry submission when origin can be verified")
         _branch_created_from = _branches["branch_created_from"]
     else:
         _branch_created_from = None
@@ -770,6 +818,13 @@ async def create_job(req: JobCreate):
                 "parent_job_id": req.parent_job_id,
                 "mnemos_refs": sorted(req.mnemos_refs or []),
                 "deadline": req.deadline,
+                "site": req.site,
+                "repo": req.repo,
+                "head_branch": req.head_branch,
+                "base_branch": req.base_branch,
+                "pr_number": req.pr_number,
+                "max_retries": req.max_retries,
+                "zero_retry_reason": req.zero_retry_reason,
             },
             sort_keys=True,
             default=str,
@@ -782,7 +837,10 @@ async def create_job(req: JobCreate):
             idempotency_key=req.idempotency_key,
         )
         try:
-            await hive_repo().submit_job(tx, **_common, dedup_hash=dedup_hash, status="queued")
+            await hive_repo().submit_job(
+                tx, **_common, dedup_hash=dedup_hash, status="queued",
+                result_json=json.dumps({"zero_retry_reason": req.zero_retry_reason}) if req.max_retries == 0 else None,
+            )
         except Exception as _dexc:
             if not is_dedup_violation(_dexc):
                 raise
@@ -799,6 +857,8 @@ async def create_job(req: JobCreate):
                 "kind": req.kind,
                 "description": req.description,
                 "priority": req.priority,
+                "max_retries": req.max_retries,
+                "zero_retry_reason": req.zero_retry_reason,
                 "required_capabilities": req.required_capabilities,
                 "eligible_kinds": req.eligible_kinds,
                 "max_cost_tier": max_cost_tier,
@@ -1020,6 +1080,8 @@ async def dequeue_next_job(agent_urn: str):
                 if not eligible:
                     continue
                 try:
+                    if not await _claim_health(tx, j_id, agent_urn):
+                        continue
                     rc = await hive_repo().claim_job(
                         tx,
                         job_id=j_id,
@@ -1199,7 +1261,7 @@ async def update_job(job_id: str, req: JobUpdate):
                 except Exception:
                     _prev = None
             if isinstance(_prev, dict):
-                for _rk in ("hive_reviews", "deepseek_reviews"):
+                for _rk in ("hive_reviews", "deepseek_reviews", "auto_review_job_id"):
                     if _prev.get(_rk) and not req.result.get(_rk):
                         req.result[_rk] = _prev[_rk]
             _reconcile_reviewer_record(job_id, req.result)
@@ -1353,6 +1415,18 @@ async def update_job(job_id: str, req: JobUpdate):
                 patch_payload["status"] = req.status
                 patch_payload["result"] = req.result
 
+        # Infrastructure attempts retain evidence and never become work failures.
+        # Exhaustion parks the row visibly without bypassing the submitter budget.
+        infra_class = infrastructure_failure(req.result) if req.status == "failed" else None
+        if infra_class and old_status in {"claimed", "running"}:
+            req.result = {**(req.result or {}), "failure_class": infra_class,
+                          "last_failed_claimant": old_claimed_by,
+                          "infrastructure_parked": retry_count >= max_retries}
+            req.status = "queued"
+            release_to_queue = True
+            patch_payload["status"] = "queued"
+            patch_payload["result"] = req.result
+
         # Build the SET map for the CAS UPDATE (column names are code-side).
         sets: dict = {"status": req.status, "last_update_at": now}
         if req.status in TERMINAL_JOB_STATUSES:
@@ -1388,7 +1462,10 @@ async def update_job(job_id: str, req: JobUpdate):
 
             _rc = int(retry_count or 0) + 1
             _bo = min(5.0 * (2 ** min(_rc, 6)), 300.0) * (1.0 + _rnd.uniform(-0.2, 0.2))
-            sets["retry_count"] = SqlExpr("retry_count+1")
+            # Routing declines are not failed work attempts and must not spend
+            # the failure budget before execution has even started.
+            if infra_class and retry_count < max_retries:
+                sets["retry_count"] = SqlExpr("retry_count+1")
             sets["retry_backoff_until"] = now + _bo
         if req.status in {"claimed", "running"}:
             sets["claim_lease_expires_at"] = now + CLAIM_LEASE_SECONDS
@@ -1506,7 +1583,10 @@ async def update_job(job_id: str, req: JobUpdate):
 
         # On failed: auto-retry if under max_retries (exponential backoff).
         retried = False
-        if req.status == "failed" and retry_count < max_retries:
+        if req.status == "failed" and retry_policy.auto_retry_allowed({
+            "status": "failed", "kind": job_kind, "retry_count": retry_count,
+            "max_retries": max_retries, "result": req.result,
+        }):
             backoff = 30.0 * (2**retry_count)
             next_at = time.time() + backoff
             await hive_repo().patch_job_status(
@@ -1523,7 +1603,7 @@ async def update_job(job_id: str, req: JobUpdate):
                     "claimed_provider": None,
                     "claimed_cost_tier": None,
                     "ended_at": None,
-                    "result": None,
+                    "result": json.dumps(req.result) if req.result is not None else None,
                     "tokens_in": None,
                     "tokens_out": None,
                     "estimated_cost_usd": None,
@@ -1669,6 +1749,10 @@ async def update_job(job_id: str, req: JobUpdate):
         # retries are exhausted stays 'failed' -> release).
         if (not retried) and req.status in DEP_DEAD_STATUSES:
             await release_dependencies(tx, job_id, req.status, emit_event=emit_event)
+        if not retried and req.status == "needs-review":
+            await dispatch_needs_review(tx, hive_repo(), job_id, now=now, emit_event=emit_event)
+        if not retried and req.status == "done":
+            await reconcile_review_parent(tx, hive_repo(), job_id, now=now, emit_event=emit_event)
         await tx.commit()
 
     async with hive_repo().connection() as event_tx:
@@ -1689,7 +1773,7 @@ async def update_job(job_id: str, req: JobUpdate):
                     "previous_claimant": old_claimed_by,
                 },
             )
-        if req.status == "failed" and retry_count < max_retries:
+        if retried:
             await emit_event(
                 event_tx,
                 "job.retry",
@@ -1887,6 +1971,8 @@ async def claim_job(job_id: str, by: str):
             "preferred_models": json_list(j_pref_models),
             "queued_at": j_started_at,
         }
+        if not await _claim_health(tx, job_id, by):
+            raise HTTPException(409, "infrastructure_hold: worker unavailable, previous failed host, or budget exhausted")
         eligible, reason = job_agent_eligible(job, agent)
         if not eligible:
             status = (

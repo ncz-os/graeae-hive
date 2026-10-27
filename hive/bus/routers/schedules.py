@@ -8,15 +8,15 @@ from __future__ import annotations
 import json
 import time
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
-from hive.bus.deps import connect_db, hive_repo, require_orchestrator_submitter, uuidv7
+from hive.bus.deps import connect_db, hive_repo, require_mutation_actor, require_orchestrator_submitter, uuidv7
 from hive.bus.schemas import JobCreate, ScheduleCreate
 
 router = APIRouter()
 
 
-@router.post("/v1/schedules")
+@router.post("/v1/schedules", dependencies=[Depends(require_mutation_actor)])
 async def create_schedule(req: ScheduleCreate):
     """Create a recurring scheduled job. Re-fires every `interval_seconds`.
     job_template is the JobCreate body that will be submitted each tick.
@@ -72,7 +72,7 @@ async def list_schedules():
     return {"count": len(rows), "schedules": rows}
 
 
-@router.patch("/v1/schedules/{sid}")
+@router.patch("/v1/schedules/{sid}", dependencies=[Depends(require_mutation_actor)])
 async def patch_schedule(sid: str, enabled: bool | None = None, interval_seconds: int | None = None):
     sets, args = [], []
     if enabled is not None:
@@ -96,7 +96,7 @@ async def patch_schedule(sid: str, enabled: bool | None = None, interval_seconds
     return {"ok": True}
 
 
-@router.delete("/v1/schedules/{sid}")
+@router.delete("/v1/schedules/{sid}", dependencies=[Depends(require_mutation_actor)])
 async def delete_schedule(sid: str):
     async with connect_db() as db:
         cur = await db.execute("DELETE FROM scheduled_jobs WHERE id=?", (sid,))
