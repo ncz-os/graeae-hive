@@ -3483,7 +3483,21 @@ def delivery_integrity_errors(
         )
     branch = evidence.get("branch")
     remote_ref = evidence.get("remote_ref")
-    if branch and remote_ref and remote_ref.endswith("/" + branch):
+    # A job that delivered NOTHING has no delivered branch: `branch` is just the
+    # branch its workspace was checked out on, and for a read-only review that is
+    # the default branch. Requiring evidence of an actual delivery keeps the
+    # "landed on the default branch" guard for commits and pushes without
+    # failing every read-only job (2026-10-27: three review: children died with
+    # delivery_integrity_check_failed while the same check passed for jobs that
+    # genuinely committed).
+    delivered_something = bool(
+        commits
+        or recorded
+        or (codex_delivery or {}).get("head")
+        or push.get("status") == "pushed"
+        or evidence.get("remote_verified") is True
+    )
+    if delivered_something and branch and remote_ref and remote_ref.endswith("/" + branch):
         default = (
             _default_branch(evidence.get("workdir", ""), os.environ)
             if evidence.get("workdir")

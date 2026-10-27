@@ -1397,6 +1397,43 @@ async def update_job(job_id: str, req: JobUpdate):
         if req.status in {"claimed", "running"} and not effective_claimed_by:
             raise HTTPException(422, f"status={req.status!r} requires an existing or explicit claimed_by")
 
+        # 2026-10-27: the deployed worker's delivery-integrity check counts the
+        # branch a read-only job's workspace was CHECKED OUT on as a delivery,
+        # so a review that produced no commits died as
+        # delivery_integrity_check_failed ("delivery landed on default branch
+        # 'master'") even though it pushed nothing. Within one hour that filled
+        # triage with review: rows. The tracked worker copy is fixed, but hosts
+        # still running the older worker must not keep killing read-only work, so
+        # normalize the exact contradiction here: read-only kind, failed, no
+        # commits, no push, and default-branch as the ONLY complaint.
+        if req.status == "failed" and is_readonly_prefix_kind(job_kind):
+            _r = req.result or {}
+            _errs = _r.get("delivery_integrity_errors") or []
+            _only_default_branch = bool(_errs) and all(
+                str(e).startswith("delivery landed on default branch") for e in _errs
+            )
+            _no_artifact = not (_r.get("commits") or []) and not (
+                (_r.get("codex_delivery") or {}).get("push") or {}
+            )
+            if (
+                _r.get("failure_reason") == "delivery_integrity_check_failed"
+                and _only_default_branch
+                and _no_artifact
+            ):
+                log.warning(
+                    "job %s: normalizing a read-only delivery_integrity false positive (%s) to done",
+                    job_id,
+                    "; ".join(str(e) for e in _errs),
+                )
+                req.status = "done"
+                req.result = {
+                    **_r,
+                    "failure_reason": None,
+                    "delivery_normalized": "readonly-no-artifact-default-branch",
+                }
+                patch_payload["status"] = "done"
+                patch_payload["result"] = req.result
+
         commit_required = kind_requires_commit(job_kind, job_repo)
         if req.status == "done" and commit_required:
             # A read-only kind (READONLY_KINDS) proves completion with its
