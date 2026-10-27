@@ -1412,8 +1412,9 @@ async def update_job(job_id: str, req: JobUpdate):
             _only_default_branch = bool(_errs) and all(
                 str(e).startswith("delivery landed on default branch") for e in _errs
             )
-            _no_artifact = not (_r.get("commits") or []) and not (
-                (_r.get("codex_delivery") or {}).get("push") or {}
+            _push = ((_r.get("codex_delivery") or {}).get("push") or {})
+            _no_artifact = not (_r.get("commits") or []) and (
+                _push.get("status") != "pushed"
             )
             if (
                 _r.get("failure_reason") == "delivery_integrity_check_failed"
