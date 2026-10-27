@@ -14,12 +14,10 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from hive.bus.deps import (
     ACTIVE_JOB_STATUSES,
-    DEP_PURGED_STATUS,
     _cascade_delete_jobs,
     connect_db,
     emit_event,
     hive_repo,
-    release_dependencies,
     require_mutation_actor,
 )
 from hive.bus.schemas import (
@@ -182,10 +180,6 @@ async def admin_purge_jobs(req: PurgeRequest):
                 results["skipped_not_dead_letter"].append(job_id)
                 continue
             await db.execute("DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,))
-            # DEPENDENCY RELEASE (incident 2026-10-27): the row is gone, so any
-            # queued/offered dependent listing it would be blocked forever.
-            # Released in the SAME transaction as the DELETE, below.
-            await release_dependencies(db, job_id, DEP_PURGED_STATUS)
             await db.commit()
             results["ok"].append(job_id)
     async with connect_db() as event_db:
@@ -339,10 +333,6 @@ async def purge_jobs(req: JobPurgeRequest):
             # cascade re-checks status at delete time, so a job that got claimed
             # between SELECT and DELETE is skipped (atomic guard, codex review #3).
             deleted = await _cascade_delete_jobs(db, matched, allow_active=req.include_active)
-            # DEPENDENCY RELEASE (incident 2026-10-27): released in the SAME
-            # transaction as the deletes, per purged id.
-            for jid in deleted:
-                await release_dependencies(db, jid, DEP_PURGED_STATUS)
             await db.commit()
     if deleted:
         async with connect_db() as event_db:

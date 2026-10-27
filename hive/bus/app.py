@@ -19,12 +19,10 @@ from contextlib import asynccontextmanager, suppress
 from fastapi import FastAPI
 
 from hive.bus.deps import (
-    DEP_PURGED_STATUS,
     _cascade_delete_jobs,
     connect_db,
     emit_event,
     hive_repo,
-    release_dependencies,
 )
 
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
@@ -399,12 +397,6 @@ async def reaper_task(app: FastAPI):
                     # delete time, so a job that somehow flipped back to active
                     # between SELECT and DELETE is left alone (atomic guard).
                     swept = await _cascade_delete_jobs(db, sweep_ids)
-                    # DEPENDENCY RELEASE (incident 2026-10-27): rows deleted by
-                    # the retention sweep are gone, so their queued/offered
-                    # dependents would be blocked forever. Released in the SAME
-                    # transaction as the deletes.
-                    for jid in swept:
-                        await release_dependencies(db, jid, DEP_PURGED_STATUS)
                     await db.commit()
                     if swept:
                         print(
