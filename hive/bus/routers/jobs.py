@@ -1651,8 +1651,6 @@ async def update_job(job_id: str, req: JobUpdate):
                 default=str,
             ),
         )
-<<<<<<< HEAD
-=======
         # DEPENDENCY RELEASE (incident 2026-10-27): a job entering a status its
         # dependents can never satisfy (failed / failed_completion / dead-letter
         # / cancelled) releases every queued/offered job that lists it in
@@ -1669,7 +1667,6 @@ async def update_job(job_id: str, req: JobUpdate):
         # retries are exhausted stays 'failed' -> release).
         if (not retried) and req.status in DEP_DEAD_STATUSES:
             await release_dependencies(tx, job_id, req.status, emit_event=emit_event)
->>>>>>> 325f811eed75b81508c82223a5937701d7757cca
         await tx.commit()
 
     async with hive_repo().connection() as event_tx:

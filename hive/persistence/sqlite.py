@@ -1284,8 +1284,6 @@ class SqliteHiveRepository(HiveMindRepository):
         test_job_prefs_deps_20261017.
         """
         db = tx
-<<<<<<< HEAD
-=======
         for _dropped in await self.drop_missing_dependencies(db, job_id=job_id):
             log.info(
                 "dependency release at claim time: %s dropped missing dependency %s (remaining=%s)",
@@ -1310,7 +1308,6 @@ class SqliteHiveRepository(HiveMindRepository):
                     "remaining": _dropped["remaining"],
                 },
             )
->>>>>>> 325f811eed75b81508c82223a5937701d7757cca
         await self._require_dependencies_done(db, job_id)
         cur = await db.execute(
             "UPDATE jobs SET status='claimed', claimed_by=?, claimed_at=?, "
