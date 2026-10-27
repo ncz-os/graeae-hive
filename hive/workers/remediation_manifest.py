@@ -80,6 +80,33 @@ SIGNATURE_HANDLERS: dict[str, dict[str, str]] = {
         "handler": "doctor.retry_budget_exhausted",
         "test": "test_failed_job_with_max_retries_zero_is_not_requeued",
     },
+    # ── never-act classes (report-only) ───────────────────────────────
+    # A submitter or a host that DECLINED the kind, and a protection guard
+    # violation, are decisions the doctor must not act on: requeueing them
+    # re-runs work the fleet explicitly refused. The doctor reports them
+    # (needs-review / announce) and parks; the unknown policy never touches
+    # these shapes. (The prefixes are the normalised, lowercased stems —
+    # `remediation.failure_signature` keeps the words but strips punctuation.)
+    "host declines kind": {
+        "handler": "doctor.report_only (never-act: submitter/host declined this kind)",
+        "test": "test_never_act_classes_are_never_retried",
+    },
+    "released by host": {
+        "handler": "doctor.report_only (never-act: the host released the job by choice)",
+        "test": "test_never_act_classes_are_never_retried",
+    },
+    # `protection_violation` normalises to "protection violation" (the
+    # normaliser lowercases and strips punctuation), so the prefix is the
+    # normalised stem.
+    "protection violation": {
+        "handler": "worker.protection_guard",
+        "test": "test_protection_violation_always_fails",
+    },
+    # ── the unknown fallback itself ──────────────────────────────────
+    "unknown_signature": {
+        "handler": "remediation.unknown_policy (verify-delivery / one retry elsewhere / park)",
+        "test": "test_unknown_signature_retries_once_then_parks_with_signature",
+    },
     # ── dead-letter remediation (hive/workers/doctor.py) ──────────────
     "transient-infra-failure": {
         "handler": "doctor.classify_dead_letter",
