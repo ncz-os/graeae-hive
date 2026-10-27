@@ -23,7 +23,23 @@ from hive.bus.deps import (
     connect_db,
     emit_event,
     hive_repo,
+    release_dependencies,
 )
+
+async def _cancel_stale_jobs(db, repo, *, cutoff: float, now: float) -> int:
+    """Cancel observed stale queued jobs and release their dependencies atomically."""
+    candidates = await repo.stale_cancel_candidates(db, cutoff=cutoff)
+    cancelled = 0
+    for candidate in candidates:
+        if await repo.cancel_stale_candidate(db, candidate, ended_at=now):
+            job_id = candidate[0]
+            await release_dependencies(db, job_id, "cancelled", emit_event=emit_event)
+            await emit_event(db, "job.cancelled", {"id": job_id, "reason": "stale_>7d"}, commit=False)
+            cancelled += 1
+    if candidates:
+        await db.commit()
+    return cancelled
+
 
 # Capacity ledger (Phase 5) moved to hive.bus.domain.capacity_ledger (Phase 1c).
 from hive.bus.domain.capacity_ledger import flush_capacity_ledger, load_capacity_ledger
@@ -307,7 +323,7 @@ async def reaper_task(app: FastAPI):
                 # Apply kind-specific override: keep job if its kind has a longer TTL
                 # AND its latest progress timestamp is within that window.
                 orphans = select_orphan_claims(
-                    candidates,
+                    [candidate[:6] for candidate in candidates],
                     now=now_ts,
                     stale_after=CLAIM_STALE_AFTER,
                     hard_max_age=CLAIM_HARD_MAX_AGE,
@@ -315,8 +331,10 @@ async def reaper_task(app: FastAPI):
                     hard_by_kind=CLAIM_HARD_MAX_AGE_BY_KIND,
                 )
                 if orphans:
+                    snapshots = {candidate[0]: candidate for candidate in candidates}
                     for job_id, claimer in orphans:
-                        await repo.requeue_orphan_job(db, job_id)
+                        if not await repo.requeue_orphan_job(db, snapshots[job_id]):
+                            continue
                         await emit_event(
                             db,
                             "job.unclaimed",
@@ -325,6 +343,7 @@ async def reaper_task(app: FastAPI):
                                 "prior_claimer": claimer,
                                 "reason": "worker_offline_or_stale_claim",
                             },
+                            commit=False,
                         )
                     await db.commit()
                 # 3. Scheduler — fire due interval-based jobs
@@ -355,12 +374,7 @@ async def reaper_task(app: FastAPI):
                     await db.commit()
                 # 4. Auto-cancel stale jobs (queued > 7 days untouched)
                 stale_job_cutoff = time.time() - 7 * 24 * 3600
-                stale_ids = await repo.select_stale_queued_job_ids(db, cutoff=stale_job_cutoff)
-                if stale_ids:
-                    await repo.cancel_jobs(db, stale_ids, ended_at=time.time())
-                    for j in stale_ids:
-                        await emit_event(db, "job.cancelled", {"id": j, "reason": "stale_>7d"})
-                    await db.commit()
+                await _cancel_stale_jobs(db, repo, cutoff=stale_job_cutoff, now=time.time())
                 # 5. Purge old events
                 retain_cutoff = time.time() - EVENTS_RETAIN_HOURS * 3600
                 await repo.purge_events_before(db, cutoff=retain_cutoff)
