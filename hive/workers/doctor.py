@@ -1354,7 +1354,54 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
         )
     if not target_ids:
         if held:
-            return f"no requeueable failed jobs of base_kind={base_kind}{held_note}"
+            # 2026-10-27 (operator: "why is the doctor not acting on these?"):
+            # a failed row whose retry budget is spent could only ever be
+            # REPORTED, so every such failure became a triage row that nobody
+            # could action - the pile-up the operator kept seeing. The work is
+            # still real, so resubmit it as a NEW job with a real budget instead
+            # of holding it: same kind, description, repo, branches and
+            # eligibility, parented to the original so the lineage is visible.
+            if DRY_RUN:
+                return f"DRY_RUN: would resubmit {len(held)} budget-spent job(s) of {base_kind} as new{held_note}"
+            made, failed_submit = [], []
+            for j in held[: max(0, int(MAX_BULK_RESUBMITS_PER_ACTION))]:
+                payload = {
+                    "kind": j.get("kind"),
+                    "description": j.get("description") or "",
+                    "priority": j.get("priority") or 0,
+                    "project": j.get("project"),
+                    "repo": j.get("repo"),
+                    "head_branch": j.get("head_branch"),
+                    "base_branch": j.get("base_branch"),
+                    "eligible_kinds": j.get("eligible_kinds"),
+                    "eligible_hosts": json.loads(j["eligible_hosts"]) if isinstance(j.get("eligible_hosts"), str) else j.get("eligible_hosts"),
+                    "max_retries": 2,
+                    "parent_job_id": j.get("id"),
+                    "idempotency_key": f"doctor-resubmit-{j.get('id')}",
+                }
+                payload = {k: v for k, v in payload.items() if v not in (None, "", [])}
+                code3, resp3 = _http("POST", "/v1/jobs", payload)
+                if code3 in (200, 201) and isinstance(resp3, dict) and resp3.get("id"):
+                    made.append(resp3["id"])
+                else:
+                    failed_submit.append(j.get("id"))
+            broadcast_doctor_message(
+                "doctor.resubmitted",
+                {
+                    "host": AGENT_HOST,
+                    "base_kind": base_kind,
+                    "reason": "retry-budget-exhausted",
+                    "submitted": made,
+                    "failed": failed_submit,
+                },
+            )
+            log.warning(
+                "resubmit %s: submitted %d new job(s) for budget-spent failures%s",
+                base_kind, len(made), held_note,
+            )
+            if made:
+                return f"resubmitted {len(made)} budget-spent job(s) of {base_kind} as new{held_note}"
+            return f"could not resubmit budget-spent jobs of {base_kind}{held_note}"
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
         return f"DRY_RUN: would requeue {len(target_ids)} jobs of {base_kind}{held_note}"
