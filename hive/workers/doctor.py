@@ -2578,6 +2578,18 @@ def _handle_decline_job(job: dict, base_kind: str) -> dict | None:
     routing signals never increment the bus decline counter — that is the
     bus classifier's job, covered in test_decline_reasons.py; this handler
     only ever logs, tallies, and escalates.
+
+    Module-level names used here (all defined in this module):
+        log                      logging.getLogger("doctor")          line ~392
+        STATE                    state_store_from_env()                line ~429
+        AGENT_HOST               socket.gethostname()                  line ~82
+        decline_paths            hive.workers.doctor_decline_paths     line ~71
+        broadcast_doctor_message _http POST /v1/messages              line ~1949
+        _base_kind               kind -> base_kind                    line ~1848
+        _signature_resubmits     STATE.timestamps wrapper             line ~2212
+        _record_signature_resubmit STATE.touch wrapper                line ~2218
+        decline_paths.INVALID_HEAD_BRANCH_PREFIX
+        decline_paths.resubmit_body_for_invalid_head
     """
     reason = decline_paths._reason(job)
     if not reason:
