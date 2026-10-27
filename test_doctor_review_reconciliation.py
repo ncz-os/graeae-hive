@@ -51,6 +51,14 @@ def test_immediate_patch_and_restart_reconciliation_share_marker(bus, monkeypatc
     assert not any("purge" in c[1] for c in calls)
 
 
+def test_triage_needs_review_is_not_dispatched_by_doctor(bus):
+    row, calls, _, _, _ = bus
+    row["kind"] = "triage:fix:thing"
+    doctor.patch_job(row["id"], "needs-review", {"failure_reason": "failed"})
+    assert doctor.run_review_followup_sweep()["skipped_triage"] == 1
+    assert not any(c[:2] == ("POST", "/v1/jobs") for c in calls)
+
+
 def test_child_listing_error_cannot_dispatch(bus, monkeypatch):
     _, calls, messages, _, http = bus
 

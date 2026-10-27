@@ -32,6 +32,9 @@ async def dispatch_needs_review(tx, repository, job_id: str, *, now: float, emit
     if not row or row[0] != "needs-review":
         return None
     status, kind, raw, repo, branch, base, project, priority, submitter = row
+    # Triage rows are remediation reports, not branches to review.
+    if str(kind or "").startswith("triage:"):
+        return None
     result = json.loads(raw) if isinstance(raw, str) and raw else (raw or {})
     if not isinstance(result, dict):
         result = {}
@@ -47,7 +50,7 @@ async def dispatch_needs_review(tx, repository, job_id: str, *, now: float, emit
     if not child_id:
         child_id = str(uuid.uuid4())
         head = result.get("head_sha") or "(resolve and report)"
-        review_kind = "review:" + str(kind).removeprefix("review:").removeprefix("triage:")
+        review_kind = "review:" + str(kind).removeprefix("review:")
         description = (
             "READ-ONLY review. Do not modify any file, branch, or commit. "
             f"Review branch {branch or '(see job)'} at HEAD {head} against base {base or '(default)'}. "
@@ -126,6 +129,9 @@ async def reconcile_review_parent(tx, repository, review_job_id: str, *, now: fl
     ) as cursor:
         parent = await cursor.fetchone()
     if not parent or parent[0] != "needs-review":
+        return None
+    # An old review child must not resolve a triage remediation report.
+    if str(parent[1] or "").startswith("triage:"):
         return None
     result = _result(parent[2])
     if protected_review_row({"kind": parent[1], "project": parent[3], "result": result}):

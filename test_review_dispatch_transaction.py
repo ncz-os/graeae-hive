@@ -59,6 +59,16 @@ class ReviewDispatchTransaction(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(same, child["id"])
         self.assertEqual(len(await self.rows()), 2)
 
+    async def test_triage_needs_review_does_not_dispatch(self):
+        async with self.repo.connection() as tx:
+            await tx.execute("UPDATE jobs SET kind=? WHERE id=?", ("triage:fix:thing", "source"))
+            await tx.commit()
+        with patch.object(jobs, "hive_repo", return_value=self.repo):
+            await jobs.update_job("source", JobUpdate(status="needs-review", result={"failure_reason": "failed"}))
+        async with self.repo.connection() as tx:
+            self.assertIsNone(await dispatch_needs_review(tx, self.repo, "source", now=time.time()))
+        self.assertEqual(len(await self.rows()), 1)
+
     async def test_rollback_does_not_leave_child_or_parent_marker(self):
         with self.assertRaisesRegex(RuntimeError, "abort"):
             async with self.repo.connection() as tx:
