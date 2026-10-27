@@ -1651,6 +1651,25 @@ async def update_job(job_id: str, req: JobUpdate):
                 default=str,
             ),
         )
+<<<<<<< HEAD
+=======
+        # DEPENDENCY RELEASE (incident 2026-10-27): a job entering a status its
+        # dependents can never satisfy (failed / failed_completion / dead-letter
+        # / cancelled) releases every queued/offered job that lists it in
+        # depends_on, in the SAME transaction as this status write (before the
+        # single commit below), so there is no window where the dep is terminal
+        # and its dependents still believe it is pending. ``done`` is NOT in
+        # DEP_DEAD_STATUSES: a completed dep satisfies its dependents the normal
+        # way, and the edge is kept for provenance.
+        #
+        # The retried-failed case (status bounced back to queued, see above)
+        # must NOT release: the dep is not dead, it is retrying — its
+        # dependents stay blocked on it. The row's FINAL status in this
+        # transaction decides (retried -> 'queued' -> no release; a job whose
+        # retries are exhausted stays 'failed' -> release).
+        if (not retried) and req.status in DEP_DEAD_STATUSES:
+            await release_dependencies(tx, job_id, req.status, emit_event=emit_event)
+>>>>>>> 325f811eed75b81508c82223a5937701d7757cca
         await tx.commit()
 
     async with hive_repo().connection() as event_tx:

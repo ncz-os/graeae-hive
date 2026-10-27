@@ -397,6 +397,15 @@ async def reaper_task(app: FastAPI):
                     # delete time, so a job that somehow flipped back to active
                     # between SELECT and DELETE is left alone (atomic guard).
                     swept = await _cascade_delete_jobs(db, sweep_ids)
+<<<<<<< HEAD
+=======
+                    # DEPENDENCY RELEASE (incident 2026-10-27): rows deleted by
+                    # the retention sweep are gone, so their queued/offered
+                    # dependents would be blocked forever. Released in the SAME
+                    # transaction as the deletes.
+                    for jid in swept:
+                        await release_dependencies(db, jid, DEP_PURGED_STATUS, emit_event=emit_event)
+>>>>>>> 325f811eed75b81508c82223a5937701d7757cca
                     await db.commit()
                     if swept:
                         print(
