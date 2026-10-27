@@ -1252,12 +1252,17 @@ def should_auto_triage(base_kind: str, failed_jobs: list[dict]) -> tuple[bool, s
     # (3) superseded: the newest job of this base_kind in ANY status is
     # done/needs-review and NEWER than the newest failure — the failures are
     # old news that a completed run already superseded.
+    #
+    # _base_kind() strips the [tag] suffix (e.g. "build:zoder [urgent]" →
+    # "build:zoder") but does NOT strip the "triage:" prefix, so a triage job
+    # (kind="triage:build:zoder") will NOT match here — it is handled by the
+    # _triage_job_for() dedupe rule below instead. Only non-triage jobs of the
+    # same base_kind participate in the supersede check.
     code, resp = _http("GET", f"/v1/jobs?limit=200", timeout=10.0)
     if code == 200 and resp:
-        target_prefix = base_kind
         sup_candidates = [
             j for j in resp.get("jobs", []) or []
-            if _base_kind(j.get("kind", "")) == target_prefix
+            if _base_kind(j.get("kind", "")) == base_kind
             and (j.get("status") or "") in ("done", "needs-review")
         ]
         if sup_candidates:
