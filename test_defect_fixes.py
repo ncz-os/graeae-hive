@@ -828,7 +828,7 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
 
                 return _c()
 
-            async def patch_job_status(self, tx, job_id, *, sets):
+            async def patch_job_status(self, tx, job_id, *, sets, expected_status=None):
                 captured["job_id"] = job_id
                 captured["sets"] = sets
                 return 1

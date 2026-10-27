@@ -149,7 +149,7 @@ class BusEndToEndTests(unittest.IsolatedAsyncioTestCase):
                 "description": "REVIEW RECORD TEST",
                 "submitter_urn": submitter,
                 "priority": 99,
-                "max_retries": 0,
+                "max_retries": 0, "zero_retry_reason": "test terminal disposition without automatic retry",
             },
         )
         self.assertEqual(r.status_code, 200, r.text)

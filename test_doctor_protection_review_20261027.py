@@ -253,12 +253,14 @@ def test_row_with_commits_and_no_review_gets_exactly_one(monkeypatch):
     doctor.run_review_followup_sweep()
     assert len(submitted) == 1
     spec = submitted[0]
-    assert spec["eligible_kinds"] == ["codex"]
-    assert spec["preferred_models"] == ["gpt-6-luna"]
-    assert spec["max_cost_tier"] == "A"
+    assert not spec.get("eligible_kinds")
+    assert not spec.get("preferred_models")
+    assert spec["max_cost_tier"] == "C"
+    assert spec["priority"] >= 100
+    assert spec["idempotency_key"] == "needs-review-followup:nr-1"
     assert spec["head_branch"] == "fix/one" and spec["base_branch"] == "master"
     assert "READ-ONLY" in spec["description"] and "nr-1" in spec["description"]
-    assert spec["kind"].startswith("review:fix:hive-one-codex-")
+    assert spec["kind"].startswith("review:fix:hive-one-")
     assert spec["parent_job_id"] == "nr-1"
 
 

@@ -54,10 +54,30 @@ class BaseBranchRoundTripTests(unittest.IsolatedAsyncioTestCase):
     """Full ASGI app against a temp sqlite DB (no orchestrator drift)."""
 
     async def asyncSetUp(self):
+        from hive.bus import deps
         self._td = tempfile.TemporaryDirectory()
-        os.environ["AGENT_BUS_DB"] = os.path.join(self._td.name, "base_branch.db")
+        env = mock.patch.dict(os.environ, {"AGENT_BUS_DB": os.path.join(self._td.name, "base_branch.db")})
+        env.start()
+        self.addCleanup(env.stop)
+        repository = mock.patch.object(deps, "_HIVE_REPO", None)
+        repository.start()
+        self.addCleanup(repository.stop)
         # Force the app/repo to re-read AGENT_BUS_DB on each test:
         await _default_hive_repo().init()
+        # Storage tests use a trusted remote with a fresh output branch.
+        from hive.bus.domain import branch_admission as ba
+        self._remote_patch = mock.patch.object(ba, "resolve_remote_url", return_value="ssh://git@example.test/repo")
+        self._remote_patch.start()
+        self.addCleanup(self._remote_patch.stop)
+        self._admission_patch = mock.patch(
+            "hive.bus.routers.jobs.branch_admission",
+            side_effect=lambda **kwargs: ba.branch_admission(
+                **kwargs, resolver=lambda repo: "ssh://git@example.test/repo",
+                prober=lambda url, ref: "present" if ref == "main" else "absent",
+            ),
+        )
+        self._admission_patch.start()
+        self.addCleanup(self._admission_patch.stop)
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=agent_bus.app),
             base_url="http://t",
@@ -145,7 +165,6 @@ class BaseBranchRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 "submitter_urn": submitter,
                 "site": "internal",
                 "repo": "org/repo",
-                "head_branch": "fix/example",
                 "priority": 5,
             },
         )
@@ -153,7 +172,7 @@ class BaseBranchRoundTripTests(unittest.IsolatedAsyncioTestCase):
         jid = submit_resp.json()["id"]
 
         got = (await c.get(f"/v1/jobs/{jid}")).json()
-        self.assertEqual(got["head_branch"], "fix/example")
+        self.assertIsNone(got["head_branch"])
         self.assertIsNone(got["base_branch"])
 
     async def test_claim_returns_base_branch_with_exact_key_worker_reads(self):
@@ -206,7 +225,6 @@ class BaseBranchRoundTripTests(unittest.IsolatedAsyncioTestCase):
                 "submitter_urn": submitter,
                 "site": "internal",
                 "repo": "org/repo",
-                "head_branch": "fix/example",
                 "eligible_kinds": ["zeroclaw"],
             },
         )

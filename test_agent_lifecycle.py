@@ -16,9 +16,9 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 os.environ.setdefault("HIVE_BACKEND", "sqlite")
-os.environ["AGENT_BUS_DB"] = os.path.join(tempfile.mkdtemp(prefix="hive-lifecycle-"), "t.db")
 
 import httpx  # noqa: E402
 
@@ -28,6 +28,15 @@ from hive.bus.deps import hive_repo  # noqa: E402
 
 class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        from hive.bus import deps
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        env = mock.patch.dict(os.environ, {"AGENT_BUS_DB": os.path.join(self._td.name, "lifecycle.db")})
+        env.start()
+        self.addCleanup(env.stop)
+        repository = mock.patch.object(deps, "_HIVE_REPO", None)
+        repository.start()
+        self.addCleanup(repository.stop)
         await hive_repo().init()
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=agent_bus.app), base_url="http://t"
@@ -70,7 +79,7 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         r = await c.post(
             "/v1/jobs",
             json={"kind": "test:lifecycle", "description": "LIFECYCLE TEST", "submitter_urn": submitter,
-                  "priority": 99, "max_retries": 0},
+                  "priority": 99, "max_retries": 0, "zero_retry_reason": "test terminal disposition without automatic retry"},
         )
         self.assertEqual(r.status_code, 200, r.text)
         jid = r.json()["id"]
@@ -149,7 +158,7 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         sub = r.json()["urn"]
         r = await c.post(
             "/v1/jobs",
-            json={"kind": "fix:thing", "description": "needs proof", "submitter_urn": sub, "max_retries": 0},
+            json={"kind": "fix:thing", "description": "needs proof", "submitter_urn": sub, "max_retries": 0, "zero_retry_reason": "test terminal disposition without automatic retry"},
         )
         jid = r.json()["id"]
         await c.post(f"/v1/jobs/next?agent_urn={sub}")
@@ -174,7 +183,7 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         # a running job is still refused (no force)
         r = await c.post("/v1/jobs", json={"kind": "fix:other", "description": "live",
-                                            "submitter_urn": sub, "max_retries": 0})
+                                            "submitter_urn": sub, "max_retries": 0, "zero_retry_reason": "test terminal disposition without automatic retry"})
         live = r.json()["id"]
         await c.post(f"/v1/jobs/next?agent_urn={sub}")
         await c.patch(f"/v1/jobs/{live}", json={"status": "running", "claimed_by": sub})
@@ -197,7 +206,7 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         sub = r.json()["urn"]
         r = await c.post(
             "/v1/jobs",
-            json={"kind": "fix:thing", "description": "needs proof", "submitter_urn": sub, "max_retries": 0},
+            json={"kind": "fix:thing", "description": "needs proof", "submitter_urn": sub, "max_retries": 0, "zero_retry_reason": "test terminal disposition without automatic retry"},
         )
         jid = r.json()["id"]
         await c.post(f"/v1/jobs/next?agent_urn={sub}")

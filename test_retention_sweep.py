@@ -474,7 +474,7 @@ class RetentionDoctorSweepTests(unittest.TestCase):
         purge on an incomplete picture)."""
         rows = [_job(f"j{i:02d}", "failed", ended=OLD + i) for i in range(25)]
         report, bus, _ = _run_doctor_sweep(rows, listing_fail=True)
-        self.assertIsNone(report)
+        self.assertEqual(report, {"error": "incomplete listing", "scanned": None, "purged": 0})
         self.assertEqual(len(bus.purge_calls), 0)
         self.assertEqual(len(bus.rows), 25)
 
