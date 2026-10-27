@@ -1237,6 +1237,196 @@ class SqliteHiveRepository(HiveMindRepository):
             done = (await cur.fetchone())[0]
         return int(done or 0) >= len(ids)
 
+    async def release_dependents(self, tx: Transaction, *, dep_id: str, dep_status: str) -> list[dict[str, Any]]:
+        """Release queued/offered jobs whose ``depends_on`` names a dead ``dep_id``.
+
+        Incident 2026-10-27: when a dependency entered a terminal non-done
+        status (failed / failed_completion / dead-letter / cancelled) — or its
+        row was purged — its dependents kept listing it in ``depends_on`` and
+        sat ``queued`` with ``claimed_by=null`` forever: the claim gate requires
+        every dep to be status='done', a dead/purged id can never be done, and
+        nothing else touched the edge.
+
+        For every dependent in status 'queued' or 'offered' whose ``depends_on``
+        contains ``dep_id``, that id is removed from the list. The column
+        becomes NULL (the canonical "no dependencies" representation — same as
+        a never-dep row, so API responses and downstream logic see it the same
+        way) when the dead dep was its last prerequisite, or keeps the
+        surviving ids as a JSON list (still blocked on those). A dependent that
+        is already claimed/running is NEVER touched — its work is in flight.
+        Deps in ``done`` keep their id (satisfied edges are provenance for the
+        worker).
+
+        Runs in the CALLER's transaction, in the same transaction as the status
+        write or the DELETE: there is no window in which the dep is terminal
+        (or gone) and its dependents still believe it is pending.
+
+        The release NEVER fails the caller's transaction: every step that can
+        raise (the candidate scan, the per-dependent update) is guarded and
+        logged, and a per-dependent compare-and-set that loses a race (the
+        dependent was claimed between the scan and the update) is skipped, not
+        raised. A missed release is recoverable — the next terminal transition
+        of another dep, or the claim-time defensive drop, still unblocks the
+        dependent; a failed status write is not.
+
+        ``dep_status`` is one of :data:`RELEASE_DEP_STATUSES` or
+        :data:`RELEASE_DEP_PURGED` (the purge path, where the row is already
+        gone). Returns one record per RELEASED dependent:
+        ``{"dependent_id", "failed_dep_id", "dep_status", "remaining"}`` —
+        exactly the ``job.dependency_released`` payload; ``remaining`` is the
+        dependent's ``depends_on`` after the removal (empty list = column set
+        to NULL = claimable now). No-op (empty list) when no dependent lists
+        the id, when the depends_on value is unreadable, or when the only
+        dependent is in-flight.
+        """
+        db = tx
+        try:
+            async with db.execute(
+                "SELECT id, status, depends_on FROM jobs WHERE status IN ('queued','offered')",
+            ) as cur:
+                rows = [tuple(r) async for r in cur]
+        except Exception as exc:  # noqa: BLE001 - never fail the caller's tx
+            log.warning("dependency release for %s skipped: candidate scan failed: %s", dep_id, exc)
+            return []
+        released: list[dict[str, Any]] = []
+        for job_id, status, depends_on in rows:
+            if not depends_on:
+                continue
+            try:
+                deps = json.loads(depends_on)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(deps, list) or dep_id not in deps:
+                continue
+            remaining = [d for d in deps if d != dep_id]
+            # A malformed entry would make the remaining list fail closed at
+            # claim time (_deps_all_done); keep it verbatim so the release
+            # never hides a pre-existing corruption. NULL (not '[]') is the
+            # canonical no-dependencies representation.
+            try:
+                rc = await self.patch_job_status(
+                    db,
+                    job_id,
+                    sets={
+                        "depends_on": json.dumps(remaining, separators=(",", ":")) if remaining else None,
+                        "last_update_at": time.time(),
+                    },
+                    expected_status=status,
+                )
+            except Exception as exc:  # noqa: BLE001 - never fail the caller's tx
+                log.warning("dependency release for %s skipped: %s: %s", dep_id, job_id, exc)
+                continue
+            if rc < 1:
+                # Lost the compare-and-set: the dependent left queued/offered
+                # (claimed) between the scan and the update. Its work is in
+                # flight, so leaving its edge intact is correct; the claim-time
+                # defensive drop covers the purge case if it is still blocked.
+                continue
+            released.append(
+                {
+                    "dependent_id": job_id,
+                    "failed_dep_id": dep_id,
+                    "dep_status": dep_status,
+                    "remaining": remaining,
+                }
+            )
+        return released
+
+    async def drop_missing_dependencies(self, tx: Transaction, *, job_id: str) -> list[dict[str, Any]]:
+        """Claim-time defensive drop of ``depends_on`` ids whose rows are gone.
+
+        A row can be deleted by an admin purge that predates this fix, so a
+        dependent's ``depends_on`` can reference an id that no longer exists.
+        Such an id can never reach ``done``, and the fail-closed gate would
+        block the job forever (the 2026-10-27 incident's escape was an admin
+        purge).
+
+        Called from the claim paths (``claim_job`` / ``claim_next_job``)
+        in-transaction, before the gate re-check: ids with no jobs row are
+        removed from ``depends_on`` (a log line per drop, at the call site), and
+        the job is claimable if that empties the list. Ids that still exist are
+        never touched — a real, not-yet-done dep still blocks (the gate below
+        keeps deciding that). A NULL/empty or malformed ``depends_on`` is
+        left to the gate exactly as before: malformed fails closed, absent is
+        satisfied. Returns one record per dropped id:
+        ``{"dependent_id", "failed_dep_id", "dep_status", "remaining"}`` (same
+        shape as :meth:`release_dependents`) — empty list when nothing to drop.
+
+        RACE GUARD: the update is a compare-and-set on the row's status as
+        read in this same transaction — only ``queued``/``offered`` rows are
+        ever rewritten. If the row changed status between the read and the
+        write, the CAS loses (rowcount 0), the drop is SKIPPED (warning log),
+        and the claim proceeds unchanged: the gate below re-reads the row and
+        makes the claim decision, so a lost drop can never corrupt a claimed
+        or in-flight row's ``depends_on``.
+        """
+        db = tx
+        async with db.execute("SELECT status, depends_on FROM jobs WHERE id=?", (job_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return []
+        status, depends_on = row[0], row[1]
+        if status not in ("queued", "offered"):
+            # Not claimable in the first place — nothing to defensively drop
+            # for a claim, and the claim CAS below refuses it anyway.
+            return []
+        if not depends_on:
+            return []
+        try:
+            deps = json.loads(depends_on)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(deps, list):
+            return []
+        ids = [str(d) for d in deps if d is not None and str(d).strip()]
+        if not ids:
+            return []
+        # Comma-separated placeholders, one per id: "?,?,?" for three ids.
+        placeholders = ",".join("?" for _ in ids)
+        try:
+            async with db.execute(
+                f"SELECT id FROM jobs WHERE id IN ({placeholders})", tuple(ids)
+            ) as cur:
+                existing = {r[0] async for r in cur}
+        except Exception as exc:  # noqa: BLE001 - fall back to fail-closed (no drop)
+            log.warning("dependency drop for %s skipped: existence scan failed: %s", job_id, exc)
+            return []
+        dropped = [i for i in ids if i not in existing]
+        if not dropped:
+            return []
+        dropped_set = set(dropped)
+        remaining = [d for d in deps if d is None or str(d) not in dropped_set]
+        try:
+            rc = await self.patch_job_status(
+                db,
+                job_id,
+                sets={
+                    # NULL (not '[]') is the canonical no-dependencies
+                    # representation; the gate below re-reads the column.
+                    "depends_on": json.dumps(remaining, separators=(",", ":")) if remaining else None,
+                    "last_update_at": time.time(),
+                },
+                expected_status=status,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed: the gate still blocks
+            log.warning("dependency drop for %s skipped: %s", job_id, exc)
+            return []
+        if rc < 1:
+            # Lost the compare-and-set: the row left queued/offered between the
+            # read and the write. Skip the drop (log it) and let the claim
+            # CAS / gate decide on the row as it now stands.
+            log.warning("dependency drop for %s skipped: status changed during drop", job_id)
+            return []
+        return [
+            {
+                "dependent_id": job_id,
+                "failed_dep_id": dep,
+                "dep_status": RELEASE_DEP_PURGED,
+                "remaining": remaining,
+            }
+            for dep in dropped
+        ]
+
     async def _require_dependencies_done(self, db: Any, job_id: str) -> None:
         """Raise ``DependencyNotReady`` unless the job's DAG prerequisites are done."""
         async with db.execute("SELECT depends_on FROM jobs WHERE id=?", (job_id,)) as cur:
