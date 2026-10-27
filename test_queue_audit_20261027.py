@@ -108,6 +108,25 @@ class QueueAuditTests(_RepoCase):
                 else:
                     await hive_jobs_router.claim_job("job", by="urn:agent:zeroclaw:other:1")
 
+    async def test_daemon_lost_preflight_is_routed_as_infrastructure(self):
+        repo = await self._repo()
+        urn = "urn:agent:zeroclaw:host:preflight"
+        await self._agent(repo, urn)
+        await self._mk(repo, "preflight", status="claimed", max_retries=2)
+        async with repo.connection() as tx:
+            await tx.execute("UPDATE jobs SET claimed_by=? WHERE id='preflight'", (urn,))
+            await tx.commit()
+        with mock.patch.object(hive_jobs_router, "hive_repo", return_value=repo):
+            await hive_jobs_router.update_job("preflight", JobUpdate(
+                status="failed", claimed_by=urn,
+                result={"failure_reason": "daemon_lost", "error": "preflight denied", "review_iterations": 0},
+            ))
+        async with repo.connection() as tx:
+            row = await repo.job_retry_context(tx, "preflight")
+        self.assertEqual(row[0], "queued")
+        self.assertEqual(json.loads(row[4])["failure_class"], "engine_unavailable")
+        self.assertEqual(json.loads(row[4])["review_iterations"], 0)
+
     async def _agent_other(self, tx):
         await tx.execute(
             "INSERT INTO agents (urn,kind,host,session_id,started_at,last_heartbeat,status) VALUES ('urn:agent:zeroclaw:other:1','zeroclaw','other','1',0,0,'online')"

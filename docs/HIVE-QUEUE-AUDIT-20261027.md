@@ -4,7 +4,7 @@
 
 Baseline and unchanged HEAD: `f2c43020c4e91965a802f665354ff9cd52dc8717`, branch `feat/hive-astra-audit-20261027`.
 
-This audit records **39 grouped findings: 19 fixed in the working tree, 20 remaining**. The remaining-effort counts are **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
+This audit records **39 grouped findings: 19 fixed in the Astra baseline, 20 remaining (1 partially remediated by Terra, 19 left)**. The remaining-effort counts are **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
 
 No live bus/database, remote forge, MNEMOS, service restart, or push was used. The explicit repository-only restriction overrides standing network registration/persistence workflows for this task. The sandbox declares `.git` read-only. No staging, commit, push, or attempt to bypass that restriction was made. The index is unchanged; the working tree necessarily contains the unstaged fixes. A literally clean working tree would require discarding them. No new commit SHA or primary zoder APPROVE is claimed. Independent local reviews caught and corrected overbroad infrastructure classification and a review-parent completion gap; they are not a substitute for the external gate.
 
@@ -225,3 +225,40 @@ Total: **44 new test functions**, expanded by parameterization into the **58 pas
 * Removed: `.audit-suite.log` after recording the complete result here; `.audit-pycache/` created solely for compilation; bytecode for the nine new Python source/test files. Temporary SQLite databases and test bare repositories were managed by fixture cleanup. No persistent clone/worktree, container, remote file, unit, mount, service, or fleet process was created.
 * Existing interpreter/pytest cache directories may have been refreshed by tests; they are ignored and left intact rather than deleting directories whose prior ownership was not established. No other session's scratch was deleted.
 * `df -h . /private/tmp`: both `/dev/disk3s1`, APFS data volume, **460 GiB total / 378 GiB used / 58 GiB available / 87%**. No tmpfs was involved. No background validation process remains.
+
+
+## Terra remediation 2026-10-27
+
+The original audit above is historical: `deploy/hive_worker.py` is now tracked at
+`9fcd71f`. This addendum records local source changes only. No live bus, fleet,
+remote, deployment, or zoder review was accessed. The deployed worker's
+sidecar imports are missing from this checkout, so worker tests stub those
+imports; they do not demonstrate an installed runtime. A socket connection
+proves connectability only, not daemon readiness or its protocol. The worker
+comment describes zoder cold-starting an ephemeral daemon, so requiring an
+already-listening socket may reject valid cold starts; deployment requires
+verification of that contract before rollout. The socket-positive test uses a
+stub because the sandbox denies binding a Unix socket.
+
+| ID | Status | Change / remaining acceptance evidence | Regression / evidence |
+|---|---|---|---|
+| R01 | Partially fixed | `deploy/hive_worker.py:2825`, `:2891`, `:3841`, `:4052`, `:5579`; `hive/bus/domain/failure.py:59`: socket preflight, infrastructure classification, remote-matched delivery with recorded untracked files. Push rejection recovery, finalizer classification, and inner loop iteration behavior after launch remain open. | `test_worker_preflight_stops_before_driver_when_daemon_unreachable`, `test_worker_preflight_accepts_connectable_socket`, `test_worker_delivery_accepts_untracked_but_rejects_tracked_changes`, `test_daemon_lost_preflight_is_routed_as_infrastructure`; local tests only. |
+| R02 | Left | Timestamped attested executor health and expiry remain required. | No new regression or acceptance evidence. |
+| R03 | Left | Durable branch reservation remains required. | No new regression or acceptance evidence. |
+| R04 | Left | Trusted origin verification for every executor remains required. | No new regression or acceptance evidence. |
+| R05 | Left | Paginated review dispatch and failed-child recovery remain required. | No new regression or acceptance evidence. |
+| R06 | Left | Stale-cancel CAS and dependency release remain required. | No new regression or acceptance evidence. |
+| R07 | Left | Owner/lease/revision CAS remains required. | No new regression or acceptance evidence. |
+| R08 | Left | Concurrent dependency release and error handling remain required. | No new regression or acceptance evidence. |
+| R09 | Left | Atomic scheduled occurrence and child insert remain required. | No new regression or acceptance evidence. |
+| R10 | Left | Cross-backend cost statistics remain required. | No new regression or acceptance evidence. |
+| R11 | Left | Durable postcommit event publication remains required. | No new regression or acceptance evidence. |
+| R12 | Left | Durable doctor sweep ledger and error propagation remain required. | No new regression or acceptance evidence. |
+| R13 | Left | Cross-process provider reservations remain required. | No new regression or acceptance evidence. |
+| R14 | Left | Production gap promotion and manifest validation remain required. | No new regression or acceptance evidence. |
+| R15 | Left | Worker lease renewal and durable result outbox remain required. | No new regression or acceptance evidence. |
+| R16 | Left | Persistence ABC and backend behavioral contract remain required. | No new regression or acceptance evidence. |
+| R17 | Left | Environment-dependent suite failures remain. | No new regression or acceptance evidence. |
+| R18 | Left | Protected project/prefix lanes must be enforced in both retry paths. | No new regression or acceptance evidence. |
+| R19 | Left | DELETE contract remains undecided. | No new regression or acceptance evidence. |
+| R20 | Left | Installed wheel validation remains required. | No new regression or acceptance evidence. |
