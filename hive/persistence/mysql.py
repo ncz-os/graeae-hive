@@ -7,8 +7,9 @@ DDL types/identity. Driver is imported lazily.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .dialect import mysql_ddl, mysql_upsert, to_format
@@ -19,7 +20,10 @@ from .sqlite import SqliteHiveRepository
 class _MyCursor:
     def __init__(self, cur: Any):
         self._cur = cur
-        self.rowcount = getattr(cur, "rowcount", 0)
+
+    @property
+    def rowcount(self) -> int:
+        return getattr(self._cur, "rowcount", 0)
 
     async def __aenter__(self) -> _MyCursor:
         return self
@@ -107,6 +111,7 @@ class MySqlHiveRepository(SqliteHiveRepository):
     async def init(self, schema: str | None = None) -> None:
         async with self.connection() as db:
             await db.executescript(mysql_ddl(schema or _SQLITE_DDL))
+            await db.commit()
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Any]:
@@ -121,10 +126,14 @@ class MySqlHiveRepository(SqliteHiveRepository):
             user=unquote(u.username or "root"),
             password=unquote(u.password or ""),
             db=(u.path or "/").lstrip("/") or None,
-            autocommit=True,
+            autocommit=False,
         )
         db = _MyConnection(conn)
+        db._repo = self
         try:
             yield db
         finally:
-            conn.close()
+            try:
+                await db.rollback()
+            finally:
+                conn.close()

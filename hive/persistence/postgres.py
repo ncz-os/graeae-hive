@@ -9,8 +9,9 @@ Driver is imported lazily so the package imports without asyncpg installed.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator
+from typing import Any
 
 from .dialect import postgres_ddl, to_numbered
 from .sqlite import DDL as _SQLITE_DDL
@@ -54,37 +55,51 @@ class _PgCursor:
 class _PgConnection:
     def __init__(self, conn: Any):
         self._conn = conn
+        self._transaction = None
 
     def execute(self, sql: str, params: Any = None):
         return _PgExecute(self, sql, params)
 
+    async def _begin(self) -> None:
+        if self._transaction is None:
+            transaction = self._conn.transaction()
+            await transaction.start()
+            self._transaction = transaction
+
     async def _run(self, sql: str, params: Any = None) -> _PgCursor:
+        await self._begin()
         translated = to_numbered(sql)
         upper = sql.lstrip().upper()
         if upper.startswith(("SELECT", "WITH", "PRAGMA")):
             rows = await self._conn.fetch(translated, *(params or ()))
             return _PgCursor(rows=[tuple(r) for r in rows], rowcount=len(rows))
-        try:
-            await self._conn.execute(translated, *(params or ()))
-        except Exception:
-            await self._conn.fetch(translated, *(params or ()))
-        return _PgCursor(rowcount=1)
+        tag = await self._conn.execute(translated, *(params or ()))
+        # asyncpg returns command tags (UPDATE 0, DELETE 2, INSERT 0 1).
+        # A lost compare-and-set must remain zero; never retry failed writes.
+        count = tag.rsplit(" ", 1)[-1]
+        return _PgCursor(rowcount=int(count) if count.isdigit() else 0)
 
     async def executemany(self, sql: str, seq: list[tuple[Any, ...]]) -> _PgCursor:
+        await self._begin()
         translated = to_numbered(sql)
         await self._conn.executemany(translated, [tuple(p) for p in seq])
         return _PgCursor(rowcount=len(seq))
 
     async def executescript(self, script: str) -> _PgCursor:
+        await self._begin()
         for stmt in [s.strip() for s in script.split(";") if s.strip()]:
             await self._conn.execute(stmt)
         return _PgCursor()
 
     async def commit(self) -> None:
-        return None  # asyncpg autocommits outside an explicit transaction
+        if self._transaction is not None:
+            await self._transaction.commit()
+            self._transaction = None
 
     async def rollback(self) -> None:
-        return None
+        if self._transaction is not None:
+            await self._transaction.rollback()
+            self._transaction = None
 
     async def close(self) -> None:
         return None
@@ -125,6 +140,7 @@ class PostgresHiveRepository(SqliteHiveRepository):
             raise RuntimeError(f"HIVE_BACKEND=postgres requires asyncpg importable: {exc}") from exc
         async with self.connection() as db:
             await db.executescript(postgres_ddl(schema or _SQLITE_DDL))
+            await db.commit()
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Any]:
@@ -134,7 +150,11 @@ class PostgresHiveRepository(SqliteHiveRepository):
             raise RuntimeError(f"HIVE_BACKEND=postgres requires asyncpg importable: {exc}") from exc
         conn = await asyncpg.connect(self.dsn)
         db = _PgConnection(conn)
+        db._repo = self
         try:
             yield db
         finally:
-            await conn.close()
+            try:
+                await db.rollback()
+            finally:
+                await conn.close()

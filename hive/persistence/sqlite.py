@@ -1506,6 +1506,7 @@ class SqliteHiveRepository(HiveMindRepository):
                     "dep_status": _dropped["dep_status"],
                     "remaining": _dropped["remaining"],
                 },
+                commit=False,
             )
         await self._require_dependencies_done(db, job_id)
         cur = await db.execute(
