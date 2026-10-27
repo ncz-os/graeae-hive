@@ -20,6 +20,11 @@ from .base import HiveMindRepository, Transaction
 
 log = logging.getLogger(__name__)
 
+#: Dependency statuses whose write releases queued/offered dependents.
+RELEASE_DEP_STATUSES = ("failed", "failed_completion", "dead-letter", "cancelled")
+#: The purge path (row deleted outright) cannot report the dep's status.
+RELEASE_DEP_PURGED = "purged"
+
 
 @dataclass(frozen=True)
 class SqlExpr:
