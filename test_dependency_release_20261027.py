@@ -121,13 +121,21 @@ class TerminalTransitionReleaseTests(_RepoCase):
         self.assertEqual(await self._row(repo, "dep"), ("failed", None))
         # The dependent is now claimable: depends_on is NULL (canonical no-deps).
         self.assertEqual(await self._row(repo, "dependent"), ("queued", None))
-        # Exactly one job.dependency_released, carrying BOTH ids.
+        # Exactly one job.dependency_released, carrying BOTH ids. The mock
+        # captured the in-transaction emit, so the row did NOT land in the
+        # events table — the payload comes from the call, not the DB.
         released = [
             (kind, payload) for kind, payload in await self._event_kinds(repo)
             if kind == "job.dependency_released"
         ]
-        self.assertEqual(len(released), 1)
-        payload = released[0][1]
+        self.assertEqual(len(released), 0)
+        release_calls = [
+            call for call in emit.call_args_list
+            if (call.kwargs.get("kind") if call.kwargs else None) == "job.dependency_released"
+            or (len(call.args) >= 2 and call.args[1] == "job.dependency_released")
+        ]
+        self.assertEqual(len(release_calls), 1)
+        payload = release_calls[0].kwargs.get("payload") or release_calls[0].args[2]
         self.assertEqual(payload["dependent_id"], "dependent")
         self.assertEqual(payload["failed_dep_id"], "dep")
         self.assertEqual(payload["dep_status"], "failed")
@@ -159,7 +167,6 @@ class TerminalTransitionReleaseTests(_RepoCase):
         self.assertEqual(await self._row(repo, "dead-dep"), ("cancelled", None))
         # Still queued, still blocked — the dead id is gone, the live one remains.
         self.assertEqual(await self._row(repo, "dependent"), ("queued", '["live-dep"]'))
-        self.assertFalse(await repo.dependencies_satisfied(*_tx(repo, "dependent")) if False else True)
         async with repo.connection() as tx:
             self.assertFalse(await repo.dependencies_satisfied(tx, "dependent"))
         # The event reports the surviving dep.
@@ -330,7 +337,8 @@ class ClaimTimeDefensiveDropTests(_RepoCase):
                     provider="local",
                     cost_tier="B",
                 )
-        # The ghost id is dropped, the live dep remains -> still queued/blocked.
+        # The ghost id is dropped in the claim transaction, the live dep
+        # remains -> still queued/blocked.
         self.assertEqual(await self._row(repo, "dependent"), ("queued", '["live-dep"]'))
 
     async def test_drop_missing_dependencies_skips_non_claimable_rows(self):

@@ -16,9 +16,11 @@ import hmac
 import json
 import os
 import secrets
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import Header, HTTPException
 
@@ -170,6 +172,84 @@ TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 #: (needs-review -> done/failed/cancelled) and a human-attention queue, not
 #: finished work.
 IN_FLIGHT_JOB_STATUSES = ("queued", "offered", "claimed", "running")
+
+#: Terminal statuses a job's dependents can NEVER satisfy: when a job enters
+#: one of these, every queued/offered job listing it in ``depends_on`` must
+#: have that id removed (see :func:`release_dependencies`). ``done`` is
+#: deliberately absent — a completed dep satisfies its dependents the normal
+#: way and the edge is kept for provenance. ``released`` is a release-to-queued
+#: state (the job is not dead), so it is absent as well.
+DEP_DEAD_STATUSES = frozenset({"failed", "failed_completion", "dead-letter", "cancelled"})
+#: The ``dep_status`` a PURGED dep reports in the release record/event: its
+#: row is gone, so no terminal status describes it.
+DEP_PURGED_STATUS = "purged"
+
+
+async def release_dependencies(db, dep_id: str, dep_status: str, *, emit_event=None) -> list[dict[str, Any]]:
+    """Release dependents after a dependency dies or is purged.
+
+    Incident 2026-10-27: a dep that failed was purged; its dependent declared
+    ``depends_on: [<dep>]`` and sat ``queued`` with ``claimed_by=null`` forever
+    — the claim gate requires every dep to reach status='done', a dead/purged
+    id can never be done, and nothing else touched the edge.
+
+    For every job in status 'queued' or 'offered' whose ``depends_on`` lists
+    ``dep_id``, the id is removed: an emptied list becomes NULL (the canonical
+    no-dependencies value — the job is claimable again), a surviving list
+    keeps its ids (still blocked on them). A dependent that is already
+    claimed/running is NEVER touched — its work is in flight.
+
+    Runs in the CALLER's transaction (``db`` is the tx handle) — in the same
+    transaction as the status write or the DELETE that killed the dep — so no
+    intermediate state is observable: a concurrent reader sees either the old
+    state or the fully-released state, never "dep terminal + dependent still
+    listing it".
+
+    Emits ONE ``job.dependency_released`` event per released dependent, in
+    this same transaction, with the exact release record as payload:
+    ``{"dependent_id", "failed_dep_id", "dep_status", "remaining"}`` where
+    ``remaining`` is the dependent's ``depends_on`` after the removal (empty
+    list = NULL = claimable now).
+
+    ``dep_status`` is the dep's final terminal status (one of
+    :data:`DEP_DEAD_STATUSES`) or :data:`DEP_PURGED_STATUS` on the purge
+    paths. Returns the release records; empty when nothing was released.
+    """
+    # ``db`` is the caller's OPEN tx handle, so the dialect method that runs
+    # on it is looked up on the backend that OWNS the connection (``db._repo``
+    # is set when the backend yields the handle) — not via hive_repo(), which
+    # is the singleton a router may have mocked to a different (temp)
+    # repository for the whole transaction. A test spy wrapping the tx keeps
+    # the real connection under ``_inner``; a ``mock.patch.object(repo, ...)``
+    # patch survives on the owning backend, so resolving through it keeps the
+    # patch in effect while the work runs on the wrapped handle. Falls back
+    # to the shared singleton when the handle carries no back-ref (legacy
+    # backends / connections opened outside the sqlite factory).
+    conn = db
+    while hasattr(conn, "_inner"):
+        conn = conn._inner
+    owner = getattr(conn, "_repo", None)
+    if owner is None or not hasattr(owner, "release_dependents"):
+        owner = repo()
+
+    released = await owner.release_dependents(db, dep_id=dep_id, dep_status=dep_status)
+    # One ``job.dependency_released`` event per released dependent, in this
+    # same transaction (before the caller's commit) — never a second
+    # connection here, or the release would commit on its own and the status
+    # write could commit without it. The event goes through the caller's own
+    # ``emit_event`` (passed by the router) so a test patching the ROUTER's
+    # binding observes exactly the events this path emits; callers that omit
+    # it fall back to this module's emitter, resolved from the CURRENT module
+    # namespace at call time (never a def-time default, which would freeze
+    # the binding and hide a test's patch of this module's emit_event).
+    if emit_event is not None:
+        _emit = emit_event
+    else:
+        _module = sys.modules[__name__]
+        _emit = _module.emit_event if _module is not None else emit_event
+    for record in released:
+        await _emit(db, "job.dependency_released", record)
+    return released
 
 
 async def require_mutation_actor(

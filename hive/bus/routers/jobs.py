@@ -1668,7 +1668,7 @@ async def update_job(job_id: str, req: JobUpdate):
         # transaction decides (retried -> 'queued' -> no release; a job whose
         # retries are exhausted stays 'failed' -> release).
         if (not retried) and req.status in DEP_DEAD_STATUSES:
-            await release_dependencies(tx, job_id, req.status)
+            await release_dependencies(tx, job_id, req.status, emit_event=emit_event)
         await tx.commit()
 
     async with hive_repo().connection() as event_tx:

@@ -404,7 +404,7 @@ async def reaper_task(app: FastAPI):
                     # dependents would be blocked forever. Released in the SAME
                     # transaction as the deletes.
                     for jid in swept:
-                        await release_dependencies(db, jid, DEP_PURGED_STATUS)
+                        await release_dependencies(db, jid, DEP_PURGED_STATUS, emit_event=emit_event)
                     await db.commit()
                     if swept:
                         print(

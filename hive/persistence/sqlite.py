@@ -492,6 +492,12 @@ class SqliteHiveRepository(HiveMindRepository):
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA synchronous=NORMAL")
             await db.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
+            # Back-ref to the repository that opened this handle: bus helpers
+            # that receive ONLY the tx (e.g. hive.bus.deps.release_dependencies)
+            # resolve dialect methods on the owning backend instead of
+            # re-resolving the module-global repo singleton, which a router
+            # may have mocked to a different (temp) repository.
+            db._repo = self  # type: ignore[attr-defined]
             yield db
         finally:
             await db.close()
@@ -1515,6 +1521,23 @@ class SqliteHiveRepository(HiveMindRepository):
                 _dropped["dependent_id"],
                 _dropped["failed_dep_id"],
                 _dropped["remaining"],
+            )
+            # One release event per dropped id (incident 2026-10-27), in this
+            # same claim transaction. Imported lazily: hive.bus.deps loads
+            # hive.persistence.factory (which imports this module) at module
+            # import, so a top-level import here would cycle.
+            import hive.bus.deps as _deps_mod
+
+            _module_emit = getattr(_deps_mod, "emit_event", None)
+            await _module_emit(
+                db,
+                "job.dependency_released",
+                {
+                    "dependent_id": _dropped["dependent_id"],
+                    "failed_dep_id": _dropped["failed_dep_id"],
+                    "dep_status": _dropped["dep_status"],
+                    "remaining": _dropped["remaining"],
+                },
             )
         await self._require_dependencies_done(db, job_id)
         cur = await db.execute(

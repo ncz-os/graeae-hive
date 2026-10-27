@@ -185,7 +185,7 @@ async def admin_purge_jobs(req: PurgeRequest):
             # DEPENDENCY RELEASE (incident 2026-10-27): the row is gone, so any
             # queued/offered dependent listing it would be blocked forever.
             # Released in the SAME transaction as the DELETE, below.
-            await release_dependencies(db, job_id, DEP_PURGED_STATUS)
+            await release_dependencies(db, job_id, DEP_PURGED_STATUS, emit_event=emit_event)
             await db.commit()
             results["ok"].append(job_id)
     async with connect_db() as event_db:
@@ -342,7 +342,7 @@ async def purge_jobs(req: JobPurgeRequest):
             # DEPENDENCY RELEASE (incident 2026-10-27): released in the SAME
             # transaction as the deletes, per purged id.
             for jid in deleted:
-                await release_dependencies(db, jid, DEP_PURGED_STATUS)
+                await release_dependencies(db, jid, DEP_PURGED_STATUS, emit_event=emit_event)
             await db.commit()
     if deleted:
         async with connect_db() as event_db:
