@@ -81,5 +81,54 @@ class ResubmitBudgetSpentTests(unittest.TestCase):
         self.assertIn("DRY_RUN", out)
 
 
+class ReplacementChainGuardTests(unittest.TestCase):
+    def test_a_doctor_replacement_is_never_resubmitted_again(self):
+        failed = {"jobs": [
+            {"id": "orig", "kind": "review:x", "max_retries": 0, "retry_count": 0, "status": "failed",
+             "description": "d", "priority": 1, "project": "p", "repo": "p", "head_branch": "b"},
+            {"id": "replacement", "kind": "review:x", "max_retries": 2, "retry_count": 2, "status": "failed",
+             "result": {"resubmitted_from": "orig"}},
+        ]}
+        calls = []
+
+        def fake_http(method, path, payload=None, timeout=10.0):
+            calls.append((method, path, payload or {}))
+            if path.startswith("/v1/jobs?status=failed"):
+                return 200, failed
+            if path == "/v1/jobs":
+                return 200, {"id": "gen2"}
+            return 200, {}
+
+        with (
+            mock.patch.object(doctor, "_http", fake_http),
+            mock.patch.object(doctor, "broadcast_doctor_message", lambda *a, **k: None),
+            mock.patch.object(doctor, "DRY_RUN", False),
+        ):
+            doctor.action_resubmit_jobs("review:x")
+        submitted = [c[2] for c in calls if c[1] == "/v1/jobs"]
+        self.assertEqual(len(submitted), 1, "only the original may be resubmitted once")
+        self.assertEqual(submitted[0]["parent_job_id"], "orig")
+
+    def test_only_replacements_left_means_no_further_generation(self):
+        failed = {"jobs": [
+            {"id": "replacement", "kind": "review:x", "max_retries": 2, "retry_count": 2,
+             "status": "failed", "result": {"resubmitted_from": "orig"}},
+        ]}
+        calls = []
+
+        def fake_http(method, path, payload=None, timeout=10.0):
+            calls.append(path)
+            return (200, failed) if path.startswith("/v1/jobs?status=failed") else (200, {})
+
+        with (
+            mock.patch.object(doctor, "_http", fake_http),
+            mock.patch.object(doctor, "broadcast_doctor_message", lambda *a, **k: None),
+            mock.patch.object(doctor, "DRY_RUN", False),
+        ):
+            out = doctor.action_resubmit_jobs("review:x")
+        self.assertNotIn("/v1/jobs", calls)
+        self.assertIn("already a replacement", out)
+
+
 if __name__ == "__main__":
     unittest.main()

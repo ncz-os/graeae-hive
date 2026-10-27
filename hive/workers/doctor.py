@@ -1333,9 +1333,22 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
     ]
     # A job whose retry budget is spent (max_retries 0, or retry_count >= max_retries)
     # is never requeued by the doctor: it is reported for review, nothing else.
-    held, eligible = [], []
+    # A replacement this doctor submitted is never resubmitted again: its own
+    # exhausted budget would otherwise mint another replacement forever
+    # (cross-family review 2026-10-27: "permanently failing jobs generate an
+    # unbounded chain of new jobs"). One generation per original, then a report.
+    def _already_a_replacement(job: dict) -> bool:
+        res = job.get("result") or {}
+        return bool(res.get("resubmitted_from") or res.get("resubmitted_as"))
+
+    held, eligible, chain = [], [], []
     for j in candidates:
-        (held if retry_budget_exhausted(j) else eligible).append(j)
+        if _already_a_replacement(j):
+            chain.append(j)
+        elif retry_budget_exhausted(j):
+            held.append(j)
+        else:
+            eligible.append(j)
     target_ids = [j["id"] for j in eligible][: max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))]
     held_note = ""
     if held:
@@ -1380,6 +1393,10 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
                     "idempotency_key": f"doctor-resubmit-{j.get('id')}",
                 }
                 payload = {k: v for k, v in payload.items() if v not in (None, "", [])}
+                payload["result"] = {
+                    "resubmitted_from": j.get("id"),
+                    "resubmitted_reason": "retry-budget-exhausted",
+                }
                 code3, resp3 = _http("POST", "/v1/jobs", payload)
                 if code3 in (200, 201) and isinstance(resp3, dict) and resp3.get("id"):
                     made.append(resp3["id"])
@@ -1399,9 +1416,14 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
                 "resubmit %s: submitted %d new job(s) for budget-spent failures%s",
                 base_kind, len(made), held_note,
             )
+            chain_note = (
+                f"; {len(chain)} replacement(s) left alone (one generation only)" if chain else ""
+            )
             if made:
-                return f"resubmitted {len(made)} budget-spent job(s) of {base_kind} as new{held_note}"
-            return f"could not resubmit budget-spent jobs of {base_kind}{held_note}"
+                return f"resubmitted {len(made)} budget-spent job(s) of {base_kind} as new{held_note}{chain_note}"
+            if chain and not held:
+                return f"no resubmit: every budget-spent job of {base_kind} is already a replacement{chain_note}"
+            return f"could not resubmit budget-spent jobs of {base_kind}{held_note}{chain_note}"
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
         return f"DRY_RUN: would requeue {len(target_ids)} jobs of {base_kind}{held_note}"
