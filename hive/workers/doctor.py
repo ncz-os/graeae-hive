@@ -285,6 +285,33 @@ MAX_BULK_RESUBMITS_PER_ACTION = 20
 DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS = doctor_v2.max_same_signature_resubmits()
 SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
 
+# ── protection_violation remediation (operator 2026-10-27) ─────────────────
+# A worker that modified another session's checkout fails with
+# failure_reason=protection_violation ("driver modified another session's
+# checkout: <path>"). The attempt delivered nothing, so the doctor handles the
+# row deterministically — no LLM decision in the path: purge the empty failed
+# row and re-dispatch the same work once on the remaining hosts, excluding the
+# offending one. The cap and the markers are durable (STATE), so a restart
+# never re-purges or re-dispatches the same original job id.
+VIOLATION_MAX_RETRIES = int(os.environ.get("VIOLATION_MAX_RETRIES", "2"))
+PROTECTION_RETRY_TTL_SEC = 30 * 86400.0
+PROTECTION_ERROR_RE = re.compile(r"driver modified another session's checkout:\s*(\S+)")
+
+# ── needs-review follow-up (operator 2026-10-27) ───────────────────────────
+# A needs-review row with no review performed (no result.review_evidence and no
+# child review:* job) used to sit there forever — the triage that produced it
+# had escalated into it with an unusable decision. The sweep now submits ONE
+# read-only codex review job per such row, oldest first, capped per sweep so a
+# big backlog cannot flood the queue. A row that HAS a review verdict is left
+# for a human/orchestrator, and a needs-review row is never auto-purged:
+# if it carries commits, those are delivered work.
+REVIEW_FOLLOWUP_MAX_PER_SWEEP = int(os.environ.get("REVIEW_FOLLOWUP_MAX_PER_SWEEP", "3"))
+REVIEW_FOLLOWUP_TTL_SEC = 30 * 86400.0
+REVIEW_FOLLOWUP_KIND_PREFIX = "review:"
+REVIEW_FOLLOWUP_ELIGIBLE_KINDS = ["codex"]
+REVIEW_FOLLOWUP_PREFERRED_MODELS = ["gpt-6-luna"]
+REVIEW_FOLLOWUP_MAX_COST_TIER = "A"
+
 
 def _max_same_signature_resubmits() -> int:
     return doctor_v2.max_same_signature_resubmits()
@@ -436,6 +463,8 @@ KEY_DLQ = "dlq"
 KEY_SSH = "ssh"
 KEY_HOST_COOLDOWN = "host_cooldown"
 KEY_TOKEN_FIX = "token_fix"
+KEY_PROTECTION = "protection"
+KEY_REVIEW = "review"
 
 
 def reset_safety_state(state: DurableStateStore | None = None) -> None:
@@ -1861,6 +1890,11 @@ def scan_for_failure_clusters() -> list[dict]:
     for j in resp.get("jobs", []) or []:
         if (j.get("ended_at") or 0) < cutoff:
             continue
+        # protection_violation is handled deterministically, here and now — no
+        # LLM triage in the path. It must not also become a triage cluster.
+        if is_protection_violation(j):
+            handle_protection_violation(j)
+            continue
         bk = _base_kind(j.get("kind", ""))
         if not bk or bk.startswith("triage:") or bk.startswith("doctor:"):
             continue
@@ -2104,7 +2138,386 @@ def run_retention_sweep() -> dict | None:
     return report
 
 
-# ───────────────────────── Triage loop ─────────────────────────
+def _job_result_dict(job: dict) -> dict:
+    """The job's result as a dict (the bus stores it as a JSON string on some
+    paths). A JSON string that does not parse to a dict is preserved as
+    ``{"raw": <text>}`` so downstream text search (e.g. the DLQ classifier)
+    still sees it; {} otherwise."""
+    res = job.get("result")
+    if isinstance(res, str):
+        if not res.strip():
+            return {}
+        try:
+            res = json.loads(res)
+        except Exception:
+            return {"raw": res}
+    return res if isinstance(res, dict) else {}
+
+
+# ───────────────────────── protection_violation remediation ─────────────────
+# (operator 2026-10-27) A worker that modified another session's checkout fails
+# with failure_reason=protection_violation; the attempt delivered nothing. The
+# doctor handles the row deterministically — no LLM decision in the path:
+# purge the empty failed row and re-dispatch the same work excluding the
+# offending host, capped by VIOLATION_MAX_RETRIES per original job id, tracked
+# durably in STATE so a restart never re-purges or re-dispatches.
+
+PROTECTION_FAILURE_REASON = "protection_violation"
+
+
+def is_protection_violation(job: dict) -> bool:
+    """Detection predicate, row-level, no model call.
+
+    True when ``failure_reason == "protection_violation"`` anywhere on the row
+    (top-level or in result) OR any error-ish text on the row contains the
+    token. The 2026-10-27 incident row carried it both ways:
+    result.failure_reason and result.error."""
+    res = _job_result_dict(job)
+    for value in (job.get("failure_reason"), res.get("failure_reason")):
+        if str(value or "").strip().lower() == PROTECTION_FAILURE_REASON:
+            return True
+    blob = " ".join(str(job.get(k) or "") for k in ("error", "failure_reason"))
+    blob += " " + " ".join(str(res.get(k) or "") for k in ("error", "note", "stderr", "stdout", "failure_reason"))
+    return PROTECTION_FAILURE_REASON in blob.lower()
+
+
+def protection_offending_path(job: dict) -> str:
+    """The checkout path named in "driver modified another session's checkout: <path>", or ''."""
+    res = _job_result_dict(job)
+    for text in (job.get("error"), res.get("error"), res.get("stderr"), res.get("stdout"), res.get("note")):
+        text = str(text or "")
+        m = PROTECTION_ERROR_RE.search(text)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def protection_offending_host(job: dict) -> str:
+    """Map the violation to a host: the host encoded in the claimant's URN
+    (urn:agent:<kind>:<host>:<session>), or ''. When the row names no claimant
+    (claimed_by/submitter_urn empty or absent), the host is unparseable and the
+    caller must not re-dispatch — it quarantines and flags needs_operator."""
+    for urn in (job.get("claimed_by"), job.get("submitter_urn")):
+        urn = str(urn or "")
+        if not urn:
+            continue
+        m = re.search(r"urn:agent:[^:]+:([^:/]+)", urn)
+        if m:
+            return m.group(1).lower()
+    return ""
+
+
+def _host_from_registry(host: str, registry: dict | None) -> dict:
+    """The live agent row that declares this host, from the registry snapshot."""
+    for agent in (registry or {}).get("agents") or []:
+        if str(agent.get("host") or "").lower() == host.lower():
+            return agent
+    return {}
+
+
+def protection_violation_retried(job_id: str) -> bool:
+    """Whether this original job id was already re-dispatched, durably.
+
+    A READ. Recording is done only after a successful submit, deliberately, for
+    the same reason as the DLQ seen-set: marking a job the moment it is looked
+    at would hide it from every later sweep for the whole window when the
+    submit failed and the work still needs a retry."""
+    return STATE.seen(f"{KEY_PROTECTION}:retried:{job_id}", ttl=PROTECTION_RETRY_TTL_SEC)
+
+
+def protection_violation_record_retry(job_id: str, at: float | None = None) -> None:
+    """Persist that this original job id has now been re-dispatched once."""
+    STATE.mark(f"{KEY_PROTECTION}:retried:{job_id}", ttl=PROTECTION_RETRY_TTL_SEC, at=at)
+
+
+def _violation_retry_idempotency_key(job_id: str) -> str:
+    """Stable per original job id: the bus refuses a second submit with the same
+    key, so the durable marker and the bus agree on "handled once"."""
+    return f"protection-violation-retry:{job_id}"
+
+
+def _build_retry_spec(job: dict, offending_host: str, retry_note: str) -> dict:
+    """The copy of a failed job's spec for one re-dispatch.
+
+    Kind gets a -retry suffix; the description carries a one-line note naming the
+    violation and the excluded host; repo/head_branch/base_branch/project/
+    priority/eligible_kinds/preferred_models/max_cost_tier are copied. eligible_hosts
+    is the original set minus the offending host — when that becomes empty, ALL
+    non-offending build hosts (the fleet build lanes minus the offender), so the
+    work still runs and is never pinned to a host that has already proven the
+    violation. Returns {} when nothing can be copied (no kind)."""
+    kind = str(job.get("kind") or "").strip()
+    if not kind:
+        return {}
+    desc = str(job.get("description") or "").strip()
+    body = {
+        "kind": f"{kind}-retry",
+        "description": (desc + f"\n\n[doctor re-dispatch] {retry_note}").strip(),
+        "priority": job.get("priority") or 0,
+        "repo": job.get("repo"),
+        "head_branch": job.get("head_branch"),
+        "base_branch": job.get("base_branch"),
+        "project": job.get("project"),
+        "eligible_kinds": list(job.get("eligible_kinds") or []),
+        "preferred_models": list(job.get("preferred_models") or []),
+        "max_cost_tier": job.get("max_cost_tier"),
+        "idempotency_key": _violation_retry_idempotency_key(job.get("id") or ""),
+    }
+    hosts = [str(h) for h in (job.get("eligible_hosts") or []) if str(h).strip()]
+    offenders = {offending_host.lower()}
+    remaining = [h for h in hosts if h.lower() not in offenders]
+    if not remaining:
+        # The original set was empty, or it only named the offending host:
+        # fall back to every non-offending build host in the live registry.
+        remaining = [h for h in _all_build_hosts() if h not in offenders]
+    body["eligible_hosts"] = remaining
+    return body
+
+
+def submit_job_spec(spec: dict) -> tuple[int, dict | None]:
+    """Submit one job via the bus as the doctor (the doctor's registered URN
+    satisfies the orchestrator-submitter tier)."""
+    body = {k: v for k, v in spec.items() if v is not None or k in ("repo", "head_branch", "base_branch", "max_cost_tier")}
+    body["submitter_urn"] = _urn or "urn:agent:doctor:pythia:unknown"
+    if not body.get("eligible_kinds"):
+        body.pop("eligible_kinds", None)
+    return _http("POST", "/v1/jobs", body)
+
+
+def _all_build_hosts() -> list[str]:
+    """Every host in the live registry, for the empty-eligible_hosts fallback."""
+    out = set()
+    code, resp = _http("GET", "/v1/agents", timeout=10.0)
+    if code == 200 and resp:
+        for agent in resp.get("agents", []) or []:
+            h = str(agent.get("host") or "").strip().lower()
+            if h:
+                out.add(h)
+    return sorted(out)
+
+
+def _cancel_failed_job(job_id: str) -> str:
+    """The fallback when the purge route refuses: mark the row cancelled."""
+    code, resp = _http("PATCH", f"/v1/jobs/{job_id}", {"status": "cancelled"})
+    if code in (200, 201, 204):
+        return f"marked cancelled {job_id[:12]} (purge refused, fallback)"
+    return f"cancel FAILED {job_id[:12]} code={code} resp={str(resp)[:160]}"
+
+
+def handle_protection_violation(job: dict) -> str:
+    """Carry out the deterministic protection-violation remediation for one row.
+
+    A row that DID deliver commits is left entirely alone — no purge, no
+    re-dispatch (the commits are real work somebody must look at) — and is
+    flagged needs_operator. Otherwise: (1) purge the empty failed row via the
+    admin purge path (or mark cancelled if refused); (2) re-dispatch the same
+    work once, excluding the offending host, at most VIOLATION_MAX_RETRIES
+    times per original job id, tracked durably. Each step is recorded in the
+    row's result/reason and the doctor.protection_violation message. No LLM
+    decision anywhere in this path. Returns a one-line outcome string."""
+    jid = str(job.get("id") or "")
+    if not jid:
+        return "no job id"
+    result = _job_result_dict(job)
+    commits = result.get("commits") or []
+    if commits:
+        # Delivered work: do not purge, do not re-dispatch. The row's commits
+        # are real and somebody must look at them.
+        steps = ["SKIPPED entirely: row carries commits (delivered work)"]
+        reason = "protection_violation; " + "; ".join(steps)
+        try:
+            _http(
+                "PATCH",
+                f"/v1/jobs/{jid}",
+                {"status": job.get("status") or "failed", "result": {**result, "doctor_reason": reason, "needs_operator": True}},
+            )
+        except Exception:
+            log.warning("protection violation: could not annotate row %s", jid[:12])
+        broadcast_doctor_message(
+            "doctor.protection_violation",
+            {
+                "host": AGENT_HOST,
+                "job_id": jid,
+                "kind": job.get("kind"),
+                "offending_host": protection_offending_host(job) or None,
+                "offending_path": protection_offending_path(job) or None,
+                "steps": steps,
+                "needs_operator": True,
+            },
+        )
+        return reason
+
+    steps: list[str] = []
+    needs_operator = False
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        steps.append("purge REFUSED: safety state unavailable")
+        needs_operator = True
+    else:
+        path, body = doctor_gates.purge_request("dlq_remove", [jid], "doctor-protection-violation")
+        code, resp = _http("POST", path, body)
+        outcome = doctor_gates.purge_result("dlq_remove", resp, [jid]) if code == 200 else None
+        if outcome is not None and outcome["removed"]:
+            steps.append(f"purged {jid[:12]} via admin purge")
+        else:
+            cancel = _cancel_failed_job(jid)
+            steps.append(f"purge refused code={code}; {cancel}")
+
+    offending_host = protection_offending_host(job)
+    offending_path = protection_offending_path(job)
+    note = (
+        f"protection_violation on original {jid[:12]}"
+        + (f" (checkout {offending_path} on {offending_host})" if offending_host else " (offending host unparseable)")
+    )
+
+    re_dispatched = False
+    if offending_host:
+        # The durable marker counts how many times this original job id has
+        # ALREADY been re-dispatched. Re-dispatch while that count is strictly
+        # below the cap, then record this attempt — so a cap of 2 permits up to
+        # two re-dispatches (one per failed attempt) across restarts.
+        used = 1 if protection_violation_retried(jid) else 0
+        if used >= VIOLATION_MAX_RETRIES:
+            steps.append(f"re-dispatch SKIPPED: {used}/{VIOLATION_MAX_RETRIES} retries already used")
+            needs_operator = True
+        else:
+            spec = _build_retry_spec(job, offending_host, note)
+            code, resp = submit_job_spec(spec)
+            new_id = (resp or {}).get("id") if isinstance(resp, dict) else None
+            if code in (200, 201) and new_id:
+                protection_violation_record_retry(jid)
+                re_dispatched = True
+                steps.append(f"re-dispatched {new_id[:12]} excluding host={offending_host} (retry {used + 1}/{VIOLATION_MAX_RETRIES})")
+            else:
+                steps.append(f"re-dispatch FAILED code={code} resp={str(resp)[:160]}")
+                needs_operator = True
+    else:
+        steps.append("re-dispatch SKIPPED: offending host unparseable")
+        needs_operator = True
+
+    reason = "protection_violation; " + "; ".join(steps)
+    try:
+        _http(
+            "PATCH",
+            f"/v1/jobs/{jid}",
+            {"status": job.get("status") or "failed", "result": {**result, "doctor_reason": reason, "needs_operator": needs_operator}},
+        )
+    except Exception:
+        log.warning("protection violation: could not annotate row %s", jid[:12])
+    payload = {
+        "host": AGENT_HOST,
+        "job_id": jid,
+        "kind": job.get("kind"),
+        "offending_host": offending_host or None,
+        "offending_path": offending_path or None,
+        "steps": steps,
+        "needs_operator": needs_operator,
+    }
+    if re_dispatched:
+        payload["re_dispatched"] = True
+    broadcast_doctor_message("doctor.protection_violation", payload)
+    return reason
+
+
+# ───────────────────────── needs-review follow-up ───────────────────────────
+# (operator 2026-10-27) A needs-review row with no review performed (no
+# result.review_evidence and no child review:* job) must get a review
+# immediately. The sweep submits ONE read-only codex review job per such row,
+# oldest first, capped by REVIEW_FOLLOWUP_MAX_PER_SWEEP. A row with a review
+# verdict is left for a human/orchestrator. A needs-review row is NEVER
+# auto-purged: if it carries commits, those are delivered work.
+
+def review_followup_row_has_verdict(job: dict) -> bool:
+    """True when a review has already been performed on this row: a non-empty
+    result.review_evidence, or a recorded auto_review_job_id (the sweep's own
+    prior submission, which by definition performed a review)."""
+    res = _job_result_dict(job)
+    if res.get("review_evidence"):
+        return True
+    if str(res.get("auto_review_job_id") or "").strip():
+        return True
+    return False
+
+
+def _needs_review_child_review_jobs(job: dict) -> list[dict]:
+    """Child jobs of this row whose kind starts with review: — a review that was
+    already dispatched for it."""
+    jid = str(job.get("id") or "")
+    code, resp = _http("GET", f"/v1/jobs?parent_job_id={jid}&limit=50", timeout=10.0)
+    if code != 200 or not resp:
+        return []
+    return [j for j in (resp.get("jobs") or []) if str(j.get("kind") or "").startswith(REVIEW_FOLLOWUP_KIND_PREFIX)]
+
+
+def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
+    """Submit ONE review job for a needs-review row. Returns (job_id, spec, note).
+
+    kind: review:<base_kind>-codex-<date>; repo/head_branch/base_branch copied
+    from the row (head sha from result.head_sha when present); eligible_kinds
+    ["codex"], preferred_models ["gpt-6-luna"], max_cost_tier "A"; description
+    says read-only, review branch vs base, return a structured verdict JSON, and
+    names the reviewed job id. No commits expected (read-only)."""
+    jid = str(job.get("id") or "")
+    res = _job_result_dict(job)
+    kind = str(job.get("kind") or "").strip()
+    if kind.startswith("review:"):
+        base_kind = kind[len("review:") :]
+    elif kind.startswith("triage:"):
+        base_kind = kind[len("triage:") :]
+    else:
+        base_kind = _base_kind(kind)
+    date = time.strftime("%Y%m%d", time.gmtime())
+    review_kind = f"review:{base_kind}-codex-{date}" if base_kind else f"review:codex-{date}"
+    head = job.get("head_branch") or res.get("head_sha") or ""
+    base = job.get("base_branch") or ""
+    desc = (
+        "READ-ONLY review. Do not modify any file, branch, or commit. "
+        f"Review the branch {head or '(see job)'} against base {base or '(default)'} "
+        "and return a structured verdict JSON with a 'verdict' field "
+        "(approve | request-changes | blocked) and a 'reason' field. "
+        f"Reviewed job id: {jid}. No commits expected."
+    ).strip()
+    spec = {
+        "kind": review_kind,
+        "description": desc,
+        "repo": job.get("repo"),
+        "head_branch": head or None,
+        "base_branch": base or None,
+        "eligible_kinds": list(REVIEW_FOLLOWUP_ELIGIBLE_KINDS),
+        "preferred_models": list(REVIEW_FOLLOWUP_PREFERRED_MODELS),
+        "max_cost_tier": REVIEW_FOLLOWUP_MAX_COST_TIER,
+        "priority": job.get("priority") or 0,
+        "project": job.get("project"),
+        "parent_job_id": jid,
+    }
+    code, resp = submit_job_spec(spec)
+    new_id = (resp or {}).get("id") if isinstance(resp, dict) else None
+    if code in (200, 201) and new_id:
+        return new_id, spec, f"submitted {review_kind}"
+    return "", spec, f"submit FAILED code={code} resp={str(resp)[:160]}"
+
+
+def _record_auto_review(job: dict, review_job_id: str) -> None:
+    """Record the submission on the original row (result.auto_review_job_id +
+    doctor_reason) AND keep the durable marker, so a second sweep (or a
+    restarted doctor) does not submit a second review for the same row."""
+    jid = str(job.get("id") or "")
+    STATE.mark(f"{KEY_REVIEW}:submitted:{jid}", ttl=REVIEW_FOLLOWUP_TTL_SEC)
+    try:
+        res = _job_result_dict(job)
+        _http(
+            "PATCH",
+            f"/v1/jobs/{jid}",
+            {"status": "needs-review", "result": {**res, "auto_review_job_id": review_job_id, "doctor_reason": f"auto review submitted {review_job_id[:12]}"}},
+        )
+    except Exception:
+        log.warning("review followup: could not annotate row %s", jid[:12])
+
+
+def review_followup_submitted(job_id: str) -> bool:
+    """Durable marker: the sweep already submitted a review for this row."""
+    return STATE.seen(f"{KEY_REVIEW}:submitted:{job_id}", ttl=REVIEW_FOLLOWUP_TTL_SEC)
+
+
 def execute_sop_decision(job: dict) -> dict:
     """Interpret the versioned decision envelope; never ask a model to execute prose.
 
@@ -2489,20 +2902,6 @@ def fetch_dead_letter_jobs(limit: int = 200) -> list[dict]:
     return jobs
 
 
-def _job_result_dict(job: dict) -> dict:
-    """Best-effort parse of a job's result field (may be dict or JSON string)."""
-    r = job.get("result")
-    if isinstance(r, dict):
-        return r
-    if isinstance(r, str) and r.strip():
-        try:
-            d = json.loads(r)
-            return d if isinstance(d, dict) else {"raw": r}
-        except Exception:
-            return {"raw": r}
-    return {}
-
-
 def classify_dead_letter(job: dict) -> tuple[str, str]:
     """Decide remediation for one dead-letter job.
 
@@ -2604,6 +3003,15 @@ def handle_dead_letter_queue() -> dict:
         if dlq_decided(jid, ttl=DLQ_SEEN_TTL):
             summary["skipped_seen"] += 1
             continue
+        # protection_violation is a deterministic path: handled here, not by the
+        # classifier. It is not recorded as a DLQ decision: it IS handled, and the
+        # durable protection markers own the dedupe. (A protection-violation
+        # worker never lands commits, so the row is safe to purge and the work
+        # is re-dispatched once on the remaining hosts — no LLM decision.)
+        if is_protection_violation(job):
+            handle_protection_violation(job)
+            summary["protection_violation"] = summary.get("protection_violation", 0) + 1
+            continue
         if dlq_protected(job):
             # Its owner's job: REPORTED, never remediated — which is why it is not
             # recorded as decided. A protected job produces no decision, so
@@ -2682,6 +3090,65 @@ def report_needs_review_sweep() -> dict:
     return {"scanned": len(rows), "rows": rows}
 
 
+def run_needs_review_sweep() -> dict:
+    """One combined needs-review sweep: the report-only classification plus the
+    review follow-up.
+
+    The report half is unchanged (classify old rows, never cancel/delete/retag).
+    The follow-up half submits ONE read-only codex review job for every row that
+    has no review performed yet (no result.review_evidence and no child
+    review:* job), oldest first, capped by REVIEW_FOLLOWUP_MAX_PER_SWEEP. A row
+    that already has a verdict is left for a human/orchestrator, and a
+    needs-review row is never auto-purged — a row with commits carries
+    delivered work, and a row without commits is still reviewable."""
+    report = report_needs_review_sweep()
+    followup = run_review_followup_sweep()
+    report["review_followup"] = followup
+    return report
+
+
+def run_review_followup_sweep() -> dict:
+    """Submit review jobs for needs-review rows that have no review performed."""
+    rows = fetch_needs_review_jobs(limit=200)
+    # Oldest first: the per-sweep cap must drain the longest-stuck rows first.
+    rows.sort(key=lambda j: (j.get("ended_at") or j.get("started_at") or j.get("last_update_at") or 0))
+    summary = {"scanned": len(rows), "submitted": 0, "skipped_verdict": 0, "skipped_marker": 0, "deferred": 0}
+    for job in rows:
+        jid = str(job.get("id") or "")
+        if not jid:
+            continue
+        if review_followup_row_has_verdict(job):
+            summary["skipped_verdict"] += 1
+            continue
+        if _needs_review_child_review_jobs(job):
+            summary["skipped_verdict"] += 1
+            continue
+        if review_followup_submitted(jid):
+            summary["skipped_marker"] += 1
+            continue
+        if summary["submitted"] >= REVIEW_FOLLOWUP_MAX_PER_SWEEP:
+            summary["deferred"] += 1
+            continue
+        review_job_id, spec, note = _submit_review_followup(job)
+        if review_job_id:
+            _record_auto_review(job, review_job_id)
+            summary["submitted"] += 1
+            log.info("needs-review followup %s -> %s (%s)", jid[:12], review_job_id[:12], note)
+            broadcast_doctor_message(
+                "doctor.needs_review",
+                {
+                    "host": AGENT_HOST,
+                    "job_id": jid,
+                    "auto_review_job_id": review_job_id,
+                    "review_kind": spec.get("kind"),
+                    "note": note,
+                },
+            )
+        else:
+            log.warning("needs-review followup %s: %s", jid[:12], note)
+    return summary
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -2717,7 +3184,7 @@ def main():
             if now - last_needs_review >= NEEDS_REVIEW_SCAN_INTERVAL:
                 last_needs_review = now
                 try:
-                    log.info("needs-review sweep: %s", report_needs_review_sweep())
+                    log.info("needs-review sweep: %s", run_needs_review_sweep())
                 except Exception as e:
                     log.warning("needs-review sweep error: %s", e)
 
