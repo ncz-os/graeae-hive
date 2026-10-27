@@ -205,10 +205,16 @@ def test_dlq_transient_failure_with_no_budget_becomes_needs_review():
 def test_dlq_remediate_never_requeues_a_job_with_no_budget(monkeypatch):
     calls = []
     monkeypatch.setattr(doctor, "DLQ_APPLY", True)
-    monkeypatch.setattr(doctor, "_http", lambda *a, **k: calls.append(a) or (200, {"ok": ["d0"]}))
+    def http(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "GET":
+            return 200, {"jobs": [{"id": "existing-review", "kind": "review:budget"}]}
+        return 200, {"ok": ["d0"]}
+
+    monkeypatch.setattr(doctor, "_http", http)
     out = doctor.remediate_dead_letter(_dl("d0", max_retries=0, retry_count=0), "resubmit", "forced")
     assert [c for c in calls if c[1] == "/v1/admin/jobs/requeue"] == []
-    assert [c[1] for c in calls] == ["/v1/admin/jobs/reclassify"]
+    assert [c[1] for c in calls if c[0] != "GET"] == ["/v1/admin/jobs/reclassify"]
     assert calls[0][2]["status"] == "needs-review"
     assert "needs-review" in out
 

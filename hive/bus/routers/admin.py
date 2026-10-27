@@ -22,6 +22,7 @@ from hive.bus.deps import (
     release_dependencies,
     require_mutation_actor,
 )
+from hive.bus.domain.review_dispatch import dispatch_needs_review
 from hive.bus.schemas import (
     JobPurgeRequest,
     PurgeRequest,
@@ -94,7 +95,7 @@ async def admin_requeue_jobs(req: RequeueRequest, actor: str = Depends(require_m
     ``override_max_retries: true`` with a non-empty ``override_reason``; an
     override is logged and emitted as ``job.requeue_override``."""
     actor = _actor_name(actor)
-    results = {"ok": [], "not_found": [], "skipped_done": [], "skipped_retry_budget": []}
+    results = {"ok": [], "not_found": [], "skipped_done": [], "skipped_retry_budget": [], "skipped_conflict": []}
     overrides: list[dict] = []
     # Storage via the HiveMindRepository ABC on one transaction (EPIMONE shape).
     async with hive_repo().connection() as tx:
@@ -134,7 +135,7 @@ async def admin_requeue_jobs(req: RequeueRequest, actor: str = Depends(require_m
                         "override_reason": req.override_reason,
                     }
                 )
-            await hive_repo().patch_job_status(
+            changed = await hive_repo().patch_job_status(
                 tx,
                 job_id,
                 sets={
@@ -156,10 +157,14 @@ async def admin_requeue_jobs(req: RequeueRequest, actor: str = Depends(require_m
                     "retry_count": 0,
                     "retry_backoff_until": None,
                 },
+                expected_status=row[0],
             )
+            if changed != 1:
+                results["skipped_conflict"].append(job_id)
+                continue
             results["ok"].append(job_id)
         await tx.commit()
-    await _emit_overrides(overrides, actor, req.reason)
+    await _emit_overrides([item for item in overrides if item["id"] in results["ok"]], actor, req.reason)
     return results
 
 
@@ -245,17 +250,13 @@ async def purge_jobs(req: JobPurgeRequest):
         async with db.execute(sql, tuple(args)) as cur:
             matched = [r[0] for r in await cur.fetchall()]
         if matched:
-            deleted = await _cascade_delete_jobs(
-                db, matched, allow_active=req.include_active
-            )
+            deleted = await _cascade_delete_jobs(db, matched, allow_active=req.include_active)
             for jid in deleted:
                 await release_dependencies(db, jid, DEP_PURGED_STATUS, emit_event=emit_event)
             await db.commit()
     if deleted:
         async with connect_db() as event_db:
-            await emit_event(
-                event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason}
-            )
+            await emit_event(event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason})
     return {"deleted": len(deleted), "matched_ids": deleted}
 
 
@@ -267,7 +268,7 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
     if req.status not in RECLASSIFY_ALLOWED_TARGETS:
         raise HTTPException(422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}")
     actor = _actor_name(actor)
-    results: dict = {"ok": [], "not_found": [], "skipped_done": [], "skipped_retry_budget": []}
+    results: dict = {"ok": [], "not_found": [], "skipped_done": [], "skipped_retry_budget": [], "skipped_conflict": []}
     overrides: list[dict] = []
     # Storage via the HiveMindRepository ABC on one transaction (EPIMONE shape).
     async with hive_repo().connection() as tx:
@@ -319,7 +320,12 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
                 }
             else:
                 sets = {"status": req.status, "claimed_by": None, "claimed_at": None}
-            await hive_repo().patch_job_status(tx, job_id, sets=sets)
+            changed = await hive_repo().patch_job_status(tx, job_id, sets=sets, expected_status=row[0])
+            if changed != 1:
+                results["skipped_conflict"].append(job_id)
+                continue
+            if req.status == "needs-review":
+                await dispatch_needs_review(tx, hive_repo(), job_id, now=time.time(), emit_event=emit_event)
             results["ok"].append(job_id)
         await tx.commit()
     async with hive_repo().connection() as event_tx:
@@ -330,5 +336,5 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
                 {"id": job_id, "new_status": req.status, "reason": req.reason},
             )
         await event_tx.commit()
-    await _emit_overrides(overrides, actor, req.reason)
+    await _emit_overrides([item for item in overrides if item["id"] in results["ok"]], actor, req.reason)
     return results

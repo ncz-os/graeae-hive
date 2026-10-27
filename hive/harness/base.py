@@ -49,6 +49,7 @@ class HarnessRegistration:
     cost_tier: str = "metered"
     auth_scheme: str = "bearer"
     metadata: dict[str, Any] = field(default_factory=dict)
+    host: str = ""
 
 
 @runtime_checkable

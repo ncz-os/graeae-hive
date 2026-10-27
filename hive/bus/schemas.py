@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class AgentRegister(BaseModel):
@@ -75,7 +75,15 @@ class JobCreate(BaseModel):
     # 'riskyeats'/'investorclaw' are PROJECTS, not capabilities. Workers don't gain/lose
     # the ability to do work because of a project label; the label is for filter+routing.
     project: str | None = None
-    max_retries: int = 2  # auto-resubmit after worker reports failed (up to N times)
+    max_retries: int = Field(2, ge=0, le=100, strict=True)
+    zero_retry_reason: str | None = Field(None, max_length=2000)
+
+    @model_validator(mode="after")
+    def require_zero_retry_reason(self):
+        if self.max_retries == 0 and not (self.zero_retry_reason or "").strip():
+            raise ValueError("max_retries=0 requires a nonblank zero_retry_reason")
+        return self
+
     # COST DISCIPLINE (per CLAUDE.md llm-usage-policy):
     max_cost_tier: str = "B"  # adaptive tier cap: A=local/NGC first (free), B=Groq/xAI overflow (paid), C=reserve. Default B=Tier A preferred, Tier B fallback when Tier A overloaded.
     preferred_providers: list[str] | None = None  # ranked preference (first match wins among tier-eligible)

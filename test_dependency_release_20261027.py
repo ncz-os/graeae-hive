@@ -224,7 +224,7 @@ class TerminalTransitionReleaseTests(_RepoCase):
         await self._mk(repo, "dependent", status="queued", deps=["dep"])
         with mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo):
             await hive_jobs_router.update_job(
-                "dep", JobUpdate(status="failed", claimed_by="urn:agent:zeroclaw:host:deprelease")
+                "dep", JobUpdate(status="failed", claimed_by="urn:agent:zeroclaw:host:deprelease", result={"retryable": True})
             )
         # The dep is retrying, not dead: its dependent stays blocked on it.
         self.assertEqual((await self._row(repo, "dep"))[0], "queued")
@@ -337,9 +337,9 @@ class ClaimTimeDefensiveDropTests(_RepoCase):
                     provider="local",
                     cost_tier="B",
                 )
-        # The ghost id is dropped in the claim transaction, the live dep
-        # remains -> still queued/blocked.
-        self.assertEqual(await self._row(repo, "dependent"), ("queued", '["live-dep"]'))
+        # No explicit commit: the failed claim and its tentative ghost drop
+        # roll back together. A later successful claim can persist the repair.
+        self.assertEqual(await self._row(repo, "dependent"), ("queued", '["ghost", "live-dep"]'))
 
     async def test_drop_missing_dependencies_skips_non_claimable_rows(self):
         """The drop never rewrites a claimed/running row's depends_on."""

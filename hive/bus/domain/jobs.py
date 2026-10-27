@@ -308,14 +308,11 @@ def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
 
 
 def valid_completion_proof(proof: dict) -> bool:
-    """Fail closed on missing Git evidence, including successful subprocesses.
+    """Require commit evidence; tolerate only proven untracked cleanup debt.
 
-    NOTE (operator directive 2026-10-15): the `remote_verified` / `remote_sha`
-    checks were removed together with the Spark remote-agent path (see
-    docs/refactor-proposal-harness-agnostic-20261015.md § "Operator directive").
-    Local Git evidence is now the sole completion gate — completion is proven
-    at the bus against local repo state, not by a remote-agent attestation.
-    The gate still fails closed: every listed field must be present and exact.
+    Clean worktrees retain the local proof contract. A dirty workspace needs
+    explicit tracked-clean evidence and a verified push of this exact HEAD;
+    untracked leftovers are retained in the result for later cleanup.
     """
     sha = proof.get("head_sha")
     commits = proof.get("commits")
@@ -329,7 +326,18 @@ def valid_completion_proof(proof: dict) -> bool:
         and isinstance(files, list)
         and files
         and all(isinstance(f, str) and f for f in files)
-        and proof.get("worktree_clean") is True
+        and (
+            proof.get("worktree_clean") is True
+            or (
+                proof.get("tracked_worktree_clean") is True
+                and isinstance(proof.get("untracked_files"), list)
+                and proof["untracked_files"]
+                and all(isinstance(f, str) and f for f in proof["untracked_files"])
+                and proof.get("pushed") is True
+                and proof.get("remote_verified") is True
+                and proof.get("remote_sha") == sha
+            )
+        )
     )
 
 

@@ -71,8 +71,14 @@ class _BusCase(unittest.IsolatedAsyncioTestCase):
     """
 
     async def asyncSetUp(self):
+        from hive.bus import deps
         self._td = tempfile.TemporaryDirectory()
-        os.environ["AGENT_BUS_DB"] = os.path.join(self._td.name, "submitter.db")
+        env = mock.patch.dict(os.environ, {"AGENT_BUS_DB": os.path.join(self._td.name, "submitter.db")})
+        env.start()
+        self.addCleanup(env.stop)
+        repository = mock.patch.object(deps, "_HIVE_REPO", None)
+        repository.start()
+        self.addCleanup(repository.stop)
         await _default_hive_repo().init()
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=agent_bus.app),
@@ -84,9 +90,9 @@ class _BusCase(unittest.IsolatedAsyncioTestCase):
                 "ok": True,
                 "reason": None,
                 "detail": None,
-                "state": "head_present",
+                "state": "head_creatable_from_base",
                 "url": None,
-                "branch_created_from": None,
+                "branch_created_from": "main",
                 "warnings": [],
             },
         )
@@ -130,6 +136,7 @@ class _BusCase(unittest.IsolatedAsyncioTestCase):
             "site": "internal",
             "repo": "graeae-hive",
             "head_branch": "fix/x",
+            "base_branch": "main",
             "priority": 5,
             **extra,
         }

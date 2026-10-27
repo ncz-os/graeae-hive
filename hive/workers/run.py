@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+import socket
 import time
 from collections.abc import Callable
 from typing import Any
@@ -48,7 +49,7 @@ class HarnessWorker:
     ) -> None:
         self.adapter = adapter
         self.urn = urn
-        self.host = host
+        self.host = host or socket.gethostname().split(".")[0]
         self.capabilities = capabilities or []
         self.version = version
         # What this worker is touching — files/languages/architectures/repo — so
@@ -73,6 +74,7 @@ class HarnessWorker:
             harness_version=self.version,
             capabilities=self.capabilities,
             cost_tier=self.adapter.cost_tier,
+            host=self.host,
         )
         self.urn = self.adapter.register(reg)
         self._last_heartbeat = time.time()
@@ -178,14 +180,25 @@ class HarnessWorker:
         logger.info("claimed %s (%s)", job_id, job.get("kind"))
         try:
             result = self.adapter.execute(self.urn, job)
-            self.adapter.complete(self.urn, job_id, result)
-            logger.info("completed %s", job_id)
-        except Exception as e:  # noqa: BLE001 - report failure, don't crash the loop
-            logger.exception("job %s failed", job_id)
-            try:
-                self.adapter.fail(self.urn, job_id, str(e))
-            except Exception as e2:  # noqa: BLE001
-                logger.error("fail-report for %s also failed: %s", job_id, e2)
+        except Exception as e:  # noqa: BLE001 - execution and reporting are separate
+            logger.exception("job %s execution raised", job_id)
+            result = {"error": str(e), "exception_type": type(e).__name__}
+        failed = bool(result.get("error")) or result.get("exit_code", 0) != 0
+        try:
+            if failed:
+                # Keep stderr/exit code and provider evidence intact for the
+                # bus's infrastructure retry policy; prose alone loses cause.
+                if hasattr(self.adapter, "fail_result"):
+                    self.adapter.fail_result(self.urn, job_id, result)
+                else:
+                    self.adapter.fail(self.urn, job_id, result.get("error") or str(result))
+            else:
+                self.adapter.complete(self.urn, job_id, result)
+                logger.info("completed %s", job_id)
+        except Exception as e:  # noqa: BLE001
+            # A lost completion response is not a failed execution. Sending a
+            # subsequent failure can overwrite a successfully committed done.
+            logger.error("result-report for %s failed: %s", job_id, e)
         return True
 
     def run_forever(self, *, max_iterations: int | None = None) -> None:

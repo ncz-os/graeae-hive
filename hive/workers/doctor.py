@@ -329,16 +329,17 @@ PROTECTION_ERROR_RE = re.compile(r"driver modified another session's checkout:\s
 # A needs-review row with no review performed (no result.review_evidence and no
 # child review:* job) used to sit there forever — the triage that produced it
 # had escalated into it with an unusable decision. The sweep now submits ONE
-# read-only codex review job per such row, oldest first, capped per sweep so a
+# read-only review job per such row, oldest first, capped per sweep so a
 # big backlog cannot flood the queue. A row that HAS a review verdict is left
 # for a human/orchestrator, and a needs-review row is never auto-purged:
 # if it carries commits, those are delivered work.
 REVIEW_FOLLOWUP_MAX_PER_SWEEP = int(os.environ.get("REVIEW_FOLLOWUP_MAX_PER_SWEEP", "3"))
 REVIEW_FOLLOWUP_TTL_SEC = 30 * 86400.0
 REVIEW_FOLLOWUP_KIND_PREFIX = "review:"
-REVIEW_FOLLOWUP_ELIGIBLE_KINDS = ["codex"]
-REVIEW_FOLLOWUP_PREFERRED_MODELS = ["gpt-6-luna"]
-REVIEW_FOLLOWUP_MAX_COST_TIER = "A"
+REVIEW_FOLLOWUP_ELIGIBLE_KINDS = []  # ANY reviewer family; scheduler owns capability matching
+REVIEW_FOLLOWUP_PREFERRED_MODELS = []
+REVIEW_FOLLOWUP_MAX_COST_TIER = "C"
+REVIEW_FOLLOWUP_PRIORITY = 100
 
 
 def _max_same_signature_resubmits() -> int:
@@ -831,7 +832,21 @@ def patch_job(job_id: str, status: str, result: dict | None = None):
     body: dict = {"status": status, "claimed_by": _urn}
     if result is not None:
         body["result"] = result
-    _http("PATCH", f"/v1/jobs/{job_id}", body)
+    code, response = _http("PATCH", f"/v1/jobs/{job_id}", body)
+    if status == "needs-review" and code in (200, 201, 204):
+        # Fetch the authoritative row: result alone lacks repo/branch context.
+        try:
+            rows = fetch_needs_review_jobs(limit=1000)
+            row = next((r for r in rows if r.get("id") == job_id), None)
+            if row is None:
+                raise RuntimeError("review row absent from reconciliation listing")
+            ensure_review_followup(row)
+        except Exception as exc:
+            log.error("immediate review dispatch failed job=%s: %s", job_id, exc)
+            broadcast_doctor_message(
+                "doctor.sweep_error", {"sweep": "immediate-review", "job_id": job_id, "error": str(exc)}
+            )
+    return code, response
 
 
 # ───────────────────────── Failure context (HTTP API) ─────────────────────────
@@ -1992,8 +2007,9 @@ def scan_for_failure_clusters() -> list[dict]:
     within CLUSTER_WINDOW_SEC, that haven't been auto-triaged within AUTO_TRIAGE_COOLDOWN.
     Returns list of {base_kind, count, sample_job_id}."""
     code, resp = _http("GET", "/v1/jobs?status=failed&limit=500", timeout=20.0)
-    if code != 200 or not resp:
-        return []
+    if code != 200 or not isinstance(resp, dict) or not isinstance(resp.get("jobs"), list):
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "failed-clusters", "http_status": code})
+        raise RuntimeError("failed-clusters incomplete listing http=" + str(code))
     cutoff = time.time() - CLUSTER_WINDOW_SEC
     counts: dict[str, list[dict]] = {}
     for j in resp.get("jobs", []) or []:
@@ -2117,14 +2133,14 @@ def _fetch_retention_rows() -> list[dict] | None:
     jobs: list[dict] = []
     for status in (*retention.DEAD_STATUSES, "done"):
         code, resp = _http("GET", f"/v1/jobs?status={status}&limit=1000", timeout=20.0)
-        if code != 200 or not resp:
+        if code != 200 or not isinstance(resp, dict) or not isinstance(resp.get("jobs"), list):
             log.warning("retention sweep: listing %s failed code=%s — skipping sweep", status, code)
             return None
         jobs.extend(resp.get("jobs", []) or [])
     return jobs
 
 
-def run_retention_sweep() -> dict | None:
+def run_retention_sweep() -> dict:
     """One terminal-job retention sweep: fetch → plan → re-read → snapshot →
     purge → verify → announce.
 
@@ -2136,12 +2152,13 @@ def run_retention_sweep() -> dict | None:
     Returns the report dict — including a report when nothing was planned or
     purged, so the invariant's state is observable on EVERY sweep (the recount
     is read-only, so dry-run and no-op sweeps verify the invariant against the
-    live bus too) — or None only when the initial listing was incomplete and
-    the queue state could not be assessed at all. ``RETENTION_DRY_RUN=1``
+    live bus too). An error report with scanned=None marks an incomplete
+    listing whose queue state could not be assessed. ``RETENTION_DRY_RUN=1``
     plans and reports without calling the purge endpoint."""
     rows = _fetch_retention_rows()
     if rows is None:
-        return None
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "retention", "error": "incomplete listing"})
+        return {"error": "incomplete listing", "scanned": None, "purged": 0}
     plan = retention.plan_retention_sweep(
         rows,
         dead_ttl=RETENTION_DEAD_TTL_SEC,
@@ -2530,21 +2547,20 @@ def handle_protection_violation(job: dict) -> str:
 # ───────────────────────── needs-review follow-up ───────────────────────────
 # (operator 2026-10-27) A needs-review row with no review performed (no
 # result.review_evidence and no child review:* job) must get a review
-# immediately. The sweep submits ONE read-only codex review job per such row,
+# immediately. The sweep submits ONE read-only review job per such row,
 # oldest first, capped by REVIEW_FOLLOWUP_MAX_PER_SWEEP. A row with a review
 # verdict is left for a human/orchestrator. A needs-review row is NEVER
 # auto-purged: if it carries commits, those are delivered work.
 
 def review_followup_row_has_verdict(job: dict) -> bool:
-    """True when a review has already been performed on this row: a non-empty
-    result.review_evidence, or a recorded auto_review_job_id (the sweep's own
-    prior submission, which by definition performed a review)."""
+    """True when a verdict exists or a review submission is already recorded.
+
+    A submission marker prevents duplicate work; it does not prove completion.
+    """
     res = _job_result_dict(job)
-    if res.get("review_evidence"):
+    if res.get("review_evidence") or res.get("verdict"):
         return True
-    if str(res.get("auto_review_job_id") or "").strip():
-        return True
-    return False
+    return bool(str(res.get("auto_review_job_id") or "").strip())
 
 
 def _needs_review_child_review_jobs(job: dict) -> list[dict]:
@@ -2552,19 +2568,17 @@ def _needs_review_child_review_jobs(job: dict) -> list[dict]:
     already dispatched for it."""
     jid = str(job.get("id") or "")
     code, resp = _http("GET", f"/v1/jobs?parent_job_id={jid}&limit=50", timeout=10.0)
-    if code != 200 or not resp:
-        return []
-    return [j for j in (resp.get("jobs") or []) if str(j.get("kind") or "").startswith(REVIEW_FOLLOWUP_KIND_PREFIX)]
+    if code != 200 or not isinstance(resp, dict) or not isinstance(resp.get("jobs"), list):
+        raise RuntimeError(f"review child lookup failed job={jid} http={code}")
+    return [j for j in resp["jobs"] if str(j.get("kind") or "").startswith(REVIEW_FOLLOWUP_KIND_PREFIX)]
 
 
 def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
     """Submit ONE review job for a needs-review row. Returns (job_id, spec, note).
 
-    kind: review:<base_kind>-codex-<date>; repo/head_branch/base_branch copied
-    from the row (head sha from result.head_sha when present); eligible_kinds
-    ["codex"], preferred_models ["gpt-6-luna"], max_cost_tier "A"; description
-    says read-only, review branch vs base, return a structured verdict JSON, and
-    names the reviewed job id. No commits expected (read-only)."""
+    Any reviewer family may claim this high-priority read-only job. Preserve
+    the branch and exact delivered SHA separately; stable idempotency closes
+    the submit/marker crash window. No commits expected (read-only)."""
     jid = str(job.get("id") or "")
     res = _job_result_dict(job)
     kind = str(job.get("kind") or "").strip()
@@ -2575,14 +2589,15 @@ def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
     else:
         base_kind = _base_kind(kind)
     date = time.strftime("%Y%m%d", time.gmtime())
-    review_kind = f"review:{base_kind}-codex-{date}" if base_kind else f"review:codex-{date}"
-    head = job.get("head_branch") or res.get("head_sha") or ""
+    review_kind = f"review:{base_kind}-{date}" if base_kind else f"review:{date}"
+    head = job.get("head_branch") or ""
+    head_sha = res.get("head_sha") or job.get("head_sha") or ""
     base = job.get("base_branch") or ""
     desc = (
         "READ-ONLY review. Do not modify any file, branch, or commit. "
-        f"Review the branch {head or '(see job)'} against base {base or '(default)'} "
+        f"Review the branch {head or '(see job)'} at HEAD {head_sha or '(resolve and report)'} against base {base or '(default)'} "
         "and return a structured verdict JSON with a 'verdict' field "
-        "(approve | request-changes | blocked) and a 'reason' field. "
+        "(approve | request-changes | blocked), a 'head_sha' field containing the exact reviewed commit, and a 'reason' field. "
         f"Reviewed job id: {jid}. No commits expected."
     ).strip()
     spec = {
@@ -2594,9 +2609,10 @@ def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
         "eligible_kinds": list(REVIEW_FOLLOWUP_ELIGIBLE_KINDS),
         "preferred_models": list(REVIEW_FOLLOWUP_PREFERRED_MODELS),
         "max_cost_tier": REVIEW_FOLLOWUP_MAX_COST_TIER,
-        "priority": job.get("priority") or 0,
+        "priority": max(REVIEW_FOLLOWUP_PRIORITY, job.get("priority") or 0),
         "project": job.get("project"),
         "parent_job_id": jid,
+        "idempotency_key": f"needs-review-followup:{jid}",
     }
     code, resp = submit_job_spec(spec)
     new_id = (resp or {}).get("id") if isinstance(resp, dict) else None
@@ -2613,13 +2629,24 @@ def _record_auto_review(job: dict, review_job_id: str) -> None:
     STATE.mark(f"{KEY_REVIEW}:submitted:{jid}", ttl=REVIEW_FOLLOWUP_TTL_SEC)
     try:
         res = _job_result_dict(job)
-        _http(
-            "PATCH",
-            f"/v1/jobs/{jid}",
-            {"status": "needs-review", "result": {**res, "auto_review_job_id": review_job_id, "doctor_reason": f"auto review submitted {review_job_id[:12]}"}},
-        )
-    except Exception:
-        log.warning("review followup: could not annotate row %s", jid[:12])
+        body = {
+            "status": "needs-review",
+            "result": {
+                **res,
+                "auto_review_job_id": review_job_id,
+                "doctor_reason": f"auto review submitted {review_job_id[:12]}",
+            },
+        }
+        if job.get("claimed_by"):
+            body["claimed_by"] = job["claimed_by"]
+        code, _ = _http("PATCH", f"/v1/jobs/{jid}", body)
+        if code not in (200, 201, 204):
+            raise RuntimeError(f"annotation failed http={code}")
+        if not STATE.persist_ok:
+            raise RuntimeError("durable review marker persistence failed")
+    except Exception as exc:
+        log.warning("review followup: could not annotate row %s: %s", jid[:12], exc)
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "review-annotation", "job_id": jid, "error": str(exc)})
 
 
 def review_followup_submitted(job_id: str) -> bool:
@@ -3289,9 +3316,9 @@ def _handle_decline_job(job: dict, base_kind: str) -> dict | None:
 def fetch_dead_letter_jobs(limit: int = 200) -> list[dict]:
     """Jobs in the terminal dead-letter queue, newest first."""
     code, resp = _http("GET", f"/v1/jobs?status=dead-letter&limit={int(limit)}", timeout=15.0)
-    if code != 200 or not resp:
-        log.warning("fetch_dead_letter http=%s", code)
-        return []
+    if code != 200 or not isinstance(resp, dict) or not isinstance(resp.get("jobs"), list):
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "fetch_dead_letter", "http_status": code})
+        raise RuntimeError("fetch_dead_letter incomplete listing http=" + str(code))
     jobs = resp.get("jobs", []) or []
     jobs.sort(key=lambda j: j.get("ended_at") or 0, reverse=True)
     return jobs
@@ -3366,6 +3393,11 @@ def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
         {"job_ids": [jid], "status": "needs-review", "reason": f"doctor-dlq-needs-review:{reason}"},
     )
     if code in (200, 201, 204):
+        try:
+            ensure_review_followup({**job, "status": "needs-review"})
+        except Exception as exc:
+            log.error("immediate DLQ review dispatch failed job=%s: %s", jid, exc)
+            broadcast_doctor_message("doctor.sweep_error", {"sweep": "immediate-review", "job_id": jid, "error": str(exc)})
         return f"re-tagged {jid[:12]} -> needs-review"
     if code == 404:
         return f"needs-review PENDING {jid[:12]}: /v1/admin/jobs/reclassify not on bus yet"
@@ -3467,13 +3499,18 @@ def handle_dead_letter_queue() -> dict:
     return summary
 
 
-def fetch_needs_review_jobs(limit: int = 200) -> list[dict]:
+def fetch_needs_review_jobs(limit: int = 1000) -> list[dict]:
     """Fetch review backlog for the report-only sweep."""
     code, response = _http("GET", f"/v1/jobs?status=needs-review&limit={int(limit)}", timeout=15.0)
-    if code != 200 or not response:
-        log.warning("fetch_needs_review http=%s", code)
-        return []
-    return list(response.get("jobs", []) or [])
+    if code != 200 or not isinstance(response, dict) or not isinstance(response.get("jobs"), list):
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "fetch_needs_review", "http_status": code})
+        raise RuntimeError("fetch_needs_review incomplete listing http=" + str(code))
+    rows = list(response["jobs"])
+    total = response.get("total", len(rows))
+    if isinstance(total, int) and total > len(rows):
+        log.error("needs-review backlog truncated: fetched=%s total=%s; API has no pagination", len(rows), total)
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "needs-review", "error": "backlog truncated; API has no pagination", "scanned": len(rows), "total": total})
+    return rows
 
 
 def _row_result_dict(job: dict) -> dict:
@@ -3500,7 +3537,7 @@ def _is_verdict_completion_candidate(job: dict) -> bool:
     already present in the tail; code-kind rows that genuinely produced
     nothing are not completed here (their tail has no verdict JSON).
     """
-    if (job or {}).get("status") != "needs-review":
+    if (job or {}).get("status") != "needs-review" or review_followup_protected(job):
         return False
     result = _row_result_dict(job)
     failure = str(result.get("failure_reason") or "").strip()
@@ -3721,7 +3758,7 @@ def run_needs_review_sweep() -> dict:
     review follow-up.
 
     The report half is unchanged (classify old rows, never cancel/delete/retag).
-    The follow-up half submits ONE read-only codex review job for every row that
+    The follow-up half submits ONE read-only review job for every row that
     has no review performed yet (no result.review_evidence and no child
     review:* job), oldest first, capped by REVIEW_FOLLOWUP_MAX_PER_SWEEP. A row
     that already has a verdict is left for a human/orchestrator, and a
@@ -3735,44 +3772,83 @@ def run_needs_review_sweep() -> dict:
 
 def run_review_followup_sweep() -> dict:
     """Submit review jobs for needs-review rows that have no review performed."""
-    rows = fetch_needs_review_jobs(limit=200)
+    rows = fetch_needs_review_jobs(limit=1000)
     # Oldest first: the per-sweep cap must drain the longest-stuck rows first.
-    rows.sort(key=lambda j: (j.get("ended_at") or j.get("started_at") or j.get("last_update_at") or 0))
+    rows.sort(key=lambda j: j.get("ended_at") or j.get("started_at") or j.get("last_update_at") or 0)
     summary = {"scanned": len(rows), "submitted": 0, "skipped_verdict": 0, "skipped_marker": 0, "deferred": 0}
     for job in rows:
         jid = str(job.get("id") or "")
         if not jid:
             continue
-        if review_followup_row_has_verdict(job):
-            summary["skipped_verdict"] += 1
-            continue
-        if _needs_review_child_review_jobs(job):
-            summary["skipped_verdict"] += 1
-            continue
-        if review_followup_submitted(jid):
-            summary["skipped_marker"] += 1
-            continue
-        if summary["submitted"] >= REVIEW_FOLLOWUP_MAX_PER_SWEEP:
-            summary["deferred"] += 1
-            continue
-        review_job_id, spec, note = _submit_review_followup(job)
-        if review_job_id:
-            _record_auto_review(job, review_job_id)
-            summary["submitted"] += 1
-            log.info("needs-review followup %s -> %s (%s)", jid[:12], review_job_id[:12], note)
+        try:
+            outcome = ensure_review_followup(job, allow_submit=summary["submitted"] < REVIEW_FOLLOWUP_MAX_PER_SWEEP)
+            summary[outcome] = summary.get(outcome, 0) + 1
+        except Exception as exc:
+            summary["errors"] = summary.get("errors", 0) + 1
+            log.error("review followup failed job=%s: %s", jid, exc)
             broadcast_doctor_message(
-                "doctor.needs_review",
-                {
-                    "host": AGENT_HOST,
-                    "job_id": jid,
-                    "auto_review_job_id": review_job_id,
-                    "review_kind": spec.get("kind"),
-                    "note": note,
-                },
+                "doctor.sweep_error", {"sweep": "review-followup", "job_id": jid, "error": str(exc)}
             )
-        else:
-            log.warning("needs-review followup %s: %s", jid[:12], note)
     return summary
+
+
+def review_followup_protected(job: dict) -> bool:
+    """Owner protection and routing-only signals apply to all review mutations."""
+    return dlq_protected(job) or decline_paths.review_is_never_act(job)
+
+
+def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
+    """Shared immediate/reconciliation path; never mutate protected lanes."""
+    jid = str(job.get("id") or "")
+    if not jid or job.get("status") != "needs-review":
+        return "skipped_status"
+    if review_followup_protected(job):
+        return "skipped_protected"
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        raise RuntimeError("review dispatch refused: durable state unavailable")
+    result = _row_result_dict(job)
+    if result.get("verdict"):
+        return "skipped_verdict"
+    children = _needs_review_child_review_jobs(job)
+    for child in children:
+        if result.get("auto_review_job_id") and result["auto_review_job_id"] != child.get("id"):
+            continue
+        proof = _row_result_dict(child)
+        if child.get("status") != "done" or not isinstance(proof.get("verdict"), dict):
+            continue
+        previous = result.get("review_evidence")
+        if (
+            isinstance(previous, dict)
+            and previous.get("review_job_id") == child.get("id")
+            and previous.get("verdict") == proof["verdict"]
+            and previous.get("artifact_valid") is True
+            and previous.get("head_matches") is True
+        ):
+            return "skipped_verdict"
+        # Replay the child completion through the bus's transactional verifier.
+        # The doctor never manufactures parent artifact proof or approval.
+        body = {"status": "done", "result": proof}
+        if child.get("claimed_by"):
+            body["claimed_by"] = child["claimed_by"]
+        code, _ = _http("PATCH", f"/v1/jobs/{child['id']}", body)
+        if code not in (200, 201, 204):
+            raise RuntimeError(f"review verdict replay failed http={code}")
+        return "replayed_verdict"
+    if review_followup_submitted(jid) or STATE.seen(KEY_VERDICT_COMPLETION + ":" + jid, ttl=VERDICT_COMPLETION_TTL):
+        return "skipped_marker"
+    if children or result.get("auto_review_job_id") or result.get("review_evidence"):
+        return "skipped_verdict"
+    if not allow_submit:
+        return "deferred"
+    review_id, spec, note = _submit_review_followup(job)
+    if not review_id:
+        raise RuntimeError(note)
+    _record_auto_review(job, review_id)
+    broadcast_doctor_message(
+        "doctor.needs_review",
+        {"host": AGENT_HOST, "job_id": jid, "auto_review_job_id": review_id, "review_kind": spec["kind"], "note": note},
+    )
+    return "submitted"
 
 
 def main():

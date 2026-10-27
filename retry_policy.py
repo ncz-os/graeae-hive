@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 
 def _is_positive_int(val) -> bool:
     return isinstance(val, int) and not isinstance(val, bool) and val > 0
@@ -30,17 +32,36 @@ def _is_blocked_result(result) -> bool:
         "needs_review",
         "superseded",
         "superseded_by",
+        "needs_operator",
+        "operator_hold",
+        "protection_violation",
     ):
         val = result.get(key)
         if val is not None and val is not False and val != "":
             return True
 
-    # Check reason/status strings
-    for key in ("reason", "status", "error", "message"):
+    # Never turn a protection refusal or an intentional routing decline into
+    # an automatic retry, even when transport errors occur in the same report.
+    never_retry = (
+        "protection-violation",
+        "host-declines-kind",
+        "released-by-host",
+        "no-workspace-for-kind",
+        "no-workspace-for-repo",
+        "no-repo-mapping",
+        "operator-hold",
+        "manual-review",
+        "needs-review",
+        "needs-operator",
+        "superseded",
+    )
+    for key in ("failure_reason", "worker_error", "reason", "status", "error", "message", "stderr", "tail"):
         val = result.get(key)
         if isinstance(val, str):
             norm = _normalize_status_str(val)
-            if norm in ("hold", "held", "superseded", "manual-review", "needs-review"):
+            if norm in ("hold", "held") or any(
+                re.search(r"(?<![a-z0-9])" + re.escape(marker) + r"(?![a-z0-9])", norm) for marker in never_retry
+            ):
                 return True
 
     return False
