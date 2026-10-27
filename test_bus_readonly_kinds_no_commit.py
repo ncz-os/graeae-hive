@@ -144,6 +144,14 @@ class ReadonlyCompletionProofTests(unittest.TestCase):
     def test_empty_verdict_dict_rejected(self):
         self.assertFalse(valid_readonly_proof({"verdict": {}, "deliverable": "x"}))
 
+    def test_verdict_dict_missing_verdict_key_does_not_raise(self):
+        # Reviewer finding: a verdict dict without the inner "verdict" key
+        # (malformed worker payload) must fail closed, not raise KeyError.
+        self.assertFalse(valid_readonly_proof({"verdict": {"confidence": 0.9}, "deliverable": "x"}))
+        self.assertFalse(valid_readonly_proof({"verdict": {"finding": "pass"}, "deliverable": "x"}))
+        self.assertFalse(valid_readonly_proof({"verdict": {"verdict": None}, "deliverable": "x"}))
+        self.assertFalse(valid_readonly_completion_proof("review:x", {"verdict": {"confidence": 0.9}, "deliverable": "x"}))
+
 
 if __name__ == "__main__":
     unittest.main()

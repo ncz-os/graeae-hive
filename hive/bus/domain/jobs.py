@@ -345,11 +345,15 @@ def valid_readonly_proof(proof: dict) -> bool:
     """
     proof = proof if isinstance(proof, dict) else {}
     verdict = proof.get("verdict")
+    # Fetch the inner key ONCE, via .get(): a verdict dict that is missing the
+    # "verdict" key (malformed worker payload) must fail closed, never raise
+    # KeyError on the completion gate.
+    verdict_text = verdict.get("verdict") if isinstance(verdict, dict) else None
     deliverable = proof.get("deliverable")
     return bool(
         isinstance(verdict, dict)
-        and isinstance(verdict.get("verdict"), str)
-        and verdict["verdict"].strip()
+        and isinstance(verdict_text, str)
+        and verdict_text.strip()
         and isinstance(deliverable, str)
         and deliverable.strip()
     )
