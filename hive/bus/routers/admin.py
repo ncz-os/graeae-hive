@@ -192,7 +192,7 @@ async def admin_purge_jobs(req: PurgeRequest):
     if deleted:
         async with connect_db() as event_db:
             await emit_event(event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason})
-    return {"deleted": len(deleted), "matched_ids": deleted}
+    return {**results, "deleted": len(deleted), "matched_ids": deleted}
 
 
 @router.post("/v1/jobs/purge", dependencies=[Depends(require_mutation_actor)])
