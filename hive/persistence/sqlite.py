@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -15,6 +17,8 @@ except ModuleNotFoundError:
     from . import _sqlite_async as aiosqlite
 
 from .base import HiveMindRepository, Transaction
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
