@@ -105,9 +105,18 @@ class _PgExecute:
 
 
 class PostgresHiveRepository(SqliteHiveRepository):
+    list_jobs_sql_reason = True  # reason_prefix is expressed in SQL here too
+
     def __init__(self, dsn: str) -> None:
         super().__init__(":memory:")
         self.dsn = dsn
+
+    def _reason_prefix_sql(self, pattern: str) -> str:
+        # postgres LIKE is case-SENSITIVE by default: wrap both sides in
+        # LOWER so the prefix match stays case-insensitive (the contract the
+        # sqlite reference provides for free). The pattern (prefix + %) is
+        # bound, never interpolated.
+        return " AND LOWER(result) LIKE LOWER(?)"
 
     async def init(self, schema: str | None = None) -> None:
         try:

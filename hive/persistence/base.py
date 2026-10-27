@@ -96,6 +96,14 @@ class HiveMindRepository(ABC):
     ) -> list[str]: ...
 
     # ---- jobs ----
+
+    #: Whether ``list_jobs(reason_prefix=...)`` is expressed IN the backend's
+    #: own SQL (case-insensitive prefix match on the job's result JSON, over
+    #: the deploy-line reason fields). sqlite/postgres/mysql can; oracle and
+    #: db2 cannot through their adapters, so the bus falls back to a Python
+    #: filter and reports the pre-filter ``total``.
+    list_jobs_sql_reason: bool = False
+
     @abstractmethod
     async def submit_job(self, tx: Transaction, **fields: Any) -> None: ...
 

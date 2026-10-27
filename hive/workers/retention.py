@@ -67,6 +67,12 @@ PROTECTED_ACTIVE_STATUSES: frozenset[str] = frozenset(
 #: Kind prefix that marks a work-order (triage) row.
 TRIAGE_KIND_PREFIX = "triage:"
 
+#: Hard cap on the dead backlog (the operator's invariant), shared between the
+#: sweep planner and GET /v1/jobs/summary so a dashboard can show both the dead
+#: count and the cap it must stay under. Env-overridable exactly like the
+#: doctor's sweep reads it (RETENTION_MAX_DEAD).
+DEAD_CAP = int(os.environ.get("RETENTION_MAX_DEAD", "10"))
+
 
 def is_triage_job(kind: str | None) -> bool:
     """True when the job kind is a triage work order (``triage:*``)."""
