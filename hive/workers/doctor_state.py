@@ -52,6 +52,7 @@ COUNTER_TTLS = {
     "token_fix": 3600.0,  # TOKEN_FIX_WINDOW_SEC
     "failures": 86400.0,  # a repository's recorded cycle failures
     "v2_resubmit": 30 * 86400.0,  # doctor SAME_SIGNATURE_RETRY_TTL
+    "verdict_completion": 86400.0,  # doctor VERDICT_COMPLETION_TTL
 }
 
 
