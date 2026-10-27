@@ -218,6 +218,42 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))
 
 
+# Read-only job kinds whose deliverable is a structured verdict (a review
+# report, an audit finding, an investigation brief, a probe result), not a
+# commit. The commit-evidence gate would treat a clean commitless run as a
+# failure (completion_evidence_missing), which is wrong for this family.
+#
+# Deliberately a DIFFERENT, narrower constant than ADMISSION_NONCOMMIT_PREFIXES
+# (workspace.py): that list is an admission-time shorthand and includes bare
+# word prefixes (``review``, ``analysis``, ...) that the BLOCKING-2 fix had to
+# stop treating as token-exempt. Here the exemption is PREFIX-ONLY: a kind
+# qualifies only when it equals ``<p>`` or starts with ``<p>:`` (never
+# ``reviewing``, ``reviewer-x``). Case-insensitive. The doctor and the tests
+# import this tuple instead of duplicating it.
+READONLY_KINDS: tuple[str, ...] = (
+    "review:",
+    "audit:",
+    "investigate:",
+    "probe:",
+)
+
+
+def is_readonly_prefix_kind(job_kind: str) -> bool:
+    """Whether ``job_kind`` matches :data:`READONLY_KINDS` at a TOKEN BOUNDARY.
+
+    Case-insensitive, PREFIX-ONLY match: every entry of :data:`READONLY_KINDS`
+    ends in ``:``, so a kind matches when the lowercased kind STARTS WITH
+    ``<p>`` (equaling the bare ``"review:"`` is included in that startswith).
+    ``review:xyz`` matches; ``review``, ``reviewing`` and
+    ``reviewer-migration`` do not — the delimiter is part of the prefix, so a
+    character other than ``:`` after the stem keeps the kind on the code path.
+    See the BLOCKING-2 regression note on :func:`is_readonly_kind` for why a
+    naive prefix match without the delimiter is unsafe.
+    """
+    k = str(job_kind or "").lower()
+    return any(k == p or k.startswith(p) for p in READONLY_KINDS)
+
+
 def is_readonly_kind(job_kind: str) -> bool:
     """Whether ``job_kind`` names a read-only kind, at a TOKEN BOUNDARY.
 
@@ -256,10 +292,11 @@ def kind_requires_commit(job_kind: str, job_repo: str | None) -> bool:
     ``completion_evidence_missing`` despite a clean verified run.
 
     The exemption is matched at a token boundary only — see
-    :func:`is_readonly_kind` (audit BLOCKING-2).
+    :func:`is_readonly_kind` (audit BLOCKING-2) and
+    :func:`is_readonly_prefix_kind` (:data:`READONLY_KINDS`, prefix-only).
     """
     k = str(job_kind or "")
-    if is_readonly_kind(k):
+    if is_readonly_kind(k) or is_readonly_prefix_kind(k):
         return False
     return (
         bool(job_repo)
@@ -294,6 +331,45 @@ def valid_completion_proof(proof: dict) -> bool:
         and all(isinstance(f, str) and f for f in files)
         and proof.get("worktree_clean") is True
     )
+
+
+def valid_readonly_proof(proof: dict) -> bool:
+    """Read-only completion proof: a structured verdict instead of a commit.
+
+    A read-only kind's deliverable is a verdict, so the proof is
+    ``result.verdict`` — a dict carrying a non-empty ``verdict`` string — plus
+    ``result.deliverable``, a non-empty string. Fails closed like
+    :func:`valid_completion_proof`: every listed field must be present and
+    non-empty. An empty ``proof`` (no result at all) is NEVER accepted — a
+    read-only job still has to report its deliverable.
+    """
+    proof = proof if isinstance(proof, dict) else {}
+    verdict = proof.get("verdict")
+    deliverable = proof.get("deliverable")
+    return bool(
+        isinstance(verdict, dict)
+        and isinstance(verdict.get("verdict"), str)
+        and verdict["verdict"].strip()
+        and isinstance(deliverable, str)
+        and deliverable.strip()
+    )
+
+
+def valid_readonly_completion_proof(job_kind: str, proof: dict) -> bool:
+    """Completion gate for read-only kinds: git proof OR verdict proof.
+
+    A ``review:``/``audit:``/``investigate:``/``probe:`` job completes with
+    EITHER the existing git evidence (:func:`valid_completion_proof`) — a
+    read-only run that also committed (docs, scripts, ...) is still valid —
+    OR the read-only proof (:func:`valid_readonly_proof`). Kinds outside
+    :data:`READONLY_KINDS` never use this entry point; the bus calls it only
+    when :func:`kind_requires_commit` says a commit is not required. An empty
+    ``proof`` fails both paths: a read-only job must carry its verdict.
+    """
+    proof = proof if isinstance(proof, dict) else {}
+    if valid_completion_proof(proof):
+        return True
+    return is_readonly_prefix_kind(job_kind) and valid_readonly_proof(proof)
 
 
 def normalize_result_payload(status: str, result: dict | None) -> dict | None:

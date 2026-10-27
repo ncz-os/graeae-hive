@@ -64,12 +64,14 @@ from hive.bus.domain.jobs import (
     field_was_set,
     hallucination_check,
     is_dedup_violation,
+    is_readonly_prefix_kind,
     is_unresolvable_release,
     json_list,
     kind_requires_commit,
     normalize_result_payload,
     stable_worker_id,
     valid_completion_proof,
+    valid_readonly_completion_proof,
 )
 from hive.bus.domain.model_admission import admission_warnings, forbidden_model, served_model_names
 from hive.bus.domain.workspace import resolve_workspace_shadow
@@ -1136,8 +1138,16 @@ async def update_job(job_id: str, req: JobUpdate):
 
         commit_required = kind_requires_commit(job_kind, job_repo)
         if req.status == "done" and commit_required:
+            # A read-only kind (READONLY_KINDS) proves completion with its
+            # verdict/deliverable, or with a git proof when it did commit.
+            # Everything else still needs the full commit-evidence gate.
             proof = req.result or {}
-            if not valid_completion_proof(proof):
+            ok = (
+                valid_readonly_completion_proof(job_kind, proof)
+                if is_readonly_prefix_kind(job_kind)
+                else valid_completion_proof(proof)
+            )
+            if not ok:
                 req.status = "needs-review"
                 completion_rejected = True
                 req.result = {**proof, "failure_reason": "completion_evidence_missing"}
