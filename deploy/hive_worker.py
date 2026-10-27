@@ -2847,9 +2847,10 @@ def completion_evidence(workdir: str, baseline: str, env: dict) -> dict:
     try:
         head = git("rev-parse", "HEAD")
         evidence["head_sha"] = head
-        evidence["worktree_clean"] = not git(
-            "status", "--porcelain", "--untracked-files=all"
-        )
+        entries = _porcelain_entries(workdir, env)
+        evidence["untracked_files"] = [path for xy, path in entries if xy == "??"]
+        evidence["tracked_worktree_clean"] = all(xy == "??" for xy, _ in entries)
+        evidence["worktree_clean"] = not entries
         # Divergent/replaced histories cannot be presented as this job's work.
         git("merge-base", "--is-ancestor", baseline, head)
         evidence["commits"] = git("rev-list", f"{baseline}..{head}").splitlines()
@@ -2867,6 +2868,7 @@ def completion_evidence(workdir: str, baseline: str, env: dict) -> dict:
         evidence["remote_ref"] = merge
         evidence["remote_sha"] = actual[0] if actual else None
         evidence["remote_verified"] = evidence["remote_sha"] == head
+        evidence["pushed"] = evidence["remote_verified"]
     except (subprocess.SubprocessError, OSError, ValueError) as exc:
         # Bounded, redacted, actionable: the command, its status and the LAST
         # stderr lines -- never a bare exception class name, which told an
@@ -2890,8 +2892,9 @@ def completion_ready(evidence: dict) -> bool:
     return bool(
         evidence.get("commits")
         and evidence.get("files_changed")
-        and evidence.get("worktree_clean") is True
+        and evidence.get("tracked_worktree_clean") is True
         and evidence.get("remote_verified") is True
+        and evidence.get("remote_sha") == evidence.get("head_sha")
     )
 
 
@@ -3865,8 +3868,8 @@ def delivery_failure_reason(
         parts.append(
             f"finalizer={status}" + (f": {finalizer_error}" if finalizer_error else "")
         )
-    if workdir and evidence.get("worktree_clean") is False:
-        parts.append("worktree still dirty (uncommitted or untracked paths)")
+    if workdir and evidence.get("tracked_worktree_clean") is False:
+        parts.append("worktree still has uncommitted tracked changes")
     if commits and evidence.get("remote_verified") is not True:
         if evidence.get("verification_error"):
             parts.append(f"remote check failed: {evidence['verification_error']}")
@@ -4058,6 +4061,8 @@ def verify_delivery(workdir: str, baseline: str) -> int:
         "changed_file_count": len(evidence["files_changed"]),
         "files_changed": [p[:240] for p in evidence["files_changed"][:20]],
         "worktree_clean": evidence["worktree_clean"],
+        "tracked_worktree_clean": evidence.get("tracked_worktree_clean", False),
+        "untracked_files": evidence.get("untracked_files", [])[:20],
         "remote_verified": evidence["remote_verified"],
         "verification_error": _cap_text(evidence.get("verification_error") or "")
         or None,
@@ -4065,8 +4070,8 @@ def verify_delivery(workdir: str, baseline: str) -> int:
             "Delivery verified."
             if ready
             else "Checkout a dedicated branch; commit legitimate task changes with "
-            "the configured Git identity; push with upstream tracking; leave a clean "
-            "worktree and remote HEAD matching local HEAD. Respect explicit job "
+            "the configured Git identity; push with upstream tracking; leave tracked "
+            "files clean and remote HEAD matching local HEAD. Respect explicit job "
             "restrictions; report blockers instead of inventing edits."
         ),
     }
@@ -5591,6 +5596,21 @@ def _run_job_inner(job: dict) -> None:
         )
         release_job(job_id, "malformed_job_id")
         return
+
+    if WORKER_KIND == "zeroclaw":
+        socket_path = os.path.expanduser("~/.zoder/data/daemon.sock")
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.settimeout(2.0)
+                probe.connect(socket_path)
+        except OSError as exc:
+            patch_job(job_id, "failed", {
+                "via": "hive_worker",
+                "failure_reason": "daemon_lost",
+                "error": _cap_text(f"daemon.sock preflight failed: {type(exc).__name__}: {exc}"),
+                "review_iterations": 0,
+            })
+            return
 
     repo_url = resolve_repo_url(job)
     if not repo_url:

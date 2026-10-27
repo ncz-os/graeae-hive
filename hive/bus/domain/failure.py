@@ -56,7 +56,8 @@ def infrastructure_failure(result) -> str | None:
     ):
         return "engine_cancel_unacknowledged"
     if (
-        "daemon stopped by pid" in evidence
+        result.get("failure_reason") == "daemon_lost"
+        or "daemon stopped by pid" in evidence
         or "socket is gone" in evidence
         or (
             "daemon.sock" in evidence
