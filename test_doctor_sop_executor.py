@@ -491,8 +491,12 @@ def test_every_durable_counter_has_a_ttl():
         "token_fix",
         "failures",
         "v2_resubmit",
+<<<<<<< HEAD
         "protection",
         "review",
+=======
+        "verdict_completion",
+>>>>>>> 2350e6a9cd09d05d61c60ba75b24149007235db5
     }
     assert all(ttl > 0 for ttl in COUNTER_TTLS.values())
 

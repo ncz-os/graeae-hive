@@ -281,6 +281,26 @@ _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
 NEEDS_REVIEW_SCAN_INTERVAL = float(os.environ.get("NEEDS_REVIEW_SCAN_INTERVAL", "3600"))
 NEEDS_REVIEW_OLDER_HOURS = float(os.environ.get("NEEDS_REVIEW_OLDER_HOURS", "24"))
+
+# ── Verdict-completion recovery for codex_delivery_failed rows ──────────────
+# The codex delivery path can hold a row in needs-review with
+# failure_reason ``codex_delivery_failed`` (e.g. "produced no workspace edits")
+# even though the review itself SUCCEEDED: the structured verdict JSON is
+# sitting in the row's own ``result.tail``. That completion is recoverable by
+# pure parsing — no retry, no re-run. ``DOCTOR_VERDICT_COMPLETION_DRY_RUN=1``
+# makes the pass log-and-return instead of PATCHing (the durable completion
+# marker is still recorded, matching the DLQ dry-run semantics).
+VERDICT_COMPLETION_DRY_RUN = os.environ.get("DOCTOR_VERDICT_COMPLETION_DRY_RUN", "0") == "1"
+# Key prefix for the durable "completion was attempted/completed for this
+# job" record in STATE. One attempt per row per process: a second pass in the
+# same process sees the marker and stops; a new process re-attempts at most
+# once (its own record starts empty), which is the intended semantics.
+KEY_VERDICT_COMPLETION = "verdict_completion"
+# The completion is a one-time recovery of a past delivery: the marker only has
+# to outlive the doctor process, not the row. The prefix is listed in
+# doctor_state.COUNTER_TTLS so its records carry this exact window (an
+# unlisted prefix would be pruned at the store's default TTL).
+VERDICT_COMPLETION_TTL = 24 * 3600
 MAX_BULK_RESUBMITS_PER_ACTION = 20
 DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS = doctor_v2.max_same_signature_resubmits()
 SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
@@ -3081,13 +3101,226 @@ def fetch_needs_review_jobs(limit: int = 200) -> list[dict]:
     return list(response.get("jobs", []) or [])
 
 
+def _row_result_dict(job: dict) -> dict:
+    """The row's ``result`` as a dict, tolerating a JSON string column."""
+    value = (job or {}).get("result")
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _is_verdict_completion_candidate(job: dict) -> bool:
+    """Whether the row is a stuck codex-delivery row the verdict pass may heal.
+
+    The row must be needs-review with ``result.failure_reason ==
+    codex_delivery_failed`` (or an error that says the driver produced no
+    workspace edits — the same delivery failure described from the other
+    side). Read-only review rows fail this way even though their verdict is
+    already present in the tail; code-kind rows that genuinely produced
+    nothing are not completed here (their tail has no verdict JSON).
+    """
+    if (job or {}).get("status") != "needs-review":
+        return False
+    result = _row_result_dict(job)
+    failure = str(result.get("failure_reason") or "").strip()
+    error = str(result.get("error") or "").strip()
+    return failure == "codex_delivery_failed" or "produced no workspace edits" in error.lower()
+
+
+def extract_verdict_from_tail(tail: str) -> dict | None:
+    """The LAST JSON object with a ``verdict`` key in a driver tail.
+
+    Tolerates leading prose (log lines before the JSON) and trailing noise
+    (the driver's final "N tokens used" line). Parses the whole stream first,
+    then walks every ``{`` with ``JSONDecoder.raw_decode`` and keeps the LAST
+    object that actually carries a ``verdict`` key — not merely the last
+    ``{``, which inside pretty-printed output is some nested findings object.
+    Returns ``None`` when there is no such object (malformed JSON included);
+    never raises.
+    """
+    text = str(tail or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict) and "verdict" in parsed:
+            return parsed
+    except (TypeError, ValueError):
+        pass
+    decoder = json.JSONDecoder()
+    last: dict | None = None
+    idx = text.find("{")
+    while idx != -1:
+        try:
+            obj, end = decoder.raw_decode(text[idx:])
+        except ValueError:
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict) and "verdict" in obj:
+            last = obj
+        idx = text.find("{", idx + max(end, 1))
+    return last
+
+
+def build_verdict_completion_result(job: dict, verdict_obj: dict, finished_at: float) -> dict:
+    """The exact result payload for a verdict-completed ``done`` PATCH.
+
+    ``summary`` reports the verdict's model/verdict/confidence/head;
+    ``deliverable`` is the parsed JSON object itself; ``head_sha``/``commits``
+    are carried ONLY when the verdict's ``head`` is a 40/64-char hex SHA; the
+    other fields are fixed for a read-only review (no workspace edits by
+    definition).
+    """
+    v = verdict_obj if isinstance(verdict_obj, dict) else {}
+    head = v.get("head")
+    head_sha = None
+    commits: list[str] = []
+    if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head.lower()):
+        head_sha = head.lower()
+        commits = [head_sha]
+    result: dict = {
+        "summary": {
+            "model": v.get("model"),
+            "verdict": v.get("verdict"),
+            "confidence": v.get("confidence"),
+            "head": head,
+        },
+        "deliverable": verdict_obj,
+        "files_changed": ["(none: read-only review)"],
+        "worktree_clean": True,
+        "verdict": v,
+        "verdict_json": json.dumps(verdict_obj, sort_keys=True),
+        "delivery_note": (
+            "verdict extracted from result.tail by the doctor verdict-completion "
+            "pass; the run was read-only and produced no workspace edits"
+        ),
+        "finished_at": finished_at,
+    }
+    if head_sha is not None:
+        result["head_sha"] = head_sha
+        result["commits"] = commits
+    return result
+
+
+def complete_verdict_job(job: dict, *, now: float | None = None) -> tuple[bool, str]:
+    """Complete ONE stuck needs-review row whose tail already holds the verdict.
+
+    Returns ``(completed, detail)``. ``completed`` is True when the row was
+    PATCHed (or, in dry-run, was eligible and the marker recorded). Never
+    retries and never purges: no parseable verdict means no action at all, and
+    a row that already has ``result.verdict`` is left alone (idempotent).
+    """
+    jid = (job or {}).get("id", "")
+    now = now if now is not None else time.time()
+    if not _is_verdict_completion_candidate(job):
+        return False, "not a codex_delivery_failed needs-review row"
+    result = _row_result_dict(job)
+    if result.get("verdict") is not None:
+        # Already completed by an earlier pass (or by the worker itself):
+        # the completion marker is what stops a second attempt in-process.
+        return False, "already has result.verdict"
+    tail = result.get("tail")
+    if not isinstance(tail, str) or not tail.strip():
+        return False, "no result.tail to parse"
+    verdict_obj = extract_verdict_from_tail(tail)
+    if not isinstance(verdict_obj, dict):
+        return False, "no parseable verdict object in tail"
+    # Durable marker: at most one attempt per row per process. Recorded BEFORE
+    # the PATCH so a crash between marker and PATCH cannot re-PATCH in this
+    # process, and a PATCH that 4xxes simply leaves the row for the next
+    # process (which gets its own one attempt).
+    STATE.mark(KEY_VERDICT_COMPLETION + ":" + jid, VERDICT_COMPLETION_TTL, at=now)
+    claimed_by = job.get("claimed_by")
+    body: dict = {
+        "status": "done",
+        "result": build_verdict_completion_result(job, verdict_obj, now),
+    }
+    if claimed_by:
+        # The bus ownership check (PATCH /v1/jobs) requires claimed_by to match
+        # the current claimant; an unclaimed row carries no claimed_by and is
+        # completed as-is.
+        body["claimed_by"] = claimed_by
+    if VERDICT_COMPLETION_DRY_RUN:
+        log.info("verdict-completion DRY_RUN: would PATCH %s -> done", jid[:12])
+        return True, "dry-run"
+    code, resp = _http("PATCH", f"/v1/jobs/{jid}", body, timeout=15.0)
+    if code in (200, 201, 204):
+        broadcast_doctor_message(
+            "doctor.verdict_completed",
+            {
+                "host": AGENT_HOST,
+                "job_id": jid,
+                "kind": job.get("kind"),
+                "head_sha": body["result"].get("head_sha"),
+                "verdict": (body["result"].get("verdict") or {}).get("verdict"),
+            },
+        )
+        log.info("verdict-completed %s kind=%s", jid[:12], job.get("kind"))
+        return True, f"patched {code}"
+    log.warning(
+        "verdict-completion PATCH %s failed code=%s resp=%s",
+        jid[:12],
+        code,
+        str(resp)[:200],
+    )
+    return False, f"patch failed code={code}"
+
+
+def complete_stuck_verdict_jobs(jobs: list[dict]) -> dict:
+    """One needs-review pass over the verdict-completion rows.
+
+    Each candidate is attempted AT MOST ONCE in this process: the attempt is
+    recorded durably in STATE before the PATCH, and a row whose marker already
+    exists is skipped without any further work (idempotency across passes
+    inside the process). The report-only classification sweep keeps running
+    over the same rows regardless.
+    """
+    now = time.time()
+    summary = {"scanned": len(jobs or []), "completed": 0, "skipped": 0, "no_action": 0}
+    for job in jobs or []:
+        jid = (job or {}).get("id", "")
+        if not jid:
+            continue
+        key = KEY_VERDICT_COMPLETION + ":" + jid
+        if STATE.seen(key, ttl=VERDICT_COMPLETION_TTL):
+            summary["skipped"] += 1
+            continue
+        if not _is_verdict_completion_candidate(job):
+            continue
+        if _row_result_dict(job).get("verdict") is not None:
+            # Idempotent: already carries its verdict; one durable record keeps
+            # this process from re-attempting it, no bus traffic at all.
+            STATE.mark(key, VERDICT_COMPLETION_TTL, at=now)
+            summary["skipped"] += 1
+            continue
+        completed, detail = complete_verdict_job(job, now=now)
+        if completed:
+            summary["completed"] += 1
+        else:
+            summary["no_action"] += 1
+        log.info("verdict-completion %s -> %s (%s)", jid[:12], "done" if completed else "no action", detail)
+    return summary
+
+
 def report_needs_review_sweep() -> dict:
-    """Classify old needs-review jobs without cancelling, deleting, or retagging."""
-    rows = doctor_v2.sweep_needs_review(fetch_needs_review_jobs(), older_than_hours=NEEDS_REVIEW_OLDER_HOURS)
+    """Classify old needs-review jobs without cancelling, deleting, or retagging,
+    and complete the stuck ``codex_delivery_failed`` rows whose verdict JSON is
+    already in ``result.tail`` (one ``doctor.verdict_completed`` message per
+    row, dry-run via ``DOCTOR_VERDICT_COMPLETION_DRY_RUN=1``)."""
+    jobs = fetch_needs_review_jobs()
+    rows = doctor_v2.sweep_needs_review(jobs, older_than_hours=NEEDS_REVIEW_OLDER_HOURS)
     for row in rows:
         log.info("needs-review report-only: %s", row)
         broadcast_doctor_message("doctor.needs_review", {"host": AGENT_HOST, **row})
-    return {"scanned": len(rows), "rows": rows}
+    verdicts = complete_stuck_verdict_jobs(jobs)
+    log.info("needs-review verdict completion: %s", verdicts)
+    return {"scanned": len(rows), "rows": rows, "verdict_completion": verdicts}
 
 
 def run_needs_review_sweep() -> dict:
