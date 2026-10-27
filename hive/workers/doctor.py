@@ -246,6 +246,7 @@ CLUSTER_WINDOW_SEC = float(os.environ.get("CLUSTER_WINDOW_SEC", "21600"))  # onl
 # auto-triaged within this rolling window:
 _recent_auto_triage: dict[str, float] = {}
 AUTO_TRIAGE_COOLDOWN = float(os.environ.get("AUTO_TRIAGE_COOLDOWN", "3600"))  # 1h per base_kind
+TRIAGE_SEEN_TTL_SEC = float(os.environ.get("TRIAGE_SEEN_TTL_SEC", str(30 * 86400)))  # 30 days
 
 # ── Dead-letter queue (DLQ) remediation ─────────────────────────────────────
 # Restored 2026-10-17: the Phase-2 refactor dropped the DLQ sweep that the
@@ -519,6 +520,30 @@ def note_triage(kind: str, ttl: float | None = None, at: float | None = None) ->
     stamp = STATE.mark(f"{KEY_COOLDOWN}:{kind}", ttl=ttl, at=at)
     _recent_auto_triage[kind] = stamp
     return stamp
+
+
+def triage_seen_key(base_kind: str) -> str:
+    """Durable marker: the newest failure this base_kind was already triaged for."""
+    return f"{KEY_COOLDOWN}:triage_seen:{base_kind}"
+
+
+def triaged_through(base_kind: str, newest_failure: float) -> bool:
+    """True when a triage already covers every failure up to ``newest_failure``.
+
+    2026-10-27 (operator): the 1 h cooldown alone re-triaged the same old
+    failures every hour, because a failed row stays in ``status=failed`` until
+    somebody deletes it. The marker records the moment the triage was submitted,
+    which is always at or after the newest failure it covered, so a second scan
+    of unchanged failures is a no-op and a genuinely NEW failure (ended after
+    the marker) still gets one triage.
+    """
+    seen = STATE.last_mark(triage_seen_key(base_kind))
+    return seen is not None and seen >= float(newest_failure or 0)
+
+
+def note_triage_seen(base_kind: str, at: float | None = None) -> float:
+    """Record that every failure up to now for ``base_kind`` has been triaged."""
+    return STATE.mark(triage_seen_key(base_kind), ttl=TRIAGE_SEEN_TTL_SEC, at=at)
 
 
 def dlq_decided(job_id: str, ttl: float | None = None) -> bool:
@@ -1840,6 +1865,11 @@ def scan_for_failure_clusters() -> list[dict]:
         # restart let every kind be re-triaged immediately.
         if cooldown_active(f"{KEY_COOLDOWN}:{bk}", AUTO_TRIAGE_COOLDOWN):
             continue
+        # 2026-10-27: a completed triage must not be repeated for the SAME
+        # failures. Only a failure that ended after the last triage re-arms it.
+        newest_failure = max((j.get("ended_at") or 0) for j in jobs)
+        if triaged_through(bk, newest_failure):
+            continue
         # Also skip if an active triage:<bk> already exists in queued/running
         if _active_triage_exists(bk):
             continue
@@ -1890,6 +1920,7 @@ def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | 
         log.info("DRY_RUN: would auto-submit triage:%s (count=%d)", base_kind, count)
         return None
     note_triage(base_kind)
+    note_triage_seen(base_kind)
     if not STATE.loaded_ok or not STATE.persist_ok:
         log.warning("auto-triage refused: cooldown could not be persisted")
         return None
