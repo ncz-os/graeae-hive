@@ -149,6 +149,28 @@ def is_dlq_protected_reason(job: dict[str, Any] | None = None, reason: str = "")
     return str(job.get("project") or "") in protected_projects
 
 
+def review_is_never_act(job: dict[str, Any]) -> bool:
+    """Check every recorded reason, including nested errors, before review.
+
+    A generic failure_reason must not hide a protected/routing-only reason in
+    another field. Inspect diagnostic fields only, never task descriptions.
+    """
+    if is_dlq_protected_reason(job):
+        return True
+    fields = {"worker_error", "last_decline_reason", "last_release_reason", "failure_reason", "error", "reason"}
+    pattern = re.compile(
+        r"(?<![a-z0-9_])(?:dlq_protected|released_by_host|host_declines_kind|no_workspace_for_kind)(?=$|[^a-z0-9_])",
+        re.IGNORECASE,
+    )
+
+    def contains(value):
+        if isinstance(value, dict):
+            return any(contains(v) for k, v in value.items() if k in fields or isinstance(v, dict))
+        return isinstance(value, str) and bool(pattern.search(value))
+
+    return contains(job) or contains(_result(job))
+
+
 def _attribution_evidence(job: dict[str, Any]) -> str:
     """The violating commit / author, straight from the worker's result."""
     res = _result(job)

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -131,6 +132,7 @@ class GenericAdapter:
         body = {
             "kind": registration.harness_kind,
             "runtime": registration.harness_kind,
+            "host": registration.host or socket.gethostname().split(".")[0],
             "version": registration.harness_version,
             "capabilities": list(
                 self.base_capabilities | self._extra_capabilities | frozenset(registration.capabilities)
@@ -188,10 +190,14 @@ class GenericAdapter:
 
     def fail(self, urn: str, job_id: str, error: str) -> None:
         """PATCH /v1/jobs/<id> status=failed."""
+        self.fail_result(urn, job_id, {"error": error})
+
+    def fail_result(self, urn: str, job_id: str, result: dict[str, Any]) -> None:
+        """Report execution failure with its original diagnostic evidence."""
         status, _ = self._call(
             "PATCH",
             f"/v1/jobs/{job_id}",
-            {"status": "failed", "result": {"error": error}, "claimed_by": urn},
+            {"status": "failed", "result": result, "claimed_by": urn},
         )
         if status != 200:
             raise RuntimeError(f"fail-report failed for {job_id!r}: status={status}")
