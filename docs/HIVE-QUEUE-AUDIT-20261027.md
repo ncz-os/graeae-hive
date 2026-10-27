@@ -4,7 +4,7 @@
 
 Baseline and unchanged HEAD: `f2c43020c4e91965a802f665354ff9cd52dc8717`, branch `feat/hive-astra-audit-20261027`.
 
-This audit records **39 grouped findings: 19 fixed in the Astra baseline, 20 remaining (1 partially remediated by Terra, 19 left)**. The remaining-effort counts are **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
+This audit records **39 grouped findings: 19 fixed in the Astra baseline, 20 remaining (3 partially remediated by Terra, 17 left)**. The remaining-effort counts are **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
 
 No live bus/database, remote forge, MNEMOS, service restart, or push was used. The explicit repository-only restriction overrides standing network registration/persistence workflows for this task. The sandbox declares `.git` read-only. No staging, commit, push, or attempt to bypass that restriction was made. The index is unchanged; the working tree necessarily contains the unstaged fixes. A literally clean working tree would require discarding them. No new commit SHA or primary zoder APPROVE is claimed. Independent local reviews caught and corrected overbroad infrastructure classification and a review-parent completion gap; they are not a substitute for the external gate.
 
@@ -262,3 +262,19 @@ stub because the sandbox denies binding a Unix socket.
 | R18 | Left | Protected project/prefix lanes must be enforced in both retry paths. | No new regression or acceptance evidence. |
 | R19 | Left | DELETE contract remains undecided. | No new regression or acceptance evidence. |
 | R20 | Left | Installed wheel validation remains required. | No new regression or acceptance evidence. |
+
+
+## Terra priority-A remediation 2026-10-27
+
+Local source only; no bus, database service, fleet, network, or deployment was accessed. The executor and reviewer files are outside the permitted paths. No primary zoder review was performed.
+
+| ID | Status | Source and remaining work | Regression and acceptance evidence |
+|---|---|---|---|
+| R02 | Left | Actual executors must publish expiring readiness; unknown readiness must fail closed at submission and both claim routes. Requires excluded executor sources and coordinated migration. | No regression; acceptance not established. |
+| R03 | Left | Cross-process ref reservations and fresh remote probing remain; the excluded worker must handle a matching already-pushed SHA. | No regression; acceptance not established. |
+| R04 | Left | A trusted origin verifier and executor proof migration remain required; submitted flags alone are not attestation. | No regression; acceptance not established. |
+| R06 | Partial | `hive/bus/app.py` `_cancel_stale_jobs`; `hive/persistence/sqlite.py` `stale_cancel_candidates` and `cancel_stale_candidate`: compare observed status, owner, lease and timestamps; skip parked infrastructure evidence; invoke dependency release in the cancellation transaction. The inherited dependency release suppresses some failures, bounded scans may be starved by old parked rows, and hold-result revision and backend concurrency remain unverified. | `test_stale_cancellation_rechecks_claim_and_releases_dependencies`: SQLite claim interleaving, parked row, and dependent release pass. Rollback on release failure and real backend concurrency remain open. |
+| R07 | Partial | `hive/bus/app.py` reaper loop; `hive/persistence/sqlite.py` `requeue_orphan_job`; `hive/persistence/base.py`: compare observed status, claimant, claim time, progress timestamp and lease; emit only on success. A monotonic claim/progress revision is still needed to eliminate ABA; real backend concurrency remains unverified. | `test_orphan_requeue_compare_and_set_observed_claim`: SQLite owner, lease, progress and status interleavings pass. |
+| R13 | Left | Cross-process provider occupancy reservation and claim transaction remain required for every backend. | No regression; acceptance not established. |
+
+Verification: local existing venv `python -m pytest -o addopts='' -q test_priority_a_reaper.py test_reaper.py test_reaper_sweeps.py test_reaper_agents.py test_reaper_schedules.py test_persistence_queue_audit_20261027.py test_backend_contract.py`: 38 passed. Production venv and real backend concurrency were not run.

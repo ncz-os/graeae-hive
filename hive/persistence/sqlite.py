@@ -2060,7 +2060,7 @@ class SqliteHiveRepository(HiveMindRepository):
         db = tx
         async with db.execute(
             "SELECT j.id, j.kind, j.claimed_by, j.claimed_at, j.last_update_at, "
-            "j.claim_lease_expires_at "
+            "j.claim_lease_expires_at, j.status "
             "FROM jobs j "
             "LEFT JOIN agents a ON a.urn = j.claimed_by "
             "WHERE j.status IN ('claimed','running') "
@@ -2071,18 +2071,24 @@ class SqliteHiveRepository(HiveMindRepository):
             "      COALESCE(j.last_update_at, j.claimed_at) < ? )",
             (now, hard_cutoff, default_cutoff),
         ) as cur:
-            return [(r[0], r[1], r[2], r[3], r[4], r[5]) async for r in cur]
+            return [tuple(r) async for r in cur]
 
-    async def requeue_orphan_job(self, tx: Transaction, job_id: str) -> None:
+    async def requeue_orphan_job(self, tx: Transaction, candidate: tuple) -> int:
         db = tx
-        await db.execute(
+        job_id, _kind, claimant, claimed_at, updated_at, lease, status = candidate
+        cur = await db.execute(
             "UPDATE jobs SET status='queued', claimed_by=NULL, claimed_at=NULL, "
             "claimed_runtime=NULL, claimed_model=NULL, claimed_provider=NULL, "
             "claimed_cost_tier=NULL, claim_lease_expires_at=NULL, "
             "ended_at=NULL, result=NULL "
-            "WHERE id=? AND status IN ('claimed','running')",
-            (job_id,),
+            "WHERE id=? AND status=? "
+            "AND (claimed_by=? OR (claimed_by IS NULL AND ? IS NULL)) "
+            "AND (claimed_at=? OR (claimed_at IS NULL AND ? IS NULL)) "
+            "AND (last_update_at=? OR (last_update_at IS NULL AND ? IS NULL)) "
+            "AND (claim_lease_expires_at=? OR (claim_lease_expires_at IS NULL AND ? IS NULL))",
+            (job_id, status, claimant, claimant, claimed_at, claimed_at, updated_at, updated_at, lease, lease),
         )
+        return cur.rowcount
 
     async def select_due_schedules(self, tx: Transaction, *, now: float) -> list[tuple]:
         db = tx
@@ -2099,6 +2105,31 @@ class SqliteHiveRepository(HiveMindRepository):
             "UPDATE scheduled_jobs SET last_fired_at=?, next_fire_at=?, fire_count=fire_count+1 WHERE id=?",
             (now, next_at, sched_id),
         )
+
+    async def stale_cancel_candidates(self, tx: Transaction, *, cutoff: float) -> list[tuple]:
+        async with tx.execute(
+            "SELECT id, claimed_by, claim_lease_expires_at, last_update_at, started_at, result "
+            "FROM jobs WHERE status='queued' AND started_at < ? ORDER BY started_at LIMIT 1000",
+            (cutoff,),
+        ) as cur:
+            return [tuple(row) async for row in cur]
+
+    async def cancel_stale_candidate(self, tx: Transaction, candidate: tuple, *, ended_at: float) -> int:
+        job_id, claimant, lease, updated, started, result = candidate
+        try:
+            evidence = json.loads(result) if result else {}
+        except (TypeError, ValueError):
+            return 0
+        if not isinstance(evidence, dict) or evidence.get("infrastructure_parked"):
+            return 0
+        cur = await tx.execute(
+            "UPDATE jobs SET status='cancelled', ended_at=? WHERE id=? AND status='queued' "
+            "AND started_at=? AND (claimed_by=? OR (claimed_by IS NULL AND ? IS NULL)) "
+            "AND (claim_lease_expires_at=? OR (claim_lease_expires_at IS NULL AND ? IS NULL)) "
+            "AND (last_update_at=? OR (last_update_at IS NULL AND ? IS NULL))",
+            (ended_at, job_id, started, claimant, claimant, lease, lease, updated, updated),
+        )
+        return cur.rowcount
 
     async def select_stale_queued_job_ids(self, tx: Transaction, *, cutoff: float) -> list[str]:
         db = tx
