@@ -14,10 +14,12 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from hive.bus.deps import (
     ACTIVE_JOB_STATUSES,
+    DEP_PURGED_STATUS,
     _cascade_delete_jobs,
     connect_db,
     emit_event,
     hive_repo,
+    release_dependencies,
     require_mutation_actor,
 )
 from hive.bus.schemas import (
@@ -169,6 +171,7 @@ async def admin_purge_jobs(req: PurgeRequest):
     (active, or other-terminal done/failed/cancelled) is refused so a stray or
     buggy caller cannot delete live or historical work."""
     results: dict = {"ok": [], "not_found": [], "skipped_not_dead_letter": []}
+    deleted: list[str] = []
     async with connect_db() as db:
         for job_id in req.job_ids:
             async with db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)) as cur:
@@ -180,14 +183,79 @@ async def admin_purge_jobs(req: PurgeRequest):
                 results["skipped_not_dead_letter"].append(job_id)
                 continue
             await db.execute("DELETE FROM jobs WHERE id=? AND status='dead-letter'", (job_id,))
+            deleted.append(job_id)
+            results["ok"].append(job_id)
             # DEPENDENCY RELEASE (incident 2026-10-27): released in the SAME
             # transaction as the deletes, per purged id.
+            await release_dependencies(db, job_id, DEP_PURGED_STATUS, emit_event=emit_event)
+        await db.commit()
+    if deleted:
+        async with connect_db() as event_db:
+            await emit_event(event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason})
+    return {"deleted": len(deleted), "matched_ids": deleted}
+
+
+@router.post("/v1/jobs/purge", dependencies=[Depends(require_mutation_actor)])
+async def purge_jobs(req: JobPurgeRequest):
+    """Housekeeping purge: delete the terminal jobs matching the given filters.
+
+    Every filter that is set is ANDed. Active statuses (queued/offered/claimed/
+    running/needs-review) are excluded unless ``include_active`` is set, so a
+    stray call cannot delete live work. This is the route the doctor's retention
+    sweep uses (``{"ids": [...], "reason": "doctor-retention-sweep"}``) and the
+    one the bus SOP contract names; dependents of a purged row are released in
+    the same transaction."""
+    where: list[str] = []
+    args: list[Any] = []
+    if req.ids:
+        where.append("id IN (%s)" % ",".join("?" for _ in req.ids))
+        args.extend(req.ids)
+    if req.kind_prefix:
+        where.append("kind LIKE ?")
+        args.append(req.kind_prefix + "%")
+    statuses: list[str] = []
+    if req.status:
+        statuses.append(req.status)
+    if req.statuses:
+        statuses.extend(req.statuses)
+    if statuses:
+        where.append("status IN (%s)" % ",".join("?" for _ in statuses))
+        args.extend(statuses)
+    if req.description_contains:
+        where.append("description LIKE ?")
+        args.append("%" + req.description_contains + "%")
+    if req.submitter_urn:
+        where.append("submitter_urn = ?")
+        args.append(req.submitter_urn)
+    if req.older_than_seconds is not None:
+        where.append("started_at <= ?")
+        args.append(time.time() - float(req.older_than_seconds))
+    if not req.include_active:
+        where.append("status NOT IN (%s)" % ",".join("?" for _ in ACTIVE_JOB_STATUSES))
+        args.extend(ACTIVE_JOB_STATUSES)
+    if not where:
+        raise HTTPException(422, "refusing an unfiltered purge: set ids or at least one filter")
+    sql = "SELECT id FROM jobs WHERE " + " AND ".join(where)
+    if req.ids:
+        # One row per requested id, so the response can report what matched.
+        sql += " LIMIT %d" % (len(req.ids) * 4)
+    matched: list[str] = []
+    deleted: list[str] = []
+    async with connect_db() as db:
+        async with db.execute(sql, tuple(args)) as cur:
+            matched = [r[0] for r in await cur.fetchall()]
+        if matched:
+            deleted = await _cascade_delete_jobs(
+                db, matched, allow_active=req.include_active
+            )
             for jid in deleted:
                 await release_dependencies(db, jid, DEP_PURGED_STATUS, emit_event=emit_event)
             await db.commit()
     if deleted:
         async with connect_db() as event_db:
-            await emit_event(event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason})
+            await emit_event(
+                event_db, "jobs.purged", {"count": len(deleted), "reason": req.reason}
+            )
     return {"deleted": len(deleted), "matched_ids": deleted}
 
 
