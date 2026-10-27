@@ -166,30 +166,33 @@ def test_no_workspace_for_kind_is_a_routing_signal_logged_once(calls):
     assert is_unresolvable_release("no_workspace_for_kind:code") is True
 
 
-def test_no_workspace_for_kind_escalates_at_three_in_six_hours(calls, monkeypatch):
+def test_no_workspace_for_kind_repeated_five_times_stays_no_action(calls, monkeypatch):
+    """The no_workspace_for_kind routing signal is report-only: five sightings
+    of the same signature still return the same no_action, never escalate,
+    and never touch the retry accounting."""
     from hive.workers.doctor_state import DurableStateStore, MemoryBackend
 
     clock = {"now": 1_000_000.0}
     store = DurableStateStore(MemoryBackend(), refresh_secs=0.0, time_fn=lambda: clock["now"])
     monkeypatch.setattr(doctor, "STATE", store)
     job = _job("fix:hive-one", result={"worker_error": "no_workspace_for_kind:code"})
-    out1 = doctor._handle_decline_job(job, "fix:hive-one")
-    assert out1["action"]["action_type"] == "no_action"
-    assert out1["action"]["routing_count"] == 1
-    clock["now"] += 3600
-    out2 = doctor._handle_decline_job(job, "fix:hive-one")
-    assert out2["action"]["routing_count"] == 2
-    assert out2["action"]["action_type"] == "no_action"
-    clock["now"] += 3600
-    out3 = doctor._handle_decline_job(job, "fix:hive-one")
-    assert out3["action"]["routing_count"] == 3
-    assert out3["action"]["action_type"] == "needs_review"
-    assert out3["needs_review"] is True
-    assert "3" in out3["action"]["reason"]
-    # The escalation is a durable-key decision: the count survived all three
-    # passes under the same signature.
+    for i in range(1, 6):
+        out = doctor._handle_decline_job(job, "fix:hive-one")
+        assert out["action"]["action_type"] == "no_action", f"sighting {i} must stay no_action"
+        assert out["action"]["routing_count"] == i, f"sighting {i} must carry its windowed count"
+        assert out["needs_review"] is False, f"sighting {i} must never create a needs-review row"
+        clock["now"] += 3600
+    # The durable telemetry tally recorded all five, but it is TELEMETRY: the
+    # action never changed and no escalation was broadcast.
     key = f"routing_signal:fix:hive-one|no_workspace_for_kind:code"
-    assert len(doctor.STATE.timestamps(key, dp.ROUTING_SIGNAL_WINDOW_SEC)) == 3
+    assert len(doctor.STATE.timestamps(key, dp.ROUTING_SIGNAL_WINDOW_SEC)) == 5
+    assert [t for t, _ in calls["messages"]] == [], "report-only signals never broadcast"
+    assert calls["llm"] == 0
+    assert calls["http"] == [], "a routing signal is logged, not requeued or dead-lettered"
+    # The retry budget is untouched: no resubmit was recorded for this job or
+    # its failure signature.
+    assert doctor._signature_resubmits("fix:hive-one", "decline:job-0001") == []
+    assert doctor._signature_resubmits("fix:hive-one", "no_workspace_for_kind:code") == []
 
 
 def test_no_workspace_for_kind_below_threshold_is_not_needs_review(calls):
@@ -229,6 +232,36 @@ def test_host_declines_kind_logs_once_per_signature(calls):
     # The bus decline counter stays at zero for all of them.
     assert is_unresolvable_release("host_declines_kind:ultra") is False
     assert is_unresolvable_release("host_declines_kind:hydra") is False
+
+
+def test_host_routing_signals_repeated_five_times_stay_report_only(calls, monkeypatch):
+    """host_declines_kind and released_by_host are report-only: five sightings
+    of the same signature still return the same no_action, create no
+    needs-review row, and leave the retry accounting untouched."""
+    from hive.workers.doctor_state import DurableStateStore, MemoryBackend
+
+    clock = {"now": 1_000_000.0}
+    store = DurableStateStore(MemoryBackend(), refresh_secs=0.0, time_fn=lambda: clock["now"])
+    monkeypatch.setattr(doctor, "STATE", store)
+    for reason in ("host_declines_kind:ultra", "released_by_host"):
+        job = _job("fix:hive-one", result={"worker_error": reason})
+        for i in range(1, 6):
+            out = doctor._handle_decline_job(job, "fix:hive-one")
+            assert out["action"]["action_type"] == "no_action", f"{reason} sighting {i} must stay no_action"
+            assert out["action"]["routing_count"] == i, f"{reason} sighting {i} must carry its windowed count"
+            assert out["needs_review"] is False, f"{reason} sighting {i} must never create a needs-review row"
+            clock["now"] += 3600
+    # The durable telemetry tally recorded all ten sightings — telemetry only.
+    assert len(doctor.STATE.keys(dp.KEY_ROUTING_SIGNAL)) == 2
+    key = f"routing_signal:fix:hive-one|host_declines_kind:ultra"
+    assert len(doctor.STATE.timestamps(key, dp.ROUTING_SIGNAL_WINDOW_SEC)) == 5
+    key = f"routing_signal:fix:hive-one|released_by_host"
+    assert len(doctor.STATE.timestamps(key, dp.ROUTING_SIGNAL_WINDOW_SEC)) == 5
+    assert calls["messages"] == [], "report-only signals never broadcast an escalation"
+    assert calls["llm"] == 0
+    assert calls["http"] == [], "a routing signal is logged, not requeued or dead-lettered"
+    # The retry budget is untouched: no resubmit was recorded for this job.
+    assert doctor._signature_resubmits("fix:hive-one", "decline:job-0001") == []
 
 
 # ── invalid_head_branch ─────────────────────────────────────────────────────

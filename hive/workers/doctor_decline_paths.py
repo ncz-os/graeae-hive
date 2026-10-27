@@ -8,9 +8,9 @@ not_task_branch / SIGHUP / push_failed / model_mismatch / review-not-approved /
 loop_unresolved); this module owns the DECLINE vocabulary none of those cover:
 
     no_workspace_for_repo:<repo>      -> canonical-id resubmit or needs-review
-    no_workspace_for_kind:<kind>      -> routing signal; escalate at 3 in 6 h
-    host_declines_kind:<host>         -> routing signal; never counted
-    released_by_host                  -> routing signal; never counted
+    no_workspace_for_kind:<kind>      -> routing signal; report-only, never escalated
+    host_declines_kind:<host>         -> routing signal; report-only, never escalated
+    released_by_host                  -> routing signal; report-only, never escalated
     invalid_head_branch               -> one resubmit with a sanitized branch
     attribution / gate-fail-closed    -> NEVER retried; needs-review + message
     dlq_protected rows                -> never acted; log only
@@ -32,12 +32,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 # Durable-key prefix for the routing-signal tally: one counter per signature,
-# pruned at the routing-signal window.
+# pruned at the routing-signal window. The tally is TELEMETRY ONLY — a pattern
+# detector for logs and dashboards. It never drives a decision: the contract
+# (module docstring, docs/DETERMINISTIC-PATHS.md) is that host routing signals
+# are never counted toward a threshold and never acted on, so no threshold
+# constant exists and `routing_signal_seen` has no escalation return value.
 KEY_ROUTING_SIGNAL = "routing_signal"
 
-# Escalate a routing signature once this many of the SAME signature have
-# arrived inside the window.
-ROUTING_SIGNAL_ESCALATE_AT = 3
 ROUTING_SIGNAL_WINDOW_SEC = 6 * 3600
 
 # Sanitized-branch ceiling (the kind slug eats most of the headroom).
@@ -316,44 +317,18 @@ def routing_signal_seen(
     *,
     now: float | None = None,
     window_sec: float = ROUTING_SIGNAL_WINDOW_SEC,
-    escalate_at: int = ROUTING_SIGNAL_ESCALATE_AT,
-) -> tuple[int, bool]:
+) -> int:
     """Record one routing-signal sighting under its durable signature key and
-    return (count_in_window, escalated_now).
+    return the sightings in the window.
 
-    The counter is the doctor's OWN durable store (the same one that holds the
-    loop and SSH limits): it is a pattern detector, not a decline counter. A
-    routing signal NEVER increments the bus decline_count, whatever this says.
+    The tally is the doctor's OWN durable store (the same one that holds the
+    loop and SSH limits): it is TELEMETRY, not a decision input. A routing
+    signal NEVER increments the bus decline_count and NEVER changes the
+    handler's action — the count exists so a repeated pattern is visible in
+    the logs, not so the doctor can act on it.
     """
     signature = routing_signal_signature(job, reason)
     key = f"{KEY_ROUTING_SIGNAL}:{signature}"
     at = float(now) if now is not None else time.time()
     stamps = store.touch(key, float(window_sec), at=at)
-    count = len([s for s in stamps if at - float(s) <= window_sec])
-    escalated = count >= int(escalate_at)
-    return count, escalated
-
-
-def routing_signal_escalation(
-    job: dict[str, Any] | None = None,
-    reason: str = "",
-    *,
-    count: int,
-    window_sec: float = ROUTING_SIGNAL_WINDOW_SEC,
-) -> DeclineDecision:
-    """The needs-review decision once a routing signature crosses its threshold."""
-    return DeclineDecision(
-        "needs_review",
-        (
-            f"routing signal {reason!r} arrived {count}x in {int(window_sec // 3600)}h "
-            f"(threshold {ROUTING_SIGNAL_ESCALATE_AT}); pattern needs an operator"
-        ),
-        needs_operator=True,
-        message_topic="doctor.routing_signal_escalation",
-        message_payload={
-            "job_id": (job or {}).get("id", ""),
-            "signature": routing_signal_signature(job, reason),
-            "count": count,
-            "window_hours": int(window_sec // 3600),
-        },
-    )
+    return len([s for s in stamps if at - float(s) <= window_sec])

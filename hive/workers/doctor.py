@@ -2576,8 +2576,12 @@ def _handle_decline_job(job: dict, base_kind: str) -> dict | None:
     failure-matrix rules do not own, or None when no decline reason is on
     record (the row falls through to the v2 rules and the LLM path). The
     routing signals never increment the bus decline counter — that is the
-    bus classifier's job, covered in test_decline_reasons.py; this handler
-    only ever logs, tallies, and escalates.
+    bus classifier's job, covered in test_decline_reasons.py — and this
+    handler never acts on them either: a routing signal is report-only. It
+    is recorded in the durable telemetry tally (one sighting per signature,
+    windowed) and logged, and nothing else: no needs-review, no escalation,
+    no resubmit, no retry-budget consumption, no matter how often the same
+    signature arrives.
 
     Module-level names used here (all defined in this module):
         log                      logging.getLogger("doctor")          line ~392
@@ -2604,42 +2608,18 @@ def _handle_decline_job(job: dict, base_kind: str) -> dict | None:
     if decision.action == "no_action" and not decision.reason.startswith("unowned"):
         # host_declines_kind / released_by_host: a legitimate "not me" from the
         # matcher. Never counted (the bus keeps it out of decline_count — pinned
-        # in test_decline_reasons.py). The doctor logs it once per signature and
-        # hands the row back to the queue's own routing; if the same signature
-        # hits 3 in 6 h the doctor escalates with the count (durable key).
-        count, escalated = decline_paths.routing_signal_seen(STATE, job, reason)
-        if escalated:
-            esc = decline_paths.routing_signal_escalation(job, reason, count=count)
-            broadcast_doctor_message(
-                "doctor.routing_signal_escalation",
-                {
-                    "host": AGENT_HOST,
-                    "job_id": job.get("id", ""),
-                    "signature": decline_paths.routing_signal_signature(job, reason),
-                    "count": count,
-                    "reason": esc.reason,
-                },
-            )
-            return {
-                "exit_code": 0,
-                "stdout": f"action=needs-review; reason={esc.reason}",
-                "action": {"action_type": "needs_review", "reason": esc.reason, "routing_count": count},
-                "base_kind": base_kind,
-                "released_to_queue": False,
-                "needs_review": True,
-                "needs_review_result": {
-                    "doctor_needs_review": True,
-                    "needs_operator": True,
-                    "reason": esc.reason,
-                },
-            }
+        # in test_decline_reasons.py) and never acted on: the sighting goes
+        # into the durable telemetry tally so a repeated pattern is visible,
+        # and the row is handed back to the queue's own routing. The tally
+        # NEVER changes this branch's action and NEVER consumes a retry
+        # budget — the signal is a report, at any count.
+        count = decline_paths.routing_signal_seen(STATE, job, reason)
         log.info(
-            "routing signal %s: job=%s count=%d in %dh (threshold %d)",
+            "routing signal %s: job=%s count=%d in %dh (telemetry only, never escalated)",
             reason,
             job.get("id", "")[:12],
             count,
             int(decline_paths.ROUTING_SIGNAL_WINDOW_SEC // 3600),
-            decline_paths.ROUTING_SIGNAL_ESCALATE_AT,
         )
         return {
             "exit_code": 0,
@@ -2667,40 +2647,17 @@ def _handle_decline_job(job: dict, base_kind: str) -> dict | None:
             },
         }
     if decision.action == "no_action_log":
-        count, escalated = decline_paths.routing_signal_seen(STATE, job, reason)
+        # no_workspace_for_kind:<kind>: same report-only contract as the host
+        # signals — the sighting goes into the durable telemetry tally and the
+        # row is handed back to the queue's own routing. The tally NEVER
+        # changes this branch's action and NEVER consumes a retry budget.
+        count = decline_paths.routing_signal_seen(STATE, job, reason)
         log.info(
-            "routing signal %s: count=%d in %dh (threshold %d)%s",
+            "routing signal %s: count=%d in %dh (telemetry only, never escalated, logged once per signature)",
             reason,
             count,
             int(decline_paths.ROUTING_SIGNAL_WINDOW_SEC // 3600),
-            decline_paths.ROUTING_SIGNAL_ESCALATE_AT,
-            " — ESCALATING" if escalated else " (logged once per signature)",
         )
-        if escalated:
-            esc = decline_paths.routing_signal_escalation(job, reason, count=count)
-            broadcast_doctor_message(
-                "doctor.routing_signal_escalation",
-                {
-                    "host": AGENT_HOST,
-                    "job_id": job.get("id", ""),
-                    "signature": decline_paths.routing_signal_signature(job, reason),
-                    "count": count,
-                    "reason": esc.reason,
-                },
-            )
-            return {
-                "exit_code": 0,
-                "stdout": f"action=needs-review; reason={esc.reason}",
-                "action": {"action_type": "needs_review", "reason": esc.reason, "routing_count": count},
-                "base_kind": base_kind,
-                "released_to_queue": False,
-                "needs_review": True,
-                "needs_review_result": {
-                    "doctor_needs_review": True,
-                    "needs_operator": True,
-                    "reason": esc.reason,
-                },
-            }
         return {
             "exit_code": 0,
             "stdout": f"action=no_action; reason={decision.reason}; routing count={count}",
