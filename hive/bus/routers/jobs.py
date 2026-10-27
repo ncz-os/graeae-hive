@@ -110,9 +110,7 @@ _JOB_COLUMNS = (
     "claimed_runtime, claimed_cost_tier, "
     # Fault 2026-10-17: JobCreate accepted these and the row carried them, but
     # GET /v1/jobs/{id} never selected/returned them.
-    "preferred_providers, preferred_models, depends_on, project, max_cost_tier, mnemos_refs, "
-    # Additive (2026-10-27): why the last worker released this job.
-    "last_decline_reason, last_decline_at, last_declined_by"
+    "preferred_providers, preferred_models, depends_on, project, max_cost_tier, mnemos_refs"
 )
 
 
@@ -269,9 +267,6 @@ async def get_job(job_id: str):
         "project": r[33],
         "max_cost_tier": r[34],
         "mnemos_refs": json.loads(r[35]) if r[35] else None,
-        "last_decline_reason": r[36],
-        "last_decline_at": r[37],
-        "last_declined_by": r[38],
     }
 
 
@@ -1167,12 +1162,17 @@ async def update_job(job_id: str, req: JobUpdate):
                     "ended_at": None,
                 }
             )
-            # Persist WHY the job left a worker (2026-10-27): the reason, the
-            # time and the releasing agent. A dead-letter row must explain itself.
+            # WHY the job left a worker, inside the row's own result JSON
+            # (2026-10-27). Backend-neutral on purpose: PANTHEON/HIVE run on
+            # Oracle in production, where adding columns to the shared SELECT
+            # means a DDL migration on the live DB; result is already returned
+            # by GET, so the row explains itself with no schema change.
+            _res = dict(req.result) if isinstance(req.result, dict) else {}
             if release_reason:
-                sets["last_decline_reason"] = release_reason
-            sets["last_decline_at"] = now
-            sets["last_declined_by"] = old_claimed_by
+                _res["last_release_reason"] = release_reason
+            _res["last_release_at"] = now
+            _res["last_released_by"] = old_claimed_by
+            sets["result"] = json.dumps(_res)
             # GRAEAE dispatch consensus 1.0 SHIP-FIRST: exponential backoff on EVERY
             # release (±20% jitter) so a job no local worker can run cannot hot-loop.
             import random as _rnd
@@ -1282,9 +1282,6 @@ async def update_job(job_id: str, req: JobUpdate):
                         "ended_at": now,
                         "claim_lease_expires_at": None,
                         "result": json.dumps(dl_result),
-                        "last_decline_reason": decline_reason or release_reason,
-                        "last_decline_at": now,
-                        "last_declined_by": old_claimed_by,
                     },
                     expected_status="queued",
                 )
