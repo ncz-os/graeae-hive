@@ -68,6 +68,7 @@ from hive.workers import remediation, retention
 # Both are stdlib-only siblings, importable without the hive package, so the
 # container still runs this module standalone.
 from hive.workers import doctor_gates, doctor_v2
+from hive.workers import doctor_decline_paths as decline_paths
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
@@ -2801,6 +2802,19 @@ def process_triage_job(job: dict) -> dict:
     failed = fetch_failed_jobs_for_kind(base_kind, limit=10)
     registry = fetch_agent_registry_summary()
 
+    # ── Deterministic decline paths (2026-10-27) ──
+    # The decline vocabulary is decided by table, not by prompt: every reason
+    # string in docs/DETERMINISTIC-PATHS.md resolves to a bounded action BEFORE
+    # any LLM call, and no invoke_doctor_agent call can follow a classified row.
+    # The main failure-matrix rules (integrity / dirty worktree / no-commits /
+    # SIGHUP / push_failed / model_mismatch / review-not-approved /
+    # loop_unresolved) are owned by the in-flight failure-matrix job; this
+    # block owns only the decline rows, in a clearly separated function so the
+    # two can be reconciled when that branch lands.
+    decline = _handle_decline_job(job, base_kind)
+    if decline is not None:
+        return decline
+
     # Deterministic rules are evaluated before any model call.  In shadow mode
     # they are logged and returned as comparison metadata while the established
     # doctor continues to act; enforce mode uses only the fixed action set.
@@ -3035,6 +3049,243 @@ def process_triage_job(job: dict) -> dict:
 
 # ───────────────────────── Main loop ─────────────────────────
 # ───────────────────── dead-letter queue remediation ─────────────────────
+# Scalar keys that never ride on a decline-resubmit JobCreate: identity,
+# terminal state, and the decline evidence of the original row.
+_RESUBMIT_BODY_EXCLUDES = (
+    "id",
+    "status",
+    "result",
+    "created_at",
+    "ended_at",
+    "worker_error",
+    "last_decline_reason",
+)
+
+
+def _resubmit_job_once(job: dict, fields: dict, note: str) -> dict:
+    """Resubmit one declined job exactly once with `fields` patched in.
+
+    A second resubmit of the same job is impossible by construction: the
+    durable key `v2_resubmit:decline:<job_id>` is checked AND recorded in one
+    step, under the 30-day signature window, so a doctor restart or a second
+    triage pass over the same row cannot re-release it.
+    """
+    jid = job.get("id", "")
+    kind_base = _base_kind(str(job.get("kind") or ""))
+    # A resubmit of a declined job is a FRESH submit, not a release of the
+    # original row: the original stays dead-letter/failed as evidence and the
+    # new row carries the corrected field. The durable key here is what keeps
+    # this to exactly one per job across restarts and triage cycles.
+    #
+    # `already` is read through the same store the handler runs on; the
+    # `decline:` signature is the job id, not a failure signature, so the
+    # 30-day window applies without the per-kind digest.
+    decline_key = f"decline:{jid}"
+    already = len(_signature_resubmits(kind_base, decline_key))
+    # One resubmit per declined job: the durable key above was written on the
+    # first pass, so a second triage cycle (or a doctor restart) finds it and
+    # holds — no second submit, ever.
+    if already:
+        return {
+            "exit_code": 0,
+            "stdout": f"action=resubmit; held {jid[:12]}: already resubmitted once ({note})",
+            "action": {"action_type": "resubmit", "reason": note, "resubmit_body": None, "already_resubmitted": True},
+            "base_kind": kind_base,
+            "released_to_queue": False,
+            "needs_review": False,
+        }
+    _record_signature_resubmit(kind_base, f"decline:{jid}")
+    # The resubmit is a fresh JobCreate: keep the scalar work fields, patch in
+    # the corrected ones, and drop identity / terminal state / decline evidence
+    # — those ride on the result of the ORIGINAL row, not the new one.
+    body = {
+        k: v
+        for k, v in job.items()
+        if isinstance(v, (str, int, float))
+        and v is not None
+        and k not in _RESUBMIT_BODY_EXCLUDES
+    }
+    body.update(fields)
+    # DRY_RUN is the doctor-wide submit switch; the DLQ switch is unrelated to
+    # triage-path resubmits and must not double-gate them.
+    if DRY_RUN:
+        text = f"DRY_RUN: would resubmit {jid[:12]} ({note})"
+    else:
+        code, resp = _http("POST", "/v1/jobs", body)
+        if code in (200, 201) and resp:
+            text = f"resubmitted {jid[:12]} -> {str(resp.get('id', ''))[:12]} ({note})"
+        else:
+            text = f"resubmit FAILED {jid[:12]} code={code} resp={str(resp)[:160]}"
+    return {
+        "exit_code": 0,
+        "stdout": f"action=resubmit; {text}",
+        "action": {"action_type": "resubmit", "reason": note, "resubmit_body": body, "already_resubmitted": False},
+        "base_kind": kind_base,
+        "released_to_queue": False,
+        "needs_review": False,
+    }
+
+
+def _handle_decline_job(job: dict, base_kind: str) -> dict | None:
+    """The doctor's deterministic decline-vocabulary handler (2026-10-27).
+
+    Returns a process_triage_job-shaped result for the decline rows the
+    failure-matrix rules do not own, or None when no decline reason is on
+    record (the row falls through to the v2 rules and the LLM path). The
+    routing signals never increment the bus decline counter — that is the
+    bus classifier's job, covered in test_decline_reasons.py — and this
+    handler never acts on them either: a routing signal is report-only. It
+    is recorded in the durable telemetry tally (one sighting per signature,
+    windowed) and logged, and nothing else: no needs-review, no escalation,
+    no resubmit, no retry-budget consumption, no matter how often the same
+    signature arrives.
+
+    Module-level names used here (all defined in this module):
+        log                      logging.getLogger("doctor")          line ~392
+        STATE                    state_store_from_env()                line ~429
+        AGENT_HOST               socket.gethostname()                  line ~82
+        decline_paths            hive.workers.doctor_decline_paths     line ~71
+        broadcast_doctor_message _http POST /v1/messages              line ~1949
+        _base_kind               kind -> base_kind                    line ~1848
+        _signature_resubmits     STATE.timestamps wrapper             line ~2212
+        _record_signature_resubmit STATE.touch wrapper                line ~2218
+        decline_paths.INVALID_HEAD_BRANCH_PREFIX
+        decline_paths.resubmit_body_for_invalid_head
+    """
+    reason = decline_paths._reason(job)
+    if not reason:
+        # No decline reason on record: the row is not a decline at all, so the
+        # decline table must not decide it — fall through to the v2 rules and,
+        # only if none of those own it, the LLM path. A decline REASON is what
+        # triggers this handler; an empty one is a non-event, not a no_action
+        # verdict on the job.
+        return None
+    decision = decline_paths.classify_decline_reason(reason, job)
+    # ── host routing signals: never counted, never acted, logged once per sig ──
+    if decision.action == "no_action" and not decision.reason.startswith("unowned"):
+        # host_declines_kind / released_by_host: a legitimate "not me" from the
+        # matcher. Never counted (the bus keeps it out of decline_count — pinned
+        # in test_decline_reasons.py) and never acted on: the sighting goes
+        # into the durable telemetry tally so a repeated pattern is visible,
+        # and the row is handed back to the queue's own routing. The tally
+        # NEVER changes this branch's action and NEVER consumes a retry
+        # budget — the signal is a report, at any count.
+        count = decline_paths.routing_signal_seen(STATE, job, reason)
+        log.info(
+            "routing signal %s: job=%s count=%d in %dh (telemetry only, never escalated)",
+            reason,
+            job.get("id", "")[:12],
+            count,
+            int(decline_paths.ROUTING_SIGNAL_WINDOW_SEC // 3600),
+        )
+        return {
+            "exit_code": 0,
+            "stdout": f"action=no_action; reason={decision.reason}; routing count={count}",
+            "action": {"action_type": "no_action", "reason": decision.reason, "routing_count": count},
+            "base_kind": base_kind,
+            "released_to_queue": False,
+            "needs_review": False,
+        }
+    if decision.action == "no_action" and decision.reason.startswith("unowned"):
+        # A reason no table owns must surface, not vanish: the registry is a
+        # contract and an unknown row is a missing row, so it is an operator
+        # question, not an LLM question.
+        return {
+            "exit_code": 0,
+            "stdout": f"action=needs-review; reason={decision.reason}",
+            "action": {"action_type": "needs_review", "reason": decision.reason, "needs_review": True},
+            "base_kind": base_kind,
+            "released_to_queue": False,
+            "needs_review": True,
+            "needs_review_result": {
+                "doctor_needs_review": True,
+                "needs_operator": True,
+                "reason": decision.reason,
+            },
+        }
+    if decision.action == "no_action_log":
+        # no_workspace_for_kind:<kind>: same report-only contract as the host
+        # signals — the sighting goes into the durable telemetry tally and the
+        # row is handed back to the queue's own routing. The tally NEVER
+        # changes this branch's action and NEVER consumes a retry budget.
+        count = decline_paths.routing_signal_seen(STATE, job, reason)
+        log.info(
+            "routing signal %s: count=%d in %dh (telemetry only, never escalated, logged once per signature)",
+            reason,
+            count,
+            int(decline_paths.ROUTING_SIGNAL_WINDOW_SEC // 3600),
+        )
+        return {
+            "exit_code": 0,
+            "stdout": f"action=no_action; reason={decision.reason}; routing count={count}",
+            "action": {"action_type": "no_action", "reason": decision.reason, "routing_count": count},
+            "base_kind": base_kind,
+            "released_to_queue": False,
+            "needs_review": False,
+        }
+    if decision.action == "resubmit":
+        if reason.startswith(decline_paths.INVALID_HEAD_BRANCH_PREFIX):
+            fields = decline_paths.resubmit_body_for_invalid_head(job)
+            note = f"invalid_head_branch -> sanitized {fields['head_branch']!r}"
+            if fields.get("branch_created_from"):
+                note += f" (kept branch_created_from {fields['branch_created_from']!r})"
+        else:
+            fields = dict(decision.resubmit_fields)
+            note = decision.reason
+        # The resubmit NEVER carries a target_workspace — unset means the bus
+        # resolves the workspace itself, which is exactly what the original
+        # decline was missing.
+        fields = {k: v for k, v in fields.items() if v is not None}
+        return _resubmit_job_once(job, fields, note)
+    if decision.action == "needs_review":
+        # Needs-review is its OWN action type, not a flavor of escalate: the
+        # terminal loop reads it to tag the row status=needs-review (the
+        # operator owns it from here), and nothing downstream may mistake it
+        # for a plain LLM escalation and re-triage it.
+        result = {
+            "doctor_needs_review": True,
+            "needs_operator": decision.needs_operator,
+            "reason": decision.reason,
+        }
+        if decision.message_topic:
+            broadcast_doctor_message(
+                decision.message_topic,
+                {
+                    "host": AGENT_HOST,
+                    "job_id": job.get("id", ""),
+                    **decision.message_payload,
+                },
+            )
+        return {
+            "exit_code": 0,
+            "stdout": f"action=needs-review; reason={decision.reason}",
+            "action": {"action_type": "needs_review", "reason": decision.reason, "needs_review": True},
+            "base_kind": base_kind,
+            "released_to_queue": False,
+            "needs_review": True,
+            "needs_review_result": result,
+        }
+    if decision.action == "log_only":
+        # A protected row: the owner of that lane handles it. The doctor's only
+        # move is to say so — no requeue, no resubmit, no escalation, and
+        # crucially NO LLM call, so a protected row can never be "fixed" into
+        # the owner's hands or retried against a host that declined it.
+        log.info(
+            "dlq_protected lane job=%s reason=%s -> log only, left for its owner",
+            job.get("id", "")[:12],
+            reason,
+        )
+        return {
+            "exit_code": 0,
+            "stdout": f"action=log_only; reason={decision.reason}",
+            "action": {"action_type": "no_action", "reason": decision.reason, "log_only": True},
+            "base_kind": base_kind,
+            "released_to_queue": False,
+            "needs_review": False,
+        }
+    return None
+
+
 def fetch_dead_letter_jobs(limit: int = 200) -> list[dict]:
     """Jobs in the terminal dead-letter queue, newest first."""
     code, resp = _http("GET", f"/v1/jobs?status=dead-letter&limit={int(limit)}", timeout=15.0)
