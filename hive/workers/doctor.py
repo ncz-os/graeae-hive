@@ -2741,6 +2741,15 @@ def main():
                 except Exception as e:
                     log.warning("scan error: %s", e)
 
+            # Periodic terminal-job retention sweep (bounded interval — never
+            # every tick): keeps the dead-job backlog at or under the cap.
+            if now - last_retention >= RETENTION_SWEEP_INTERVAL:
+                last_retention = now
+                try:
+                    run_retention_sweep()
+                except Exception as e:
+                    log.warning("retention sweep error: %s", e)
+
             job = claim_next_job()
             if not job:
                 time.sleep(POLL_INTERVAL)
