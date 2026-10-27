@@ -3802,6 +3802,9 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     jid = str(job.get("id") or "")
     if not jid or job.get("status") != "needs-review":
         return "skipped_status"
+    # Triage rows are remediation reports, not branches for code review.
+    if str(job.get("kind") or "").startswith("triage:"):
+        return "skipped_triage"
     if review_followup_protected(job):
         return "skipped_protected"
     if not STATE.loaded_ok or not STATE.persist_ok:

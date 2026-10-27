@@ -1749,7 +1749,8 @@ async def update_job(job_id: str, req: JobUpdate):
         # retries are exhausted stays 'failed' -> release).
         if (not retried) and req.status in DEP_DEAD_STATUSES:
             await release_dependencies(tx, job_id, req.status, emit_event=emit_event)
-        if not retried and req.status == "needs-review":
+        # Triage rows describe remediation, not code branches for review.
+        if not retried and req.status == "needs-review" and not str(job_kind or "").startswith("triage:"):
             await dispatch_needs_review(tx, hive_repo(), job_id, now=now, emit_event=emit_event)
         if not retried and req.status == "done":
             await reconcile_review_parent(tx, hive_repo(), job_id, now=now, emit_event=emit_event)
