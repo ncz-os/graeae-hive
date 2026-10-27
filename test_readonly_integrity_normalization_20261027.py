@@ -51,7 +51,7 @@ class ReadonlyIntegrityNormalizationTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(hive_jobs_router, "hive_repo", lambda: repo),
             mock.patch.object(hive_jobs_router, "connect_db", repo.connection),
         ):
-            return await hive_jobs_router.patch_job(
+            return await hive_jobs_router.update_job(
                 job_id,
                 JobUpdate(status=status, claimed_by="urn:agent:zeroclaw:host:x", result=result),
             )
