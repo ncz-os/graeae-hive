@@ -1,6 +1,7 @@
 """Queue incident regressions through production routes and SQLite transactions."""
 
 import json
+import time
 from unittest import mock
 
 from fastapi import HTTPException
@@ -59,6 +60,32 @@ class QueueAuditTests(_RepoCase):
             with self.assertRaises(HTTPException) as exc:
                 await self._submit(repo, repo="example", head_branch="published")
         self.assertIn("output_branch_exists", exc.exception.detail)
+
+    async def test_submit_reprobes_cached_absent_output_ref(self):
+        repo = await self._repo()
+        await self._agent(repo)
+        ba = hive_jobs_router._ba_mod
+        url = "ssh://origin/repo"
+        ba.clear_probe_cache()
+        ba._PROBE_CACHE[(url, "refs/heads/published")] = (time.time(), "absent")
+        ba._PROBE_CACHE[(url, "refs/heads/main")] = (time.time(), "present")
+        published = mock.Mock(returncode=0, stdout="abc\trefs/heads/published\n")
+        admission = ba.branch_admission
+        try:
+            with (
+                mock.patch.object(ba, "resolve_remote_url", return_value=url),
+                mock.patch.object(ba.subprocess, "run", return_value=published) as probe,
+                mock.patch.object(
+                    hive_jobs_router, "branch_admission",
+                    side_effect=lambda **kw: admission(**kw, resolver=lambda _: url),
+                ),
+            ):
+                with self.assertRaises(HTTPException) as exc:
+                    await self._submit(repo, repo="example", head_branch="published", base_branch="main")
+            self.assertIn("output_branch_exists", exc.exception.detail)
+            self.assertEqual(probe.call_count, 1)
+        finally:
+            ba.clear_probe_cache()
 
     async def test_infra_requeues_preserves_evidence_excludes_failed_host_and_parks_at_budget(self):
         for budget, expected_count, parked in [(2, 1, False), (0, 0, True)]:

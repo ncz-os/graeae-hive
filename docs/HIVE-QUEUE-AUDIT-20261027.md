@@ -4,8 +4,7 @@
 
 Baseline and unchanged HEAD: `f2c43020c4e91965a802f665354ff9cd52dc8717`, branch `feat/hive-astra-audit-20261027`.
 
-This audit records **39 grouped findings: 19 fixed in the Astra baseline, 20 remaining (3 partially remediated by Terra, 17 left)**. The remaining-effort counts are **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
-This audit records **39 grouped findings: 19 fixed in the Astra baseline; of the 20 remaining findings, 1 fixed, 2 partial, and 17 left** after the priority-B addendum below. The original remaining-effort counts were **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
+This audit records **39 grouped findings: 20 fixed and 19 remaining** (5 partial, 14 left) after priority-C. The original remaining-effort counts were **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
 
 No live bus/database, remote forge, MNEMOS, service restart, or push was used. The explicit repository-only restriction overrides standing network registration/persistence workflows for this task. The sandbox declares `.git` read-only. No staging, commit, push, or attempt to bypass that restriction was made. The index is unchanged; the working tree necessarily contains the unstaged fixes. A literally clean working tree would require discarding them. No new commit SHA or primary zoder APPROVE is claimed. Independent local reviews caught and corrected overbroad infrastructure classification and a review-parent completion gap; they are not a substitute for the external gate.
 
@@ -318,3 +317,42 @@ and bytecode created for the new test; no remote files, build trees, services,
 or background processes were created. `df -h . /private/tmp` reported the same
 APFS volume at 460 GiB total, 325 GiB used, 110 GiB available, 75% capacity;
 no tmpfs was used.
+
+## Terra priority-C remediation 2026-10-27
+
+Local source only. The repository-only restriction excludes network access,
+including MNEMOS, Hive and zoder; no external review or backend matrix was run.
+The git metadata is read-only; changes remain unstaged for the orchestrator.
+
+| ID | Status | Location, regression and acceptance evidence / outstanding work |
+|---|---|---|
+| R01 | Partial | Prior worker remediation remains as described above; no new regression. Deployed runtime and finalizer acceptance remain open. |
+| R02 | Left | `hive/bus/domain/failure.py:10`, `hive/workers/run.py:84`: no new regression; executor-published expiring readiness and explicit legacy policy remain. |
+| R03 | Partial | `hive/bus/domain/branch_admission.py:162`, `test_queue_audit_20261027.py:65`: `test_submit_reprobes_cached_absent_output_ref` drives submission with a legacy cached negative and a published ref; it rejects the ref. A model of the old cache behavior fails the regression by admitting the job. Cross-process durable reservations, the remaining probe-to-push race, and idempotent worker delivery remain open. |
+| R04 | Left | `hive/bus/domain/jobs.py:310`: no new regression; trusted origin verification and executor migration remain. |
+| R05 | Left | `hive/workers/doctor.py:3502`: no new regression; pagination and failed-child recovery remain. |
+| R06 | Partial | Prior compare-and-set remediation remains; revision ABA and visible release errors remain. No new regression. |
+| R07 | Partial | Prior owner/lease compare-and-set remains; monotonic revision and backend concurrency remain. No new regression. |
+| R08 | Left | `hive/persistence/sqlite.py:1249`: no new regression; dependency CAS and savepoint behavior remain. |
+| R09 | Left | `hive/bus/app.py:331`: no new regression; atomic stable occurrence insertion remains. |
+| R10 | Left | `hive/persistence/sqlite.py:1727`: no new regression; portable cost query and backend matrix remain. |
+| R11 | Left | `hive/bus/deps.py:87`: no new regression; transactional post-commit outbox remains. |
+| R12 | Left | `hive/workers/doctor.py:856`: no new regression; durable sweep ledger and fetch error reporting remain. |
+| R13 | Left | `hive/bus/domain/capacity_ledger.py:20`: no new regression; cross-process provider reservation remains. |
+| R14 | Left | `hive/workers/remediation.py:417`: no new regression; production promotion and manifest validation remain. |
+| R15 | Left | `hive/workers/run.py:180`: no new regression; independent lease renewal and durable report outbox remain. |
+| R16 | Left | `hive/persistence/base.py:1`: no new regression; ABC and backend behavioral matrix remain. |
+| R17 | Left | `test_eih_probe.py:556`: no new regression; local suite environment and baseline assumptions remain. |
+| R18 | Left | `hive/bus/routers/jobs.py:1586`: no new regression; protected project/prefix enforcement remains. |
+| R19 | Fixed | Prior priority-B contract regression remains; no new change. |
+| R20 | Partial | Prior package inclusion regression remains; isolated wheel build and installed runtime validation remain. |
+
+Verification: local Python 3.14, with existing cached `aiosqlite` and
+`sse_starlette` supplied on PYTHONPATH, ran `test_queue_audit_20261027.py` and
+`test_submitter_controls_20261025.py`: **50 passed**. The new test fails when
+the previous negative-cache lookup behavior is restored in memory: **1 failed
+as expected**, because the submission succeeds. This does not test real remote
+Git, PostgreSQL/MySQL, cross-process reservations, or installed production
+executors. Production venv `/opt/agent-bus-venv/bin/python` is on PYTHIA and was
+not accessed. Positive cache entries remain unchanged; pre-existing negative
+entries are discarded on lookup. No schema or public API changed.

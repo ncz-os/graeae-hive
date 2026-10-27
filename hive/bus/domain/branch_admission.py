@@ -85,7 +85,7 @@ def _env_float(name: str, default: float, *, minimum: float, maximum: float) -> 
 #: the bus beyond a few seconds.
 PROBE_TIMEOUT = _env_float("HIVE_BRANCH_PROBE_TIMEOUT", 15.0, minimum=1.0, maximum=120.0)
 
-#: Cache window (seconds) for SUCCESSFUL probe results. 0 disables caching
+#: Cache window (seconds) for positive probe results. 0 disables caching
 #: (tests). Transport errors are never cached, whatever this says.
 PROBE_CACHE_TTL = _env_float("HIVE_BRANCH_PROBE_TTL", 60.0, minimum=0.0, maximum=3600.0)
 
@@ -168,6 +168,12 @@ def _cache_get(url: str, ref: str) -> str | None:
     if not hit:
         return None
     ts, state = hit
+    # An absent ref may be published at any time.  In particular it cannot
+    # establish that an output ref is still available at admission time.
+    # Discard legacy negative entries too, including those set by old code.
+    if state != "present":
+        _PROBE_CACHE.pop((url, ref), None)
+        return None
     if time.time() - ts > PROBE_CACHE_TTL:
         _PROBE_CACHE.pop((url, ref), None)
         return None
@@ -175,10 +181,8 @@ def _cache_get(url: str, ref: str) -> str | None:
 
 
 def _cache_put(url: str, ref: str, state: str) -> None:
-    # Only a DEFINITE answer is worth remembering. ``transport_error`` is a
-    # statement about the network right now, not about the branch, so caching
-    # it would keep failing open after the remote came back.
-    if PROBE_CACHE_TTL > 0 and state in ("present", "absent"):
+    # A negative answer can become stale as soon as another writer pushes.
+    if PROBE_CACHE_TTL > 0 and state == "present":
         _PROBE_CACHE[(url, ref)] = (time.time(), state)
 
 
