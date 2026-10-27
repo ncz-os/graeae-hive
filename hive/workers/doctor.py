@@ -62,6 +62,8 @@ import urllib.request
 import uuid
 from collections import deque
 
+from hive.workers import retention
+
 # SOP phase 3 (2026-10-22): durable safety state and the destructive-action rails.
 # Both are stdlib-only siblings, importable without the hive package, so the
 # container still runs this module standalone.
@@ -237,6 +239,16 @@ def _classify_attempt_failure(reason: str) -> str:
         return "transport"
     return "other"
 
+
+# ── Terminal-job retention (operator 2026-10-27) ──
+# The queue must never hold a backlog of dead jobs ("we should never have a
+# queue of 20+ dead jobs"). The doctor sweeps terminal rows on a bounded
+# interval; the pure planner + snapshot helpers live in hive.workers.retention.
+RETENTION_DRY_RUN = os.environ.get("RETENTION_DRY_RUN", "0") == "1"
+RETENTION_DEAD_TTL_SEC = float(os.environ.get("RETENTION_DEAD_TTL_SEC", "3600"))   # dead rows older than 1 h
+RETENTION_TRIAGE_TTL_SEC = float(os.environ.get("RETENTION_TRIAGE_TTL_SEC", "600"))  # triage work orders older than 10 min
+RETENTION_MAX_DEAD = int(os.environ.get("RETENTION_MAX_DEAD", "10"))   # hard cap on dead (failed+dead-letter+cancelled)
+RETENTION_SWEEP_INTERVAL = float(os.environ.get("RETENTION_SWEEP_INTERVAL", "600"))  # seconds between retention sweeps
 
 # Self-triage scanner config
 SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))  # seconds between failed-cluster scans
@@ -1954,6 +1966,144 @@ def broadcast_doctor_message(topic: str, payload: dict):
         log.debug("broadcast %s failed code=%s", topic, code)
 
 
+# ───────────────────────── Terminal-job retention sweep ─────────────────────────
+def _fetch_retention_rows() -> list[dict] | None:
+    """Fetch every row the sweep may look at: all terminal statuses plus
+    ``done`` (for ``triage:*`` work orders). Returns None when ANY listing is
+    incomplete (a failed sweep must never purge on a partial picture)."""
+    jobs: list[dict] = []
+    for status in (*retention.DEAD_STATUSES, "done"):
+        code, resp = _http("GET", f"/v1/jobs?status={status}&limit=1000", timeout=20.0)
+        if code != 200 or not resp:
+            log.warning("retention sweep: listing %s failed code=%s — skipping sweep", status, code)
+            return None
+        jobs.extend(resp.get("jobs", []) or [])
+    return jobs
+
+
+def run_retention_sweep() -> dict | None:
+    """One terminal-job retention sweep: fetch → plan → re-read → snapshot →
+    purge → verify → announce.
+
+    Operator invariant: after a sweep ``count(failed+dead-letter+cancelled) <=
+    RETENTION_MAX_DEAD``. Protected rows (active statuses, non-triage ``done``)
+    are never touched; a snapshot is written BEFORE any deletion and a failed
+    snapshot aborts the sweep (no purge without a snapshot).
+
+    Returns the report dict — including a report when nothing was planned or
+    purged, so the invariant's state is observable on EVERY sweep (the recount
+    is read-only, so dry-run and no-op sweeps verify the invariant against the
+    live bus too) — or None only when the initial listing was incomplete and
+    the queue state could not be assessed at all. ``RETENTION_DRY_RUN=1``
+    plans and reports without calling the purge endpoint."""
+    rows = _fetch_retention_rows()
+    if rows is None:
+        return None
+    plan = retention.plan_retention_sweep(
+        rows,
+        dead_ttl=RETENTION_DEAD_TTL_SEC,
+        triage_ttl=RETENTION_TRIAGE_TTL_SEC,
+        max_dead=RETENTION_MAX_DEAD,
+    )
+    purge_ids: list[str] = plan["purge_ids"]
+
+    # Re-read each candidate immediately before deleting: never purge a job
+    # another code path may still be writing (row vanished or moved active).
+    to_purge: list[str] = []
+    skipped = 0
+    for jid in purge_ids:
+        code, row = _http("GET", f"/v1/jobs/{jid}", timeout=15.0)
+        if code != 200 or not row:
+            skipped += 1
+            continue
+        if row.get("status") in retention.PROTECTED_ACTIVE_STATUSES:
+            skipped += 1
+            continue
+        to_purge.append(jid)
+    entries = [e for e in plan["entries"] if e.get("id") in set(to_purge)]
+
+    # Snapshot BEFORE delete — a failed audit write aborts the sweep.
+    snap_path: str | None = None
+    if entries and not RETENTION_DRY_RUN:
+        p = retention.write_retention_snapshot(retention.default_snapshot_dir(), entries)
+        if p is not None:
+            snap_path = str(p)
+
+    purged = 0
+    if to_purge and not RETENTION_DRY_RUN:
+        # ALL candidates go in ONE explicit-ids purge call (the operator's
+        # "oldest first" ordering is the plan order — split calls would lose it
+        # and the purge endpoint's own active guard is the second line).
+        code, resp = _http("POST", "/v1/jobs/purge",
+                           {"ids": to_purge, "reason": "doctor-retention-sweep"}, timeout=30.0)
+        purged = int((resp or {}).get("deleted", 0) or 0)
+        if code not in (200, 201, 204):
+            log.warning("retention sweep: purge failed code=%s resp=%s",
+                        code, str(resp)[:200])
+
+    ages = [e.get("age_sec") for e in entries if isinstance(e.get("age_sec"), (int, float))]
+    report = {
+        "dry_run": RETENTION_DRY_RUN,
+        "would_purge": len(purge_ids) if RETENTION_DRY_RUN else 0,
+        "purged": 0 if RETENTION_DRY_RUN else purged,
+        "skipped": skipped,
+        "counts_by_reason": {},
+        "dead_after_sweep": None,
+        "invariant_satisfied": False,
+        "snapshot_file": snap_path,
+        "oldest_purged_sec": None,
+        "newest_purged_sec": None,
+    }
+    for r in plan["reasons"].values():
+        report["counts_by_reason"][r] = report["counts_by_reason"].get(r, 0) + 1
+    report["counts_by_reason"] = {k: v for k, v in report["counts_by_reason"].items() if v}
+    if ages:
+        report["oldest_purged_sec"] = max(ages)
+        report["newest_purged_sec"] = min(ages)
+
+    # Post-sweep recount on the LIVE bus: a row skipped because it vanished or
+    # moved active between listing and re-read is already out of the queue, so
+    # the recount is the truth for the invariant (not the pre-sweep planning
+    # set). Read-only, so it runs on EVERY sweep — dry-run and no-op included
+    # — because the invariant must be verifiable after every sweep regardless
+    # of whether any jobs were deleted. (The recount is skipped only when the
+    # initial listing failed, in which case this function already returned
+    # None — no partial view, no false invariant claim.)
+    counts_by_status: dict[str, int] = {}
+    recount = _fetch_retention_rows()
+    if recount is not None:
+        for j in recount:
+            st = j.get("status") or "(null)"
+            counts_by_status[st] = counts_by_status.get(st, 0) + 1
+        report["dead_after_sweep"] = sum(
+            1 for j in recount if j.get("status") in retention.DEAD_STATUSES
+        )
+        report["invariant_satisfied"] = report["dead_after_sweep"] <= RETENTION_MAX_DEAD
+    report["counts_by_status"] = counts_by_status
+
+    log.info(
+        "retention sweep: %s planned=%d purged=%d skipped=%d dead_after=%s invariant=%s",
+        "dry-run" if RETENTION_DRY_RUN else "sweep", len(purge_ids), report["purged"],
+        skipped, report["dead_after_sweep"], report["invariant_satisfied"],
+    )
+
+    broadcast_doctor_message("doctor.retention", {
+        "host": AGENT_HOST,
+        "dry_run": RETENTION_DRY_RUN,
+        "purged": report["purged"],
+        "skipped": skipped,
+        "counts_by_reason": report["counts_by_reason"],
+        "counts_by_status": report["counts_by_status"],
+        "dead_after_sweep": report["dead_after_sweep"],
+        "invariant_satisfied": report["invariant_satisfied"],
+        "max_dead": RETENTION_MAX_DEAD,
+        "oldest_purged_sec": report["oldest_purged_sec"],
+        "newest_purged_sec": report["newest_purged_sec"],
+        "snapshot_file": snap_path,
+    })
+    return report
+
+
 # ───────────────────────── Triage loop ─────────────────────────
 def execute_sop_decision(job: dict) -> dict:
     """Interpret the versioned decision envelope; never ask a model to execute prose.
@@ -2544,6 +2694,7 @@ def main():
     register()
     last_hb = time.time()
     last_scan = 0.0
+    last_retention = 0.0
     last_dlq = 0.0
     last_needs_review = 0.0
 
