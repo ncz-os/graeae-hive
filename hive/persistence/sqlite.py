@@ -120,7 +120,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   max_retries INTEGER NOT NULL DEFAULT 2,
   retry_backoff_until REAL,
   last_update_at REAL,
-  claim_lease_expires_at REAL
+  claim_lease_expires_at REAL,
+  last_decline_reason TEXT,                    -- why the last worker released it
+  last_decline_at REAL,
+  last_declined_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status            ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter         ON jobs(submitter_urn);
@@ -448,6 +451,9 @@ class SqliteHiveRepository(HiveMindRepository):
             await db.commit()
             await self._ensure_column(db, "jobs", "dedup_hash", "dedup_hash TEXT")
             await self._ensure_column(db, "jobs", "decline_count", "decline_count INTEGER NOT NULL DEFAULT 0")
+            await self._ensure_column(db, "jobs", "last_decline_reason", "last_decline_reason TEXT")
+            await self._ensure_column(db, "jobs", "last_decline_at", "last_decline_at REAL")
+            await self._ensure_column(db, "jobs", "last_declined_by", "last_declined_by TEXT")
             await db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS jobs_active_dedup_uq ON jobs (dedup_hash) "
                 "WHERE dedup_hash IS NOT NULL AND status IN ('queued', 'offered', 'claimed', 'running')"
@@ -949,7 +955,8 @@ class SqliteHiveRepository(HiveMindRepository):
             "base_branch, pr_number, max_retries, retry_count, claimed_at, claim_lease_expires_at, "
             "last_update_at, claimed_model, claimed_provider, claimed_runtime, "
             "claimed_cost_tier, preferred_providers, preferred_models, depends_on, "
-            "project, max_cost_tier, mnemos_refs FROM jobs WHERE 1=1"
+            "project, max_cost_tier, mnemos_refs, last_decline_reason, last_decline_at, "
+            "last_declined_by FROM jobs WHERE 1=1"
         )
         cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
         args: list[Any] = []
@@ -1027,6 +1034,9 @@ class SqliteHiveRepository(HiveMindRepository):
                     "project": r[32],
                     "max_cost_tier": r[33],
                     "mnemos_refs": json.loads(r[34]) if r[34] else None,
+                    "last_decline_reason": r[35],
+                    "last_decline_at": r[36],
+                    "last_declined_by": r[37],
                 }
                 if not include_result:
                     job.pop("result", None)

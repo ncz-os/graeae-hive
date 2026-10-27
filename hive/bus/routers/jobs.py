@@ -110,7 +110,9 @@ _JOB_COLUMNS = (
     "claimed_runtime, claimed_cost_tier, "
     # Fault 2026-10-17: JobCreate accepted these and the row carried them, but
     # GET /v1/jobs/{id} never selected/returned them.
-    "preferred_providers, preferred_models, depends_on, project, max_cost_tier, mnemos_refs"
+    "preferred_providers, preferred_models, depends_on, project, max_cost_tier, mnemos_refs, "
+    # Additive (2026-10-27): why the last worker released this job.
+    "last_decline_reason, last_decline_at, last_declined_by"
 )
 
 
@@ -267,6 +269,9 @@ async def get_job(job_id: str):
         "project": r[33],
         "max_cost_tier": r[34],
         "mnemos_refs": json.loads(r[35]) if r[35] else None,
+        "last_decline_reason": r[36],
+        "last_decline_at": r[37],
+        "last_declined_by": r[38],
     }
 
 
@@ -955,10 +960,13 @@ async def update_job(job_id: str, req: JobUpdate):
     # ``no_repo_mapping`` is deployment-dependent (worker REPO_MAP vs bus catalog),
     # so it only counts when the job's repo is genuinely absent from the catalog
     # (audit BLOCKING-1) -- see is_unresolvable_release.
+    release_reason = None
     decline_reason = None
     dead_lettered = False
     if req.status == "queued" and isinstance(req.result, dict):
-        _werr = str(req.result.get("worker_error") or "")
+        _werr = str(req.result.get("worker_error") or "").strip()
+        if _werr:
+            release_reason = _werr
         if _werr and is_unresolvable_release(_werr):
             decline_reason = _werr
 
@@ -1159,6 +1167,12 @@ async def update_job(job_id: str, req: JobUpdate):
                     "ended_at": None,
                 }
             )
+            # Persist WHY the job left a worker (2026-10-27): the reason, the
+            # time and the releasing agent. A dead-letter row must explain itself.
+            if release_reason:
+                sets["last_decline_reason"] = release_reason
+            sets["last_decline_at"] = now
+            sets["last_declined_by"] = old_claimed_by
             # GRAEAE dispatch consensus 1.0 SHIP-FIRST: exponential backoff on EVERY
             # release (±20% jitter) so a job no local worker can run cannot hot-loop.
             import random as _rnd
@@ -1268,6 +1282,9 @@ async def update_job(job_id: str, req: JobUpdate):
                         "ended_at": now,
                         "claim_lease_expires_at": None,
                         "result": json.dumps(dl_result),
+                        "last_decline_reason": decline_reason or release_reason,
+                        "last_decline_at": now,
+                        "last_declined_by": old_claimed_by,
                     },
                     expected_status="queued",
                 )
