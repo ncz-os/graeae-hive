@@ -1343,12 +1343,15 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
 
     held, eligible, chain = [], [], []
     for j in candidates:
-        if _already_a_replacement(j):
-            chain.append(j)
-        elif retry_budget_exhausted(j):
-            held.append(j)
-        else:
+        if not retry_budget_exhausted(j):
+            # A replacement this doctor minted still has its granted budget, so
+            # it is a normal job again: requeue it like any other. Only a
+            # BUDGET-SPENT replacement is the end of the line.
             eligible.append(j)
+        elif _already_a_replacement(j):
+            chain.append(j)
+        else:
+            held.append(j)
     target_ids = [j["id"] for j in eligible][: max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))]
     held_note = ""
     if held:
@@ -1377,7 +1380,8 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
             if DRY_RUN:
                 return f"DRY_RUN: would resubmit {len(held)} budget-spent job(s) of {base_kind} as new{held_note}"
             made, failed_submit = [], []
-            for j in held[: max(0, int(MAX_BULK_RESUBMITS_PER_ACTION))]:
+            cap = max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))
+            for j in held[:cap]:
                 payload = {
                     "kind": j.get("kind"),
                     "description": j.get("description") or "",
@@ -1400,6 +1404,21 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
                 code3, resp3 = _http("POST", "/v1/jobs", payload)
                 if code3 in (200, 201) and isinstance(resp3, dict) and resp3.get("id"):
                     made.append(resp3["id"])
+                    # Point the ORIGINAL at its replacement so the next sweep
+                    # does not select it again and lean on server-side
+                    # idempotency alone (cross-family review 2026-10-27).
+                    _http(
+                        "PATCH",
+                        f"/v1/jobs/{j.get('id')}",
+                        {
+                            "claimed_by": j.get("claimed_by"),
+                            "result": {
+                                **(j.get("result") or {}),
+                                "resubmitted_as": resp3["id"],
+                                "resubmitted_reason": "retry-budget-exhausted",
+                            },
+                        },
+                    )
                 else:
                     failed_submit.append(j.get("id"))
             broadcast_doctor_message(
@@ -1421,9 +1440,12 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
             )
             if made:
                 return f"resubmitted {len(made)} budget-spent job(s) of {base_kind} as new{held_note}{chain_note}"
-            if chain and not held:
-                return f"no resubmit: every budget-spent job of {base_kind} is already a replacement{chain_note}"
             return f"could not resubmit budget-spent jobs of {base_kind}{held_note}{chain_note}"
+        if chain:
+            return (
+                f"no resubmit: every budget-spent job of {base_kind} is already a replacement "
+                f"({len(chain)} left alone, one generation only)"
+            )
         return f"no failed jobs of base_kind={base_kind}"
     if DRY_RUN:
         return f"DRY_RUN: would requeue {len(target_ids)} jobs of {base_kind}{held_note}"

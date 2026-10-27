@@ -129,6 +129,50 @@ class ReplacementChainGuardTests(unittest.TestCase):
         self.assertNotIn("/v1/jobs", calls)
         self.assertIn("already a replacement", out)
 
+    def test_a_replacement_that_still_has_budget_is_requeued(self):
+        failed = {"jobs": [
+            {"id": "replacement", "kind": "review:x", "max_retries": 2, "retry_count": 1,
+             "status": "failed", "result": {"resubmitted_from": "orig"}},
+        ]}
+        calls = []
+
+        def fake_http(method, path, payload=None, timeout=10.0):
+            calls.append((method, path))
+            return (200, failed) if path.startswith("/v1/jobs?status=failed") else (200, {"ok": True})
+
+        with (
+            mock.patch.object(doctor, "_http", fake_http),
+            mock.patch.object(doctor, "broadcast_doctor_message", lambda *a, **k: None),
+            mock.patch.object(doctor, "DRY_RUN", False),
+        ):
+            doctor.action_resubmit_jobs("review:x")
+        self.assertIn(("POST", "/v1/admin/jobs/requeue"), calls)
+
+    def test_the_original_is_pointed_at_its_replacement(self):
+        failed = {"jobs": [
+            {"id": "orig", "kind": "review:x", "max_retries": 0, "retry_count": 0,
+             "status": "failed", "claimed_by": None, "result": {"commits": []}},
+        ]}
+        calls = []
+
+        def fake_http(method, path, payload=None, timeout=10.0):
+            calls.append((method, path, payload or {}))
+            if path.startswith("/v1/jobs?status=failed"):
+                return 200, failed
+            if path == "/v1/jobs":
+                return 200, {"id": "gen1"}
+            return 200, {"ok": True}
+
+        with (
+            mock.patch.object(doctor, "_http", fake_http),
+            mock.patch.object(doctor, "broadcast_doctor_message", lambda *a, **k: None),
+            mock.patch.object(doctor, "DRY_RUN", False),
+        ):
+            doctor.action_resubmit_jobs("review:x")
+        patches = [c for c in calls if c[0] == "PATCH"]
+        self.assertEqual(len(patches), 1, calls)
+        self.assertEqual(patches[0][2]["result"]["resubmitted_as"], "gen1")
+
 
 if __name__ == "__main__":
     unittest.main()
