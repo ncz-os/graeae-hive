@@ -169,31 +169,28 @@ class AgentLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.json().get("status"), "needs-review")
         return sub, jid
 
-    async def test_delete_needs_review_allowed_running_still_refused(self):
-        # needs-review is a QUARANTINE state: its worker already stopped, so
-        # DELETE must succeed without ?force=true. Genuinely in-flight work
-        # (claimed/running) must still be refused.
+    async def test_individual_delete_is_not_supported_for_review_or_running(self):
+        # The API exposes filtered purge, not individual DELETE. Both states
+        # must remain intact when a caller attempts the unsupported endpoint.
         sub, jid = await self._needs_review_job()
         c = self.client
         r = await c.delete(f"/v1/jobs/{jid}", headers={"X-Hive-Actor": sub})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(r.json()["deleted"], 1)
-        self.assertEqual(r.json()["prior_status"], "needs-review")
-        self.assertEqual((await c.get(f"/v1/jobs/{jid}")).status_code, 404)
+        self.assertEqual(r.status_code, 405, r.text)
+        self.assertEqual((await c.get(f"/v1/jobs/{jid}")).json()["status"], "needs-review")
 
-        # a running job is still refused (no force)
+        # A force query parameter cannot create a missing endpoint either.
         r = await c.post("/v1/jobs", json={"kind": "fix:other", "description": "live",
                                             "submitter_urn": sub, "max_retries": 0, "zero_retry_reason": "test terminal disposition without automatic retry"})
         live = r.json()["id"]
-        await c.post(f"/v1/jobs/next?agent_urn={sub}")
-        await c.patch(f"/v1/jobs/{live}", json={"status": "running", "claimed_by": sub})
+        claim = await c.post(f"/v1/jobs/{live}/claim", params={"by": sub})
+        self.assertEqual(claim.status_code, 200, claim.text)
+        running = await c.patch(f"/v1/jobs/{live}", json={"status": "running", "claimed_by": sub})
+        self.assertEqual(running.status_code, 200, running.text)
         r = await c.delete(f"/v1/jobs/{live}", headers={"X-Hive-Actor": sub})
-        self.assertEqual(r.status_code, 409, r.text)
-        self.assertIn("force=true", r.text)
-        # ...and force still overrides it
+        self.assertEqual(r.status_code, 405, r.text)
         r = await c.delete(f"/v1/jobs/{live}?force=true", headers={"X-Hive-Actor": sub})
-        self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual((await c.get(f"/v1/jobs/{live}")).status_code, 404)
+        self.assertEqual(r.status_code, 405, r.text)
+        self.assertEqual((await c.get(f"/v1/jobs/{live}")).json()["status"], "running")
 
     async def test_completion_without_evidence_goes_to_needs_review(self):
         # a 'done' on an evidence-required kind with no proof -> needs-review

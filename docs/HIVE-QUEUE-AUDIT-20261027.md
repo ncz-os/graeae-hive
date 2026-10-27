@@ -5,6 +5,7 @@
 Baseline and unchanged HEAD: `f2c43020c4e91965a802f665354ff9cd52dc8717`, branch `feat/hive-astra-audit-20261027`.
 
 This audit records **39 grouped findings: 19 fixed in the Astra baseline, 20 remaining (3 partially remediated by Terra, 17 left)**. The remaining-effort counts are **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
+This audit records **39 grouped findings: 19 fixed in the Astra baseline; of the 20 remaining findings, 1 fixed, 2 partial, and 17 left** after the priority-B addendum below. The original remaining-effort counts were **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
 
 No live bus/database, remote forge, MNEMOS, service restart, or push was used. The explicit repository-only restriction overrides standing network registration/persistence workflows for this task. The sandbox declares `.git` read-only. No staging, commit, push, or attempt to bypass that restriction was made. The index is unchanged; the working tree necessarily contains the unstaged fixes. A literally clean working tree would require discarding them. No new commit SHA or primary zoder APPROVE is claimed. Independent local reviews caught and corrected overbroad infrastructure classification and a review-parent completion gap; they are not a substitute for the external gate.
 
@@ -278,3 +279,42 @@ Local source only; no bus, database service, fleet, network, or deployment was a
 | R13 | Left | Cross-process provider occupancy reservation and claim transaction remain required for every backend. | No regression; acceptance not established. |
 
 Verification: local existing venv `python -m pytest -o addopts='' -q test_priority_a_reaper.py test_reaper.py test_reaper_sweeps.py test_reaper_agents.py test_reaper_schedules.py test_persistence_queue_audit_20261027.py test_backend_contract.py`: 38 passed. Production venv and real backend concurrency were not run.
+## Terra priority-B remediation 2026-10-27
+
+This addendum supersedes the priority-B statuses in the preceding table. The
+repository-only restriction prevented fleet, MNEMOS, Hive, zoder and remote
+access. The persistence and domain exclusions prevent changes to their
+contracts and implementations; no cross-backend or deployment claim is made.
+
+| ID | Status | Location and acceptance evidence / remaining work |
+|---|---|---|
+| R05 | Left | `hive/workers/doctor.py:3502`; `hive/bus/routers/jobs.py:252`: pagination needs repository changes and dead-child recovery needs a transactional marker design. No new regression. |
+| R09 | Left | `hive/bus/app.py:331`: occurrence insert and marker require a shared persistence transaction and stable unique key. No new regression. |
+| R10 | Left | `hive/persistence/sqlite.py:1727`: cost query needs backend-specific persistence work and backend matrix. No new regression. |
+| R12 | Left | `hive/workers/doctor.py:856`: fetch error propagation and durable sweep ledger remain. No new regression. |
+| R15 | Left | `hive/workers/run.py:180`: independent lease renewal and restart-safe report outbox remain. Agent heartbeat alone does not renew the job lease. No new regression. |
+| R11 | Left | `hive/bus/deps.py:87`: transactional outbox and recovery remain. No new regression. |
+| R18 | Left | `hive/bus/routers/jobs.py:1586`: retry policy and persistence contexts need project-aware protection on both paths. No new regression. |
+| R14 | Left | `hive/workers/remediation.py:417`; `hive/workers/remediation_manifest.py:28`: production promotion and truthful manifest validation remain. No new regression. |
+| R16 | Left | `hive/persistence/base.py`: ABC and behavioral backend matrix remain, outside ownership boundary. No new regression. |
+| R08 | Left | `hive/persistence/sqlite.py:1249`: dependency CAS and savepoints remain, outside ownership boundary. No new regression. |
+| R17 | Left | `test_eih_probe.py:556`; `test_repo_argonas_fallback.py:504`; `test_gitguardian_config.py:45`: environment and baseline assumptions remain. No new regression. |
+| R19 | Fixed | `test_agent_lifecycle.py:172`; `hive/bus/routers/admin.py:1`: contract is no individual DELETE; test verifies 405 and unchanged needs-review and running rows, including force parameter. `test_individual_delete_is_not_supported_for_review_or_running` passed locally. Existing guarded purge remains the separate supported operation. |
+| R20 | Partial | `pyproject.toml:30`; `test_packaging_bus.py:6`: explicitly include bus, domain and routers; `test_distribution_includes_all_bus_packages` passed against package configuration. An isolated wheel build/install and import/start test remains required. |
+
+Local focused verification: existing venv `python -m pytest -o addopts='' -q
+test_packaging_bus.py test_agent_lifecycle.py` produced **7 passed**. An initial
+run failed collection because setuptools is absent from that venv; the test was
+changed to inspect package directories using the standard library. An interim
+run exposed a queued review child being claimed instead of the intended job;
+the lifecycle regression now uses targeted claim and asserts both claim and
+running transitions. Neither failed run was counted as acceptance. No wheel was
+built from the dirty tree. `.git` is sandbox read-only, so changes are unstaged
+and no commit or push was made.
+
+Cleanup receipt: kept the audit, packaging correction, lifecycle contract test,
+and new packaging test as the requested handoff. Removed the compilation cache
+and bytecode created for the new test; no remote files, build trees, services,
+or background processes were created. `df -h . /private/tmp` reported the same
+APFS volume at 460 GiB total, 325 GiB used, 110 GiB available, 75% capacity;
+no tmpfs was used.
