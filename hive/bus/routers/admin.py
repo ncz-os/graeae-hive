@@ -1,7 +1,7 @@
 """Job admin endpoints (Phase 1c router extraction).
 
-/v1/admin/jobs/* (requeue/purge/reclassify), DELETE /v1/jobs/{id}, and
-POST /v1/jobs/purge. Depends on hive.bus.deps + hive.bus.schemas.
+/v1/admin/jobs/* (requeue/purge/reclassify) and POST /v1/jobs/purge.
+Individual DELETE /v1/jobs/{id} is not provided.
 """
 
 from __future__ import annotations
