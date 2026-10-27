@@ -62,7 +62,7 @@ import urllib.request
 import uuid
 from collections import deque
 
-from hive.workers import retention
+from hive.workers import remediation, retention
 
 # SOP phase 3 (2026-10-22): durable safety state and the destructive-action rails.
 # Both are stdlib-only siblings, importable without the hive package, so the
@@ -1370,6 +1370,87 @@ def _children_of(parent_ids: list[str], limit: int = 200) -> list[str]:
             if cid and cid not in found and not dlq_protected(child):
                 found.append(cid)
     return found
+
+
+def _unknown_signature_decision(job: dict, reason: str) -> dict | None:
+    """The deterministic unknown-signature decision, or None when there is no
+    failure to classify.
+
+    Called from `process_triage_job` at exactly one point — where the doctor
+    classifies a failure it does not know, i.e. after the v2 rules and the
+    known-signature map both miss. The decision comes from
+    `remediation.unknown_policy`, which classifies what no
+    `remediation_manifest.SIGNATURE_HANDLERS` row claims, and every durable
+    counter it keeps lives in STATE (the signature table, the per-signature+job
+    retry counter), never in a module dict — a pod restart must not reset them.
+
+    Branches:
+      a. delivered — commits already on origin: no requeue, no release; the
+         triage job is finished and its result says so;
+      b. retried — one requeue via the normal release path (doctor excluded,
+         so another eligible host claims it), tagged ``unknown_signature``;
+      c. needs-review — parked for a human, signature and raw reason recorded.
+
+    The never-act classes (host_declines_kind / released_by_host /
+    protection_violation) are claimed by manifest rows, so this function
+    returns None for them: they stay report-only and are never requeued.
+    """
+    if not (reason or "").strip():
+        return None
+    signature = remediation.failure_signature(reason)
+    row = remediation.handler_for_signature(signature)
+    if row is not None:
+        # A manifest row claims this shape: the known handler owns it, and the
+        # unknown policy — and this function — stay out of its way.
+        return None
+
+    decision = remediation.unknown_policy(
+        STATE,
+        job,
+        reason,
+        commits_reachable_from_origin=False,  # the doctor never proves delivery on its own
+    )
+    signature = decision["signature"]
+
+    if decision["action"] == "retried":
+        # One retry on a different eligible host: the normal release path keeps
+        # 'doctor' out of eligible_kinds, so the requeued work lands on a
+        # different worker. The signature is tagged on the job result.
+        text, released = apply_release(job["id"], job.get("kind", "").startswith("triage:"), _base_kind(job.get("kind") or ""), None)
+        if not released:
+            log.warning("unknown_signature %s: release rejected; retry not queued", signature)
+        return {
+            "action_type": "release_to_queue",
+            "confidence": 0.9,
+            "reason": decision["result"]["status_note"],
+            "signature": signature,
+            "unknown_signature": signature,
+            "unknown_signature_retry": True,
+            "released_to_queue": released,
+            "release_text": text,
+        }
+
+    # delivered and needs-review both terminate the triage job with the
+    # policy's result; needs-review additionally parks it for a human.
+    if decision["action"] == "delivered":
+        return {
+            "action_type": "no_action",
+            "confidence": 1.0,
+            "reason": decision["result"]["status_note"],
+            "signature": signature,
+            "unknown_signature": signature,
+            "result": dict(decision["result"]),
+        }
+    return {
+        "action_type": "escalate",
+        "confidence": 1.0,
+        "reason": decision["result"]["status_note"],
+        "signature": signature,
+        "unknown_signature": signature,
+        "needs_review": True,
+        "needs_operator": True,
+        "result": dict(decision["result"]),
+    }
 
 
 def action_cancel_jobs(base_kind: str | None, max_cancels: int = 20) -> str:
@@ -2819,6 +2900,42 @@ def process_triage_job(job: dict) -> dict:
             "failed_count_seen": len(failed),
             "auto_detected": True,
             "released_to_queue": released,
+        }
+
+    # ── Unknown-signature policy — the single point where the doctor
+    # classifies a failure it does not know (the v2 rules and the
+    # known-signature map both missed above). Deterministic code, no LLM:
+    # verify delivery, retry once on another eligible host, or park for a
+    # human. The durable signature table and retry counters live in STATE,
+    # so a restart does not reset them. Never-act classes (host_declines_kind
+    # / released_by_host / protection_violation) are report-only: their
+    # manifest rows keep them out of the policy.
+    _first_failed = failed[0] if failed else {}
+    _first_result = _first_failed.get("result")
+    if not isinstance(_first_result, str):
+        _first_result = ""
+    unknown_action = _unknown_signature_decision(
+        job,
+        str(_first_failed.get("failure_reason") or _first_result or "").strip(),
+    )
+    if unknown_action:
+        a = unknown_action.get("action_type", "no_action")
+        released = bool(unknown_action.get("released_to_queue", False))
+        release_text = unknown_action.get("release_text", "")
+        parts = [f"action={a}", f"conf={unknown_action.get('confidence', 1.0):.2f}", f"unknown_signature={unknown_action.get('unknown_signature', '')}", f"reason={unknown_action.get('reason', '')}"]
+        if a == "release_to_queue" and release_text:
+            parts.append(release_text)
+        log.info("doctor decision (UNKNOWN-SIGNATURE): action=%s signature=%s", a, unknown_action.get("signature", "?"))
+        return {
+            "exit_code": 0,
+            "stdout": "; ".join(parts),
+            "action": unknown_action,
+            "base_kind": base_kind,
+            "failed_count_seen": len(failed),
+            "auto_detected": True,
+            "released_to_queue": released,
+            "needs_review": unknown_action.get("needs_review", False),
+            "result": unknown_action.get("result"),
         }
 
     prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
