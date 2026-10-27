@@ -73,7 +73,8 @@ router = APIRouter()
 _JOB_COLUMNS = (
     "id, submitter_urn, parent_job_id, kind, description, priority, status, "
     "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
-    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count"
+    "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, pr_number, max_retries, retry_count, "
+    "last_decline_reason, last_decline_at, last_declined_by"
 )
 
 
@@ -149,6 +150,11 @@ async def get_job(job_id: str):
         "pr_number": r[18],
         "max_retries": r[19],
         "retry_count": r[20],
+        # Additive columns (2026-10-27): the last release/decline reason, when
+        # it happened and who released — so a dead-letter row explains itself.
+        "last_decline_reason": r[21],
+        "last_decline_at": r[22],
+        "last_declined_by": r[23],
     }
 
 
@@ -726,10 +732,18 @@ async def update_job(job_id: str, req: JobUpdate):
 
     # Skip releases are not failures. DECLINE_REASON_PREFIXES is intentionally
     # narrow unless a future real failure release reason needs dead-letter counting.
+    # The REASON itself is captured for EVERY release (any worker_error string)
+    # and persisted on the row (last_decline_reason / last_decline_at /
+    # last_declined_by, 2026-10-27) so a job row always explains WHY it left a
+    # worker — dead-letter rows included. Only the COUNTING of a decline toward
+    # the dead-letter threshold is restricted to DECLINE_REASON_PREFIXES.
+    release_reason = None
     decline_reason = None
     dead_lettered = False
     if req.status == "queued" and isinstance(req.result, dict):
-        _werr = str(req.result.get("worker_error") or "")
+        _werr = str(req.result.get("worker_error") or "").strip()
+        if _werr:
+            release_reason = _werr
         if _werr in DECLINE_REASON_PREFIXES or any(_werr.startswith(p + ":") for p in DECLINE_REASON_PREFIXES):
             decline_reason = _werr
 
@@ -845,6 +859,13 @@ async def update_job(job_id: str, req: JobUpdate):
                     "ended_at": None,
                 }
             )
+            # Persist the last release/decline reason on EVERY release so the
+            # row (and any later dead-letter transition) carries WHY. The
+            # releasing agent is the current claimant (verified above).
+            if release_reason:
+                sets["last_decline_reason"] = release_reason
+            sets["last_decline_at"] = now
+            sets["last_declined_by"] = old_claimed_by
             # GRAEAE dispatch consensus 1.0 SHIP-FIRST: exponential backoff on EVERY
             # release (±20% jitter) so a job no local worker can run cannot hot-loop.
             import random as _rnd
@@ -908,6 +929,13 @@ async def update_job(job_id: str, req: JobUpdate):
                         "ended_at": now,
                         "claim_lease_expires_at": None,
                         "result": json.dumps(dl_result),
+                        # The dead-letter row must explain itself in
+                        # GET /v1/jobs — belt-and-braces: the columns were
+                        # already set by the release SET above, but if the
+                        # decline reason only arrived here we still record it.
+                        "last_decline_reason": decline_reason,
+                        "last_decline_at": now,
+                        "last_declined_by": old_claimed_by,
                     },
                     expected_status="queued",
                 )

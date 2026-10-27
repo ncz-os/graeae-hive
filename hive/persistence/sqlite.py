@@ -109,7 +109,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   max_retries INTEGER NOT NULL DEFAULT 2,
   retry_backoff_until REAL,
   last_update_at REAL,
-  claim_lease_expires_at REAL
+  claim_lease_expires_at REAL,
+  -- last release/decline reason (graeae:dead-letter-explains-itself 2026-10-27):
+  -- persisted on every release so status=dead-letter always carries WHY.
+  last_decline_reason TEXT,
+  last_decline_at REAL,
+  last_declined_by TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_status            ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitter         ON jobs(submitter_urn);
@@ -382,6 +387,13 @@ class SqliteHiveRepository(HiveMindRepository):
                 ("jobs", "repo", "repo TEXT"),
                 ("jobs", "head_branch", "head_branch TEXT"),
                 ("jobs", "pr_number", "pr_number INTEGER"),
+                # graeae:dead-letter-explains-itself (2026-10-27): persist the
+                # last release/decline reason so dead-letter rows explain
+                # themselves in GET /v1/jobs. Additive TEXT/REAL columns —
+                # safe on existing databases (no rebuild, no backfill).
+                ("jobs", "last_decline_reason", "last_decline_reason TEXT"),
+                ("jobs", "last_decline_at", "last_decline_at REAL"),
+                ("jobs", "last_declined_by", "last_declined_by TEXT"),
             )
             # Run CHECK-constraint rebuilds BEFORE additive column ALTERs: the
             # rebuild recreates the table from SCHEMA (sans drift columns), then the
@@ -913,7 +925,8 @@ class SqliteHiveRepository(HiveMindRepository):
             "SELECT id, submitter_urn, parent_job_id, kind, description, priority, status, "
             "claimed_by, started_at, ended_at, result, estimated_cost_usd, "
             "required_capabilities, eligible_kinds, eligible_hosts, site, repo, head_branch, "
-            "pr_number, max_retries, retry_count FROM jobs WHERE 1=1"
+            "pr_number, max_retries, retry_count, "
+            "last_decline_reason, last_decline_at, last_declined_by FROM jobs WHERE 1=1"
         )
         cnt_sql = "SELECT COUNT(*) FROM jobs WHERE 1=1"
         args: list[Any] = []
@@ -973,6 +986,11 @@ class SqliteHiveRepository(HiveMindRepository):
                     "pr_number": r[18],
                     "max_retries": r[19],
                     "retry_count": r[20],
+                    # Additive columns: NULL on rows written before the
+                    # 2026-10-27 migration (older rows still deserialise).
+                    "last_decline_reason": r[21],
+                    "last_decline_at": r[22],
+                    "last_declined_by": r[23],
                 }
                 if not include_result:
                     job.pop("result", None)

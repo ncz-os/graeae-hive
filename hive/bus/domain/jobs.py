@@ -95,10 +95,24 @@ def stable_worker_id(urn: str) -> str:
 # Skip releases (host_declines_kind/released_by_host/no_workspace_for_kind) are
 # legitimate "not me" routing signals. They must not burn the decline dead-letter
 # threshold; real execution failures use the failed/retry path.
+#
+# 2026-10-27 (dead-letter-explains-itself): the fleet's `invalid_base_branch` /
+# `invalid_head_branch` releases are ALSO job-level unschedulable — a branch
+# that does not exist on origin can never be cloned by ANY host, so the job is
+# doomed no matter who claims it. The old code left them OUT of the counted
+# set (so they hot-looped the reclaim until max_retries) but DID record them
+# as `worker_error` on the release, which the bus then counted as a job-level
+# decline anyway (the 2026-10-27 incident: 3 jobs dead-lettered with
+# retry_count=3 and no visible reason). Add them to DECLINE_REASON_PREFIXES so
+# the counted set matches the real fleet vocabulary and the dead-letter
+# transition carries the reason. The reason strings themselves are unchanged —
+# existing writers (hive_worker.py) keep working.
 MAX_DECLINE_REQUEUES = 3
 DECLINE_REASON_PREFIXES: tuple[str, ...] = (
     "no_workspace_for_kind",
     "no_workspace_for_repo",
+    "invalid_base_branch",
+    "invalid_head_branch",
 )  # job-level unschedulable -> count toward dead-letter (terminate reclaim loop); host_declines_kind/released_by_host stay OUT (matcher routes to capable hosts)
 STATUS_TRANSITIONS: dict[str, set[str]] = {
     "queued": {"queued", "offered", "claimed", "cancelled"},

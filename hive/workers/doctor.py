@@ -1092,6 +1092,11 @@ def _base_kind(kind: str) -> str:
     return re.sub(r"\s*\[.*?\]\s*$", "", kind or "").strip()
 
 
+# base_kind of the job currently being processed (set by process_triage_job)
+# so the durable triage cache can be refreshed when THIS process finishes it.
+_current_triage_base_kind: str | None = None
+
+
 def scan_for_failure_clusters() -> list[dict]:
     """Inspect /v1/jobs?status=failed; return clusters of N+ failures of same base_kind
     within CLUSTER_WINDOW_SEC, that haven't been auto-triaged within AUTO_TRIAGE_COOLDOWN.
@@ -1109,15 +1114,17 @@ def scan_for_failure_clusters() -> list[dict]:
             continue
         counts.setdefault(bk, []).append(j)
     clusters = []
-    now = time.time()
     for bk, jobs in counts.items():
         if len(jobs) < CLUSTER_THRESHOLD:
             continue
-        last = _recent_auto_triage.get(bk, 0)
-        if now - last < AUTO_TRIAGE_COOLDOWN:
-            continue
-        # Also skip if an active triage:<bk> already exists in queued/running
-        if _active_triage_exists(bk):
+        # Durable, restart-proof dedupe gate (2026-10-27): an existing
+        # triage:<bk> in ANY status, a superseded cluster, and the durable
+        # cooldown (derived from the newest triage row) are all consulted —
+        # the in-memory _recent_auto_triage map is a cache only and a doctor
+        # restart can no longer reset the cooldown.
+        ok, why = should_auto_triage(bk, jobs)
+        if not ok:
+            log.debug("scan: base_kind=%s not auto-triaged (%s)", bk, why)
             continue
         clusters.append({
             "base_kind": bk,
@@ -1127,20 +1134,192 @@ def scan_for_failure_clusters() -> list[dict]:
     return clusters
 
 
-def _active_triage_exists(base_kind: str) -> bool:
-    """True if a triage:<base_kind> job is currently queued or running."""
-    for status in ("queued", "running"):
+# ───────────────────────── Durable auto-triage state (2026-10-27) ─────────────────────────
+# Production incident: a finished triage job was invisible to the scanner (it
+# only looked at queued/running), and AUTO_TRIAGE_COOLDOWN was an in-process
+# dict that a doctor restart wiped — so the same failure cluster was re-triaged
+# over and over (61 duplicate rows in one night; triage rows recreated minutes
+# after a purge with zero new failures).
+#
+# The triage job row on the bus IS the durable state. `_recent_auto_triage`
+# (the in-memory dict) is now a cache ONLY: every decision is derived from the
+# newest existing `triage:<base_kind>` job (any status), so a restart or a
+# purge race can no longer reset the cooldown.
+#
+# Dedupe predicate for `should_auto_triage(base_kind, failed_jobs)`:
+#   1. active     — a triage:<base_kind> in queued/offered/claimed/running
+#                   exists -> block (the old behaviour, now any-status aware).
+#   2. supersede  — the newest job of the same base_kind in ANY status is
+#                   done/needs-review and newer (started_at) than the newest
+#                   failure  -> the failures are old news; skip.
+#   3. no-new-fails — no failed job ended after the newest triage job was
+#                      created (failure.ended_at > triage.created_at is the
+#                      ONLY condition that makes a new triage legitimate)
+#                   -> skip; otherwise a new triage is legitimate.
+#
+# The AUTO_TRIAGE_COOLDOWN window (env-overridable, default 1h, unchanged)
+# still suppresses re-triage of GENUINE NEW failures while the newest triage
+# is young: its start time is derived from the newest triage job's created_at
+# (durable — a doctor restart must not reset it), never from the in-memory
+# map alone. A failure that ended BEFORE the newest triage was created is
+# blocked by the no-new-failures rule regardless of the cooldown (so a triage
+# row can never be re-created within minutes of itself for the same cluster).
+TRIAGE_JOB_STATUSES = (
+    "queued", "offered", "claimed", "running", "done",
+    "failed", "cancelled", "dead-letter", "needs-review",
+)
+# base_kind -> newest triage job for that kind (from the bus). Refreshed per
+# scan; also populated on submit (durable cache, see _record_triage_started).
+_recent_triage_jobs: dict[str, dict] = {}
+
+
+def _triage_job_for(base_kind: str) -> dict | None:
+    """Find the newest `triage:<base_kind>` job in ANY status.
+
+    Any status is consulted — a DONE triage job is still a triage job and must
+    block its duplicates (the defect: finished triage was invisible, so the
+    next sweep created another one). Prefers the durable in-memory cache;
+    re-queries the bus when the cache is empty (doctor restart) or stale.
+    Returns the job dict (with id/kind/status/started_at/created_at/ended_at)
+    or None."""
+    cached = _recent_triage_jobs.get(base_kind)
+    if cached:
+        return cached
+    target = f"triage:{base_kind}"
+    newest: dict | None = None
+    for status in TRIAGE_JOB_STATUSES:
         code, resp = _http("GET", f"/v1/jobs?status={status}&limit=200", timeout=10.0)
         if code != 200 or not resp:
             continue
-        target = f"triage:{base_kind}"
         for j in resp.get("jobs", []) or []:
-            if (j.get("kind") or "").startswith(target):
-                # Also check it includes "doctor" in eligible_kinds OR is unrestricted
+            kind = j.get("kind") or ""
+            if kind == target or kind.startswith(target):
+                # doctor-eligible only, as before
                 ek = j.get("eligible_kinds") or []
-                if not ek or "doctor" in ek:
-                    return True
-    return False
+                if ek and "doctor" not in ek:
+                    continue
+                if newest is None:
+                    newest = j
+                    continue
+                if (j.get("started_at") or 0) > (newest.get("started_at") or 0):
+                    newest = j
+    if newest is not None:
+        _recent_triage_jobs[base_kind] = newest
+    return newest
+
+
+def _record_triage_started(base_kind: str, created_at: float, job: dict | None = None) -> None:
+    """Cache the triage we just submitted (or the triage we just finished).
+
+    The bus row is the source of truth; this keeps the cache warm so the very
+    next scan doesn't need a bus round-trip and — importantly — a finished
+    triage job (patched done by THIS process) is visible to the cooldown even
+    before the next /v1/jobs sweep picks it up."""
+    now = time.time()
+    j = dict(job) if isinstance(job, dict) else {}
+    j.setdefault("kind", f"triage:{base_kind}")
+    j.setdefault("started_at", created_at)
+    j.setdefault("created_at", created_at)
+    existing = _recent_triage_jobs.get(base_kind)
+    if existing and (existing.get("started_at") or 0) >= (created_at or now):
+        return  # an even newer triage is already cached
+    _recent_triage_jobs[base_kind] = j
+    # Cooldown cache (kept for the legacy read path only; the durable value
+    # above is what decisions use).
+    _recent_auto_triage[base_kind] = created_at or now
+
+
+def _active_triage_exists(base_kind: str) -> bool:
+    """True if a triage:<base_kind> job is currently queued or running.
+
+    Kept for API compatibility; implemented on top of the any-status lookup
+    (a triage in queued/offered/claimed/running blocks a new one)."""
+    j = _triage_job_for(base_kind)
+    if not j:
+        return False
+    return (j.get("status") or "") in ("queued", "offered", "claimed", "running")
+
+
+def should_auto_triage(base_kind: str, failed_jobs: list[dict]) -> tuple[bool, str]:
+    """Durable, restart-proof dedupe gate for auto-triage of one base_kind.
+
+    Returns (ok, reason). See the module-level predicate comment above.
+    All timestamps fall back safely (missing fields never raise)."""
+    if not failed_jobs:
+        return False, "no failures"
+    newest_failure_ended = max((j.get("ended_at") or 0) for j in failed_jobs)
+
+    # (3) superseded: the newest job of this base_kind in ANY status is
+    # done/needs-review and NEWER than the newest failure — the failures are
+    # old news that a completed run already superseded.
+    code, resp = _http("GET", f"/v1/jobs?limit=200", timeout=10.0)
+    if code == 200 and resp:
+        target_prefix = base_kind
+        sup_candidates = [
+            j for j in resp.get("jobs", []) or []
+            if _base_kind(j.get("kind", "")) == target_prefix
+            and (j.get("status") or "") in ("done", "needs-review")
+        ]
+        if sup_candidates:
+            newest_done = max((j.get("started_at") or j.get("ended_at") or 0)
+                              for j in sup_candidates)
+            if newest_done > newest_failure_ended:
+                return False, "superseded_by_newer_done_job"
+
+    triage = _triage_job_for(base_kind)
+    if triage is not None:
+        triage_created = triage.get("created_at") or triage.get("started_at") or 0
+        status = (triage.get("status") or "").strip().lower()
+        # (1) a triage in ANY non-terminal status blocks a new one outright
+        #     (queued/offered/claimed/running).
+        if status in ("queued", "offered", "claimed", "running"):
+            return False, f"triage_{status}_exists"
+        # (2) no new failures since the newest triage was created -> already
+        #     evaluated (covers done/failed/cancelled/dead-letter/needs-review
+        #     triage outcomes; a self-terminating no_action triage ends done
+        #     and is handled here). Checked BEFORE the cooldown: a failure that
+        #     ended a few seconds before a young triage was submitted must NOT
+        #     re-triage while that triage is still fresh (the 2026-10-27 race:
+        #     triage rows recreated minutes after a purge with zero new fails).
+        if newest_failure_ended <= triage_created:
+            return False, "no_new_failures_since_triage"
+        # (3) genuine NEW failures since the last triage: the AUTO_TRIAGE_COOLDOWN
+        #     window (start time = newest triage's created_at, DURABLE) still
+        #     suppresses re-triage while that triage is young (default 1h).
+        #     Once the cooldown has elapsed, the new failures are triaged.
+        if time.time() - triage_created < AUTO_TRIAGE_COOLDOWN:
+            return False, "cooldown"
+    else:
+        # (2b) no triage job exists at all; the in-memory cooldown is a cache
+        # only and must never be the SOLE blocker — the durable truth is "no
+        # triage row exists", so there is nothing to dedupe against.
+        pass
+    return True, "new_failures"
+
+
+def _finalize_triage_cache(base_kind: str, triage_job: dict | None,
+                           action_type: str | None) -> None:
+    """Record the DURABLE outcome of a triage we just finished (2026-10-27).
+
+    The triage's bus row (id/kind/started_at/status) is the durable record —
+    a human can see it was evaluated (done + result.action), and the scanner's
+    dedupe rule sees it via the next /v1/jobs sweep. Here we keep the in-memory
+    cache in step with the row we just patched so the very next scan is
+    race-free even before the sweep catches up. A no_action / superseded
+    triage ends `done` and participates in dedupe exactly like a real fix:
+    the cluster is considered evaluated, new triage only on NEW failures.
+    """
+    if not base_kind:
+        return
+    j = triage_job if isinstance(triage_job, dict) else {}
+    j.setdefault("kind", f"triage:{base_kind}")
+    j.setdefault("started_at", j.get("created_at") or time.time())
+    status = (j.get("status") or "done").strip().lower()
+    if action_type:
+        j["last_action"] = action_type
+    _record_triage_started(base_kind, j.get("started_at") or time.time(), j)
+    log.info("triage durable-outcome recorded base_kind=%s status=%s action=%s",
+             base_kind, status, action_type or "?")
 
 
 def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | None:
@@ -1166,7 +1345,9 @@ def submit_auto_triage(base_kind: str, count: int, sample_job_id: str) -> str | 
     code, resp = _http("POST", "/v1/jobs", body, timeout=15.0)
     if code in (200, 201) and resp:
         jid = resp.get("id", "")
-        _recent_auto_triage[base_kind] = time.time()
+        # Durable state: cache the triage we just created (its bus row is the
+        # source of truth; the cache keeps the next scan race-free).
+        _record_triage_started(base_kind, time.time(), resp if isinstance(resp, dict) else None)
         log.info("auto-triage submitted id=%s base_kind=%s count=%d",
                  jid[:12], base_kind, count)
         return jid
@@ -1202,12 +1383,15 @@ def process_triage_job(job: dict) -> dict:
     eligible_kinds includes 'doctor'.  The user's directive (2026-05-26):
     'ALL FAILS ARE DOCTOR ELIGIBLE' — so the doctor must be able to diagnose
     any failure, not only triage:* wrappers."""
+    global _current_triage_base_kind
     job_id = job.get("id", "")
     kind = job.get("kind", "")
     desc = job.get("description", "") or ""
 
     is_explicit_triage = kind.startswith("triage:")
     base_kind = kind[len("triage:"):] if is_explicit_triage else _base_kind(kind)
+    if is_explicit_triage:
+        _current_triage_base_kind = base_kind
 
     m = re.search(r"(\d+)\s+fail", desc, re.IGNORECASE)
     failure_count = int(m.group(1)) if m else 0
@@ -1411,6 +1595,16 @@ def main():
                 result = process_triage_job(job)
                 dur = int(time.time() - t0)
                 result.setdefault("duration_sec", dur)
+                # Durable triage outcome (2026-10-27): record what this triage
+                # evaluated to (done + result.action, or failed + error) on the
+                # durable cache so the next scan's dedupe sees it immediately —
+                # including a self-terminating no_action/superseded triage.
+                if kind.startswith("triage:"):
+                    _finalize_triage_cache(
+                        kind[len("triage:"):],
+                        job,
+                        (result.get("action") or {}).get("action_type"),
+                    )
                 if result.get("released_to_queue"):
                     # Doctor already patched job back to queued via the action.
                     # Don't overwrite with done/failed; just log + broadcast.
