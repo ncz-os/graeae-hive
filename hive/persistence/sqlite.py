@@ -1270,13 +1270,9 @@ class SqliteHiveRepository(HiveMindRepository):
         write or the DELETE: there is no window in which the dep is terminal
         (or gone) and its dependents still believe it is pending.
 
-        The release NEVER fails the caller's transaction: every step that can
-        raise (the candidate scan, the per-dependent update) is guarded and
-        logged, and a per-dependent compare-and-set that loses a race (the
-        dependent was claimed between the scan and the update) is skipped, not
-        raised. A missed release is recoverable — the next terminal transition
-        of another dep, or the claim-time defensive drop, still unblocks the
-        dependent; a failed status write is not.
+        Database errors propagate so the caller can roll back the terminal
+        transition along with this release. A lost status compare-and-set is
+        still skipped; the dependent may have entered flight.
 
         ``dep_status`` is one of :data:`RELEASE_DEP_STATUSES` or
         :data:`RELEASE_DEP_PURGED` (the purge path, where the row is already
@@ -1289,14 +1285,10 @@ class SqliteHiveRepository(HiveMindRepository):
         dependent is in-flight.
         """
         db = tx
-        try:
-            async with db.execute(
-                "SELECT id, status, depends_on FROM jobs WHERE status IN ('queued','offered')",
-            ) as cur:
-                rows = [tuple(r) async for r in cur]
-        except Exception as exc:  # noqa: BLE001 - never fail the caller's tx
-            log.warning("dependency release for %s skipped: candidate scan failed: %s", dep_id, exc)
-            return []
+        async with db.execute(
+            "SELECT id, status, depends_on FROM jobs WHERE status IN ('queued','offered')",
+        ) as cur:
+            rows = [tuple(r) async for r in cur]
         released: list[dict[str, Any]] = []
         for job_id, status, depends_on in rows:
             if not depends_on:
@@ -1312,19 +1304,15 @@ class SqliteHiveRepository(HiveMindRepository):
             # claim time (_deps_all_done); keep it verbatim so the release
             # never hides a pre-existing corruption. NULL (not '[]') is the
             # canonical no-dependencies representation.
-            try:
-                rc = await self.patch_job_status(
-                    db,
-                    job_id,
-                    sets={
-                        "depends_on": json.dumps(remaining, separators=(",", ":")) if remaining else None,
-                        "last_update_at": time.time(),
-                    },
-                    expected_status=status,
-                )
-            except Exception as exc:  # noqa: BLE001 - never fail the caller's tx
-                log.warning("dependency release for %s skipped: %s: %s", dep_id, job_id, exc)
-                continue
+            rc = await self.patch_job_status(
+                db,
+                job_id,
+                sets={
+                    "depends_on": json.dumps(remaining, separators=(",", ":")) if remaining else None,
+                    "last_update_at": time.time(),
+                },
+                expected_status=status,
+            )
             if rc < 1:
                 # Lost the compare-and-set: the dependent left queued/offered
                 # (claimed) between the scan and the update. Its work is in

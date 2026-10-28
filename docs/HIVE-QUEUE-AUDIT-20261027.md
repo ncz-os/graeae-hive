@@ -4,7 +4,7 @@
 
 Baseline and unchanged HEAD: `f2c43020c4e91965a802f665354ff9cd52dc8717`, branch `feat/hive-astra-audit-20261027`.
 
-This audit records **39 grouped findings: 20 fixed and 19 remaining** (5 partial, 14 left) after priority-C. The original remaining-effort counts were **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
+This audit records **39 grouped findings: 20 fixed and 19 remaining** (5 partial, 14 left) after Terra grind round 1. The original remaining-effort counts were **LOW 5 / MEDIUM 11 / HIGH 4**. “Fixed” means the specified source path and regression test changed; it does not mean deployed or verified on the fleet. Some fixed findings have separately named residuals.
 
 No live bus/database, remote forge, MNEMOS, service restart, or push was used. The explicit repository-only restriction overrides standing network registration/persistence workflows for this task. The sandbox declares `.git` read-only. No staging, commit, push, or attempt to bypass that restriction was made. The index is unchanged; the working tree necessarily contains the unstaged fixes. A literally clean working tree would require discarding them. No new commit SHA or primary zoder APPROVE is claimed. Independent local reviews caught and corrected overbroad infrastructure classification and a review-parent completion gap; they are not a substitute for the external gate.
 
@@ -356,3 +356,52 @@ Git, PostgreSQL/MySQL, cross-process reservations, or installed production
 executors. Production venv `/opt/agent-bus-venv/bin/python` is on PYTHIA and was
 not accessed. Positive cache entries remain unchanged; pre-existing negative
 entries are discarded on lookup. No schema or public API changed.
+
+
+## Terra grind round 1 — 2026-10-28
+
+Local source only; no network, live bus, service, or external database was used.
+No cross-family or zoder review was available under the repository-only boundary;
+no approval is claimed. Git metadata is read-only, so the handoff is necessarily
+unstaged and the working tree cannot literally be clean while retaining the fixes.
+The round changes error semantics, not the public API shape: callers of
+`release_dependents` now receive database errors and must roll back their existing
+transaction. Existing rows need no migration; a later sweep retries a rolled-back
+cancellation. A lost status CAS still skips the dependent, and concurrent list
+updates are not yet protected against lost edges.
+
+| ID | Status | Location; regression and acceptance evidence / remaining gate |
+|---|---|---|
+| R01 | Partial | `deploy/hive_worker.py:5593`: previous socket preflight remains; no new test. Cold-start behavior, deployed runtime and finalizer still require verification. |
+| R02 | Left | `hive/bus/domain/failure.py:10`, `deploy/hive_worker.py:5593`: no new regression; expiring executor readiness and explicit legacy policy are absent. A socket-only check could reject the documented cold start. |
+| R03 | Partial | `hive/bus/domain/branch_admission.py:162`: prior `test_submit_reprobes_cached_absent_output_ref`; durable reservations and push race remain. |
+| R04 | Left | `hive/bus/domain/jobs.py:310`: no new regression; trusted origin verification and executor migration remain. |
+| R05 | Left | `hive/workers/doctor.py:3502`: no new regression; pagination and bounded failed-child recovery remain. |
+| R06 | Partial | `hive/persistence/sqlite.py:1249`, `hive/bus/app.py:29`: `test_stale_cancellation_rolls_back_when_dependency_update_fails` injects a dependency update failure through the real reaper path and verifies both rows roll back. Scan/update SQL errors now propagate; ABA revision and other suppressed release paths remain. |
+| R07 | Partial | `hive/persistence/sqlite.py:2076`: prior `test_orphan_requeue_compare_and_set_observed_claim`; monotonic revision and multi-backend concurrency remain. |
+| R08 | Left | `hive/persistence/sqlite.py:1249`: this round propagates release errors, but no dependency-value CAS or concurrency regression exists; lost updates remain possible. |
+| R09 | Left | `hive/bus/app.py:331`: no new regression; occurrence and insertion remain separate transactions. |
+| R10 | Left | `hive/persistence/sqlite.py:1727`: no new regression; portable cost query and backend matrix remain. |
+| R11 | Left | `hive/bus/deps.py:80`: no new regression; durable postcommit outbox remains. |
+| R12 | Left | `hive/workers/doctor.py:856`: no new regression; fetch errors and durable sweep ledger remain. |
+| R13 | Left | `hive/bus/domain/capacity_ledger.py:20`: no new regression; cross-process reservations remain. |
+| R14 | Left | `hive/workers/remediation.py:417`: no new regression; production promotion and manifest validation remain. |
+| R15 | Left | `hive/workers/run.py:180`: no new regression; concurrent lease renewal and durable result outbox remain. |
+| R16 | Left | `hive/persistence/base.py:1`: no new regression; ABC and behavioral matrix remain. |
+| R17 | Left | `test_eih_probe.py:556`: no new regression; local full-suite assumptions remain. |
+| R18 | Left | `hive/bus/routers/jobs.py:1586`: no new regression; protected project/prefix retry enforcement remains. |
+| R19 | Fixed | `test_agent_lifecycle.py:172`: previous `test_individual_delete_is_not_supported_for_review_or_running`; no change this round. |
+| R20 | Partial | `pyproject.toml:30`: previous `test_distribution_includes_all_bus_packages`; isolated wheel and runtime validation remain. |
+
+Focused verification with cached local Python dependencies: `python3 -m pytest
+-o addopts='' -q test_priority_a_reaper.py test_dependency_release_20261027.py
+test_persistence_queue_audit_20261027.py` **23 passed**; `python3 -m pytest
+-o addopts='' -q test_reaper.py test_reaper_sweeps.py test_reaper_agents.py
+test_reaper_schedules.py test_backend_contract.py test_queue_audit_20261027.py`
+**38 passed**. This is SQLite and local adapter evidence, not real PostgreSQL or
+MySQL concurrency evidence.
+
+Cleanup receipt: kept the requested unstaged source, test and audit changes;
+no build directory, clone, remote file, process, service or mount was created.
+Existing ignored test caches may have been refreshed. `df -h . /private/tmp`:
+APFS, 460 GiB total, 286 GiB used, 150 GiB available, 66%; no tmpfs used.

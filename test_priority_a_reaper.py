@@ -1,4 +1,7 @@
 import asyncio
+from unittest import mock
+
+import pytest
 
 from hive.persistence.sqlite import SqliteHiveRepository
 
@@ -47,3 +50,30 @@ async def _stale_cancellation(tmp_path):
         async with tx.execute('SELECT id, status, depends_on FROM jobs ORDER BY id') as cur:
             rows = {r[0]: (r[1], r[2]) for r in await cur.fetchall()}
         assert rows == {'child': ('queued', None), 'parent': ('cancelled', None), 'parked': ('queued', None), 'race': ('claimed', None)}
+
+
+def test_stale_cancellation_rolls_back_when_dependency_update_fails(tmp_path):
+    asyncio.run(_stale_cancellation_release_failure(tmp_path))
+
+
+async def _stale_cancellation_release_failure(tmp_path):
+    from hive.bus.app import _cancel_stale_jobs
+
+    repo = SqliteHiveRepository(str(tmp_path / 'failure.db'))
+    await repo.init()
+    async with repo.connection() as tx:
+        for job_id, deps, started in [('parent', None, 1), ('child', '["parent"]', 100)]:
+            await tx.execute(
+                "INSERT INTO jobs (id, submitter_urn, kind, description, status, started_at, depends_on) VALUES (?, 'u', 'test', 'd', 'queued', ?, ?)",
+                (job_id, started, deps),
+            )
+        await tx.commit()
+    with mock.patch.object(repo, 'patch_job_status', side_effect=RuntimeError('release failed')):
+        with pytest.raises(RuntimeError, match='release failed'):
+            async with repo.connection() as tx:
+                await _cancel_stale_jobs(tx, repo, cutoff=10, now=10)
+    async with repo.connection() as tx:
+        async with tx.execute('SELECT id, status, depends_on FROM jobs ORDER BY id') as cur:
+            assert [tuple(row) for row in await cur.fetchall()] == [
+                ('child', 'queued', '["parent"]'), ('parent', 'queued', None)
+            ]
