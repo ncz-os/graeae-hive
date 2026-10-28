@@ -2379,13 +2379,16 @@ def build_busy(now: float | None = None) -> str:
                 return f"marker {name} (pid {first})"
         elif age < BUSY_MARKER_TTL:
             return f"marker {name}"
-    if not (BUSY_PROCS or PIPELINE_PROCS or _pipeline_uids()):
+    # CI users are dedicated service accounts (gitlab-runner, buildkite-agent):
+    # on an idle host they own no processes besides the daemon, so any other
+    # process of theirs is a pipeline job. Do not list a human's login here.
+    ci_uids = _pipeline_uids()
+    if not (BUSY_PROCS or PIPELINE_PROCS or ci_uids):
         return ""
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
         return ""
-    ci_uids = _pipeline_uids()
     for pid in pids:
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as fh:
