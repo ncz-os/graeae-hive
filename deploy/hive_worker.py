@@ -5617,7 +5617,22 @@ def _run_job_inner(job: dict) -> None:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
                 probe.settimeout(2.0)
                 probe.connect(socket_path)
+        except FileNotFoundError:
+            # An ABSENT socket is a cold daemon, not a dead one: zoder
+            # cold-starts `zeroclaw daemon --ephemeral` on first use (see
+            # REAP_SHARED_DAEMON_BINARIES), so an idle host has no socket until
+            # the first job runs. Failing here made every idle host release
+            # every job it claimed as daemon_lost (2026-10-28: hydra, minos,
+            # tydeus), and the queue churned with nothing running.
+            print(
+                f"[hive-worker:{WORKER_KIND}] {socket_path} absent, daemon is cold; "
+                "zoder starts it on first use",
+                flush=True,
+            )
         except OSError as exc:
+            # A socket FILE that refuses or times out is a daemon that died or
+            # hung and left its socket behind: that is the dead engine this
+            # preflight exists to catch before a wasted agent loop.
             patch_job(job_id, "failed", {
                 "via": "hive_worker",
                 "failure_reason": "daemon_lost",

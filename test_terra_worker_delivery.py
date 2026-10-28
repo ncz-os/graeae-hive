@@ -68,17 +68,42 @@ def test_worker_delivery_accepts_untracked_but_rejects_tracked_changes(worker, t
     assert worker.verify_delivery(str(repo), base) == 1
 
 
-def test_worker_preflight_stops_before_driver_when_daemon_unreachable(worker, tmp_path, monkeypatch):
+def test_worker_preflight_stops_before_driver_when_daemon_socket_is_stale(worker, tmp_path, monkeypatch):
     monkeypatch.setenv('HOME', str(tmp_path))
     monkeypatch.setattr(worker, 'WORKER_KIND', 'zeroclaw')
     reports = []
     monkeypatch.setattr(worker, 'patch_job', lambda *args: reports.append(args))
     monkeypatch.setattr(worker, '_find_driver', lambda name: pytest.fail('driver started'))
-    job = {'id': '01234567-89ab-cdef-0123-456789abcdef'}
-    worker.run_job(job)
+    class Socket:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def settimeout(self, timeout): pass
+        def connect(self, path): raise ConnectionRefusedError(111, 'Connection refused')
+    monkeypatch.setattr(worker.socket, 'socket', lambda *args: Socket())
+    worker.run_job({'id': '01234567-89ab-cdef-0123-456789abcdef'})
     assert reports[0][1] == 'failed'
     assert reports[0][2]['failure_reason'] == 'daemon_lost'
     assert reports[0][2]['review_iterations'] == 0
+
+
+def test_worker_preflight_lets_a_cold_daemon_through(worker, tmp_path, monkeypatch):
+    """No socket file = idle host whose zoder cold-starts the daemon. It must
+    not fail the job as daemon_lost (the 2026-10-28 queue churn)."""
+    monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setattr(worker, 'WORKER_KIND', 'zeroclaw')
+    failures, releases = [], []
+    monkeypatch.setattr(worker, 'patch_job', lambda *args: failures.append(args))
+    monkeypatch.setattr(worker, 'resolve_repo_url', lambda job: None)
+    monkeypatch.setattr(worker, 'release_job', lambda *args: releases.append(args))
+    class Socket:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def settimeout(self, timeout): pass
+        def connect(self, path): raise FileNotFoundError(2, 'No such file or directory')
+    monkeypatch.setattr(worker.socket, 'socket', lambda *args: Socket())
+    worker.run_job({'id': '01234567-89ab-cdef-0123-456789abcdef'})
+    assert failures == []
+    assert releases[0][1] == 'no_repo_mapping'
 
 
 def test_worker_preflight_accepts_connectable_socket(worker, tmp_path, monkeypatch):
