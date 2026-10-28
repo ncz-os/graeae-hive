@@ -129,6 +129,47 @@ class ReplacementChainGuardTests(unittest.TestCase):
         self.assertNotIn("/v1/jobs", calls)
         self.assertIn("already a replacement", out)
 
+    def test_the_create_payload_carries_the_replacement_marker(self):
+        failed = {"jobs": [{"id": "orig", "kind": "review:x", "max_retries": 0, "retry_count": 0,
+                            "status": "failed", "claimed_by": None, "result": {"commits": []}}]}
+        calls = []
+
+        def fake_http(method, path, payload=None, timeout=10.0):
+            calls.append((method, path, payload or {}))
+            if path.startswith("/v1/jobs?status=failed"):
+                return 200, failed
+            if path == "/v1/jobs":
+                return 200, {"id": "gen1"}
+            return 200, {"ok": True}
+
+        with (
+            mock.patch.object(doctor, "_http", fake_http),
+            mock.patch.object(doctor, "broadcast_doctor_message", lambda *a, **k: None),
+            mock.patch.object(doctor, "DRY_RUN", False),
+        ):
+            doctor.action_resubmit_jobs("review:x")
+        created = [c[2] for c in calls if c[1] == "/v1/jobs"]
+        self.assertEqual(created[0]["result"]["resubmitted_from"], "orig", created[0]["result"])
+
+    def test_a_budget_spent_row_with_a_parent_is_never_resubmitted(self):
+        """The durable signal is parent_job_id, not a field the worker may overwrite."""
+        failed = {"jobs": [{"id": "child", "kind": "review:x", "max_retries": 0, "retry_count": 0,
+                            "status": "failed", "parent_job_id": "orig", "result": {}}]}
+        calls = []
+
+        def fake_http(method, path, payload=None, timeout=10.0):
+            calls.append(path)
+            return (200, failed) if path.startswith("/v1/jobs?status=failed") else (200, {})
+
+        with (
+            mock.patch.object(doctor, "_http", fake_http),
+            mock.patch.object(doctor, "broadcast_doctor_message", lambda *a, **k: None),
+            mock.patch.object(doctor, "DRY_RUN", False),
+        ):
+            out = doctor.action_resubmit_jobs("review:x")
+        self.assertNotIn("/v1/jobs", calls)
+        self.assertIn("already a replacement", out)
+
     def test_a_replacement_that_still_has_budget_is_requeued(self):
         failed = {"jobs": [
             {"id": "replacement", "kind": "review:x", "max_retries": 2, "retry_count": 1,

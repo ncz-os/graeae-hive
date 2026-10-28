@@ -1337,9 +1337,31 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
     # exhausted budget would otherwise mint another replacement forever
     # (cross-family review 2026-10-27: "permanently failing jobs generate an
     # unbounded chain of new jobs"). One generation per original, then a report.
+    def _as_dict(value) -> dict:
+        """job['result'] is worker-mutable and may be a JSON string or absent."""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                decoded = json.loads(value)
+                return decoded if isinstance(decoded, dict) else {}
+            except ValueError:
+                return {}
+        return {}
+
     def _already_a_replacement(job: dict) -> bool:
-        res = job.get("result") or {}
-        return bool(res.get("resubmitted_from") or res.get("resubmitted_as"))
+        """True when this row is a child, i.e. someone already re-dispatched it.
+
+        The signal is the DURABLE parent_job_id column, not a field inside
+        result: the worker overwrites result on failure, so a marker stored
+        there disappears exactly when the guard is needed. Conservative by
+        design - a review child (parent = its triage row) is also left alone,
+        because re-dispatching review children is the dispatcher's job.
+        """
+        return bool(job.get("parent_job_id")) or bool(
+            _as_dict(job.get("result")).get("resubmitted_from")
+            or _as_dict(job.get("result")).get("resubmitted_as")
+        )
 
     held, eligible, chain = [], [], []
     for j in candidates:
@@ -1379,7 +1401,7 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
             # eligibility, parented to the original so the lineage is visible.
             if DRY_RUN:
                 return f"DRY_RUN: would resubmit {len(held)} budget-spent job(s) of {base_kind} as new{held_note}"
-            made, failed_submit = [], []
+            made, failed_submit, unmarked = [], [], []
             cap = max(0, min(MAX_BULK_RESUBMITS_PER_ACTION, int(max_resubmits)))
             for j in held[:cap]:
                 payload = {
@@ -1407,18 +1429,27 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
                     # Point the ORIGINAL at its replacement so the next sweep
                     # does not select it again and lean on server-side
                     # idempotency alone (cross-family review 2026-10-27).
-                    _http(
+                    patch_code, _patch_resp = _http(
                         "PATCH",
                         f"/v1/jobs/{j.get('id')}",
                         {
                             "claimed_by": j.get("claimed_by"),
                             "result": {
-                                **(j.get("result") or {}),
+                                **_as_dict(j.get("result")),
                                 "resubmitted_as": resp3["id"],
                                 "resubmitted_reason": "retry-budget-exhausted",
                             },
                         },
                     )
+                    if patch_code not in (200, 201):
+                        # Not fatal: the durable parent_job_id on the child and
+                        # the submit idempotency key both still prevent a second
+                        # generation. It must be VISIBLE though.
+                        log.warning(
+                            "resubmit %s: could not mark %s as resubmitted (http=%s)",
+                            base_kind, j.get("id"), patch_code,
+                        )
+                        unmarked.append(j.get("id"))
                 else:
                     failed_submit.append(j.get("id"))
             broadcast_doctor_message(
@@ -1429,6 +1460,7 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
                     "reason": "retry-budget-exhausted",
                     "submitted": made,
                     "failed": failed_submit,
+                    "unmarked_originals": unmarked,
                 },
             )
             log.warning(
