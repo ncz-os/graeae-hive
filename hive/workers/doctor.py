@@ -310,6 +310,7 @@ VERDICT_COMPLETION_TTL = 24 * 3600
 VERDICT_COMPLETION_RETRY_TTL = 600  # 10 min
 KEY_VERDICT_COMPLETION_RETRY = "verdict_completion_retry"
 ORPHAN_RESUBMIT_TTL_SEC = 600
+STALE_QUEUE_SEC = 900
 MAX_BULK_RESUBMITS_PER_ACTION = 20
 DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS = doctor_v2.max_same_signature_resubmits()
 SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
@@ -1875,6 +1876,87 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
     if acted:
         log.info("orphan-failure sweep: %s", acted)
     return {"scanned": len(failed), "bases": len(bases), "acted": acted, "skipped": skipped}
+
+
+def sweep_unclaimable_queued(max_rows: int = 3) -> dict:
+    """Re-dispatch a queued row that no worker can ever claim.
+
+    2026-10-28 (orchestrator coordination on the bus): a build job pinned to
+    ``eligible_hosts: ["hydra"]`` sat queued for hours. HYDRA runs no zeroclaw
+    worker unit at all, so no agent could ever match it - and a queued row is
+    invisible to every other sweep, which is why it looked like "the claim path
+    is stalled". The claim path was fine; the eligibility was unsatisfiable.
+
+    For each queued, unclaimed, non-parked row older than STALE_QUEUE_SEC whose
+    eligible hosts contain no host with an active worker agent, submit a
+    replacement with the host restriction removed (a runner is chosen by the
+    claim gate), parented to the original, and mark the row so one pass cannot
+    submit it twice.
+    """
+    code, resp = _http("GET", "/v1/jobs?status=queued&limit=200", timeout=15.0)
+    if code != 200 or not resp:
+        log.warning("unclaimable-queued sweep: could not list queued rows (http=%s)", code)
+        return {"scanned": 0, "error": f"http={code}"}
+    acode, aresp = _http("GET", "/v1/agents?status=online&limit=500", timeout=15.0)
+    if acode != 200 or not aresp:
+        log.warning("unclaimable-queued sweep: could not list agents (http=%s)", acode)
+        return {"scanned": 0, "error": f"agents http={acode}"}
+    worker_hosts = {
+        str(a.get("host") or "").lower()
+        for a in (aresp.get("agents") or [])
+        if str(a.get("kind") or "") in {"zeroclaw", "codex", "opencode"}
+    }
+    now = time.time()
+    acted, skipped = {}, []
+    for j in resp.get("jobs", []) or []:
+        if len(acted) >= max(0, int(max_rows)):
+            break
+        res = j.get("result") or {}
+        if j.get("claimed_by") or res.get("infrastructure_parked") or dlq_protected(j):
+            continue
+        if now - float(j.get("started_at") or now) < STALE_QUEUE_SEC:
+            continue
+        hosts = j.get("eligible_hosts")
+        if isinstance(hosts, str):
+            try:
+                hosts = json.loads(hosts)
+            except ValueError:
+                hosts = None
+        if not hosts:
+            continue  # unset eligibility is claimable by anyone
+        if {str(h).lower() for h in hosts} & worker_hosts:
+            continue  # a live worker host can still take it
+        key = "unclaimable_queued:" + str(j.get("id"))
+        if STATE.last_mark(key) is not None:
+            skipped.append(j.get("id"))
+            continue
+        payload = {
+            "kind": j.get("kind"),
+            "description": (j.get("description") or "")
+            + "\n\nRE-DISPATCHED (doctor 2026-10-28): the original was pinned to "
+            + ",".join(str(h) for h in hosts)
+            + ", which runs no worker, so nothing could ever claim it. Host restriction removed.",
+            "priority": j.get("priority") or 0,
+            "project": j.get("project"),
+            "repo": j.get("repo"),
+            "head_branch": j.get("head_branch"),
+            "base_branch": j.get("base_branch"),
+            "eligible_kinds": j.get("eligible_kinds"),
+            "max_retries": 2,
+            "parent_job_id": j.get("id"),
+            "idempotency_key": f"doctor-unclaimable-{j.get('id')}",
+            "result": {"resubmitted_from": j.get("id"), "resubmitted_reason": "unclaimable_eligible_hosts"},
+        }
+        payload = {k: v for k, v in payload.items() if v not in (None, "", [])}
+        code3, resp3 = _http("POST", "/v1/jobs", payload)
+        if code3 in (200, 201) and isinstance(resp3, dict) and resp3.get("id"):
+            acted[j.get("id")] = resp3["id"]
+            STATE.mark(key, ttl=ORPHAN_RESUBMIT_TTL_SEC)
+        else:
+            acted[j.get("id")] = f"submit http={code3}"
+    if acted:
+        log.warning("unclaimable-queued sweep: %s", acted)
+    return {"scanned": len(resp.get("jobs", []) or []), "acting": acted, "skipped": skipped}
 
 
 def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str:
@@ -4105,6 +4187,10 @@ def main():
                     log.info("orphan-failure sweep: %s", sweep_orphan_failures())
                 except Exception as e:
                     log.warning("orphan-failure sweep error: %s", e)
+                try:
+                    log.info("unclaimable-queued sweep: %s", sweep_unclaimable_queued())
+                except Exception as e:
+                    log.warning("unclaimable-queued sweep error: %s", e)
 
             # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
             if now - last_scan >= SCAN_INTERVAL:
