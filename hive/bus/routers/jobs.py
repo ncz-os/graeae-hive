@@ -44,6 +44,7 @@ from hive.bus.domain import branch_admission as _ba_mod
 from hive.bus.domain.branch_admission import branch_admission
 from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
+    host_pin_warnings,
     THROTTLE_HEADROOM,
     _norm_str,
     _norm_str_set,
@@ -640,6 +641,7 @@ async def create_job(req: JobCreate):
     #     a usable base_branch -> accepted and recorded as branch_created_from;
     #     missing with no base -> 422 naming the ref.
     warnings: list[str] = []
+    warnings.extend(host_pin_warnings(req.kind, req.eligible_hosts, req.pin_reason))
     if req.preferred_models:
         bad_models = [m for m in req.preferred_models if forbidden_model(m)]
         if bad_models:
