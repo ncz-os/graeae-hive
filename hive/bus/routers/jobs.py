@@ -684,7 +684,17 @@ async def create_job(req: JobCreate):
         if _branches["state"] == "head_present" and kind_requires_commit(req.kind, req.repo):
             raise HTTPException(422, "output_branch_exists: choose a fresh head_branch; published branches are read-only inputs")
         if _branches["state"] in {"unreachable", "unprobed"}:
-            raise HTTPException(422, "branch_unverified: retry submission when origin can be verified")
+            # 2026-10-28: refusing here made EVERY commit-producing submission
+            # fail whenever the bus could not reach origin (its own ssh key, a
+            # probe timeout, a catalog entry with no remote) - that is a
+            # transport fault, not a reason to reject work. A ref we could not
+            # verify is recorded so the failure class is visible, and the worker
+            # treats an identical already-pushed head as its own delivery, so the
+            # collision this guard exists for is still caught.
+            warnings.append(
+                f"branch_probe_unverified: could not verify {req.head_branch!r} on origin "
+                f"({_branches['state']}); the worker will deliver idempotently if it exists"
+            )
         _branch_created_from = _branches["branch_created_from"]
     else:
         _branch_created_from = None
