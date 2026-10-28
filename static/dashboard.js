@@ -366,8 +366,12 @@ async function refreshRunning(){
   const hosts=Object.create(null);
   for(const a of agents){
     const host=(a.urn||'').split(':')[3]||'?';
-    const h=hosts[host]||(hosts[host]={host,total:0,busy:0,jobs:[]});
+    const h=hosts[host]||(hosts[host]={host,total:0,busy:0,jobs:[],building:''});
     h.total++;
+    // build_busy is the worker's own build gate (a build orchestrator or busy
+    // marker is present): the host is building and claims nothing new.
+    const bb=a.metadata&&typeof a.metadata.build_busy==='string'?a.metadata.build_busy:'';
+    if(bb&&!h.building)h.building=bb;
     const j=byClaimer[a.urn];
     if(j){ h.busy++; h.jobs.push(j); }
   }
@@ -395,17 +399,17 @@ async function refreshRunning(){
   grid.innerHTML='';
   if(!list.length){empty.style.display='';return;}
   empty.style.display='none';
-  list.sort((a,b)=>(b.busy-a.busy)||a.host.localeCompare(b.host));
+  list.sort((a,b)=>(!!b.building-!!a.building)||(b.busy-a.busy)||a.host.localeCompare(b.host));
   for(const h of list){
     const card=document.createElement('div');
-    card.className='worker-card'+(h.busy?'':' idle');
+    card.className='worker-card'+(h.building?' building':(h.busy?'':' idle'));
     if(h.busy){ const j0=h.jobs[0]; card.onclick=()=>showJobModal(j0); }
     const jobKinds=h.jobs.map(j=>`${esc(j.kind||'?')} <span class="dim">[${esc(claimedModelLabel(j))}]</span>`).join(', ');
     card.innerHTML=`
       <div class="wc-agent"><span class="wc-dot"></span>
-        <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}</div>
+        <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}${h.building?` <span class="wc-build-badge" title="${esc(h.building)}">BUILDING</span>`:''}</div>
       <div class="wc-job">${h.busy}/${h.total} active</div>
-      <div class="wc-desc${h.busy?'':' dim'}">${h.busy?jobKinds:'all idle \u00b7 waiting for work'}</div>
+      <div class="wc-desc${h.busy||h.building?'':' dim'}">${h.building?`build running \u00b7 not claiming (${esc(h.building)})`+(h.busy?` \u00b7 ${jobKinds}`:''):(h.busy?jobKinds:'all idle \u00b7 waiting for work')}</div>
       <div class="wc-meta"><span>${h.total} worker${h.total===1?'':'s'}</span><span>${h.busy} busy</span></div>`;
     grid.appendChild(card);
   }

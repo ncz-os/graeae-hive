@@ -149,6 +149,9 @@ small.dim{font-size:.85em}
 .worker-card .wc-desc{font-size:.75em;color:#8b949e;max-height:2.8em;overflow:hidden;line-height:1.4}
 .worker-card .wc-meta{font-size:.72em;color:#6e7681;margin-top:.3em;display:flex;gap:.5em}
 .worker-card .wc-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:#238636;animation:pulse 1.5s infinite}
+.worker-card.building{border-color:#d29922;background:#271d05;box-shadow:0 0 0 1px #d29922}
+.worker-card .wc-build-badge{background:#d29922;color:#1a1300;padding:.05em .4em;border-radius:3px;font-size:.75em;font-weight:700;letter-spacing:.04em}
+.worker-card.building .wc-dot{background:#d29922}
 .worker-card.idle .wc-dot{background:#6e7681;animation:none}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 #workers-empty{color:#6e7681;font-size:.82em;padding:.3em}
