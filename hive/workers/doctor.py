@@ -1833,6 +1833,19 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         log.warning("orphan-failure sweep: could not list failed rows (http=%s)", code)
         return {"scanned": 0, "error": f"http={code}"}
     failed = resp.get("jobs", []) or []
+    # A row the infrastructure classifier PARKED sits in status=queued, not
+    # failed, so a sweep that only reads failed rows never sees it - and with
+    # max_retries 0 the bus will never claim it again. That is what the operator
+    # reported as "P76 in the queue is not being claimed". Read the parked rows
+    # too and treat them as work to re-dispatch.
+    pcode, presp = _http("GET", "/v1/jobs?status=queued&limit=200", timeout=15.0)
+    parked = []
+    if pcode == 200 and presp:
+        for j in presp.get("jobs", []) or []:
+            res = j.get("result") or {}
+            if res.get("infrastructure_parked"):
+                parked.append(j)
+    failed = failed + parked
     bases: dict[str, int] = {}
     for j in failed:
         if j.get("parent_job_id") or dlq_protected(j):
