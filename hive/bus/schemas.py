@@ -68,6 +68,7 @@ class JobCreate(BaseModel):
     required_capabilities: list[str] | None = None  # worker must have ALL of these
     eligible_kinds: list[str] | None = None  # restrict to agent kinds; null = any
     eligible_hosts: list[str] | None = None  # restrict to agent hosts (e.g. ["cixmini"]); null = any
+    pin_reason: str | None = None  # why eligible_hosts is set; omitting it makes the bus warn
     target_workspace: str | None = (
         None  # GRAEAE permanent-fix: bus-side first-class workspace (replaces worker KIND_WORKSPACE_MAP guessing)
     )

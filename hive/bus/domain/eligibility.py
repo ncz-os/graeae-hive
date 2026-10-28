@@ -418,3 +418,34 @@ def job_agent_eligible(job: dict[str, Any], agent: dict[str, Any]) -> tuple[bool
         )
 
     return True, "eligible"
+
+
+def host_pin_warnings(kind: str, eligible_hosts: object, pin_reason: object = None) -> list[str]:
+    """Submitter-facing warning for an ``eligible_hosts`` pin (2026-10-28).
+
+    Hosts are interchangeable for ordinary authoring, review and fix jobs, so a
+    pin is the exception. Measured on 141 jobs: unpinned zeroclaw claims spread
+    across 7 hosts, while hand-picked pin lists put 71 of 141 claims on three
+    hosts and left hydra, proteus and typhon-worker nearly idle. A pin also
+    strands the job when it fails: the bus never re-offers a job to the host
+    that failed it, so a one-host pin that fails once stays queued forever.
+
+    Warn-only. A ``pin_reason`` or a hardware-bound kind (the narrow-host
+    allowlist) silences it, so deliberate pins stay quiet.
+    """
+    hosts = sorted(h for h in _norm_str_set(eligible_hosts) if h != "*")
+    if not hosts or (isinstance(pin_reason, str) and pin_reason.strip()):
+        return []
+    if _norm_str(kind).startswith(NARROW_ALLOWLIST) or set(hosts) <= NARROW_HOSTS:
+        return []
+    out = [
+        f"eligible_hosts={hosts} pins this job to specific hosts with no pin_reason; hosts are "
+        "interchangeable for ordinary work, so leave eligible_hosts unset unless the job needs "
+        "that hardware, and say why in pin_reason"
+    ]
+    if len(hosts) == 1:
+        out.append(
+            f"a single-host pin ({hosts[0]}) strands the job if that host fails it: the bus does "
+            "not re-offer a failed job to the host that failed it"
+        )
+    return out
