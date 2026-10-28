@@ -2291,6 +2291,78 @@ def draining() -> bool:
     return os.path.exists(DRAIN_FILE)
 
 
+#: Build-host busy gate (2026-10-28). A host that is running an image or system
+#: build must not take new Hive jobs: they compete for the CPU, RAM and IO the
+#: build needs, and the build's cleanup rules assume nothing else is running.
+#: Between jobs only -- a job already running is never interrupted. Two signals:
+#:   * a marker file in ``BUSY_DIR`` (a build script ``touch``es one; a pid on
+#:     its first line makes it stale when that process is gone, otherwise it
+#:     expires after ``BUSY_MARKER_TTL`` seconds);
+#:   * a running build orchestrator named in ``HIVE_WORKER_BUSY_PROCS``.
+BUSY_DIR = os.path.expanduser(
+    os.environ.get("HIVE_WORKER_BUSY_DIR", "~/.config/hive-worker/busy.d")
+)
+BUSY_MARKER_TTL = float(os.environ.get("HIVE_WORKER_BUSY_TTL", str(12 * 3600)))
+BUSY_PROCS = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "HIVE_WORKER_BUSY_PROCS",
+        "build-image.sh,bitbake,mkosi,mksquashfs,mmdebstrap,debootstrap",
+    ).split(",")
+    if name.strip()
+)
+
+
+def _busy_marker_pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def build_busy(now: float | None = None) -> str:
+    """Why this host is busy with a build, or "" when it may claim work."""
+    now = time.time() if now is None else now
+    try:
+        names = sorted(os.listdir(BUSY_DIR))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(BUSY_DIR, name)
+        try:
+            age = now - os.path.getmtime(path)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                first = fh.readline().strip()
+        except OSError:
+            continue
+        if first.isdigit():
+            if _busy_marker_pid_alive(int(first)):
+                return f"marker {name} (pid {first})"
+        elif age < BUSY_MARKER_TTL:
+            return f"marker {name}"
+    if not BUSY_PROCS:
+        return ""
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return ""
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                argv = fh.read().split(b"\0")
+        except OSError:
+            continue
+        # argv[0] and, for interpreter-run scripts, argv[1] (``bash build-image.sh``)
+        for arg in argv[:2]:
+            base = os.path.basename(arg.decode("utf-8", "replace"))
+            if base in BUSY_PROCS:
+                return f"process {base} (pid {pid})"
+    return ""
+
+
 def argonas_auth_state() -> str:
     ok = _argonas_auth["ok"]
     return "unknown" if ok is None else ("ok" if ok else "fail")
@@ -2490,6 +2562,7 @@ def heartbeat_loop() -> None:
                     "current_job": _current_job_id,
                     "argonas_auth": argonas_auth_state(),
                     "draining": draining(),
+                    "build_busy": build_busy(),
                 },
             },
             timeout=10,
@@ -6745,9 +6818,21 @@ def main() -> None:
     register()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
     print(f"[hive-worker:{WORKER_KIND}] polling {HIVE_URL} as {_urn}", flush=True)
+    _last_busy = ""
     while _running:
         restart_after_source_update()
         if draining():
+            time.sleep(POLL_INTERVAL)
+            continue
+        _busy = build_busy()
+        if _busy != _last_busy:
+            print(
+                f"[hive-worker:{WORKER_KIND}] build gate: "
+                + (f"busy, not claiming ({_busy})" if _busy else "idle, claiming again"),
+                flush=True,
+            )
+            _last_busy = _busy
+        if _busy:
             time.sleep(POLL_INTERVAL)
             continue
         if not argonas_auth_ok():
