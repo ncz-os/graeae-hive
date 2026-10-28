@@ -309,6 +309,7 @@ VERDICT_COMPLETION_TTL = 24 * 3600
 # the backoff marker are independent records.
 VERDICT_COMPLETION_RETRY_TTL = 600  # 10 min
 KEY_VERDICT_COMPLETION_RETRY = "verdict_completion_retry"
+ORPHAN_RESUBMIT_TTL_SEC = 600
 MAX_BULK_RESUBMITS_PER_ACTION = 20
 DOCTOR_MAX_SAME_SIGNATURE_RESUBMITS = doctor_v2.max_same_signature_resubmits()
 SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
@@ -1793,6 +1794,50 @@ def apply_release(
         text = action_resubmit_jobs(base_kind)
         return text, False
     return _release_job(job_id, release_eligible_kinds)
+
+
+def sweep_orphan_failures(max_bases: int = 5) -> dict:
+    """Resubmit failed rows that nothing else will ever look at.
+
+    2026-10-27/28 (operator, twice: "triage queue has a loop_unresolved"): a
+    failed row reaches the resubmit path only through a ``triage:`` wrapper, and
+    the wrapper is suppressed for a base_kind already triaged inside the marker
+    window. A failure that appears after that window, or a wrapper that was
+    never created, therefore sat in ``failed`` forever with nobody acting on it -
+    which is exactly the triage pile-up the operator kept seeing.
+
+    This sweep closes that loop deterministically, without the LLM: for every
+    distinct base_kind among failed rows that have no parent and are not
+    protected, call the resubmit action (idempotent per original id, one
+    generation only). Bounded per pass and marked per base_kind so a pass cannot
+    spin.
+    """
+    code, resp = _http("GET", "/v1/jobs?status=failed&limit=200", timeout=15.0)
+    if code != 200 or not resp:
+        log.warning("orphan-failure sweep: could not list failed rows (http=%s)", code)
+        return {"scanned": 0, "error": f"http={code}"}
+    failed = resp.get("jobs", []) or []
+    bases: dict[str, int] = {}
+    for j in failed:
+        if j.get("parent_job_id") or dlq_protected(j):
+            continue
+        kind = re.sub(r"\s*\[.*?\]\s*$", "", str(j.get("kind") or "")).strip()
+        if not kind:
+            continue
+        bases[kind] = bases.get(kind, 0) + 1
+    acted, skipped = {}, []
+    for base_kind in sorted(bases, key=lambda k: -bases[k])[:max(0, int(max_bases))]:
+        if STATE.last_mark("orphan_resubmit:" + base_kind) is not None:
+            skipped.append(base_kind)
+            continue
+        try:
+            acted[base_kind] = action_resubmit_jobs(base_kind)
+        except Exception as exc:  # noqa: BLE001 - a sweep must not kill the loop
+            acted[base_kind] = f"error: {type(exc).__name__}: {exc}"
+        STATE.mark("orphan_resubmit:" + base_kind, ttl=ORPHAN_RESUBMIT_TTL_SEC)
+    if acted:
+        log.info("orphan-failure sweep: %s", acted)
+    return {"scanned": len(failed), "bases": len(bases), "acted": acted, "skipped": skipped}
 
 
 def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str:
@@ -4015,6 +4060,14 @@ def main():
                     log.info("needs-review sweep: %s", run_needs_review_sweep())
                 except Exception as e:
                     log.warning("needs-review sweep error: %s", e)
+                # The wrapper path is not the only way a failure must be acted
+                # on: a failed row whose base_kind was already triaged inside the
+                # marker window would otherwise sit forever (operator: "triage
+                # queue has a loop_unresolved").
+                try:
+                    log.info("orphan-failure sweep: %s", sweep_orphan_failures())
+                except Exception as e:
+                    log.warning("orphan-failure sweep error: %s", e)
 
             # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
             if now - last_scan >= SCAN_INTERVAL:
