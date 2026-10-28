@@ -407,9 +407,9 @@ async function refreshRunning(){
     const jobKinds=h.jobs.map(j=>`${esc(j.kind||'?')} <span class="dim">[${esc(claimedModelLabel(j))}]</span>`).join(', ');
     card.innerHTML=`
       <div class="wc-agent"><span class="wc-dot"></span>
-        <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}${h.building?` <span class="wc-build-badge" title="${esc(h.building)}">BUILDING</span>`:''}</div>
+        <span class="wc-kind-badge">zeroclaw</span> ${esc(h.host)}${h.building?` <span class="wc-build-badge" title="${esc(h.building)}">${/^pipeline /.test(h.building)?'PIPELINE':'BUILDING'}</span>`:''}</div>
       <div class="wc-job">${h.busy}/${h.total} active</div>
-      <div class="wc-desc${h.busy||h.building?'':' dim'}">${h.building?`build running \u00b7 not claiming (${esc(h.building)})`+(h.busy?` \u00b7 ${jobKinds}`:''):(h.busy?jobKinds:'all idle \u00b7 waiting for work')}</div>
+      <div class="wc-desc${h.busy||h.building?'':' dim'}">${h.building?`${/^pipeline /.test(h.building)?'in a pipeline':'build running'} \u00b7 not claiming (${esc(h.building)})`+(h.busy?` \u00b7 ${jobKinds}`:''):(h.busy?jobKinds:'all idle \u00b7 waiting for work')}</div>
       <div class="wc-meta"><span>${h.total} worker${h.total===1?'':'s'}</span><span>${h.busy} busy</span></div>`;
     grid.appendChild(card);
   }

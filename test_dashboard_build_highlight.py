@@ -24,6 +24,7 @@ class BuildHighlight(unittest.TestCase):
         self.assertIn("' building'", JS)
         self.assertIn("wc-build-badge", JS)
         self.assertIn("BUILDING", JS)
+        self.assertIn("PIPELINE", JS)  # a pipeline host reads PIPELINE, a build host BUILDING
         self.assertIn("(!!b.building-!!a.building)", JS)
         self.assertIn("not claiming", JS)
 

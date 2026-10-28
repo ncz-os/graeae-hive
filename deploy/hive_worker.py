@@ -2313,6 +2313,42 @@ BUSY_PROCS = tuple(
 )
 
 
+#: Pipeline participation (2026-10-28): a host that is a stage of a pipeline
+#: (CI job on a GitLab runner / Buildkite agent, the RiskyEats pipeline, the apt
+#: publish) takes no new jobs either. Two signals besides the busy markers:
+#:   * a named pipeline process, ``HIVE_WORKER_PIPELINE_PROCS``;
+#:   * any process owned by a CI user, ``HIVE_WORKER_PIPELINE_USERS`` (the
+#:     runner daemon itself is ignored; idle hosts own no such processes).
+PIPELINE_PROCS = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "HIVE_WORKER_PIPELINE_PROCS",
+        "ncz-reprepro-publish.sh,reprepro,riskyeats.pipeline,pipeline.py",
+    ).split(",")
+    if name.strip()
+)
+PIPELINE_USERS = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "HIVE_WORKER_PIPELINE_USERS", "gitlab-runner,buildkite-agent"
+    ).split(",")
+    if name.strip()
+)
+_PIPELINE_DAEMONS = ("gitlab-runner", "gitlab-ci-multi-runner", "buildkite-agent")
+
+
+def _pipeline_uids() -> dict[int, str]:
+    out: dict[int, str] = {}
+    for name in PIPELINE_USERS:
+        try:
+            import pwd
+
+            out[pwd.getpwnam(name).pw_uid] = name
+        except (ImportError, KeyError):
+            continue
+    return out
+
+
 def _busy_marker_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -2343,23 +2379,35 @@ def build_busy(now: float | None = None) -> str:
                 return f"marker {name} (pid {first})"
         elif age < BUSY_MARKER_TTL:
             return f"marker {name}"
-    if not BUSY_PROCS:
+    if not (BUSY_PROCS or PIPELINE_PROCS or _pipeline_uids()):
         return ""
     try:
         pids = [p for p in os.listdir("/proc") if p.isdigit()]
     except OSError:
         return ""
+    ci_uids = _pipeline_uids()
     for pid in pids:
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as fh:
-                argv = fh.read().split(b"\0")
+                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0")]
         except OSError:
             continue
-        # argv[0] and, for interpreter-run scripts, argv[1] (``bash build-image.sh``)
-        for arg in argv[:2]:
-            base = os.path.basename(arg.decode("utf-8", "replace"))
+        # argv[0], then for interpreter-run scripts argv[1] (``bash build-image.sh``)
+        # and ``python -m module`` (argv[2])
+        bases = [os.path.basename(a) for a in argv[:3] if a]
+        for base in bases:
             if base in BUSY_PROCS:
                 return f"process {base} (pid {pid})"
+            if base in PIPELINE_PROCS:
+                return f"pipeline {base} (pid {pid})"
+        if ci_uids:
+            try:
+                uid = os.stat(f"/proc/{pid}").st_uid
+            except OSError:
+                continue
+            # the runner/agent daemon is always up; only its job processes count
+            if uid in ci_uids and not (bases[:1] and bases[0] in _PIPELINE_DAEMONS and argv[1:2] and argv[1] in ("run", "start")):
+                return f"pipeline CI job as {ci_uids[uid]} ({bases[0] if bases else '?'}, pid {pid})"
     return ""
 
 
