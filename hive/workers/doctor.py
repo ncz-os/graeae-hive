@@ -1425,6 +1425,22 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
                     "resubmitted_reason": "retry-budget-exhausted",
                 }
                 code3, resp3 = _http("POST", "/v1/jobs", payload)
+                if code3 not in (200, 201):
+                    # The original's branch usually EXISTS after its first
+                    # attempt, and the bus refuses a commit-producing job whose
+                    # output ref is already published - correctly. A resubmit
+                    # therefore needs a fresh ref: derive one deterministically
+                    # from the original id so a second pass cannot collide with
+                    # itself either.
+                    short = str(j.get("id") or "")[:8]
+                    derived = f"{(payload.get('head_branch') or 'resubmit')[:40]}-resub-{short}"
+                    payload["head_branch"] = derived
+                    payload["idempotency_key"] = f"doctor-resubmit-{j.get('id')}-{short}"
+                    log.warning(
+                        "resubmit %s: %s refused on the original ref (http=%s); retrying on %s",
+                        base_kind, j.get("id"), code3, derived,
+                    )
+                    code3, resp3 = _http("POST", "/v1/jobs", payload)
                 if code3 in (200, 201) and isinstance(resp3, dict) and resp3.get("id"):
                     made.append(resp3["id"])
                     # Point the ORIGINAL at its replacement so the next sweep
