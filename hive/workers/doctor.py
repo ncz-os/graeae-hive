@@ -1847,10 +1847,18 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             skipped.append(base_kind)
             continue
         try:
-            acted[base_kind] = action_resubmit_jobs(base_kind)
+            text = action_resubmit_jobs(base_kind)
         except Exception as exc:  # noqa: BLE001 - a sweep must not kill the loop
-            acted[base_kind] = f"error: {type(exc).__name__}: {exc}"
-        STATE.mark("orphan_resubmit:" + base_kind, ttl=ORPHAN_RESUBMIT_TTL_SEC)
+            text = f"error: {type(exc).__name__}: {exc}"
+        acted[base_kind] = text
+        # Mark ONLY a definitive outcome. A refusal, a transport failure or an
+        # exception must leave the base_kind unmarked so the next pass retries;
+        # marking those is what made a real failure look "handled" for the TTL
+        # (2026-10-28: the first sweep marked after a refused submit).
+        definitive = text.startswith("resubmitted ") or text.startswith("no failed jobs") \
+            or "already a replacement" in text or "could not resubmit" not in text and text.startswith("resubmitted")
+        if text.startswith("resubmitted ") or text.startswith("no failed jobs") or "already a replacement" in text:
+            STATE.mark("orphan_resubmit:" + base_kind, ttl=ORPHAN_RESUBMIT_TTL_SEC)
     if acted:
         log.info("orphan-failure sweep: %s", acted)
     return {"scanned": len(failed), "bases": len(bases), "acted": acted, "skipped": skipped}
