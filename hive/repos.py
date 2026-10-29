@@ -32,6 +32,17 @@ from typing import Any
 
 from hive.registry import ARGONAS_GIT_PATH_NFS, argonas_nfs_path, argonas_ssh_url
 
+
+class CatalogCorruptionError(ValueError):
+    """The catalog file exists but is not valid JSON.
+
+    A corrupt ``repos.json`` must never surface as a raw ``json.JSONDecodeError``
+    through the bus endpoint or a worker lookup: callers need to be able to tell
+    "the build artifact is broken, rebuild it" apart from "no such file" or a
+    transient I/O fault.
+    """
+
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CATALOG_PATH = _REPO_ROOT / "data" / "repos.json"
 
@@ -61,7 +72,13 @@ def load_catalog(path: str | os.PathLike | None = None, *, force: bool = False) 
             raise FileNotFoundError(f"repo catalog not found: {p}") from None
         if not force and _CACHE["catalog"] is not None and _CACHE["path"] == str(p) and _CACHE["mtime"] == mtime:
             return _CACHE["catalog"]
-        data = json.loads(p.read_text())
+        try:
+            data = json.loads(p.read_text())
+        except json.JSONDecodeError as exc:
+            raise CatalogCorruptionError(
+                f"repo catalog is corrupt JSON at {p} (line {exc.lineno}, column {exc.colno}): {exc.msg}; "
+                "rebuild the catalog (hive.registry) before serving"
+            ) from exc
         entries = {e["id"]: e for e in data.get("repos", []) if e.get("id")}
         _CACHE.update(catalog=entries, mtime=mtime, path=str(p), meta=data.get("_meta", {}))
         return entries
@@ -245,32 +262,63 @@ class _FallbackCache:
 
         ``only_if_absent`` is the compare-and-swap the probe needs: the probe
         runs with no lock held, so between a miss and this call another thread
-        may already have answered. The rule is deliberately ASYMMETRIC:
+        may already have answered. The rule is deliberately ASYMMETRIC and is
+        about the VALUE, not the clock:
 
-          * a NEGATIVE answer never displaces a live POSITIVE one (the repo
-            exists; this thread's probe simply ran before it did), and
-          * a POSITIVE answer DOES displace a live NEGATIVE one -- a repo that
-            was absent when this thread probed is served the moment it is
-            found, instead of waiting out the negative TTL.
+          * a NEGATIVE answer never displaces an existing POSITIVE one -- not
+            while it is live, and not merely because its TTL has lapsed. The
+            repo still exists on the mount; a stale "it went away" must not
+            evict a known "it is here" (that would make a real repo
+            intermittently 404 across a TTL boundary). An expired positive is
+            therefore treated as live for DISPLACEMENT purposes; it is
+            re-confirmed by the very probe this store answers, and gets a
+            fresh TTL instead of being replaced by a negative.
+          * a POSITIVE answer DOES displace a NEGATIVE one, live or expired --
+            a repo that was absent when the negative was cached is served the
+            moment a probe finds it, instead of waiting out the negative TTL.
 
-        Identical answers are a no-op either way. The check and the insert
-        happen under the same lock, so the decision is atomic.
+        The same-value confirmations are TTL refreshes: two threads that both
+        probed the same repo and got the same answer each refresh the entry's
+        expiry to their own (newer) moment, so a confirmed answer outlives the
+        thread that first cached it instead of expiring a window early. The
+        check, the decision and the write happen under the same lock, so the
+        decision is atomic.
 
-        At most ONE entry is evicted per insert (the LRU end), so concurrent
-        inserts at capacity cannot evict N entries for N inserts.
+        At most ONE entry is evicted per store (the LRU end), so concurrent
+        stores at capacity cannot evict N entries for N stores.
         """
+        now = time.monotonic()
         with self._lock:
             if only_if_absent and slug in self._entries:
                 expires_at, existing = self._entries[slug]
-                if expires_at > time.monotonic():  # a LIVE answer already exists
-                    replaces_negative = existing is None and entry is not None
-                    if not replaces_negative:  # anything else keeps the live answer
-                        return False
-                # otherwise (expired, or upgrading a negative) replace it
-            self._entries[slug] = (time.monotonic() + ttl, entry)
+                if entry is None and existing is not None:
+                    # A NEGATIVE answer never displaces a POSITIVE one, live or
+                    # not: the repo exists, this probe's "absent" is stale.
+                    # Refresh the positive's TTL so it keeps serving.
+                    self._entries[slug] = (now + _POSITIVE_TTL, existing)
+                    self._entries.move_to_end(slug)
+                    return False
+                if entry is not None and existing is not None:
+                    # Two POSITIVE answers to the same probe: keep the existing
+                    # entry's value, but this thread re-probed and confirmed it
+                    # -- refresh the TTL and LRU slot so the confirmed answer
+                    # outlives the thread that first cached it.
+                    self._entries[slug] = (now + ttl, existing)
+                    self._entries.move_to_end(slug)
+                    return False
+                if entry is None and existing is None:
+                    # Two NEGATIVE answers to the same probe: keep the existing
+                    # entry, refresh its TTL and LRU slot. (A confirm, not a
+                    # win -- identical answers are a no-op either way.)
+                    self._entries[slug] = (now + ttl, existing)
+                    self._entries.move_to_end(slug)
+                    return False
+                # here: the key is absent, or a POSITIVE is being stored over
+                # a (live or expired) NEGATIVE -- insert below.
+            self._entries[slug] = (now + ttl, entry)
             self._entries.move_to_end(slug)
-            while len(self._entries) > self._max:
-                self._entries.popitem(last=False)  # the LRU end, one at a time
+            if len(self._entries) > self._max:  # at most ONE eviction per store
+                self._entries.popitem(last=False)  # the LRU end
             return True
 
     def clear(self) -> None:
@@ -306,9 +354,21 @@ def _valid_slug(slug: str) -> bool:
 
 
 def _read_text(path: str) -> str | None:
-    """The file's text, or None if it cannot be read. Never raises."""
+    """The file's text, or None if it cannot be read. Never raises.
+
+    Opened with ``O_NOFOLLOW`` on POSIX so the open does NOT traverse a
+    symlink: a bare-repo directory that is swapped for a link between the
+    caller's ``lstat`` and this open cannot be followed to read a target's
+    HEAD (see :func:`_probe_argonas_live` for the TOCTOU it closes). On
+    platforms without ``O_NOFOLLOW`` it degrades to a plain open.
+    """
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except (AttributeError, OSError):
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
             return fh.read()
     except OSError:
         return None
@@ -341,7 +401,7 @@ def _bare_head_branch(bare_dir: str, head_text: str | None) -> str:
 
 
 def _contained(path: str, root: str) -> bool:
-    """Whether ``path`` is ``root`` or lies beneath it (both already realpath'd).
+    """Whether ``path`` is ``root`` or lies beneath it (both already canonical).
 
     ``commonpath`` rather than ``startswith(root + os.sep)``: the string form
     turns a root of ``"/"`` into ``"//"``, which no absolute path starts with,
@@ -354,16 +414,40 @@ def _contained(path: str, root: str) -> bool:
 
 
 def _canonical_root(root: str) -> str:
-    """``root`` as an absolute, lexically-normal path WITHOUT stat-ing it.
+    """``root`` fully resolved: symlinks followed, lexically normalized.
 
-    ``os.path.realpath`` is not free: when the root does not exist yet it
-    resolves component by component, which is three stat calls per lookup on a
-    missing mount. ``abspath`` only does getcwd/expanduser, so the "one stat
-    call" budget holds. The root may legitimately BE a symlink (the NFS mount
-    is one on some hosts) and is not resolved here; a child that escapes is
-    refused by ``_contained`` on the same path we stat.
+    ``os.path.realpath`` resolves every existing component, so a symlinked
+    ARGONAS mount (``HIVE_ARGONAS_GIT_ROOT`` pointing at a link to the real
+    mount) works: the bare-repo path is built from the REAL root, the ``lstat``
+    of ``<slug>.git`` sees the actual directory, and a planted link that
+    resolves outside the real root is refused by ``_contained`` on the resolved
+    path -- which is exactly where the containment check has to look.
+
+    The resolution is cached process-wide (below): it costs real stat calls on
+    a network mount, but a lookup must stay at one ``lstat`` of the bare repo,
+    so this runs ONCE per distinct root string, not once per slug.
     """
-    return os.path.abspath(root)
+    return _realpath_cached(root)
+
+
+_REALPATH_CACHE: dict[str, str] = {}
+_REALPATH_LOCK = threading.Lock()
+
+
+def _realpath_cached(root: str) -> str:
+    """Memoized ``os.path.realpath``: the mount may be slow, lookups are not.
+
+    A root is either a host constant or one env value, so the cache stays at
+    one entry in practice; the lock just makes concurrent first hits safe. A
+    root that later moves (remounted at a different real path) is picked up by
+    the next ``clear_fallback_cache`` (which also drops this memo).
+    """
+    with _REALPATH_LOCK:
+        hit = _REALPATH_CACHE.get(root)
+        if hit is None:
+            hit = os.path.realpath(root)
+            _REALPATH_CACHE[root] = hit
+        return hit
 
 
 def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
@@ -377,9 +461,10 @@ def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
     try:
         if not _valid_slug(slug):
             return None
-        # Build the candidate from ONE canonical root (no stat), so containment
-        # is decided on exactly the path the directory test uses and a link
-        # cannot be swapped between two calls to point outside the root.
+        # Build the candidate from ONE canonical (realpath'd, memoized) root,
+        # so containment is decided on exactly the path the directory test
+        # uses, a symlinked ARGONAS mount works, and a planted link that
+        # resolves outside the real root is caught by _contained.
         root = _canonical_root(argonas_git_root())
         bare = os.path.join(root, slug + ".git")
         if not _contained(bare, root):  # belt and braces: the slug is already safe
@@ -396,8 +481,19 @@ def _probe_argonas_live(slug: str) -> dict[str, Any] | None:
             return None
         if not stat.S_ISDIR(st.st_mode):
             return None
+        # Re-confirm the directory is still a directory at the moment of the
+        # open: a bare-repo dir swapped for a symlink between the lstat above
+        # and this open is caught here (lstat, not stat -- a link to a dir
+        # still reads as a link). The follow-up read is ALSO O_NOFOLLOW, so
+        # even if the swap slipped past this re-check, the open refuses to
+        # follow the link and returns None instead of reading a target's HEAD.
+        try:
+            if not stat.S_ISDIR(os.lstat(bare).st_mode):
+                return None
+        except OSError:
+            return None
         # ONE read of the bare repo's HEAD: a single open()+read, no directory
-        # listing, no second stat, no subprocess.
+        # listing, no subprocess.
         head_text = _read_text(os.path.join(bare, "HEAD"))
         return {
             "id": slug,
@@ -454,6 +550,8 @@ def _fallback_entry(slug: str) -> dict[str, Any] | None:
 def clear_fallback_cache() -> None:
     """Drop cached ARGONAS live lookups (tests, and after creating a bare repo)."""
     _FALLBACK.clear()
+    with _REALPATH_LOCK:
+        _REALPATH_CACHE.clear()
 
 
 def _raw_entry(repo_id: str) -> dict[str, Any] | None:

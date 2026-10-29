@@ -439,6 +439,12 @@ def _parse_stream(
                     result.first_token_ms = round((time.monotonic() - started) * 1000.0, 1)
 
 
+# ``main``'s clock, overridable by a test: ``probe.probe_now = lambda: fixed``.
+# ``None`` means the real wall clock. (A module attribute, like ``http_transport``,
+# so the override is a plain assignment and needs no signature surgery.)
+probe_now: Any = None  # override for main()'s clock: a zero-arg callable, or None
+
+
 def http_transport(
     *,
     base_url: str,
@@ -896,6 +902,14 @@ def main(argv: list[str] | None = None, *, env: dict[str, str] | None = None) ->
         log_line(f"eih_probe: configuration error: {exc}")
         return 2
 
+    # The transport is read through the module attribute (probe.http_transport),
+    # so a test that swaps it in is honoured without any new plumbing.
+    # The clock is likewise overridable (probe.probe_now) so a test can pin the
+    # moment -- and thereby name the daily output file the run writes -- instead
+    # of racing the publish window or the UTC date at run time.
+    if probe_now is not None:
+        moment = probe_now()
+
     directory = output_dir(source)
     writer = RowWriter(directory, log=log_line)
     try:
@@ -904,6 +918,8 @@ def main(argv: list[str] | None = None, *, env: dict[str, str] | None = None) ->
     except OSError as exc:  # pragma: no cover - unwritable dir
         log_line(f"eih_probe: prune failed: {type(exc).__name__}")
 
+    # The transport is read through the module attribute (probe.http_transport),
+    # so a test that swaps it in is honoured here without any new plumbing.
     run = run_probe(now=moment, models=models, api_key=api_key)
     written = 0
     for row in run.rows:
