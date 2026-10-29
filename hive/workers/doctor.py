@@ -1820,12 +1820,13 @@ _WORKER_KINDS = ("zeroclaw", "codex", "opencode")
 def _online_worker_kinds() -> set[str] | None:
     """Kinds of the worker agents online now, or None when the bus cannot say."""
     code, resp = _http("GET", "/v1/agents?status=online&limit=500", timeout=15.0)
-    if code != 200 or not isinstance(resp, dict):
+    agents = resp.get("agents") if code == 200 and isinstance(resp, dict) else None
+    if not isinstance(agents, list):
         return None
     return {
         str(a.get("kind") or "")
-        for a in (resp.get("agents") or [])
-        if str(a.get("kind") or "") in _WORKER_KINDS
+        for a in agents
+        if isinstance(a, dict) and str(a.get("kind") or "") in _WORKER_KINDS
     }
 
 
@@ -1839,6 +1840,8 @@ def _kinds_claimable(job: dict, live_kinds: set[str]) -> bool:
             return False  # corrupt eligibility: leave the row for a human, never loop it
     if not kinds:
         return True  # unset eligibility is claimable by any kind
+    if not isinstance(kinds, list):
+        return False  # malformed eligibility: same as corrupt, never loop it
     return bool({str(k) for k in kinds} & live_kinds)
 
 
