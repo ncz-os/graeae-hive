@@ -1923,7 +1923,7 @@ def _loop_requeue_record(job_id: str) -> None:
     STATE.mark(f"loop_requeue:{job_id}:{n}", ttl=LOOP_REQUEUE_TTL_SEC)
 
 
-def _park_for_review(job: dict, cls: str) -> None:
+def _park_for_review(job: dict, cls: str, detail: str = "") -> None:
     """Move a row that automation cannot fix to needs-review, once, with the cause."""
     jid = str(job.get("id") or "")
     if not jid or STATE.seen(f"loop_park:{jid}", LOOP_PARK_TTL_SEC):
@@ -1938,7 +1938,7 @@ def _park_for_review(job: dict, cls: str) -> None:
         STATE.mark(f"loop_park:{jid}", ttl=LOOP_PARK_TTL_SEC)
         broadcast_doctor_message(
             "doctor.needs-review",
-            {"host": AGENT_HOST, "job_ids": [jid], "reason": f"loop-outcome:{cls}"},
+            {"host": AGENT_HOST, "job_ids": [jid], "reason": f"loop-outcome:{cls}{detail}"},
         )
         log.info("parked %s as needs-review (%s)", jid[:12], cls)
     else:
@@ -1994,6 +1994,7 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
     excluded: set[str] = set()
     requeue_marks: list[str] = []
     outcome_notes: dict[str, str] = {}
+    class_counts: dict[str, int] = {}
     bases: dict[str, int] = {}
     base_ids: dict[str, list[str]] = {}
     for j in failed:
@@ -2003,7 +2004,11 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             continue
         jid = str(j.get("id") or "")
         cls = loop_outcome.classify(j)
-        verdict = loop_outcome.decide(cls, _loop_requeue_count(jid), reviewer_probe)
+        class_counts[cls] = class_counts.get(cls, 0) + 1
+        local_only = cls == loop_outcome.KILLED_BY_SIGNAL and loop_outcome.has_local_only_commits(j)
+        verdict = loop_outcome.decide(
+            cls, _loop_requeue_count(jid), reviewer_probe, local_commits_only=local_only
+        )
         if cls != loop_outcome.UNKNOWN:
             outcome_notes[jid[:12]] = f"{cls}->{verdict}"
         if verdict in ("hold", "skip"):
@@ -2011,7 +2016,7 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             continue
         if verdict == "needs_review":
             excluded.add(jid)
-            _park_for_review(j, cls)
+            _park_for_review(j, cls, ":local_commits_only" if local_only else "")
             continue
         if verdict == "requeue":
             requeue_marks.append(jid)
@@ -2062,9 +2067,11 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         log.info("orphan-failure sweep: %s", acted)
     if outcome_notes:
         log.info("orphan-failure sweep outcomes: %s", outcome_notes)
+    if class_counts:
+        log.info("orphan-failure sweep class_counts: %s", class_counts)
     return {
         "scanned": len(failed), "bases": len(bases), "acted": acted, "skipped": skipped,
-        "outcomes": outcome_notes,
+        "outcomes": outcome_notes, "class_counts": class_counts,
     }
 
 
