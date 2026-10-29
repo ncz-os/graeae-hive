@@ -29,17 +29,24 @@ def _failed(jid="f1", kind="build:codex", kinds=("codex",)):
 
 
 class _FakeState:
-    def __init__(self):
+    """Mirrors DurableStateStore: last_mark() never expires, seen() applies the window."""
+
+    def __init__(self, now=1_000_000.0):
         self.marks = {}
+        self.now = now
 
     def last_mark(self, key):
         return self.marks.get(key)
 
     def mark(self, key, ttl=None):
-        self.marks[key] = ttl
+        self.marks[key] = self.now
+
+    def seen(self, key, ttl):
+        last = self.marks.get(key)
+        return last is not None and ttl > 0 and (self.now - last) <= ttl
 
 
-def _run(failed, agents, resubmit_text="requeued 1 jobs of build:codex (api=200)"):
+def _run(failed, agents, resubmit_text="requeued 1 jobs of build:codex (api=200)", state=None):
     resubmitted = []
 
     def fake_http(method, path, payload=None, timeout=10.0):
@@ -55,7 +62,7 @@ def _run(failed, agents, resubmit_text="requeued 1 jobs of build:codex (api=200)
         resubmitted.append(base_kind)
         return resubmit_text
 
-    state = _FakeState()
+    state = state or _FakeState()
     with (
         mock.patch.object(doctor, "_http", fake_http),
         mock.patch.object(doctor, "dlq_protected", lambda j: False),
@@ -110,6 +117,26 @@ class OrphanSweepKindTests(unittest.TestCase):
             resubmit_text="requeued 1 jobs of build:zeroclaw (api=500)",
         )
         self.assertNotIn("orphan_resubmit:build:zeroclaw", state.marks)
+
+    def test_a_mark_older_than_the_window_does_not_suppress_new_failures(self):
+        """Regression 2026-10-29: last_mark() never expires, so a stale mark blocked the kind forever."""
+        state = _FakeState()
+        state.marks["orphan_resubmit:build:zeroclaw"] = state.now - (doctor.ORPHAN_RESUBMIT_TTL_SEC + 60)
+        _, resubmitted, _ = _run(
+            [_failed(kind="build:zeroclaw", kinds=("zeroclaw",))],
+            [{"kind": "zeroclaw"}],
+            resubmit_text="requeued 1 jobs of build:zeroclaw (api=200)",
+            state=state,
+        )
+        self.assertEqual(resubmitted, ["build:zeroclaw"])
+
+    def test_a_fresh_mark_still_throttles_the_same_kind(self):
+        state = _FakeState()
+        state.marks["orphan_resubmit:build:zeroclaw"] = state.now - 30
+        _, resubmitted, _ = _run(
+            [_failed(kind="build:zeroclaw", kinds=("zeroclaw",))], [{"kind": "zeroclaw"}], state=state
+        )
+        self.assertEqual(resubmitted, [])
 
 
 if __name__ == "__main__":

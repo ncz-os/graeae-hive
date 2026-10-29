@@ -1897,7 +1897,10 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         bases[kind] = bases.get(kind, 0) + 1
     acted, skipped = {}, []
     for base_kind in sorted(bases, key=lambda k: -bases[k])[:max(0, int(max_bases))]:
-        if STATE.last_mark("orphan_resubmit:" + base_kind) is not None:
+        # 2026-10-29: this is a COOLDOWN, so ask `seen(key, ttl)`. `last_mark()` returns when the key was
+        # last marked and never expires: with `is not None` the first requeue of a base_kind suppressed every
+        # later failure of that kind (operator: the triage backlog was never serviced).
+        if STATE.seen("orphan_resubmit:" + base_kind, ORPHAN_RESUBMIT_TTL_SEC):
             skipped.append(base_kind)
             continue
         try:
