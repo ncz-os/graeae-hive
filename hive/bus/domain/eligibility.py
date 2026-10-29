@@ -21,6 +21,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "codex": {"codex"},
     "codex-cli": {"codex"},
     "hermes": {"hermes"},
+    "freebuff": {"freebuff"},  # Freebuff agentic CLI (operator 2026-10-29) -- its own kind, no aliasing
     "zeroclaw": {"zeroclaw"},  # zeroclaw is its own kind; does not alias codex/opencode/claude
     "openclaw": {"openclaw"},
     "ic-engine": {"ic-engine"},
@@ -47,7 +48,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
 # come up with a bridged alias table.
 _DOCTOR_EXECUTOR_RUNTIMES = frozenset({
     "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
-    "claude", "claude-code", "claude-cli",
+    "claude", "claude-code", "claude-cli", "freebuff",
 })
 for _rt in _DOCTOR_EXECUTOR_RUNTIMES:
     if "doctor" in RUNTIME_KIND_MAP.get(_rt, set()):
@@ -196,7 +197,7 @@ def agent_kind_aliases(kind: str, runtime: str | None) -> set[str]:
 # invariant check above.
 _DOCTOR_EXECUTOR_ALIASES = frozenset({
     "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
-    "claude", "claude-code", "claude-cli",
+    "claude", "claude-code", "claude-cli", "freebuff",
 })
 
 
@@ -308,7 +309,7 @@ def _doctor_scope_allowed(job: dict[str, Any], kinds: set[str]) -> tuple[bool, s
 DOCTOR_OPT_IN_EXCLUDE_ALIASES = frozenset(
     {"*", "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
      "claude", "claude-code", "claude-cli", "openclaw", "ic-engine",
-     "hermes", "mnemos", "human", "system", "dream-walker", "unknown"}
+     "hermes", "mnemos", "human", "system", "dream-walker", "freebuff", "unknown"}
 )
 
 

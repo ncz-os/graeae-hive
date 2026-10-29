@@ -20,6 +20,7 @@ ORCHESTRATOR_RUNTIMES: frozenset[str] = frozenset(
         "codex-cli",
         "opencode",  # agentic CLI — submits its own orchestration jobs AND claims
         "opencode-cli",
+        "freebuff",  # agentic CLI like opencode: registers, heartbeats, may submit (operator 2026-10-29)
         "human",
         "mnemos",
         "doctor",  # PYTHIA triage authority — submits codex sub-jobs + auto-triage
