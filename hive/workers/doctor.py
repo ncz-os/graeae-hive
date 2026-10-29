@@ -1956,6 +1956,7 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
     requeue_marks: list[str] = []
     outcome_notes: dict[str, str] = {}
     bases: dict[str, int] = {}
+    base_ids: dict[str, list[str]] = {}
     for j in failed:
         if j.get("parent_job_id") or dlq_protected(j):
             continue
@@ -1979,12 +1980,21 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         if not kind:
             continue
         bases[kind] = bases.get(kind, 0) + 1
+        base_ids.setdefault(kind, []).append(jid)
     acted, skipped = {}, []
     for base_kind in sorted(bases, key=lambda k: -bases[k])[:max(0, int(max_bases))]:
         # 2026-10-29: this is a COOLDOWN, so ask `seen(key, ttl)`. `last_mark()` returns when the key was
         # last marked and never expires: with `is not None` the first requeue of a base_kind suppressed every
         # later failure of that kind (operator: the triage backlog was never serviced).
-        if STATE.seen("orphan_resubmit:" + base_kind, ORPHAN_RESUBMIT_TTL_SEC):
+        # 2026-10-29 (operator: "triage queue is ballooning, why isn't the doctor addressing"):
+        # the cooldown was per base_kind, so ONE requeue held back every other failure of that
+        # kind for the whole window. Key it on the SET of failed rows instead: the same rows
+        # inside the window are still skipped (no requeue loop), but a row that failed since
+        # the last pass changes the set and is acted on at once.
+        set_key = "orphan_resubmit:" + base_kind + ":" + hashlib.sha1(
+            ",".join(sorted(base_ids.get(base_kind, []))).encode()
+        ).hexdigest()[:12]
+        if STATE.seen(set_key, ORPHAN_RESUBMIT_TTL_SEC):
             skipped.append(base_kind)
             continue
         try:
@@ -2006,7 +2016,7 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             or re.match(r"requeued \d+ jobs .*\(api=20[01]\)", text)
             or "already a replacement" in text
         ):
-            STATE.mark("orphan_resubmit:" + base_kind, ttl=ORPHAN_RESUBMIT_TTL_SEC)
+            STATE.mark(set_key, ttl=ORPHAN_RESUBMIT_TTL_SEC)
             for jid in requeue_marks:
                 _loop_requeue_record(jid)
     if acted:

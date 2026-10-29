@@ -164,7 +164,8 @@ class SweepTests(unittest.TestCase):
             self.assertEqual(calls["resubmit"], ["build:zeroclaw"])
             with mock.patch.object(doctor, "STATE", state):
                 self.assertEqual(doctor._loop_requeue_count("job-1"), expected)
-            state.marks.pop("orphan_resubmit:build:zeroclaw", None)  # cooldown elapsed
+            for key in [k for k in state.marks if k.startswith("orphan_resubmit:")]:
+                state.marks.pop(key)  # cooldown elapsed
         # third pass: cap reached -> parked, not requeued
         with mock.patch.object(doctor, "STATE", state):
             self.assertEqual(doctor._loop_requeue_count("job-1"), loop_outcome.MAX_AUTO_REQUEUES)

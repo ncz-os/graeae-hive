@@ -8,6 +8,7 @@ could claim it were codex workers that failed it again at once.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import unittest
 from unittest import mock
@@ -73,6 +74,12 @@ def _run(failed, agents, resubmit_text="requeued 1 jobs of build:codex (api=200)
     return out, resubmitted, state
 
 
+def _set_key(*ids, base="build:zeroclaw"):
+    """The cooldown key the sweep uses: base kind plus a digest of the failed row ids."""
+    digest = hashlib.sha1(",".join(sorted(ids)).encode()).hexdigest()[:12]
+    return f"orphan_resubmit:{base}:{digest}"
+
+
 class OrphanSweepKindTests(unittest.TestCase):
     def test_codex_only_row_is_skipped_when_no_codex_worker_is_online(self):
         _, resubmitted, _ = _run([_failed()], [{"kind": "zeroclaw", "host": "hydra"}])
@@ -108,7 +115,7 @@ class OrphanSweepKindTests(unittest.TestCase):
             [{"kind": "zeroclaw"}],
             resubmit_text="requeued 1 jobs of build:zeroclaw (api=200)",
         )
-        self.assertIn("orphan_resubmit:build:zeroclaw", state.marks)
+        self.assertIn(_set_key("f1"), state.marks)
 
     def test_refused_requeue_leaves_the_base_kind_unmarked(self):
         _, _, state = _run(
@@ -116,12 +123,12 @@ class OrphanSweepKindTests(unittest.TestCase):
             [{"kind": "zeroclaw"}],
             resubmit_text="requeued 1 jobs of build:zeroclaw (api=500)",
         )
-        self.assertNotIn("orphan_resubmit:build:zeroclaw", state.marks)
+        self.assertNotIn(_set_key("f1"), state.marks)
 
     def test_a_mark_older_than_the_window_does_not_suppress_new_failures(self):
         """Regression 2026-10-29: last_mark() never expires, so a stale mark blocked the kind forever."""
         state = _FakeState()
-        state.marks["orphan_resubmit:build:zeroclaw"] = state.now - (doctor.ORPHAN_RESUBMIT_TTL_SEC + 60)
+        state.marks[_set_key("f1")] = state.now - (doctor.ORPHAN_RESUBMIT_TTL_SEC + 60)
         _, resubmitted, _ = _run(
             [_failed(kind="build:zeroclaw", kinds=("zeroclaw",))],
             [{"kind": "zeroclaw"}],
@@ -132,11 +139,23 @@ class OrphanSweepKindTests(unittest.TestCase):
 
     def test_a_fresh_mark_still_throttles_the_same_kind(self):
         state = _FakeState()
-        state.marks["orphan_resubmit:build:zeroclaw"] = state.now - 30
+        state.marks[_set_key("f1")] = state.now - 30
         _, resubmitted, _ = _run(
             [_failed(kind="build:zeroclaw", kinds=("zeroclaw",))], [{"kind": "zeroclaw"}], state=state
         )
         self.assertEqual(resubmitted, [])
+
+    def test_a_new_failure_of_the_same_kind_is_acted_on_inside_the_window(self):
+        """2026-10-29: one requeue used to hold back every other failure of the kind for 10 minutes."""
+        state = _FakeState()
+        state.marks[_set_key("f1")] = state.now - 30  # f1 was just handled
+        rows = [
+            _failed(jid="f1", kind="build:zeroclaw", kinds=("zeroclaw",)),
+            _failed(jid="f2", kind="build:zeroclaw", kinds=("zeroclaw",)),
+        ]
+        _, resubmitted, state = _run(rows, [{"kind": "zeroclaw"}], state=state)
+        self.assertEqual(resubmitted, ["build:zeroclaw"])
+        self.assertIn(_set_key("f1", "f2"), state.marks)
 
 
 if __name__ == "__main__":
