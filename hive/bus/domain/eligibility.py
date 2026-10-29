@@ -22,6 +22,8 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
     "codex-cli": {"codex"},
     "hermes": {"hermes"},
     "freebuff": {"freebuff"},  # Freebuff agentic CLI (operator 2026-10-29) -- its own kind, no aliasing
+    "freebuff-cli": {"freebuff"},
+    "codebuff": {"freebuff"},  # the CLI Freebuff ships as; registers as kind=freebuff
     "zeroclaw": {"zeroclaw"},  # zeroclaw is its own kind; does not alias codex/opencode/claude
     "openclaw": {"openclaw"},
     "ic-engine": {"ic-engine"},
@@ -48,7 +50,7 @@ RUNTIME_KIND_MAP: dict[str, set[str]] = {
 # come up with a bridged alias table.
 _DOCTOR_EXECUTOR_RUNTIMES = frozenset({
     "zeroclaw", "codex", "codex-cli", "opencode", "opencode-cli",
-    "claude", "claude-code", "claude-cli", "freebuff",
+    "claude", "claude-code", "claude-cli", "freebuff", "freebuff-cli", "codebuff",
 })
 for _rt in _DOCTOR_EXECUTOR_RUNTIMES:
     if "doctor" in RUNTIME_KIND_MAP.get(_rt, set()):

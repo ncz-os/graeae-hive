@@ -57,6 +57,12 @@ class FreebuffRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r.status_code, 200, f"{extra}: {r.text}")
             self.assertIn(":freebuff:", r.json()["urn"])
 
+    async def test_cli_runtime_names_register_as_the_freebuff_kind(self):
+        for runtime in ("freebuff-cli", "codebuff"):
+            r = await self._register(runtime=runtime, kind="freebuff")
+            self.assertEqual(r.status_code, 200, f"{runtime}: {r.text}")
+            self.assertIn(":freebuff:", r.json()["urn"])
+
     async def test_heartbeat_keeps_the_agent_online(self):
         urn = (await self._register(runtime="freebuff", kind="freebuff")).json()["urn"]
         r = await self.client.post("/v1/agents/heartbeat", json={"urn": urn, "status": "online"})
@@ -79,7 +85,7 @@ class FreebuffRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for table in ("_DOCTOR_EXECUTOR_RUNTIMES", "_DOCTOR_EXECUTOR_ALIASES", "DOCTOR_OPT_IN_EXCLUDE_ALIASES"):
             self.assertIn("freebuff", getattr(eligibility, table), table)
         for rt, kinds in eligibility.RUNTIME_KIND_MAP.items():
-            if rt != "freebuff":
+            if rt not in ("freebuff", "freebuff-cli", "codebuff"):
                 self.assertNotIn("freebuff", kinds, f"{rt} must not alias freebuff")
         self.assertNotIn("doctor", eligibility.RUNTIME_KIND_MAP["freebuff"])
 
