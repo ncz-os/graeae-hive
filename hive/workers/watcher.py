@@ -11,7 +11,7 @@ Prevents ARGOS-style oversubscription (CLAUDE.md gotcha: load=92 incident
 AND current load before assigning to a host.
 
 Env:
-  HIVE_URL                  http://192.0.2.67:5005
+  HIVE_URL                  bus base URL (required; no default)
   AGENT_HOST                default hostname -s
   LOAD_THRESHOLD            max 1-min load_avg before refusing new jobs (default 0.75 × cpu_count)
   HEARTBEAT_INTERVAL        seconds (default 15)
@@ -33,7 +33,11 @@ import time
 import urllib.error
 import urllib.request
 
-HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
+HIVE_URL = os.environ.get("HIVE_URL", "")
+if not HIVE_URL:
+    # No baked-in bus address (operator rule 2026-10-29): one line, then bus calls
+    # below are skipped rather than sent to a relative URL.
+    print("[sysw] HIVE_URL is not set: bus calls are disabled", flush=True)
 # C1: bus transport auth bearer token (env-sourced, never baked in).
 HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
@@ -56,6 +60,8 @@ signal.signal(signal.SIGINT, _signal)
 
 
 def _http(method: str, path: str, body: dict | None = None) -> tuple[int, dict | None]:
+    if not HIVE_URL:
+        return 0, None
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}

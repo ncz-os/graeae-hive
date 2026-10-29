@@ -19,7 +19,8 @@ jobs pin an exact local/EIH route allowlist; codex jobs always get
 NOT negotiated per job.
 
 Env:
-  HIVE_URL            default http://192.0.2.67:5005
+  HIVE_URL            required: bus base URL. No default; unset refuses to poll
+                      (see docs/ENVIRONMENT.md)
   AGENT_HOST          default hostname -s
   HIVE_WORKER_SLOT    stable per-host worker slot (default 1)
   WORKER_KIND         "zeroclaw" or "codex" (required)
@@ -114,6 +115,7 @@ import provenance
 # ``fleet_git_env`` is the one ARGONAS credential helper shared by the clone,
 # the zeroclaw push and the codex push.
 from hive import codex_delivery, llm_roles, push_policy, review_evidence, review_record
+from hive.core import fleet_inventory
 from hive.codex_delivery import fleet_git_env
 
 
@@ -177,6 +179,29 @@ def _driver_supports_verified_delivery(driver: str) -> bool:
     return "--config" in output
 
 
+def _coder_base_url_ok(url: str) -> bool:
+    """Whether the manifest's coder base is acceptable.
+
+    The base address is configuration: the check this replaces compared against a
+    literal fleet address, which meant every clone of the repo carried one and a
+    re-addressed host failed the gate for being correct. ``HIVE_TYDEUS_BASE_URL``
+    pins the exact base when the operator sets it; unset, a well-formed http(s)
+    base is accepted and the weaker check is reported once.
+    """
+    base = str(url or "").strip()
+    if not base.startswith(("http://", "https://")):
+        return False
+    expected = os.environ.get("HIVE_TYDEUS_BASE_URL", "").strip().rstrip("/")
+    if not expected:
+        fleet_inventory.warn_once(
+            "worker.coder_base",
+            "HIVE_TYDEUS_BASE_URL is not set: the strict-route coder base is checked "
+            "for shape only, not identity (set it to pin the route)",
+        )
+        return True
+    return base.rstrip("/") == expected
+
+
 def load_strict_routes():
     """Consume the pinned FleetOps validator; never guess an unready role."""
 
@@ -223,15 +248,13 @@ def load_strict_routes():
             "schema version",
         )
         coder = data["coder"]
-        require(
-            coder
-            == {
-                "provider_id": "tydeus-coder",
-                "model_id": "qwen38",
-                "base_url": "http://192.0.2.73:8006/v1",
-            },
-            "coder mismatch",
-        )
+        require(isinstance(coder, dict), "coder dict")
+        require(coder.get("provider_id") == "tydeus-coder", "coder provider")
+        require(coder.get("model_id") == "qwen38", "coder model")
+        # WHICH base the coder is served on is operator config, never source
+        # (operator rule 2026-10-29): with HIVE_TYDEUS_BASE_URL set the exact base
+        # is pinned, and unset checks only that a real http(s) base was declared.
+        require(_coder_base_url_ok(coder.get("base_url", "")), "coder base")
         reviewer = data["reviewer"]
         require(isinstance(reviewer, dict), "reviewer dict")
         require(reviewer.get("provider_id") == "cerberus-reviewer", "reviewer provider")
@@ -609,7 +632,15 @@ HIVE_ALLOW_UNSANDBOXED_CODEX_ENV = "HIVE_ALLOW_UNSANDBOXED_CODEX"
 UNSANDBOXED_CODEX_MODE = "danger-full-access"
 DEFAULT_CODEX_SANDBOX = "workspace-write"
 
-HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
+HIVE_URL = os.environ.get("HIVE_URL", "")
+# No baked-in bus address (operator rule 2026-10-29). Unset is refused where the
+# worker would otherwise spin on relative URLs; one log line, no crash loop.
+if not HIVE_URL:
+    fleet_inventory.warn_once(
+        "worker.HIVE_URL",
+        "HIVE_URL is not set: this worker cannot poll the bus and will refuse to run "
+        "(set HIVE_URL in its unit environment)",
+    )
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 WORKER_KIND = os.environ.get("WORKER_KIND", "").strip().lower()
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
@@ -6897,6 +6928,13 @@ def main() -> None:
         raise SystemExit(1)
     register()
     threading.Thread(target=heartbeat_loop, daemon=True).start()
+    if not HIVE_URL:
+        print(
+            f"[hive-worker:{WORKER_KIND}] HIVE_URL is not set: refusing to poll. "
+            "Set HIVE_URL in the unit environment (see docs/ENVIRONMENT.md).",
+            flush=True,
+        )
+        sys.exit(2)
     print(f"[hive-worker:{WORKER_KIND}] polling {HIVE_URL} as {_urn}", flush=True)
     _last_busy = ""
     while _running:

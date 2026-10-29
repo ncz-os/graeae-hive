@@ -16,6 +16,8 @@ agents.db*
 *.log
 *.wal
 
+*.egg-info/
+
 # runtime artifacts (capacity shadow ledger) - not source
 admission_shadow.jsonl
 *.jsonl

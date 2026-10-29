@@ -76,7 +76,7 @@ MCP_BRIDGE_ADMIN_TOKEN = os.environ.get("MCP_BRIDGE_ADMIN_TOKEN", "")
 # The fleet runs on the local LAN and does not require auth (operator
 # 2026-10-15). The bridge is OPEN by default. Setting MCP_BRIDGE_TOKEN is
 # optional and, when present, is enforced.
-MNEMOS_URL = os.environ.get("MNEMOS_URL", "http://192.0.2.67:5002")
+MNEMOS_URL = os.environ.get("MNEMOS_URL", "")  # no baked-in address (operator rule 2026-10-29)
 # MNEMOS bearer token comes from env. No source-baked default — having a
 # token literal in source meant every clone of this repo carried a working
 # Authorization header for the live MNEMOS instance. mnemos.* tool calls
@@ -215,6 +215,13 @@ async def _hive(method: str, path: str, *, admin_authorized: bool = False, **kw)
 
 
 async def _mnemos(method: str, path: str, **kw) -> dict:
+    if not MNEMOS_URL:
+        raise RuntimeError(
+            "MNEMOS_URL is not set in the environment; the mcp_bridge carries no "
+            "source-baked default. Configure MNEMOS_URL and MNEMOS_TOKEN via "
+            "systemd EnvironmentFile (/etc/default/graeae-mcp-bridge) or container "
+            "env before invoking mnemos.* tools."
+        )
     if not MNEMOS_TOKEN:
         raise RuntimeError(
             "MNEMOS_TOKEN is not set in the environment. The mcp_bridge no "

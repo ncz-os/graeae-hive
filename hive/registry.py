@@ -27,6 +27,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from hive.core import fleet_inventory
 from hive.core.config import get_settings
 
 _API_KEYS = Path.home() / ".api_keys_master.json"
@@ -36,13 +37,23 @@ _API_KEYS = Path.home() / ".api_keys_master.json"
 # other hosts. Derived from these constants so argonas_bare / clone_ssh /
 # clone_nfs can never drift apart (review finding).
 ARGONAS_SSH_USER = "jasonperlow"  # documented clone user (ssh://jasonperlow@...); needs a key
-ARGONAS_SSH_HOST = "192.0.2.101"
+# ARGONAS's address is operator config (operator rule 2026-10-29), never source:
+# set ARGONAS_SSH_HOST. Unset skips ARGONAS discovery and emits no clone recipe
+# rather than publishing a URL that points nowhere.
+ARGONAS_SSH_HOST = os.environ.get("ARGONAS_SSH_HOST", "")
 ARGONAS_GIT_PATH_SSH = "/mnt/datapool/git"  # real directory on the NAS
 ARGONAS_GIT_PATH_NFS = "/mnt/argonas_git"  # NFS mount spelling of the same dir
 ARGONAS_DISCOVER_USER = "root"  # proven user for the NAS listing (password/sshpass)
 
 
 def argonas_ssh_url(slug: str) -> str:
+    """The ARGONAS clone URL, or ``""`` when ARGONAS_SSH_HOST is not configured."""
+    if not ARGONAS_SSH_HOST:
+        fleet_inventory.warn_once(
+            "registry.argonas.host",
+            "ARGONAS_SSH_HOST is not set: no ARGONAS clone URL can be built",
+        )
+        return ""
     return f"ssh://{ARGONAS_SSH_USER}@{ARGONAS_SSH_HOST}{ARGONAS_GIT_PATH_SSH}/{slug}.git"
 
 
@@ -141,12 +152,19 @@ def discover_github(token: str, user: str | None = None) -> dict[str, dict[str, 
 
 def discover_argonas(
     *,
-    host: str = ARGONAS_SSH_HOST,
+    host: str | None = None,
     user: str = ARGONAS_DISCOVER_USER,
     password: str | None = None,
     git_dir: str = ARGONAS_GIT_PATH_SSH,
 ) -> set[str]:
     """Canonical bare repos present on ARGONAS (`ls *.git`). Returns slugs."""
+    host = host or ARGONAS_SSH_HOST
+    if not host:
+        fleet_inventory.warn_once(
+            "registry.argonas.discover",
+            "ARGONAS_SSH_HOST is not set: ARGONAS discovery is skipped",
+        )
+        return set()
     ssh = [
         "ssh",
         "-o",

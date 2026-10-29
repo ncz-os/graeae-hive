@@ -1,0 +1,94 @@
+{
+  "_comment": [
+    "EXAMPLE ONLY. Copy to a path outside the repo, fill in the real addresses,",
+    "and point HIVE_FLEET_INVENTORY at it. Every address below is from the",
+    "TEST-NET-1 block (192.0.2.0/24, RFC 5737) and is guaranteed not to be a",
+    "live host: this file must never be edited into the source tree with real",
+    "addresses, because that is exactly what the inventory exists to replace.",
+    "auth: key | password. A 'password' host needs password_env named here and",
+    "set in the service environment.",
+    "os: linux | macos (drives the token-fix restart recipe)."
+  ],
+  "schema_version": 1,
+  "hosts": {
+    "studio": {
+      "address": "192.0.2.10",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "macos"
+    },
+    "ultra": {
+      "address": "192.0.2.60",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "macos"
+    },
+    "cerberus": {
+      "address": "192.0.2.96",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    },
+    "tydeus": {
+      "address": "192.0.2.73",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    },
+    "hydra": {
+      "address": "192.0.2.78",
+      "user": "jasonperlow",
+      "auth": "password",
+      "os": "linux"
+    },
+    "medusa": {
+      "address": "192.0.2.64",
+      "user": "jasonperlow",
+      "auth": "password",
+      "os": "linux"
+    },
+    "proteus": {
+      "address": "192.0.2.25",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    },
+    "bigpi": {
+      "address": "192.0.2.65",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    },
+    "clawpi": {
+      "address": "192.0.2.54",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    },
+    "zeropi": {
+      "address": "192.0.2.56",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    },
+    "typhon": {
+      "address": "192.0.2.61",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    },
+    "cixmini": {
+      "address": "192.0.2.99",
+      "user": "mini",
+      "auth": "password",
+      "password_env": "CIXMINI_SSH_PASSWORD",
+      "os": "linux"
+    },
+    "argin": {
+      "address": "192.0.2.101",
+      "user": "jasonperlow",
+      "auth": "key",
+      "os": "linux"
+    }
+  }
+}

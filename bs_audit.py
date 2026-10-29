@@ -1,7 +1,9 @@
 import json, os, urllib.request, re, time
-B="http://192.0.2.67:5005"
+B=os.environ.get("HIVE_URL", "")  # no baked-in bus address (operator rule 2026-10-29)
 TOKEN=os.environ.get("HIVE_BUS_TOKEN", "")
 def api(path):
+    if not B:
+        raise RuntimeError("HIVE_URL must be configured before running bs_audit.py")
     if not TOKEN:
         raise RuntimeError("HIVE_BUS_TOKEN must be configured before running bs_audit.py")
     req=urllib.request.Request(B+path,headers={"Authorization":f"Bearer {TOKEN}"})

@@ -15,6 +15,10 @@ import logging
 import math
 import os
 
+# Fleet addresses come from operator config, never source (HIVE_FLEET_INVENTORY).
+# Stdlib-only module: the loader it uses is stdlib-only too.
+from hive.core import fleet_inventory
+
 log = logging.getLogger("doctor.gates")
 
 # Env read once per process, like the doctor's other configuration. The tests
@@ -247,33 +251,48 @@ def purge_result(intent: str, response, requested: list[str]) -> dict:
 
 # ── one restart allowlist ────────────────────────────────────────────────────
 
-#: The hosts a restart may target. `FLEET_HOSTS` from the doctor, plus cixmini —
-#: which `DOCTOR_SYSTEM` already offered and the executor could not reach.
-#: `address` comes from the environment so a host is only listed once somebody
-#: has recorded where it is; an unconfigured entry is refused BY NAME.
-RESTART_TARGETS: dict[str, dict] = {
-    "cerberus": {"address": "192.0.2.96", "user": "jasonperlow", "auth": "key"},
-    "medusa": {"address": "192.0.2.64", "user": "jasonperlow", "auth": "key"},
-    "proteus": {"address": "192.0.2.25", "user": "jasonperlow", "auth": "key"},
-    "hydra": {"address": "192.0.2.78", "user": "jasonperlow", "auth": "key"},
-    "bigpi": {"address": "192.0.2.65", "user": "jasonperlow", "auth": "key"},
-    "clawpi": {"address": "192.0.2.54", "user": "jasonperlow", "auth": "key"},
-    "zeropi": {"address": "192.0.2.56", "user": "jasonperlow", "auth": "key"},
-    "typhon": {"address": "192.0.2.61", "user": "jasonperlow", "auth": "key"},
-    # DOCTOR_SYSTEM has offered this since 2026-05-26. It is here NOW, and it is
-    # reachable now: address and sudo user come from the environment, and until
-    # both are set the restart is refused with the variable to set rather than
-    # reported as an unknown host.
-    "cixmini": {
-        "address_env": "CIXMINI_IP",
+def _build_restart_targets() -> dict[str, dict]:
+    """The hosts a restart may target: the inventory, plus cixmini.
+
+    Every entry that only names an address, user and auth comes from the fleet
+    inventory (``HIVE_FLEET_INVENTORY``) — the table this function replaces held
+    stale addresses for three hosts and put a real address in every clone of the
+    repo. The inventory's ``password_env`` is carried across so a password-auth
+    host still refuses before any SSH when its password is unset.
+
+    cixmini stays a static ENTRY with no address: its address and sudo user come
+    from CIXMINI_IP / DOCTOR_CIXMINI_SUDO_USER, which is why it can be listed (and
+    offered by DOCTOR_SYSTEM) while remaining refused by name until configured.
+    """
+    targets: dict[str, dict] = {
+        # DOCTOR_SYSTEM has offered this since 2026-05-26. It is here NOW, and it is
+        # reachable now: address and sudo user come from the environment, and until
+        # both are set the restart is refused with the variable to set rather than
+        # reported as an unknown host.
+        "cixmini": {
+            "address_env": "CIXMINI_IP",
         # Read at resolve time, not import time, so a test can set it and so a
         # later config reload does not need a restart to take effect.
-        "user_env": "DOCTOR_CIXMINI_SUDO_USER",
-        "user": "mini",
-        "auth": "password",
-        "password_env": "CIXMINI_SSH_PASSWORD",
-    },
-}
+            "user_env": "DOCTOR_CIXMINI_SUDO_USER",
+            "user": "mini",
+            "auth": "password",
+            "password_env": "CIXMINI_SSH_PASSWORD",
+        }
+    }
+    for name, entry in fleet_inventory.load_inventory().items():
+        if name in targets:
+            continue
+        target = {"address": entry["address"], "user": entry["user"], "auth": entry["auth"]}
+        if entry.get("password_env"):
+            target["password_env"] = entry["password_env"]
+        targets[name] = target
+    return targets
+
+
+#: The hosts a restart may target. Built once at import: an operator who edits the
+#: inventory restarts the doctor to pick it up, which is the same rule as every
+#: other env read in this worker.
+RESTART_TARGETS: dict[str, dict] = _build_restart_targets()
 
 #: Hosts no restart may ever target, whatever the allowlist says (the doctor's
 #: `RESTART_BLOCKED_HOSTS`: production and the doctor host itself).
@@ -306,8 +325,8 @@ def resolve_restart_target(host: str | None, env: dict | None = None) -> tuple[d
             f"{name} is a restart target but has no recorded address; set "
             f"{address_env or 'the entry address'} before a restart can target it"
         )
-    if entry.get("auth") == "password" and not (env.get(entry.get("password_env", ""), "") or ""):
-        return None, (f"restart_service refused: {name} needs {entry.get('password_env')} and it is not set")
+    if entry.get("auth") == "password" and entry.get("password_env") and not env.get(entry["password_env"], ""):
+        return None, f"restart_service refused: {name} needs {entry['password_env']} and it is not set"
     # The env overrides the entry's default, and the entry's default is what makes
     # the host usable without configuration. Reading only the env would turn
     # cixmini's recorded `mini` user into "unrecorded" on every host that has not

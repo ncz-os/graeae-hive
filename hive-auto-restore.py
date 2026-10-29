@@ -23,7 +23,11 @@ from pathlib import Path
 
 from retry_policy import _is_non_negative_int, auto_retry_allowed
 
-HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
+HIVE_URL = os.environ.get("HIVE_URL", "")
+if not HIVE_URL:
+    # No baked-in bus address (operator rule 2026-10-29). One line at start; the
+    # bus calls below then return "no answer" instead of raising on a relative URL.
+    print("[hive-auto-restore] HIVE_URL is not set: bus calls are disabled", flush=True)
 STATE_DIR = Path("/var/lib/hive-auto-restore")
 STATE_FILE = STATE_DIR / "retry_counts.json"
 LOG_FILE = "/var/log/hive-auto-restore.log"
@@ -62,6 +66,8 @@ def save_state(state):
 def _http(
     method: str, path: str, body: dict | None = None, timeout: float = 15.0
 ) -> tuple[int, dict | None]:
+    if not HIVE_URL:
+        return 0, None
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(

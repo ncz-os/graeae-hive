@@ -18,7 +18,42 @@ store is replaced, never emptied — clearing the dicts alone would leave the du
 half behind, which is the bug the module exists to remove.
 """
 
+import json
+import os
+from pathlib import Path
+
 import pytest
+
+_FIXTURES = Path(__file__).parent / "tests" / "fixtures"
+
+
+def _export_test_fleet_env() -> None:
+    """Declare the fleet addresses the suite asserts on.
+
+    Fleet addresses moved out of source into the environment / the inventory file
+    (operator rule 2026-10-29), so the suite has to declare the fleet it runs
+    against. The declarations live in ``tests/fixtures/test_fleet_env.json`` —
+    under ``tests/``, which the hardcoded-address audit excludes — and are
+    exported **at conftest import time**, because a test module's import of e.g.
+    ``hive.workers.doctor`` reads these into module-level constants.
+
+    ``setdefault``: an operator or CI run that already configured a value keeps
+    it. ``HIVE_FLEET_INVENTORY`` names a fixture file, resolved relative to this
+    directory.
+    """
+    try:
+        declared = json.loads((_FIXTURES / "test_fleet_env.json").read_text())
+    except OSError:
+        return
+    for key, value in declared.items():
+        if key.startswith("_") or not isinstance(value, str) or not value:
+            continue
+        if key == "HIVE_FLEET_INVENTORY":
+            value = str((_FIXTURES / value).resolve())
+        os.environ.setdefault(key, value)
+
+
+_export_test_fleet_env()
 
 
 @pytest.fixture(autouse=True)

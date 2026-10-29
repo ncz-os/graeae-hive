@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "TEST environment only. The fleet addresses the code used to bake into source",
+    "now come from the environment / HIVE_FLEET_INVENTORY; the suite still runs",
+    "with a fleet, so it declares one here. conftest.py exports these at import",
+    "time (before any test module reads a module-level URL).",
+    "These are the addresses the suite's assertions were written against, which is",
+    "exactly why they live under tests/ (the hardcoded-address audit skips this",
+    "directory) and not in hive/."
+  ],
+  "HIVE_URL": "http://192.0.2.67:5005",
+  "MNEMOS_URL": "http://192.0.2.67:5002",
+  "HIVE_BUS_URL": "http://192.0.2.67:5005",
+  "ARGONAS_SSH_HOST": "192.0.2.101",
+  "HIVE_TYDEUS_BASE_URL": "http://192.0.2.73:8006/v1",
+  "HIVE_FLEET_INVENTORY": "fleet_inventory.test.json"
+}

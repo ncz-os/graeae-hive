@@ -4,7 +4,7 @@
 Sources (all optional; missing creds just skip that source):
   gitlab   GITLAB_PAT            or ~/.api_keys_master.json gitlab.ncz_os_pat
   github   GITHUB_PAT            or ...github.oauth_token_perlowja
-  argonas  ARGONAS_SSH_PASS      (ssh root@192.0.2.101 'ls *.git')
+  argonas  ARGONAS_SSH_HOST + ARGONAS_SSH_PASS  (ssh root@$ARGONAS_SSH_HOST 'ls *.git')
   buildkite BUILDKITE_API_TOKEN  or ...buildkite.api_access_token
   r2       R2_ACCOUNT_ID + CLOUDFLARE_R2_API_TOKEN (or ~/.api_keys_master.json cloudflare.r2_*)
 

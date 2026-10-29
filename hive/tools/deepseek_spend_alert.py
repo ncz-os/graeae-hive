@@ -52,7 +52,7 @@ from collections.abc import Callable
 
 # ── endpoints / identity ────────────────────────────────────────────────────
 BALANCE_URL = "https://api.deepseek.com/user/balance"
-DEFAULT_BUS_URL = "http://192.0.2.67:5005"
+DEFAULT_BUS_URL = ""  # no baked-in bus address (operator rule 2026-10-29)
 FETCH_TIMEOUT_SECS = 20.0
 BUS_TIMEOUT_SECS = 10.0
 
@@ -572,6 +572,11 @@ def run(
     # straight to fetch and never logged or persisted.
     if not config.api_key:
         raise ConfigError("DEEPSEEK_API_KEY is not set; it is read from the environment at run time")
+    if not no_bus and not config.bus_url:
+        raise ConfigError(
+            "HIVE_BUS_URL is not set; the alert cannot reach the bus. "
+            "Set it in the unit environment, or pass --no-bus to run offline."
+        )
 
     snapshot = fetch(config.api_key, config.currency, now)
     # 1. Persist first: the reading is the only record of real money, so a bus
