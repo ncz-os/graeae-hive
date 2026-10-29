@@ -58,6 +58,10 @@ class AgentHeartbeat(BaseModel):
     metadata: dict | None = None
 
 
+class AgentDeregister(BaseModel):
+    reason: str | None = None
+
+
 class JobCreate(BaseModel):
     submitter_urn: str  # who is asking (user OR delegating agent)
     parent_job_id: str | None = None

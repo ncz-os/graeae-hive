@@ -6,11 +6,13 @@ consts/helpers) and hive.bus.schemas — not on the agent_bus monolith.
 
 from __future__ import annotations
 
+import hmac
 import json
+import os
 import time
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 
 from hive.bus.deps import (
     AUTH_METHODS,
@@ -21,10 +23,11 @@ from hive.bus.deps import (
     connect_db,
     emit_event,
     hive_repo,
+    is_admin_tier,
     make_urn,
 )
 from hive.bus.domain.eligibility import RUNTIME_KIND_MAP, THROTTLE_HEADROOM
-from hive.bus.schemas import AgentHeartbeat, AgentRegister
+from hive.bus.schemas import AgentDeregister, AgentHeartbeat, AgentRegister
 from hive.core.models import cost_tier_for
 
 router = APIRouter()
@@ -232,6 +235,88 @@ async def heartbeat(req: AgentHeartbeat):
         # instead of hammering 404s forever (2026-10-16: hydra zombie worker).
         raise HTTPException(409, f"agent not registered: {req.urn}")
     return {"ack": True, "ts": now}
+
+
+def _authorize_deregister(urn: str, actor: str | None, authorization: str | None, token: str | None) -> None:
+    """Admin tier, or the agent itself (X-Hive-Actor == urn). Else 401/403."""
+    if is_admin_tier(authorization):
+        return
+    actor = (actor or "").strip()
+    if not actor:
+        raise HTTPException(401, "X-Hive-Actor header (or the admin token) is required to deregister")
+    if actor != urn:
+        raise HTTPException(403, "only the admin tier or the agent itself may deregister an agent")
+    # Same shared-secret layer as every other mutating route; the agent may be
+    # offline already (a repeat call), so it is NOT required to be 'active'.
+    secret = os.environ.get("HIVE_SHARED_SECRET")
+    if secret and (not token or not hmac.compare_digest(str(token), str(secret))):
+        raise HTTPException(401, "missing or incorrect X-Hive-Token")
+
+
+@router.post("/v1/agents/{urn_path:path}/deregister")
+async def deregister_agent(
+    urn_path: str,
+    req: AgentDeregister | None = None,
+    x_hive_actor: str | None = Header(default=None, alias="X-Hive-Actor"),
+    x_hive_token: str | None = Header(default=None, alias="X-Hive-Token"),
+    authorization: str | None = Header(default=None),
+):
+    """Take an agent offline with a recorded reason. Idempotent.
+
+    Allowed for the admin tier or the agent itself. The record lives in the
+    agent's metadata under ``deregistered`` (no schema change). Repeating the
+    call on an agent already offline WITH that record returns the same record
+    and writes nothing: no second event, no second job release."""
+    _authorize_deregister(urn_path, x_hive_actor, authorization, x_hive_token)
+    reason = ((req.reason if req else None) or "").strip() or "deregistered"
+    repo = hive_repo()
+    async with repo.connection() as tx:
+        for _attempt in range(3):
+            async with tx.execute(
+                "SELECT status, last_heartbeat, metadata FROM agents WHERE urn=?", (urn_path,)
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                raise HTTPException(404, f"agent not found: {urn_path}")
+            status, last_hb, raw_meta = row
+            try:
+                meta = json.loads(raw_meta) if raw_meta else {}
+            except Exception:
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            prior = meta.get("deregistered")
+            if status == "offline" and isinstance(prior, dict):
+                return {"ok": True, "urn": urn_path, "status": "offline", **prior}
+            record = {
+                "reason": reason,
+                "deregistered_at": time.time(),
+                "deregistered_by": "admin" if is_admin_tier(authorization) else urn_path,
+            }
+            meta["deregistered"] = record
+            # Compare-and-set on the state we read, so two racing calls cannot
+            # both win (and both emit): the loser re-reads and returns the record.
+            cur = await tx.execute(
+                "UPDATE agents SET status='offline', metadata=? WHERE urn=? AND status=? AND last_heartbeat=?",
+                (json.dumps(meta, default=str), urn_path, status, last_hb),
+            )
+            if (getattr(cur, "rowcount", 0) or 0) != 1:
+                continue
+            released = await repo.release_unstarted_jobs_for_agent(tx, urn_path)
+            for job_id in released:
+                await emit_event(
+                    tx,
+                    "job.unclaimed",
+                    {"id": job_id, "prior_claimer": urn_path, "reason": "agent_deregistered"},
+                    commit=False,
+                )
+            await emit_event(
+                tx,
+                "agent.offline",
+                {"urn": urn_path, "reason": "deregistered", "detail": reason},
+            )
+            return {"ok": True, "urn": urn_path, "status": "offline", **record}
+    raise HTTPException(409, f"agent {urn_path} changed concurrently; retry")
 
 
 @router.get("/v1/agents")
