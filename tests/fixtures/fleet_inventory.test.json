@@ -1,0 +1,16 @@
+{
+  "_comment": "TEST fixture inventory: the host map the doctor's old in-source tables held, which existing tests assert on.",
+  "schema_version": 1,
+  "hosts": {
+    "ultra": {"address": "192.0.2.60", "user": "jasonperlow", "auth": "key", "os": "macos"},
+    "studio": {"address": "192.0.2.10", "user": "jasonperlow", "auth": "key", "os": "macos"},
+    "medusa": {"address": "192.0.2.64", "user": "jasonperlow", "auth": "password", "os": "linux"},
+    "hydra": {"address": "192.0.2.78", "user": "jasonperlow", "auth": "password", "os": "linux"},
+    "cerberus": {"address": "192.0.2.96", "user": "jasonperlow", "auth": "key", "os": "linux"},
+    "proteus": {"address": "192.0.2.25", "user": "jasonperlow", "auth": "key", "os": "linux"},
+    "bigpi": {"address": "192.0.2.65", "user": "jasonperlow", "auth": "key", "os": "linux"},
+    "clawpi": {"address": "192.0.2.54", "user": "jasonperlow", "auth": "key", "os": "linux"},
+    "zeropi": {"address": "192.0.2.56", "user": "jasonperlow", "auth": "key", "os": "linux"},
+    "typhon": {"address": "192.0.2.61", "user": "jasonperlow", "auth": "key", "os": "linux"}
+  }
+}

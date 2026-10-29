@@ -68,17 +68,65 @@ def _bulk_http(jobs, calls):
     return _http
 
 
+def _resubmit_http(jobs, calls, new_id="replacement-1"):
+    """GET failed jobs; POST /v1/jobs mints a child; PATCH marks the original.
+
+    The bulk fake below answers a submit with `{"ok": [...]}`, which is the
+    requeue shape; a submit answers with an id, so the resubmit-as-new path needs
+    its own fake to be exercised at all.
+    """
+
+    def _http(method, path, body=None, **_kw):
+        calls.append((method, path, body))
+        if method == "GET":
+            return 200, {"jobs": jobs}
+        if method == "POST" and path == "/v1/jobs":
+            return 201, {"id": new_id}
+        if method == "PATCH":
+            return 200, {}
+        return 200, {"ok": list((body or {}).get("job_ids", []))}
+
+    return _http
+
+
 def test_failed_job_with_max_retries_zero_is_not_requeued(monkeypatch):
+    """Operator rule 2026-10-26: a no-budget row is never REQUEUED.
+
+    Decision (F3, 2026-10-29): these assertions predated the 2026-10-27 change in
+    `action_resubmit_jobs` (operator: "why is the doctor not acting on these?").
+    A budget-spent failure is now re-dispatched as a NEW job — new id, real
+    budget, parented to the original, one generation only — instead of becoming a
+    needs-review row nobody can action. It is still never requeued: no
+    `/v1/admin/jobs/requeue` call and no operator override, which is what the
+    2026-10-26 rule is about. These assertions now pin that distinction rather
+    than pinning "nothing happens".
+    """
     calls, messages = [], []
     monkeypatch.setattr(doctor, "DRY_RUN", False)
-    monkeypatch.setattr(doctor, "_http", _bulk_http([_failed("01a178cd-dead", max_retries=0)], calls))
+    monkeypatch.setattr(doctor, "_http", _resubmit_http([_failed("01a178cd-dead", max_retries=0)], calls))
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda t, p: messages.append((t, p)))
     text = doctor.action_resubmit_jobs("build:x")
-    assert [c for c in calls if c[0] == "POST"] == [], "no requeue may reach the bus"
-    assert "no requeueable failed jobs" in text and "needs-review" in text
-    assert "01a178cd-dea" in text
-    assert messages and messages[0][0] == "doctor.needs-review"
+
+    # 1. Never a requeue, and never the operator override that would bypass the rule.
+    assert [c for c in calls if c[1] == "/v1/admin/jobs/requeue"] == [], "no requeue may reach the bus"
+    assert "override_max_retries" not in json.dumps([c[2] for c in calls if c[0] == "POST"])
+    # 2. Exactly one replacement: parented, real budget, stable idempotency key.
+    posts = [c for c in calls if c[0] == "POST" and c[1] == "/v1/jobs"]
+    assert len(posts) == 1
+    payload = posts[0][2]
+    assert payload["parent_job_id"] == "01a178cd-dead"
+    assert payload["max_retries"] == 2
+    assert payload["idempotency_key"] == "doctor-resubmit-01a178cd-dead"
+    assert payload["result"]["resubmitted_from"] == "01a178cd-dead"
+    # 3. The original points at its replacement, so the next sweep skips it.
+    patches = [c for c in calls if c[0] == "PATCH"]
+    assert patches and patches[0][1] == "/v1/jobs/01a178cd-dead"
+    assert patches[0][2]["result"]["resubmitted_as"] == "replacement-1"
+    # 4. The operator is told both halves: held, then what was submitted.
+    assert [m[0] for m in messages] == ["doctor.needs-review", "doctor.resubmitted"]
     assert messages[0][1]["job_ids"] == ["01a178cd-dead"]
+    assert messages[1][1]["submitted"] == ["replacement-1"]
+    assert "resubmitted 1 budget-spent job(s) of build:x as new" in text
 
 
 def test_exhausted_budget_is_not_requeued_but_jobs_with_retries_left_are(monkeypatch):
@@ -118,15 +166,21 @@ def test_requeue_record_regex_still_matches_with_held_note(monkeypatch):
 
 
 def test_triage_release_of_max_retries_zero_job_does_not_requeue(monkeypatch):
-    """The exact incident path: a triage:<kind> wrapper deciding release_to_queue."""
+    """The exact incident path: a triage:<kind> wrapper deciding release_to_queue.
+
+    Same decision as above: not released into the queue (no requeue, `released`
+    False), but re-dispatched once as a parented replacement.
+    """
     calls = []
     monkeypatch.setattr(doctor, "DRY_RUN", False)
-    monkeypatch.setattr(doctor, "_http", _bulk_http([_failed("01a17930", max_retries=0)], calls))
+    monkeypatch.setattr(doctor, "_http", _resubmit_http([_failed("01a17930", max_retries=0)], calls))
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
     text, released = doctor.apply_release("wrapper", True, "build:x", None)
-    assert released is False
-    assert [c for c in calls if c[0] == "POST"] == []
-    assert "needs-review" in text
+    assert released is False, "a no-budget row is not released back into the queue"
+    assert [c for c in calls if c[1] == "/v1/admin/jobs/requeue"] == []
+    posts = [c for c in calls if c[0] == "POST" and c[1] == "/v1/jobs"]
+    assert len(posts) == 1 and posts[0][2]["parent_job_id"] == "01a17930"
+    assert "resubmitted 1 budget-spent job(s)" in text
 
 
 # ── SOP executor release_to_queue of the original failed job ───────────────

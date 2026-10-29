@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit non-test Python for hardcoded fleet addresses (192.168.207.x).
+"""Audit non-test Python for hardcoded fleet addresses (the fleet LAN range).
 
 Addresses must come from the environment or the fleet inventory, not source:
 a baked-in IP goes stale silently (ULTRA .60, MEDUSA .64 and PROTEUS .25 in this

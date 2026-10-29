@@ -39,6 +39,22 @@ _TEARDOWN_TO_CLASS = {
 }
 
 
+def _seq(event: dict) -> int:
+    """A sortable event sequence number, whatever the store put there.
+
+    MNEMOS metadata is free-form and has been seen with ``seq`` as a string. A
+    mixed str/int list makes ``sorted`` raise ``TypeError``, and because the whole
+    fetcher is best-effort that used to return None — i.e. ONE mistyped event
+    discarded the entire trail and the row classified as ``unknown`` instead of
+    ``crash``/``timeout``. A value that cannot be an int sorts first rather than
+    taking the trail with it.
+    """
+    try:
+        return int(event.get("_seq") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _result_dict(job: dict) -> dict:
     res = job.get("result")
     if isinstance(res, str):
@@ -89,7 +105,7 @@ def fetch_loop_events(job_id: str, timeout: float = 4.0) -> list[dict] | None:
                 payload.setdefault("phase", meta.get("phase"))
                 payload["_seq"] = meta.get("seq", 0)
                 events.append(payload)
-        return sorted(events, key=lambda e: e.get("_seq") or 0)
+        return sorted(events, key=_seq)
     except Exception:  # noqa: BLE001 - diagnosis must never break the sweep
         return None
 

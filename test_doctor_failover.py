@@ -76,7 +76,12 @@ def doctor(monkeypatch):
     monkeypatch.setenv("DOCTOR_REVIEW_MODEL", "gemma4-e2b")
     monkeypatch.setenv("DOCTOR_TRIAGE_BASE_URL", HYDRA)
     monkeypatch.setenv("DOCTOR_REVIEW_BASE_URL", ACHILLES)
-    monkeypatch.delenv("DOCTOR_FALLBACK_BASE_URLS", raising=False)
+    # The doctor-wide base (unknown phases, codex-alias fallthrough) is env-only
+    # since 2026-10-29; the test declares it the same way the phase bases are.
+    monkeypatch.setenv("DOCTOR_OPENWEIGHT_BASE_URL", CERBERUS)
+    # The fallback chain is a list of ADDRESSES and has no in-source default any
+    # more (operator rule 2026-10-29), so the test declares the chain it exercises.
+    monkeypatch.setenv("DOCTOR_FALLBACK_BASE_URLS", f"{HYDRA},{ACHILLES},{CERBERUS}")
     monkeypatch.delenv("DOCTOR_FALLBACK_MODELS", raising=False)
     monkeypatch.delenv("DOCTOR_OPENWEIGHT_API_KEY", raising=False)
     from hive.workers import doctor as _doctor
@@ -134,29 +139,64 @@ def test_repo_default_models(doctor_defaults):
     assert d.DOCTOR_OPENWEIGHT_MODEL == "gpt-oss-20b"
 
 
-def test_repo_default_bases_pair_each_model_with_its_server(doctor_defaults):
+def test_no_model_base_url_is_baked_into_source(doctor_defaults):
+    """Operator rule 2026-10-29: a base URL IS a fleet address, so it is env-only.
+
+    This test used to assert the opposite (defaults of CERBERUS and TYDEUS). Those
+    defaults were addresses in source, and the ones this tree shipped had already
+    gone stale for three hosts. The contract now is fail-closed: no env, no base,
+    and the phase call reports itself disabled (asserted just below).
+    """
     d = doctor_defaults
-    # cerberus-reviewer / gpt-oss-20b are CERBERUS aliases; qwen38 is served on TYDEUS.
-    assert d.DOCTOR_OPENWEIGHT_BASE_URL == CERBERUS
-    assert d.DOCTOR_TRIAGE_BASE_URL == CERBERUS
-    assert d.DOCTOR_REVIEW_BASE_URL == CERBERUS
-    assert d.DOCTOR_FIX_BASE_URL == TYDEUS
+    assert d.DOCTOR_OPENWEIGHT_BASE_URL == ""
+    assert d.DOCTOR_TRIAGE_BASE_URL == ""
+    assert d.DOCTOR_REVIEW_BASE_URL == ""
+    assert d.DOCTOR_FIX_BASE_URL == ""
 
 
-def test_fix_phase_default_goes_to_tydeus_qwen38(doctor_defaults, monkeypatch):
-    rec = _install(doctor_defaults, monkeypatch, {TYDEUS: "patched"})
-    ok, text = doctor_defaults.invoke_doctor_agent("p", phase="fix")
-    assert ok and text == "patched"
-    assert rec.bases == [TYDEUS]
-    assert _wire_models(rec) == ["qwen38"]
-
-
-def test_triage_phase_default_goes_to_cerberus_reviewer(doctor_defaults, monkeypatch):
-    rec = _install(doctor_defaults, monkeypatch, {CERBERUS: "diagnosis"})
+def test_an_unconfigured_phase_is_disabled_rather_than_called(doctor_defaults, monkeypatch):
+    rec = _install(doctor_defaults, monkeypatch, {})
     ok, text = doctor_defaults.invoke_doctor_agent("p", phase="triage")
-    assert ok and text == "diagnosis"
-    assert rec.bases == [CERBERUS]
-    assert _wire_models(rec) == ["cerberus-reviewer"]
+    assert ok is False
+    assert "no base URL configured" in text
+    assert rec.calls == [], "a disabled phase must not reach the network"
+
+
+def test_fix_phase_goes_to_the_configured_tydeus_base(monkeypatch):
+    """The fix phase still finds qwen38 at TYDEUS — now because env says so."""
+    for name in _DEFAULT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DOCTOR_FIX_BASE_URL", TYDEUS)
+    from hive.workers import doctor as _doctor
+
+    d = importlib.reload(_doctor)
+    try:
+        rec = _install(d, monkeypatch, {TYDEUS: "patched"})
+        ok, text = d.invoke_doctor_agent("p", phase="fix")
+        assert ok and text == "patched"
+        assert rec.bases == [TYDEUS]
+        assert _wire_models(rec) == ["qwen38"]
+    finally:
+        monkeypatch.delenv("DOCTOR_FIX_BASE_URL", raising=False)
+        importlib.reload(_doctor)
+
+
+def test_triage_phase_goes_to_the_configured_openweight_base(monkeypatch):
+    for name in _DEFAULT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DOCTOR_OPENWEIGHT_BASE_URL", CERBERUS)
+    from hive.workers import doctor as _doctor
+
+    d = importlib.reload(_doctor)
+    try:
+        rec = _install(d, monkeypatch, {CERBERUS: "diagnosis"})
+        ok, text = d.invoke_doctor_agent("p", phase="triage")
+        assert ok and text == "diagnosis"
+        assert rec.bases == [CERBERUS]
+        assert _wire_models(rec) == ["cerberus-reviewer"]
+    finally:
+        monkeypatch.delenv("DOCTOR_OPENWEIGHT_BASE_URL", raising=False)
+        importlib.reload(_doctor)
 
 
 def test_fix_base_env_override_still_wins(monkeypatch):
@@ -173,9 +213,14 @@ def test_fix_base_env_override_still_wins(monkeypatch):
 
 
 # ─────────────────────────── failover ───────────────────────────
-def test_default_chain_is_local_hydra_achilles_cerberus(doctor):
-    assert doctor.DOCTOR_FALLBACK_BASE_URLS == [HYDRA, ACHILLES, CERBERUS]
-    assert doctor.DOCTOR_FALLBACK_MODELS == ["gemma4-e2b", "gemma4-e2b", "gemma4-31b"]
+def test_no_failover_rungs_until_they_are_configured(doctor_defaults):
+    """DOCTOR_FALLBACK_BASE_URLS is a list of ADDRESSES, so it has no default.
+
+    The fixture deletes it; the model list is not an address and keeps its
+    non-address default, which simply goes unused with no rungs to pair it with.
+    """
+    assert doctor_defaults.DOCTOR_FALLBACK_BASE_URLS == []
+    assert doctor_defaults.DOCTOR_FALLBACK_MODELS == ["gemma4-e2b", "gemma4-e2b", "gemma4-31b"]
 
 
 def test_phase_base_answers_without_any_failover(doctor, monkeypatch):

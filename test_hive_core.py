@@ -16,7 +16,9 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(s.backend, "sqlite")
         self.assertEqual(s.agent_bus_db, "/srv/agent-bus/agents.db")
         self.assertEqual(s.claim_lease_seconds, 1800)
-        self.assertEqual(s.mnemos_url, "http://192.0.2.67:5002")
+        # MNEMOS_URL is env-only (operator rule 2026-10-29): the address is not a
+        # setting the code gets to guess, so unset means "no MNEMOS" not a default.
+        self.assertEqual(s.mnemos_url, "")
 
     def test_env_overrides_and_types(self):
         env = {

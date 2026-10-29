@@ -102,7 +102,9 @@ class Settings:
             claim_hard_max_age=_env_int("HIVE_CLAIM_HARD_MAX_AGE", 14400),
             retain_done_jobs_days=_env_int("RETAIN_DONE_JOBS_DAYS", 30),
             retain_test_jobs_days=_env_int("RETAIN_TEST_JOBS_DAYS", 3),
-            mnemos_url=_env("MNEMOS_URL", "http://192.0.2.67:5002").rstrip("/"),
+            # No baked-in address (operator rule 2026-10-29): unset means the
+            # MNEMOS-backed features are disabled with one log line.
+            mnemos_url=_env("MNEMOS_URL", "").rstrip("/"),
             mnemos_token=_env("MNEMOS_TOKEN", ""),
             mcp_bridge_token=_env("MCP_BRIDGE_TOKEN", ""),
             mcp_bridge_admin_token=_env("MCP_BRIDGE_ADMIN_TOKEN", ""),

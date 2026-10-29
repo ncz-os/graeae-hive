@@ -22,7 +22,8 @@ Constraints:
   • Together AI FORBIDDEN for doctor (too expensive per hive rules).
 
 Env:
-  HIVE_URL                   http://192.0.2.67:5005
+  HIVE_URL                   bus base URL. NO DEFAULT: unset disables the doctor's
+                             bus features with one log line (see docs/ENVIRONMENT.md)
   ZEROCLAW_BIN               /usr/local/bin/zeroclaw
   DOCTOR_AGENT_ALIAS         hive_doctor (must exist in ~/.zeroclaw/config.toml)
   AGENT_HOST                 PYTHIA
@@ -36,10 +37,10 @@ Env:
   DOCTOR_REVIEW_MODEL        adversarial-review phase model (default cerberus-reviewer)
   DOCTOR_FIX_MODEL           in-doctor fix phase model (default qwen38)
   DOCTOR_OPENWEIGHT_BASE_URL OpenAI-compatible base for the triage/review phases
-                             and unknown phases (default CERBERUS
-                             http://192.0.2.96:8080/v1)
-  DOCTOR_FIX_BASE_URL        base for the fix phase (default TYDEUS
-                             http://192.0.2.73:8006/v1)
+                             and unknown phases. NO DEFAULT: unset disables model
+                             calls (set it to the CERBERUS llama-server base)
+  DOCTOR_FIX_BASE_URL        base for the fix phase. NO DEFAULT: set it to the
+                             TYDEUS base that serves qwen38
   DOCTOR_OPENWEIGHT_MODEL    model id for the open-weight path (default gpt-oss-20b)
   DOCTOR_OPENWEIGHT_API_KEY  key for open-weight path (falls back to config.toml deepseek)
 """
@@ -62,6 +63,8 @@ import urllib.request
 import uuid
 from collections import deque
 
+# Fleet addresses come from operator config (HIVE_FLEET_INVENTORY), never source.
+from hive.core import fleet_inventory
 from hive.workers import remediation, retention
 
 # SOP phase 3 (2026-10-22): durable safety state and the destructive-action rails.
@@ -72,7 +75,17 @@ from hive.workers import doctor_decline_paths as decline_paths
 from hive.workers import loop_outcome
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
-HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
+HIVE_URL = os.environ.get("HIVE_URL", "")
+# No baked-in bus address (operator rule 2026-10-29): a literal address in source
+# goes stale without anybody noticing. Unset means this doctor cannot reach the
+# bus, so every bus-backed feature is disabled with one log line rather than
+# crash-looping on a relative URL.
+if not HIVE_URL:
+    fleet_inventory.warn_once(
+        "doctor.HIVE_URL",
+        "HIVE_URL is not set: this doctor cannot reach the bus, so claims, "
+        "heartbeats and job updates are disabled (set HIVE_URL in its service env)",
+    )
 # C1: bus transport auth bearer token (env-sourced). The doctor SUBMITS jobs
 # (dispatch_codex_fix), so this token must satisfy the bus admin tier if one is
 # configured (HIVE_BUS_ADMIN_TOKEN); otherwise worker-tier auth suffices.
@@ -125,15 +138,17 @@ _PHASE_MODELS = {
     "fix": DOCTOR_FIX_MODEL,
 }
 # OpenAI-compatible local endpoint: CERBERUS llama-server (the durable brain).
-DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get("DOCTOR_OPENWEIGHT_BASE_URL", "http://192.0.2.96:8080/v1").rstrip("/")
+DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get("DOCTOR_OPENWEIGHT_BASE_URL", "").rstrip("/")
 DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "gpt-oss-20b")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
 DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
 # Per-phase bases. Triage and review default to CERBERUS (DOCTOR_OPENWEIGHT_BASE_URL);
 # the fix phase defaults to TYDEUS, where qwen38 is served — a phase model id
 # is sent to its phase base, so the two must agree. Override any phase to a
-# LIGHT model on HYDRA/ACHILLES (e.g. DOCTOR_TRIAGE_BASE_URL=http://192.0.2.78:8080/v1).
-DOCTOR_FIX_DEFAULT_BASE_URL = "http://192.0.2.73:8006/v1"
+# LIGHT model on HYDRA/ACHILLES (e.g. DOCTOR_TRIAGE_BASE_URL=<hydra>:8080/v1).
+# No baked-in address for either phase: DOCTOR_FIX_BASE_URL must say where qwen38
+# is served. Unset disables the fix phase's model call with one log line.
+DOCTOR_FIX_DEFAULT_BASE_URL = ""
 DOCTOR_TRIAGE_BASE_URL = os.environ.get("DOCTOR_TRIAGE_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 DOCTOR_REVIEW_BASE_URL = os.environ.get("DOCTOR_REVIEW_BASE_URL", DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
 DOCTOR_FIX_BASE_URL = os.environ.get("DOCTOR_FIX_BASE_URL", DOCTOR_FIX_DEFAULT_BASE_URL).rstrip("/")
@@ -155,7 +170,7 @@ DOCTOR_FALLBACK_BASE_URLS: list[str] = [
     u.strip().rstrip("/")
     for u in os.environ.get(
         "DOCTOR_FALLBACK_BASE_URLS",
-        "http://192.0.2.78:8080/v1,http://192.0.2.11:8080/v1,http://192.0.2.96:8080/v1",
+        "",
     ).split(",")
     if u.strip()
 ]
@@ -433,19 +448,24 @@ KNOWN_FAILURE_SIGNATURES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"pair gateway first via POST /pair", re.IGNORECASE), "token_mismatch"),
     (re.compile(r"gateway.*unauthorized.*token", re.IGNORECASE), "token_mismatch"),
 ]
-# Full fleet including Mac hosts (ULTRA, STUDIO) and sshpass hosts (MEDUSA, HYDRA)
-ALL_FLEET_HOSTS: dict[str, dict] = {
-    "ultra": {"ip": "192.0.2.60", "os": "macos", "auth": "passwordless", "user": "jasonperlow"},
-    "studio": {"ip": "192.0.2.10", "os": "macos", "auth": "passwordless", "user": "jasonperlow"},
-    "medusa": {"ip": "192.0.2.64", "os": "linux", "auth": "sshpass", "user": "jasonperlow"},
-    "hydra": {"ip": "192.0.2.78", "os": "linux", "auth": "sshpass", "user": "jasonperlow"},
-    "cerberus": {"ip": "192.0.2.96", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
-    "proteus": {"ip": "192.0.2.25", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
-    "bigpi": {"ip": "192.0.2.65", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
-    "clawpi": {"ip": "192.0.2.54", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
-    "zeropi": {"ip": "192.0.2.56", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
-    "typhon": {"ip": "192.0.2.61", "os": "linux", "auth": "passwordless", "user": "jasonperlow"},
-}
+# The full fleet — Mac hosts, Linux hosts and the password-auth ones — read from
+# the operator's inventory (HIVE_FLEET_INVENTORY, see hive/core/fleet_inventory.py).
+# There is no in-source table any more: the entries this replaced carried stale
+# addresses (ULTRA, MEDUSA and PROTEUS were all wrong) and every clone of the repo
+# carried them too. Empty inventory = no known host = the host-addressed actions
+# refuse by name instead of dialling a guess.
+
+def all_fleet_hosts() -> dict[str, dict]:
+    """``host -> {ip, os, auth, user}`` from the fleet inventory.
+
+    The legacy ``ip`` key is kept because every caller and test reads it; it is
+    the inventory's ``address``. Read per call rather than at import so a test (or
+    an operator) that sets the inventory sees it take effect without a reload.
+    """
+    return {
+        name: {"ip": entry["address"], "os": entry["os"], "auth": entry["auth"], "user": entry["user"]}
+        for name, entry in fleet_inventory.load_inventory().items()
+    }
 
 log = logging.getLogger("doctor")
 
@@ -655,6 +675,15 @@ def _signal(signum, frame):
 
 # ───────────────────────── HTTP helpers ─────────────────────────
 def _http(method: str, path: str, body: dict | None = None, timeout: float = 15.0) -> tuple[int, dict | None]:
+    if not HIVE_URL:
+        # Bus disabled (see the module-level warning): report "no answer" so every
+        # caller takes its existing unreachable-bus path instead of raising.
+        fleet_inventory.warn_once(
+            "doctor.http.disabled",
+            "bus call skipped: HIVE_URL is not set (the doctor's bus features are disabled)",
+            level=logging.DEBUG,
+        )
+        return 0, None
     url = f"{HIVE_URL}{path}"
     data = json.dumps(body).encode() if body is not None else None
     headers = {"content-type": "application/json"}
@@ -1045,6 +1074,16 @@ def _invoke_openweight(
     missing key is only fatal when a base is explicitly remote."""
     base = (base_url or DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
     model_id = model or DOCTOR_OPENWEIGHT_MODEL
+    if not base:
+        # No address in source, no default base: this phase is unconfigured. Say so
+        # once and return a refusal the caller records, rather than POSTing to a
+        # relative URL and reporting a transport error nobody can act on.
+        fleet_inventory.warn_once(
+            "doctor.base_url.disabled",
+            "no model base URL is configured (DOCTOR_OPENWEIGHT_BASE_URL / "
+            "DOCTOR_<PHASE>_BASE_URL): doctor model calls are disabled",
+        )
+        return False, f"model {model_id} disabled: no base URL configured (set DOCTOR_OPENWEIGHT_BASE_URL)"
     api_key = _openweight_api_key()
     body = {
         "model": model_id,
@@ -2120,10 +2159,19 @@ def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str
     if blocked:
         return f"REFUSED: {blocked}"
     body = {
-        "kind": f"doctor:codex-fix:{int(time.time())}",
+        # IDEMPOTENCY (F2 audit 2026-10-29): the kind used to embed
+        # int(time.time()), so two dispatches for one parent produced two fix
+        # jobs. Kind and idempotency_key are now both derived from the parent id:
+        # the bus dedups on queue_logic.dedup_key(kind, description,
+        # idempotency_key), so a replayed dispatch coalesces onto the first job.
+        # The kind keeps the `doctor:codex-fix:` prefix that
+        # DOCTOR_CLAIM_KIND_EXCLUDE_PREFIXES relies on (the doctor must never
+        # claim its own dispatch).
+        "kind": f"doctor:codex-fix:{parent_job_id}",
         "description": codex_task,
         "submitter_urn": _urn,
         "parent_job_id": parent_job_id,
+        "idempotency_key": f"doctor-codex-fix:{parent_job_id}",
         # codex-first (operator 2026-06-03): the fix runs on a codex-capable
         # zeroclaw worker (ChatGPT-OAuth, NO API key). hard:codex gates it to
         # codex workers only AND stops the doctor (no codex cap) from re-claiming
@@ -2186,7 +2234,7 @@ def _record_token_fix_attempt(host: str):
 def _build_token_fix_codex_task(offending_host: str) -> str:
     """Build an imperative codex task to fix gateway token mismatch on a host.
     Includes OS detection, auth method selection, and health-check verification."""
-    host_info = ALL_FLEET_HOSTS.get(offending_host.lower(), {})
+    host_info = all_fleet_hosts().get(offending_host.lower(), {})
     ip = host_info.get("ip", offending_host)
     os_type = host_info.get("os", "linux")
     auth = host_info.get("auth", "passwordless")
@@ -2394,8 +2442,11 @@ def _match_known_signature(job: dict, base_kind: str, failed: list[dict]) -> dic
             }
 
         # Check host is known
-        if offending_host.lower() not in ALL_FLEET_HOSTS:
-            log.warning("token-fix: host %s not in ALL_FLEET_HOSTS — falling through to LLM", offending_host)
+        if offending_host.lower() not in all_fleet_hosts():
+            log.warning(
+                "token-fix: host %s has no address in the fleet inventory — falling through to LLM",
+                offending_host,
+            )
             return None
 
         # SECURITY (review C2/H3): fail closed without a configured LAN token. The
@@ -4307,6 +4358,14 @@ def main():
     )
     signal.signal(signal.SIGTERM, _signal)
     signal.signal(signal.SIGINT, _signal)
+    if not HIVE_URL:
+        # Fail closed, once: a doctor with no bus cannot claim, heartbeat or
+        # report, so spinning here would be a silent crash loop (and a log flood).
+        log.error(
+            "HIVE_URL is not set: this doctor has no bus to serve, refusing to start "
+            "(set HIVE_URL in the service environment — see docs/ENVIRONMENT.md)"
+        )
+        return 2
     log.info("starting on %s url=%s alias=%s dry_run=%s", AGENT_HOST, HIVE_URL, DOCTOR_AGENT_ALIAS, DRY_RUN)
     register()
     last_hb = time.time()
