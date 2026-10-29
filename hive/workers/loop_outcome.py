@@ -1,0 +1,159 @@
+"""Classify why a zoder loop job failed, and decide what the doctor does about it.
+
+A failed loop row used to look the same whatever went wrong, so the doctor either
+requeued it blindly or spawned an LLM triage job per cluster, and the triage queue
+filled with rows that only needed the reviewer to come back. The loop now reports
+its teardown reason (``ZODER_LOOP_RESULT`` stored by the worker as
+``result.loop_result``, and ``projects/zoder-loop-events`` memories in MNEMOS);
+this module turns that into a class and a policy. Everything here is fail-soft:
+classification never raises and an unknown outcome keeps today's behaviour.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import urllib.request
+from collections.abc import Callable
+
+REVIEWER_UNAVAILABLE = "reviewer_unavailable"
+AUTHOR_FAILED = "author_failed"
+TIMEOUT = "timeout"
+CRASH = "crash"
+EXHAUSTED = "exhausted_request_changes"
+NOTHING_TO_COMMIT = "nothing_to_commit"
+APPROVED_UNMERGED = "approved_unmerged"
+UNKNOWN = "unknown"
+
+# Cap on automatic requeues of one job for the classes that are not the job's fault.
+MAX_AUTO_REQUEUES = 2
+
+_TEARDOWN_TO_CLASS = {
+    "approved": APPROVED_UNMERGED,
+    "reviewer_unavailable": REVIEWER_UNAVAILABLE,
+    "author_failed": AUTHOR_FAILED,
+    "timeout": TIMEOUT,
+    "crash": CRASH,
+    "exhausted": EXHAUSTED,
+    "nothing_to_commit": NOTHING_TO_COMMIT,
+}
+
+
+def _result_dict(job: dict) -> dict:
+    res = job.get("result")
+    if isinstance(res, str):
+        try:
+            res = json.loads(res)
+        except ValueError:
+            return {"raw": res}
+    return res if isinstance(res, dict) else {}
+
+
+def fetch_loop_events(job_id: str, timeout: float = 4.0) -> list[dict] | None:
+    """The job's ``zoder-loop-events`` from MNEMOS, oldest first; None if unavailable."""
+    base, token = os.environ.get("MNEMOS_URL"), os.environ.get("MNEMOS_TOKEN")
+    if not base or not token or not job_id:
+        return None
+    try:
+        req = urllib.request.Request(
+            base.rstrip("/") + "/v1/memories/search",
+            data=json.dumps({"query": job_id, "subcategory": "zoder-loop-events", "limit": 50}).encode(),
+            method="POST",
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured URL
+            body = json.load(resp)
+        if isinstance(body, dict):
+            rows = body.get("memories") or body.get("results") or []
+        elif isinstance(body, list):
+            rows = body
+        else:
+            rows = []
+        events = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            meta = row.get("metadata") or {}
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except ValueError:
+                    meta = {}
+            if meta.get("job_id") != job_id:
+                continue
+            try:
+                payload = json.loads(row.get("content") or "{}")
+            except ValueError:
+                continue
+            if isinstance(payload, dict):
+                payload.setdefault("phase", meta.get("phase"))
+                payload["_seq"] = meta.get("seq", 0)
+                events.append(payload)
+        return sorted(events, key=lambda e: e.get("_seq") or 0)
+    except Exception:  # noqa: BLE001 - diagnosis must never break the sweep
+        return None
+
+
+def classify(job: dict, events_fetcher: Callable[[str], list[dict] | None] = fetch_loop_events) -> str:
+    """One class for a failed loop row. Never raises."""
+    try:
+        res = _result_dict(job)
+        teardown = (res.get("loop_result") or {}).get("teardown")
+        if isinstance(teardown, dict) and teardown.get("reason") in _TEARDOWN_TO_CLASS:
+            return _TEARDOWN_TO_CLASS[teardown["reason"]]
+        events = events_fetcher(str(job.get("id") or ""))
+        if events:
+            for ev in reversed(events):
+                if ev.get("phase") == "teardown" and ev.get("reason") in _TEARDOWN_TO_CLASS:
+                    return _TEARDOWN_TO_CLASS[ev["reason"]]
+            phases = [e.get("phase") for e in events]
+            if "teardown" not in phases:
+                return CRASH  # a trail with no teardown: the loop died mid-way
+        text = " ".join(str(res.get(k) or "") for k in ("error", "failure_reason", "tail", "raw")).lower()
+        if "reviewer_unavailable" in text:
+            return REVIEWER_UNAVAILABLE
+        if "nothing_to_commit" in text:
+            return NOTHING_TO_COMMIT
+        if "timed out" in text or "timeout" in text:
+            return TIMEOUT
+    except Exception:  # noqa: BLE001
+        pass
+    return UNKNOWN
+
+
+def reviewer_healthy(url: str | None = None, timeout: float = 3.0) -> bool:
+    """Bounded probe of the production reviewer. Unreachable counts as unhealthy."""
+    url = url or os.environ.get("DOCTOR_REVIEWER_HEALTH_URL", "http://192.0.2.96:8080/health")
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - operator-configured URL
+            return 200 <= resp.status < 300
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def decide(cls: str, requeues_so_far: int, reviewer_ok: Callable[[], bool] = reviewer_healthy) -> str:
+    """What the sweep does with a failed row of this class.
+
+    ``requeue``      resubmit it (existing resubmit path)
+    ``hold``         do nothing this pass (cause is outside the job; retry later)
+    ``needs_review`` stop automation, a human or the review lane looks once
+    ``skip``         not the auto-requeue path (approved work waits for a merge)
+    ``default``      unknown outcome: today's behaviour
+    """
+    if cls == REVIEWER_UNAVAILABLE:
+        if requeues_so_far >= MAX_AUTO_REQUEUES:
+            return "needs_review"
+        return "requeue" if reviewer_ok() else "hold"
+    if cls in (AUTHOR_FAILED, TIMEOUT, CRASH):
+        return "needs_review" if requeues_so_far >= MAX_AUTO_REQUEUES else "requeue"
+    if cls in (EXHAUSTED, NOTHING_TO_COMMIT):
+        return "needs_review"
+    if cls == APPROVED_UNMERGED:
+        return "skip"
+    return "default"
+
+
+def cluster_is_infrastructure(classes: list[str]) -> bool:
+    """True when every failure in a cluster is a class the doctor handles
+    deterministically, so no LLM triage job should be created for it."""
+    return bool(classes) and all(c != UNKNOWN for c in classes)
