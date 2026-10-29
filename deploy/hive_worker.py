@@ -2848,6 +2848,37 @@ def _redact_tree(value):
     return value
 
 
+# F2 idempotency audit (2026-10-29): ONE terminal patch per (job id, status) per
+# process. The bus's auto-retry branch fires on `req.status == "failed"`, not only
+# on a transition, so a second `failed` PATCH increments retry_count and requeues a
+# job the first patch already failed. run_job's always-terminal except path does
+# exactly that after _run_job_inner has already failed the row. Renewals
+# (claimed/running) are deliberately NOT deduped: repeating them is the point.
+_TERMINAL_PATCH_STATUSES = frozenset({"done", "failed", "cancelled", "needs-review"})
+_terminal_patched: set[tuple[str, str]] = set()
+_TERMINAL_PATCH_MEMORY = 5000  # long-lived worker: bound the set, oldest first
+
+
+def _terminal_patch_already_sent(job_id: str, status: str) -> bool:
+    """True when this process already sent this exact terminal patch."""
+    if status not in _TERMINAL_PATCH_STATUSES or not job_id:
+        return False
+    return (job_id, status) in _terminal_patched
+
+
+def _remember_terminal_patch(job_id: str, status: str) -> None:
+    if status not in _TERMINAL_PATCH_STATUSES or not job_id:
+        return
+    if len(_terminal_patched) >= _TERMINAL_PATCH_MEMORY:
+        # A set has no order; dropping half is enough to keep a multi-day worker
+        # from growing without bound, and a dropped entry can only cost one
+        # redundant terminal patch (the bus still refuses a second terminal move
+        # on a finished row).
+        for _ in range(_TERMINAL_PATCH_MEMORY // 2):
+            _terminal_patched.pop()
+    _terminal_patched.add((job_id, status))
+
+
 def patch_job(job_id: str, status: str, result: dict) -> bool:
     # PATCH /v1/jobs/{id} requires claimed_by to match the job's current
     # claimant (agent_bus.py: "job update requires claimed_by to match the
@@ -2857,6 +2888,13 @@ def patch_job(job_id: str, status: str, result: dict) -> bool:
     # Every free-text field (tail, finalizer/attribution stderr, exception
     # text) is redacted here, once, so no path can post a credential.
     body = {"status": status, "result": _redact_tree(result), "claimed_by": _urn}
+    if _terminal_patch_already_sent(job_id, status):
+        print(
+            f"[hive-worker:{WORKER_KIND}] {job_id}: terminal patch {status} already sent "
+            "by this process — skipping the duplicate (it would spend a retry)",
+            flush=True,
+        )
+        return True
     if status in ("claimed", "running", "done", "needs-review", "failed"):
         # Provenance-in-progress: the bus serializes claimed_model/provider/
         # runtime/cost_tier, so every renewal keeps reporting the real route
@@ -2874,6 +2912,8 @@ def patch_job(job_id: str, status: str, result: dict) -> bool:
             f"job may be stranded in claimed state",
             flush=True,
         )
+    if code == 200:
+        _remember_terminal_patch(job_id, status)
     return code == 200
 
 
