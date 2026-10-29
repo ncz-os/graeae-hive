@@ -2159,10 +2159,19 @@ def action_dispatch_codex_fix(codex_task: str | None, parent_job_id: str) -> str
     if blocked:
         return f"REFUSED: {blocked}"
     body = {
-        "kind": f"doctor:codex-fix:{int(time.time())}",
+        # IDEMPOTENCY (F2 audit 2026-10-29): the kind used to embed
+        # int(time.time()), so two dispatches for one parent produced two fix
+        # jobs. Kind and idempotency_key are now both derived from the parent id:
+        # the bus dedups on queue_logic.dedup_key(kind, description,
+        # idempotency_key), so a replayed dispatch coalesces onto the first job.
+        # The kind keeps the `doctor:codex-fix:` prefix that
+        # DOCTOR_CLAIM_KIND_EXCLUDE_PREFIXES relies on (the doctor must never
+        # claim its own dispatch).
+        "kind": f"doctor:codex-fix:{parent_job_id}",
         "description": codex_task,
         "submitter_urn": _urn,
         "parent_job_id": parent_job_id,
+        "idempotency_key": f"doctor-codex-fix:{parent_job_id}",
         # codex-first (operator 2026-06-03): the fix runs on a codex-capable
         # zeroclaw worker (ChatGPT-OAuth, NO API key). hard:codex gates it to
         # codex workers only AND stops the doctor (no codex cap) from re-claiming
