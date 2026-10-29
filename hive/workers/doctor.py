@@ -4248,6 +4248,175 @@ def complete_stuck_verdict_jobs(jobs: list[dict]) -> dict:
     return summary
 
 
+# ── needs-review evidence (docs/NEEDS_REVIEW_POLICY.md, step 1: report only) ──
+# Every function here is read-only and fail-soft: an evidence source that is
+# missing, slow or wrong yields "unknown", never an exception and never a write.
+UNKNOWN = "unknown"
+_SUPERSEDING_STATUSES = ("running", "done")
+
+
+def branch_merged_into_base(job: dict) -> bool | None:
+    """Whether the row's head branch is already merged into its base branch.
+
+    True/False when the answer is certain, None when it cannot be known. The
+    repo is resolved through the catalog (``resolve_remote_url``: unambiguous
+    ids only, validated URL). A bare repo on a local path answers with
+    ``merge-base --is-ancestor``; any other remote can only prove the trivial
+    case (head sha == base sha) through ``git ls-remote``, otherwise None.
+    """
+    try:
+        from hive.bus.domain import branch_admission as ba
+
+        head = str(job.get("head_branch") or "")
+        base = str(job.get("base_branch") or "")
+        if not (ba.valid_branch_name(head) and ba.valid_branch_name(base)):
+            return None
+        url = ba.resolve_remote_url(job.get("repo"))
+        if not url:
+            return None
+        env = ba._probe_env()
+        if url.startswith("/"):
+            proc = subprocess.run(
+                ["git", f"--git-dir={url}", "merge-base", "--is-ancestor", f"refs/heads/{head}", f"refs/heads/{base}"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=20,
+                check=False,
+                shell=False,
+            )
+            return {0: True, 1: False}.get(proc.returncode)
+        shas = {}
+        for name in (head, base):
+            proc = subprocess.run(
+                ["git", "ls-remote", "--heads", url, f"refs/heads/{name}"],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=20,
+                check=False,
+                shell=False,
+            )
+            line = (proc.stdout or "").split()
+            if proc.returncode != 0 or len(line) < 2:
+                return None
+            shas[name] = line[0]
+        return True if shas[head] == shas[base] else None
+    except Exception:  # noqa: BLE001 - evidence is best effort
+        return None
+
+
+def _make_branch_jobs_fetcher():
+    """A once-per-sweep lister of jobs (any status) for ``head_branch`` lookups.
+
+    The API has no head_branch filter, so one unfiltered listing is fetched
+    lazily and reused for every row. Raises on a failed fetch (the caller maps
+    that to "unknown").
+    """
+    cache: list[list[dict]] = []
+
+    def fetch(job: dict) -> list[dict]:
+        if not cache:
+            code, response = _http("GET", "/v1/jobs?limit=1000&include_result=false", timeout=15.0)
+            if code != 200 or not isinstance(response, dict) or not isinstance(response.get("jobs"), list):
+                raise RuntimeError(f"job listing unavailable http={code}")
+            cache.append(list(response["jobs"]))
+        branch = job.get("head_branch")
+        return [j for j in cache[0] if j.get("head_branch") == branch]
+
+    return fetch
+
+
+def _as_float(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def needs_review_superseder(job: dict, branch_jobs: list[dict]) -> str | None:
+    """Id of the newest job on the same head branch (same repo when both name
+    one) created after ``job`` that is running or done; None when there is none."""
+    created = _as_float(job.get("created_at"))
+    if created is None:
+        return None
+    newer = [
+        j
+        for j in branch_jobs
+        if j.get("id")
+        and str(j.get("id")) != str(job.get("id"))
+        and j.get("head_branch") == job.get("head_branch")
+        and j.get("status") in _SUPERSEDING_STATUSES
+        and (_as_float(j.get("created_at")) or 0.0) > created
+        and not (job.get("repo") and j.get("repo") and job.get("repo") != j.get("repo"))
+    ]
+    if not newer:
+        return None
+    newer.sort(key=lambda j: ((_as_float(j.get("created_at")) or 0.0), str(j.get("id"))))
+    return str(newer[-1]["id"])
+
+
+def gather_needs_review_evidence(job: dict, *, merged_fn, branch_jobs_fn, state=None, now: float | None = None) -> dict:
+    """Read-only evidence for one needs-review row; any field may be "unknown"."""
+    state = STATE if state is None else state
+    now = time.time() if now is None else now
+    jid = str(job.get("id") or "")
+    head = job.get("head_branch")
+    evidence: dict = {"job_id": jid, "head_branch": head, "base_branch": job.get("base_branch")}
+    if not head:
+        evidence["merged"] = False
+        evidence["superseded_by"] = None
+    else:
+        try:
+            merged = merged_fn(job)
+            evidence["merged"] = merged if isinstance(merged, bool) else UNKNOWN
+        except Exception:  # noqa: BLE001
+            evidence["merged"] = UNKNOWN
+        try:
+            evidence["superseded_by"] = needs_review_superseder(job, list(branch_jobs_fn(job)))
+        except Exception:  # noqa: BLE001
+            evidence["superseded_by"] = UNKNOWN
+    try:
+        parked_at = state.last_mark(f"loop_park:{jid}") if jid else None
+    except Exception:  # noqa: BLE001
+        parked_at = UNKNOWN
+    if parked_at == UNKNOWN:
+        evidence["doctor_parked"] = UNKNOWN
+        evidence["parked_age_sec"] = UNKNOWN
+    else:
+        evidence["doctor_parked"] = parked_at is not None
+        evidence["parked_age_sec"] = max(0.0, now - float(parked_at)) if parked_at is not None else None
+    return evidence
+
+
+def needs_review_suggestion(evidence: dict) -> str:
+    """The suggested (never executed) action for one row's evidence."""
+    if evidence.get("merged") is True:
+        return "merged: safe to cancel"
+    superseded_by = evidence.get("superseded_by")
+    if superseded_by not in (None, UNKNOWN):
+        return f"superseded by {superseded_by}: safe to cancel"
+    if not evidence.get("head_branch"):
+        return "needs a human: row has no head branch to check"
+    gaps = [name for name in ("merged", "superseded_by") if evidence.get(name) == UNKNOWN]
+    if gaps:
+        return "needs a human: evidence unknown (" + ", ".join(gaps) + ")"
+    reason = "not merged and not superseded"
+    if evidence.get("doctor_parked") is True:
+        age = evidence.get("parked_age_sec")
+        reason += (
+            f"; parked by the doctor {int(age // 3600)}h ago" if isinstance(age, float) else "; parked by the doctor"
+        )
+    return f"needs a human: {reason}"
+
+
+def needs_review_evidence_fn(*, merged_fn=None, branch_jobs_fn=None):
+    """Bind the evidence sources (looked up at call time, so tests can inject)."""
+    merged_fn = merged_fn or branch_merged_into_base
+    branch_jobs_fn = branch_jobs_fn or _make_branch_jobs_fetcher()
+    now = time.time()
+    return lambda job: gather_needs_review_evidence(job, merged_fn=merged_fn, branch_jobs_fn=branch_jobs_fn, now=now)
+
+
 def report_needs_review_sweep() -> dict:
     """Classify old needs-review jobs without cancelling, deleting, or retagging,
     and complete the stuck ``codex_delivery_failed`` rows whose verdict JSON is
@@ -4255,6 +4424,15 @@ def report_needs_review_sweep() -> dict:
     row, dry-run via ``DOCTOR_VERDICT_COMPLETION_DRY_RUN=1``)."""
     jobs = fetch_needs_review_jobs()
     rows = doctor_v2.sweep_needs_review(jobs, older_than_hours=NEEDS_REVIEW_OLDER_HOURS)
+    # Step 1 of docs/NEEDS_REVIEW_POLICY.md: evidence and a suggested action per
+    # row, report only. Nothing below this line writes to the bus or to STATE.
+    by_id = {str(j.get("id")): j for j in jobs if j.get("id")}
+    rows = [dict(row) for row in rows]
+    evidence_fn = needs_review_evidence_fn()
+    for row in rows:
+        evidence = evidence_fn(by_id.get(str(row.get("job_id")), {"id": row.get("job_id")}))
+        row["evidence"] = evidence
+        row["suggested_action"] = needs_review_suggestion(evidence)
     for row in rows:
         log.info("needs-review report-only: %s", row)
         broadcast_doctor_message("doctor.needs_review", {"host": AGENT_HOST, **row})
