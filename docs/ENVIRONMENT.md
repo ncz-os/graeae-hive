@@ -46,6 +46,18 @@ Unset `HIVE_FLEET_INVENTORY`: no host is known, so a restart is refused **by
 name** and token-mismatch auto-fix falls through to the LLM instead of SSHing to a
 guess. Editing the inventory takes effect on the next doctor start.
 
+### cixmini
+
+`cixmini` is the one host the restart allowlist still names statically, because
+its address and its sudo user are their own variables and the inventory cannot
+carry a sudo user.
+
+| Variable | Meaning | Example |
+|---|---|---|
+| `CIXMINI_IP` | Address of the cixmini host, used by the restart allowlist. | `<cixmini-host>` |
+| `DOCTOR_CIXMINI_SUDO_USER` | Sudo user for the cixmini restart recipe. | `<cixmini-sudo-user>` |
+| `CIXMINI_SSH_PASSWORD` | SSH password for the cixmini host. | — |
+
 ## Doctor model endpoints (all required)
 
 Every phase base is env-only. There is no CERBERUS/TYDEUS default: which host
@@ -90,3 +102,62 @@ no failover rung.
 
 Unset with the bus enabled: the tool raises a configuration error before running
 (it does not post anywhere); `--no-bus` runs it offline.
+
+## Before deploy
+
+Every variable above is a variable the doctor needs *at runtime*, and none of
+them has a default any more. That is the point — but it moves the failure: a
+container started without them no longer crashes, it starts *wrong*. It logs one
+line, disables the feature that needed the variable, and keeps polling. Nothing
+is broken and nothing looks broken; the doctor is simply blind, and you find
+out later that a job was never triaged.
+
+So check before you start it, not after:
+
+```bash
+# in the container image / host, with the doctor's environment loaded
+python scripts/check_env.py
+
+# ... and, if you want proof the bus is reachable at the configured address
+python scripts/check_env.py --probe
+
+# to check a specific environment file instead of the process environment
+python scripts/check_env.py --env-file /etc/graeae/doctor.env
+```
+
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | Ready: every required variable passed (and the probe answered, if `--probe` was given). |
+| `1` | Not ready: at least one required variable is missing or malformed. The failing variables are named on stdout. |
+| `2` | The variables are fine but the probe did not answer. The bus is not reachable at `HIVE_URL`. |
+
+`--probe` does exactly one bounded GET against `HIVE_URL/v1/agents/stats`, with
+a short timeout, and reports the status only — never the body.
+
+Secret values are never printed. The rule is by **name**: any variable whose
+name contains `token`, `key`, `secret`, `password`, `passwd` or `credential` is
+reported as `ok (set)` and nothing else, so a token that lands in a variable
+someone forgot to mark secret still is not echoed. A URL that turns out to
+carry embedded credentials is reported with the userinfo replaced by `***@`
+rather than as the whole URL.
+
+The list of variables the checker enforces is machine-readable:
+[`docs/environment-requirements.json`](environment-requirements.json). It is the
+twin of this document, and a test asserts the two agree — a variable added to
+one and not the other fails the suite, so the checker and this page cannot
+drift apart.
+
+Required for the doctor, in one place:
+
+| Variable | Why it is required |
+|---|---|
+| `HIVE_URL` | Every bus call the doctor makes goes through it. |
+| `HIVE_BUS_ADMIN_TOKEN` | The doctor registers as an orchestrator and calls `/v1/admin/*`; both use the admin token. |
+| `HIVE_FLEET_INVENTORY` | Without it no host address is known, so restarts and token-mismatch auto-fix are refused. |
+| `DOCTOR_OPENWEIGHT_BASE_URL` | Serves the triage and review phases and every unknown phase. |
+| `DOCTOR_FIX_BASE_URL` | Where the fix model is served. |
+| `DOCTOR_OPENWEIGHT_MODEL` | The model id the open-weight path asks for; there is no safe default to guess. |
+| `MNEMOS_URL` | Loop-event fetches go to MNEMOS; without it the doctor cannot classify a failed loop. |
+| `MNEMOS_TOKEN` | `fetch_loop_events` returns `None` without it, so the loop classification silently stops. |

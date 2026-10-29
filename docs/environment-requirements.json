@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "Machine-readable form of docs/ENVIRONMENT.md.",
+    "",
+    "The markdown is what an operator reads; this file is what scripts/check_env.py",
+    "reads. test_check_env_20261029.py asserts the two agree, so neither can drift",
+    "from the other: a variable added to one and not the other fails the suite.",
+    "",
+    "Fields per variable:",
+    "  name    - the environment variable name.",
+    "  kind    - how it is validated: url | url_list | text | text_list | secret | inventory.",
+    "  required- true when the deploy gate fails if this variable is missing or",
+    "           malformed. 'required' applies to the profiles named in 'profiles'.",
+    "  profiles- the deployment profiles the 'required' flag applies to. Omitted",
+    "           means every profile.",
+    "  why     - what breaks when it is missing. Keep it true.",
+    "  meaning - one line, mirrored in the markdown table.",
+    "  example - a placeholder value. Never a real address or token.",
+    "  source  - where in the tree the variable is read, so a reader can check it."
+  ],
+  "variables": [
+    {
+      "name": "HIVE_URL",
+      "kind": "url",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "Every bus call the doctor makes goes through it; unset and the doctor sees no bus at all.",
+      "meaning": "Base URL of the graeae-hive bus.",
+      "example": "http://<bus-host>:5005",
+      "source": "hive/workers/doctor.py:78"
+    },
+    {
+      "name": "HIVE_BUS_TOKEN",
+      "kind": "secret",
+      "required": false,
+      "why": "Worker-tier bearer token; only needed when the bus requires worker auth.",
+      "meaning": "Optional worker-tier bearer token.",
+      "example": "",
+      "source": "hive/workers/doctor.py:92"
+    },
+    {
+      "name": "HIVE_BUS_ADMIN_TOKEN",
+      "kind": "secret",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "The doctor registers as an orchestrator and calls /v1/admin/*; both use the admin token.",
+      "meaning": "Admin-tier bearer token; the doctor needs it to register as an orchestrator and to call /v1/admin/*.",
+      "example": "",
+      "source": "hive/workers/doctor.py:93"
+    },
+    {
+      "name": "HIVE_FLEET_INVENTORY",
+      "kind": "inventory",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "Without it no host address is known, so restarts and token-mismatch auto-fix are refused.",
+      "meaning": "Path to the fleet inventory JSON. No default path, because a default path would itself carry an address.",
+      "example": "/etc/graeae/fleet-inventory.json",
+      "source": "hive/core/fleet_inventory.py:42"
+    },
+    {
+      "name": "ARGONAS_SSH_HOST",
+      "kind": "text",
+      "required": false,
+      "why": "Needed to build ssh:// clone URLs and to run ARGONAS discovery; the NFS mount covers cloning without it.",
+      "meaning": "ARGONAS hostname or address, used to build ssh:// clone URLs and to run ARGONAS discovery.",
+      "example": "<argonas-host>",
+      "source": "hive/registry.py:43"
+    },
+    {
+      "name": "ARGONAS_SSH_PASS",
+      "kind": "secret",
+      "required": false,
+      "why": "Discovery only; the doctor never needs it to clone.",
+      "meaning": "Password for the ARGONAS discovery user.",
+      "example": "",
+      "source": "hive/core/config.py:117"
+    },
+    {
+      "name": "DOCTOR_OPENWEIGHT_BASE_URL",
+      "kind": "url",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "Serves the triage and review phases and every unknown phase; unset disables the model call entirely.",
+      "meaning": "OpenAI-compatible base for the triage/review phases and any unknown phase.",
+      "example": "http://<openweight-host>:8080/v1",
+      "source": "hive/workers/doctor.py:141"
+    },
+    {
+      "name": "DOCTOR_TRIAGE_BASE_URL",
+      "kind": "url",
+      "required": false,
+      "why": "Defaults to DOCTOR_OPENWEIGHT_BASE_URL; only needed to send triage somewhere else.",
+      "meaning": "Triage phase base. Defaults to DOCTOR_OPENWEIGHT_BASE_URL.",
+      "example": "http://<triage-host>:8080/v1",
+      "source": "hive/workers/doctor.py:152"
+    },
+    {
+      "name": "DOCTOR_REVIEW_BASE_URL",
+      "kind": "url",
+      "required": false,
+      "why": "Defaults to DOCTOR_OPENWEIGHT_BASE_URL; only needed to send review somewhere else.",
+      "meaning": "Review phase base. Defaults to DOCTOR_OPENWEIGHT_BASE_URL.",
+      "example": "http://<review-host>:8080/v1",
+      "source": "hive/workers/doctor.py:153"
+    },
+    {
+      "name": "DOCTOR_FIX_BASE_URL",
+      "kind": "url",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "Where the fix model is served; unset disables the fix phase with one log line.",
+      "meaning": "Fix phase base (where the fix model is served).",
+      "example": "http://<fix-host>:8006/v1",
+      "source": "hive/workers/doctor.py:154"
+    },
+    {
+      "name": "DOCTOR_FALLBACK_BASE_URLS",
+      "kind": "url_list",
+      "required": false,
+      "why": "With no rungs there is no failover; the phase base is the whole chain.",
+      "meaning": "Comma list of local bases tried after the phase base, in order. No default rungs.",
+      "example": "http://<fallback-a>:8080/v1,http://<fallback-b>:8080/v1",
+      "source": "hive/workers/doctor.py:171"
+    },
+    {
+      "name": "DOCTOR_FALLBACK_MODELS",
+      "kind": "text_list",
+      "required": false,
+      "why": "Parallel to the fallback bases; does nothing with no bases.",
+      "meaning": "Parallel list of model ids, one per fallback base.",
+      "example": "gemma4-e2b,gemma4-31b",
+      "source": "hive/workers/doctor.py:179"
+    },
+    {
+      "name": "DOCTOR_OPENWEIGHT_MODEL",
+      "kind": "text",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "The model id the open-weight path asks for; there is no safe default to guess.",
+      "meaning": "Model id for the open-weight path.",
+      "example": "gpt-oss-20b",
+      "source": "hive/workers/doctor.py:142"
+    },
+    {
+      "name": "DOCTOR_OPENWEIGHT_API_KEY",
+      "kind": "secret",
+      "required": false,
+      "why": "Only when the serving side wants a key.",
+      "meaning": "Key for the open-weight path, when the server wants one.",
+      "example": "",
+      "source": "hive/workers/doctor.py:143"
+    },
+    {
+      "name": "DOCTOR_REVIEWER_HEALTH_URL",
+      "kind": "url",
+      "required": false,
+      "why": "Unset means assume healthy; the requeue cap still applies.",
+      "meaning": "Optional bounded probe used by the loop sweep before an automatic requeue.",
+      "example": "http://<review-host>:8080/health",
+      "source": "hive/workers/loop_outcome.py:147"
+    },
+    {
+      "name": "HIVE_TYDEUS_BASE_URL",
+      "kind": "url",
+      "required": false,
+      "why": "Unset leaves the strict-route coder's base checked for shape only, and logs that once.",
+      "meaning": "Pins the exact base the strict-route coder must be served from.",
+      "example": "http://<strict-route-host>:8006/v1",
+      "source": "deploy/hive_worker.py:194"
+    },
+    {
+      "name": "MNEMOS_URL",
+      "kind": "url",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "Loop-event fetches go to MNEMOS; without it the doctor cannot classify a failed loop.",
+      "meaning": "MNEMOS base URL (MCP bridge, Settings.mnemos_url, loop-event fetches).",
+      "example": "http://<mnemos-host>:5002",
+      "source": "hive/workers/loop_outcome.py:70"
+    },
+    {
+      "name": "MNEMOS_TOKEN",
+      "kind": "secret",
+      "required": true,
+      "profiles": [
+        "doctor"
+      ],
+      "why": "fetch_loop_events returns None without it, so the doctor's loop classification silently stops.",
+      "meaning": "MNEMOS bearer token.",
+      "example": "",
+      "source": "hive/workers/loop_outcome.py:70"
+    },
+    {
+      "name": "HIVE_BUS_URL",
+      "kind": "url",
+      "required": false,
+      "why": "Only the deepseek spend alert reads it.",
+      "meaning": "Bus base URL used by hive/tools/deepseek_spend_alert.py.",
+      "example": "http://<bus-host>:5005",
+      "source": "hive/tools/deepseek_spend_alert.py:106"
+    },
+    {
+      "name": "CIXMINI_IP",
+      "kind": "text",
+      "required": false,
+      "why": "cixmini's address is its own variable because the restart recipe needs it separately from the inventory.",
+      "meaning": "Address of the cixmini host, used by the restart allowlist.",
+      "example": "<cixmini-host>",
+      "source": "hive/workers/doctor_gates.py:273"
+    },
+    {
+      "name": "DOCTOR_CIXMINI_SUDO_USER",
+      "kind": "text",
+      "required": false,
+      "why": "The restart recipe needs a sudo user; unset and the cixmini restart is refused.",
+      "meaning": "Sudo user for the cixmini restart recipe.",
+      "example": "<cixmini-sudo-user>",
+      "source": "hive/workers/doctor_gates.py:276"
+    },
+    {
+      "name": "CIXMINI_SSH_PASSWORD",
+      "kind": "secret",
+      "required": false,
+      "why": "Only needed when cixmini's inventory entry says auth=password.",
+      "meaning": "SSH password for the cixmini host.",
+      "example": "",
+      "source": "hive/workers/doctor_gates.py:279"
+    }
+  ]
+}
