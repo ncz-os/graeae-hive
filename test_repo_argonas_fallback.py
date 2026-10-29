@@ -504,6 +504,12 @@ class IdContractTests(_FallbackCase):
     def test_case_is_not_a_tolerance_for_the_fallback(self):
         # Catalog lookups are case-insensitive; the filesystem is NOT, so the
         # fallback must not silently answer for a differently-cased name.
+        # macOS default APFS is case-insensitive: the OS itself resolves the
+        # differently-cased path, so this Linux-only contract cannot hold.
+        import sys
+
+        if sys.platform == "darwin":
+            self.skipTest("case-sensitive filesystem required: macOS APFS is case-insensitive")
         _make_bare(self.root, "lowercase")
         self.assertIsNone(repos.find_exact("LowerCase"))
         self.assertIsNone(repos.get_repo("LOWERCASE"))
@@ -851,7 +857,10 @@ class OldCodeContrastTests(unittest.TestCase):
     baseline revision is not available (shallow export, no git).
     """
 
-    BASELINE = "origin/deploy/integrate-20261017"
+    # Pinned pre-fallback commit: the fallback landed in cf0dd19, so a moving
+    # branch name would stop being the "old" code once merged. Pinning keeps
+    # the old-vs-new contrast deterministic and hermetic (no network).
+    BASELINE = "8307fa1be2aa258652a074a5e0ad0ce511ccceff"
 
     def _load_baseline(self, path: Path):
         spec = importlib.util.spec_from_file_location("baseline_repos", path)

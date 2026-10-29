@@ -43,13 +43,19 @@ class GitGuardianConfigShapeTests(unittest.TestCase):
         )
 
     def test_config_declares_version_2(self):
-        import yaml  # local import: optional dep in some environments
+        try:
+            import yaml  # local import: optional dep in some environments
+        except ModuleNotFoundError:
+            self.skipTest("pyyaml not installed: cannot parse .gitguardian.yaml")
 
         cfg = yaml.safe_load(_config_text())
         self.assertEqual(cfg.get("version"), 2, "version: 2 is required")
 
     def test_ignored_paths_is_present_and_iterable(self):
-        import yaml
+        try:
+            import yaml
+        except ModuleNotFoundError:
+            self.skipTest("pyyaml not installed: cannot parse .gitguardian.yaml")
 
         cfg = yaml.safe_load(_config_text())
         secret = cfg.get("secret") or {}
@@ -62,7 +68,10 @@ class GitGuardianConfigShapeTests(unittest.TestCase):
         # Every path in ignored-paths must (a) exist in the repo and (b) live
         # under the test layout. A future expansion is allowed; production
         # code never earns an entry here.
-        import yaml
+        try:
+            import yaml
+        except ModuleNotFoundError:
+            self.skipTest("pyyaml not installed: cannot parse .gitguardian.yaml")
 
         cfg = yaml.safe_load(_config_text())
         ignored = (cfg.get("secret") or {}).get("ignored-paths") or []
@@ -98,9 +107,7 @@ class GitGuardianConfigIntegrityTests(unittest.TestCase):
     """The config itself must remain scanner-safe (no complete token literal)."""
 
     FORBIDDEN_HEAD = re.compile("gl" + "pat" + "-" + r"[0-9A-Za-z_-]{18,}")
-    FORBIDDEN_SSHPASS = re.compile(
-        "ssh" + "pass" + r"\s+" + "-p" + r"\s+['\"]?[^\s'\"]"
-    )
+    FORBIDDEN_SSHPASS = re.compile("ssh" + "pass" + r"\s+" + "-p" + r"\s+['\"]?[^\s'\"]")
 
     def test_no_complete_token_literal_in_config(self):
         # Even if a future operator hand-edits the comment block, no GitGuardian

@@ -553,7 +553,9 @@ class OutputFileTests(unittest.TestCase):
         env = {"EIH_API_KEY": FAKE_KEY, "EIH_PROBE_DIR": str(self.dir)}
         code = probe.main([], env=env)
         self.assertEqual(code, 0)
-        rows = [json.loads(line) for line in (self.dir / "eih-probe-2026-10-26.jsonl").read_text().splitlines()]
+        written = sorted(self.dir.glob("eih-probe-*.jsonl"))
+        self.assertEqual(len(written), 1, [p.name for p in written])
+        rows = [json.loads(line) for line in written[0].read_text().splitlines()]
         self.assertEqual(len(rows), len(probe.DEFAULT_MODELS) * 2)  # each 503 retried once
         self.assertTrue(all(row["outcome"] == "503" for row in rows))
 
