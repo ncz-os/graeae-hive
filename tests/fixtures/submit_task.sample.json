@@ -1,0 +1,12 @@
+{
+  "_comment": "Task file for scripts/submit_job.py: kind + description are required, everything else is an optional JobCreate field. Nothing here names an address or a secret.",
+  "kind": "build:ncz-os-image",
+  "description": "Rebuild the NCZ OS image with the firmware blobs from the 2026-10-29 drop and report the checksum.",
+  "project": "ncz",
+  "repo": "ncz/ncz-os-image",
+  "head_branch": "feat/firmware-20261029",
+  "base_branch": "main",
+  "priority": 5,
+  "max_retries": 2,
+  "max_cost_tier": "B"
+}
