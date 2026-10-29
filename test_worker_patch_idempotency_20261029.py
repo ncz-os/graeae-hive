@@ -8,6 +8,13 @@ already have failed the same row, which spends a retry the job never used.
 
 Renewals are deliberately not deduped: repeating ``claimed``/``running`` is how a
 claim lease is kept alive.
+
+Loading note: ``deploy/hive_worker.py`` imports sidecars that ship with the
+deployment and are deliberately not tracked in this repo (``hive_budget``,
+``provenance``, the ``hive.*`` delivery modules). They are stubbed here the way
+``tests/test_terra_worker_delivery.py`` stubs them. Without the stubs ``exec_module``
+raises and every case below becomes a silent skip — which is exactly how these
+regression tests first managed to pass by not running.
 """
 
 from __future__ import annotations
@@ -19,44 +26,40 @@ import types
 
 import pytest
 
-
-def _stub_hive_budget() -> None:
-    """`hive_budget` is a stdlib-only sibling that ships with the deployment, not
-    this repo (tests/test_worker_build_busy.py stubs it the same way). The worker
-    reads only ``FAILURE_REASON`` at import; the rest are runtime helpers these
-    tests never reach, so a minimal module is enough to import patch_job.
-    """
-    if "hive_budget" in sys.modules:
-        return
-    budget = types.ModuleType("hive_budget")
-    budget.FAILURE_REASON = "budget_exceeded"
-    for name in ("from_text", "message_line", "iso_utc", "summary", "reset_at"):
-        setattr(budget, name, lambda *a, **k: None)
-    sys.modules["hive_budget"] = budget
+ROOT = pathlib.Path(__file__).parent
 
 
-def _load_worker():
-    root = pathlib.Path(__file__).parent
-    # deploy/ holds the worker's sibling modules (`provenance`, `retry_policy`, …)
-    # and the repo root holds `hive`; without both, exec_module raises and the whole
-    # module skips — which silently turns these regression tests into no-ops.
-    for entry in (str(root), str(root / "deploy")):
+def _stub(monkeypatch, name: str, **attrs) -> None:
+    """A stand-in module: real attributes where the worker reads one at import,
+    a no-op callable for anything else."""
+    module = types.ModuleType(name)
+    module.__getattr__ = lambda _attr: lambda *a, **k: None  # noqa: ARG005
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+
+
+def _load_worker(monkeypatch):
+    for entry in (str(ROOT), str(ROOT / "deploy")):
         if entry not in sys.path:
             sys.path.insert(0, entry)
-    _stub_hive_budget()
-    path = root / "deploy" / "hive_worker.py"
-    spec = importlib.util.spec_from_file_location("hive_worker_patch_under_test", path)
+    _stub(monkeypatch, "hive_budget", FAILURE_REASON="budget_exceeded")
+    _stub(monkeypatch, "provenance", STATIC_AGENT_MODELS={}, KNOWN_COST_TIERS=set())
+    _stub(monkeypatch, "hive.codex_delivery", fleet_git_env=lambda *a, **k: {})
+    _stub(monkeypatch, "hive.llm_roles")
+    _stub(monkeypatch, "hive.push_policy", argonas_url_for_slug=lambda slug: slug)
+    _stub(monkeypatch, "hive.review_evidence")
+    _stub(monkeypatch, "hive.review_record")
+    spec = importlib.util.spec_from_file_location("hive_worker_patch_under_test", ROOT / "deploy" / "hive_worker.py")
     module = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(module)
-    except BaseException as exc:  # noqa: BLE001 - the worker needs env/host bits on some hosts
-        pytest.skip(f"hive_worker not importable here: {exc}")
+    # No skip: a worker that cannot import here is a broken test, not a passing one.
+    spec.loader.exec_module(module)
     return module
 
 
 @pytest.fixture
 def worker(monkeypatch):
-    module = _load_worker()
+    module = _load_worker(monkeypatch)
     module._terminal_patched.clear()
     calls: list[tuple] = []
 
@@ -86,7 +89,6 @@ def test_the_exception_path_after_an_inner_failure_is_a_no_op(worker):
     """The exact regression: inner run fails the job, then raises, run_job re-fails it."""
     module, calls = worker
     module.patch_job("job-2", "failed", {"failure_reason": "loop_failed"})
-    # run_job's except path:
     module.patch_job("job-2", "failed", {"failure_reason": "unhandled_exception"})
     assert _patched_statuses(calls) == ["failed"]
 
@@ -112,19 +114,15 @@ def test_another_job_is_unaffected(worker):
     assert _patched_statuses(calls) == ["failed", "failed"]
 
 
-def test_a_failed_patch_is_not_remembered(monkeypatch):
+def test_a_failed_patch_is_not_remembered(worker, monkeypatch):
     """Only a 200 counts: a rejected patch must stay retryable."""
-    module = _load_worker()
-    module._terminal_patched.clear()
-    calls: list[tuple] = []
+    module, calls = worker
 
     def _http(method, path, body=None, **_kw):
         calls.append((method, path, body))
         return 500, {}
 
-    _stub_hive_budget()
     monkeypatch.setattr(module, "_http", _http)
-    monkeypatch.setattr(module, "_claim_provenance", lambda job_id: {})
     assert module.patch_job("job-7", "failed", {}) is False
     assert module.patch_job("job-7", "failed", {}) is False
     assert len(calls) == 2, "a failed terminal patch must be retryable"
