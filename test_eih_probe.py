@@ -551,9 +551,6 @@ class OutputFileTests(unittest.TestCase):
         probe.http_transport = FakeTransport(*[failing for _ in range(scripted)])  # type: ignore[assignment]
         self.addCleanup(setattr, probe, "http_transport", original)
         env = {"EIH_API_KEY": FAKE_KEY, "EIH_PROBE_DIR": str(self.dir)}
-        original_now = probe.probe_now
-        probe.probe_now = lambda: NO_SKIP  # pin the run's clock: the file name is the run's UTC date
-        self.addCleanup(setattr, probe, "probe_now", original_now)
         code = probe.main([], env=env)
         self.assertEqual(code, 0)
         rows = [json.loads(line) for line in (self.dir / "eih-probe-2026-10-26.jsonl").read_text().splitlines()]

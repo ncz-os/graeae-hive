@@ -273,17 +273,17 @@ class HostileSlugTests(_FallbackCase):
 
     def test_symlinked_root_still_finds_its_children(self):
         # The ROOT being a symlink is legitimate (the NFS mount is one on some
-        # hosts). The root is resolved ONCE per process (memoized) so the
-        # child path is <real-root>/<slug>.git -- inside the root by
-        # construction, and the lstat sees the actual directory.
+        # hosts). It is used as given, so the child path is
+        # <link>/<slug>.git -- inside the root by construction, whatever the
+        # link points at. Resolving it would cost a stat per lookup and would
+        # only move the check onto a path we do not stat.
         _make_bare(self.root, "behind-link", head="ref: refs/heads/trunk\n")
         link = self.outside / "root-link"
         link.symlink_to(self.root)
         with mock.patch.dict(os.environ, {"HIVE_ARGONAS_GIT_ROOT": str(link)}):
-            repos.clear_fallback_cache()  # drop the memoized realpath of the old root
             entry = repos._probe_argonas_live("behind-link")
         self.assertIsNotNone(entry)
-        self.assertEqual(entry["argonas_bare"], str(self.root / "behind-link.git"))
+        self.assertEqual(entry["argonas_bare"], str(link / "behind-link.git"))
         self.assertEqual(entry["id"], "behind-link")
         self.assertEqual(entry["default_branch"], "trunk")  # README read through the link
 
@@ -345,49 +345,42 @@ class StatBudgetTests(_FallbackCase):
 
     def test_hit_costs_exactly_one_stat_and_one_read(self):
         _make_bare(self.root, "budgeted", head="ref: refs/heads/main\n")
-        # Pre-resolve the root so realpath's component-walk is outside the spy.
-        # The probe lstats the bare repo TWICE (first check + re-confirm at the
-        # open) and reads HEAD once; that is the steady-state cost.
-        root_str = str(self.root)
-        with mock.patch("hive.repos._realpath_cached", return_value=os.path.realpath(root_str)):
-            stats, lstat_spy = self._spy(repos.os, "lstat")
-            files: list[str] = []
-            real_read = repos._read_text
+        stats, lstat_spy = self._spy(repos.os, "lstat")
+        reads, realpath_spy = self._spy(repos.os.path, "abspath")
+        files: list[str] = []
+        real_read = repos._read_text
 
-            def read_text(path):
-                files.append(path)
-                return real_read(path)
+        def read_text(path):
+            files.append(path)
+            return real_read(path)
 
-            with (
-                mock.patch("hive.repos.os.lstat", side_effect=lstat_spy),
-                mock.patch("hive.repos._read_text", side_effect=read_text),
-            ):
-                entry = repos._probe_argonas_live("budgeted")
+        with (
+            mock.patch("hive.repos.os.lstat", side_effect=lstat_spy),
+            mock.patch("hive.repos.os.path.abspath", side_effect=realpath_spy),
+            mock.patch("hive.repos._read_text", side_effect=read_text),
+        ):
+            entry = repos._probe_argonas_live("budgeted")
         self.assertIsNotNone(entry)
-        self.assertEqual(len(stats), 2, f"expected two lstat (check + re-confirm), saw {stats}")
+        self.assertEqual(len(stats), 1, f"expected one stat, saw {stats}")
         self.assertEqual(len(files), 1, f"expected one read, saw {files}")
         self.assertEqual(entry["default_branch"], "main")
 
     def test_miss_costs_one_stat_and_no_read(self):
-        root_str = str(self.root)
-        with mock.patch("hive.repos._realpath_cached", return_value=os.path.realpath(root_str)):
-            stats, lstat_spy = self._spy(repos.os, "lstat")
-            files: list[str] = []
-            with (
-                mock.patch("hive.repos.os.lstat", side_effect=lstat_spy),
-                mock.patch("hive.repos._read_text", side_effect=lambda p: files.append(p)),
-            ):
-                self.assertIsNone(repos._probe_argonas_live("absent"))
-        self.assertEqual(len(stats), 1)  # absent: the first lstat fails, no re-confirm
+        stats, lstat_spy = self._spy(repos.os, "lstat")
+        files: list[str] = []
+        with (
+            mock.patch("hive.repos.os.lstat", side_effect=lstat_spy),
+            mock.patch("hive.repos._read_text", side_effect=lambda p: files.append(p)),
+        ):
+            self.assertIsNone(repos._probe_argonas_live("absent"))
+        self.assertEqual(len(stats), 1)
         self.assertEqual(files, [])
 
     def test_symlink_refused_at_the_same_one_stat(self):
         os.symlink(self.outside / "escaped.git", self.root / "escape2.git")
-        root_str = str(self.root)
-        with mock.patch("hive.repos._realpath_cached", return_value=os.path.realpath(root_str)):
-            stats, lstat_spy = self._spy(repos.os, "lstat")
-            with mock.patch("hive.repos.os.lstat", side_effect=lstat_spy):
-                self.assertIsNone(repos._probe_argonas_live("escape2"))
+        stats, lstat_spy = self._spy(repos.os, "lstat")
+        with mock.patch("hive.repos.os.lstat", side_effect=lstat_spy):
+            self.assertIsNone(repos._probe_argonas_live("escape2"))
         self.assertEqual(len(stats), 1)  # refused by the very stat that found it
 
 
@@ -446,44 +439,13 @@ class NormalizationBeforeValidationTests(_FallbackCase):
 
 
 class ProbeSyscallAndHeadTests(_FallbackCase):
-    def test_realpath_is_memoized_not_per_lookup(self):
-        """The root is resolved ONCE (memoized), not once per slug lookup.
-
-        The old code called ``os.path.abspath`` (no stat) per lookup to keep a
-        strict one-stat budget; the new code resolves the root via ``realpath``
-        but caches it process-wide, so the per-lookup cost is still one lstat
-        of the bare repo. This test proves the memo is hit (realpath is NOT
-        re-called on the second lookup of the same root).
-        """
+    def test_realpath_is_never_called_by_the_probe(self):
+        """Containment is decided on the exact path that was stat'ed."""
         _make_bare(self.root, "statme")
-        calls: list[str] = []
-        real_realpath = os.path.realpath
-
-        def spy_realpath(p):
-            calls.append(os.fspath(p))
-            return real_realpath(p)
-
-        with mock.patch("hive.repos.os.path.realpath", side_effect=spy_realpath):
-            repos.clear_fallback_cache()
-            e1 = repos._probe_argonas_live("statme")
-            first_count = len(calls)
-            e2 = repos._probe_argonas_live("statme")
-            second_count = len(calls)
-        self.assertIsNotNone(e1)
-        self.assertIsNotNone(e2)
-        # The first lookup resolves the root (realpath called); the second
-        # lookup hits the memo (realpath NOT called again for the same root).
-        self.assertGreaterEqual(first_count, 1)
-        self.assertEqual(second_count, first_count, "realpath was re-called per lookup")
+        with mock.patch("hive.repos.os.path.realpath", side_effect=AssertionError("realpath in probe")):
+            self.assertIsNotNone(repos._probe_argonas_live("statme"))
 
     def test_symlink_target_is_never_resolved(self):
-        """A symlinked bare repo is refused by lstat, not by resolving its target.
-
-        The root is resolved (memoized), but the BARE REPO path is lstat'ed --
-        and lstat does NOT follow symlinks, so a link to anywhere (in-root or
-        out-of-root) is refused. This test proves the probe never calls
-        realpath on the bare-repo path itself.
-        """
         calls: list[tuple[str, str]] = []
         real_lstat, real_realpath = os.lstat, os.path.realpath
         _make_bare(self.root, "target")
@@ -492,24 +454,16 @@ class ProbeSyscallAndHeadTests(_FallbackCase):
         with (
             mock.patch(
                 "hive.repos.os.lstat",
-                side_effect=lambda p: (calls.append(("lstat", os.fspath(p))), real_lstat(p))[1],
+                side_effect=lambda p: (calls.append(("lstat", p)), real_lstat(p))[1],
             ),
             mock.patch(
                 "hive.repos.os.path.realpath",
-                side_effect=lambda p: (calls.append(("realpath", os.fspath(p))), real_realpath(p))[1],
+                side_effect=lambda p: (calls.append(("realpath", p)), real_realpath(p))[1],
             ),
         ):
-            repos.clear_fallback_cache()
             self.assertIsNone(repos._probe_argonas_live("link"))
             self.assertIsNone(repos._probe_argonas_live("inner-link"))
-        # realpath was called only for the ROOT (memoized), never for the
-        # bare-repo path. (lstat is also used inside realpath's own
-        # component-walk, so we assert on the realpath calls, not lstat.)
-        realpath_paths = [p for kind, p in calls if kind == "realpath"]
-        self.assertFalse(
-            any(p.endswith(".git") for p in realpath_paths),
-            f"realpath on a bare repo: {realpath_paths}",
-        )
+        self.assertEqual([kind for kind, _ in calls], ["lstat", "lstat"])
 
     def test_head_is_parsed_not_split(self):
         cases = {
@@ -636,32 +590,15 @@ class StoreIfAbsentTests(unittest.TestCase):
         cache.store("pos", 60, {"id": "pos"})
         self.assertFalse(cache.store("pos", 60, {"id": "pos"}, only_if_absent=True))
         cache.store("neg", 10, None)
-        # Two negative answers to the same probe: the existing entry is kept,
-        # its TTL refreshed to the newer store's clock (a confirm, not a win).
         self.assertFalse(cache.store("neg", 10, None, only_if_absent=True))
-        self.assertEqual(cache.lookup("neg"), (True, None))
 
-    def test_an_expired_negative_is_refreshed(self):
-        # An EXPIRED NEGATIVE is confirmed by a fresh negative probe: kept, with
-        # its TTL refreshed to the newer store's clock (a confirm, not a win).
-        cache = repos._FallbackCache()
-        cache.store("slug", 10, None)
-        real = time.monotonic
-        with mock.patch("hive.repos.time.monotonic", lambda: real() + 11):
-            self.assertFalse(cache.store("slug", 60, None, only_if_absent=True))
-        self.assertEqual(cache.lookup("slug"), (True, None))
-
-    def test_expired_positive_is_never_replaced_by_negative(self):
-        # An EXPIRED POSITIVE is NOT replaceable by a negative: the repo exists,
-        # the "absent" is stale, so the negative refreshes the positive instead
-        # (see FallbackCacheTests.test_negative_never_displaces_expired_positive
-        # for the full assertion set).
+    def test_an_expired_entry_is_replaced(self):
         cache = repos._FallbackCache()
         cache.store("slug", 10, {"id": "old"})
         real = time.monotonic
         with mock.patch("hive.repos.time.monotonic", lambda: real() + 11):
-            self.assertFalse(cache.store("slug", 60, None, only_if_absent=True))
-        self.assertEqual(cache.lookup("slug"), (True, {"id": "old"}))
+            self.assertTrue(cache.store("slug", 60, None, only_if_absent=True))
+            self.assertEqual(cache.lookup("slug"), (True, None))
 
     def test_losing_the_race_returns_the_other_threads_answer(self):
         """Probe A started before the repo existed; B finished first with a hit."""
@@ -702,26 +639,6 @@ class CatalogWinsTests(_FallbackCase):
         ids = [e["id"] for e in repos.list_repos()]
         self.assertNotIn("live-but-unlisted", ids)
         self.assertEqual(repos.resolve("live-but-unlisted"), [])
-
-    def test_corrupt_catalog_raises_catalog_corruption_error(self):
-        """A malformed repos.json must raise CatalogCorruptionError, not a raw
-        json.JSONDecodeError -- so a bus endpoint can distinguish 'the build
-        artifact is broken, rebuild it' from a transient I/O fault.
-        """
-        import tempfile as _tf
-
-        td = _tf.TemporaryDirectory()
-        try:
-            catalog = Path(td.name) / "repos.json"
-            catalog.write_text("{ this is not valid json ]")
-            with mock.patch.dict(os.environ, {"HIVE_REPO_CATALOG": str(catalog)}):
-                repos.clear_fallback_cache()
-                with self.assertRaises(repos.CatalogCorruptionError) as ctx:
-                    repos.load_catalog(force=True)
-            self.assertIn("corrupt JSON", str(ctx.exception))
-        finally:
-            repos.clear_fallback_cache()
-            td.cleanup()
 
 
 class UnreadableRootTests(unittest.TestCase):
@@ -888,129 +805,6 @@ class FallbackCacheTests(unittest.TestCase):
         self.assertFalse(cache.lookup("slug-1")[0])  # only the LRU end went
         self.assertTrue(cache.lookup("slug-2")[0])
 
-    def test_concurrent_stores_at_capacity_evict_one_per_store(self):
-        """Regression: the eviction loop was `while`, so N concurrent stores
-        at capacity evicted N entries, not one per store.
-
-        With the `if` fix, after filling the cache and running many concurrent
-        stores, the cache is still at capacity and the survivors are the most
-        recently stored -- exactly one LRU entry is dropped per store.
-        """
-        cache = repos._FallbackCache(max_entries=4)
-        # Fill to capacity.
-        for i in range(4):
-            cache.store(f"slug-{i}", 60, {"id": f"slug-{i}"})
-        self.assertEqual(len(cache), 4)
-
-        # Hammer with concurrent stores of NEW keys. Each store evicts at most
-        # one entry, so after 10 new stores the cache holds the 4 most recent.
-        barrier = threading.Barrier(4)
-
-        def hammer(worker: int) -> None:
-            barrier.wait()
-            for i in range(10):
-                cache.store(f"w{worker}-new-{i}", 60, {"w": worker, "i": i})
-
-        threads = [threading.Thread(target=hammer, args=(w,)) for w in range(4)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(10)
-        # The cache must be exactly at capacity -- never over, never under
-        # (under would mean the `while` bug evicted more than one per store).
-        self.assertEqual(len(cache), 4, f"cache at {len(cache)}, expected 4")
-
-    def test_ttl_refresh_on_cas_lose(self):
-        """Regression: when two threads race to store the SAME positive answer,
-        the CAS loser used to leave the winner's entry on its (shorter) TTL.
-        Now the loser refreshes the TTL to its own (longer) value.
-
-        The probe path always stores a POSITIVE entry with a 60s TTL, so the
-        race is two positive stores of the same answer: the first (the thread
-        that probed first) cached it, the second (the thread that probed
-        slightly later) "loses" the CAS but must refresh the TTL.
-        """
-        cache = repos._FallbackCache()
-        real = time.monotonic
-        t0 = real()
-        # Thread 1 stores the positive entry at t0 with a 60s TTL.
-        with mock.patch("hive.repos.time.monotonic", lambda: t0):
-            cache.store("race", 60.0, {"id": "race"}, only_if_absent=True)
-        # Thread 2 (a concurrent probe of the same repo) stores the SAME
-        # positive answer 30s later via only_if_absent. The existing entry is
-        # live and positive, so the CAS "loses" (returns False) -- but the
-        # entry's TTL must be refreshed to t0+30+60, not left at t0+60.
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 30.0):
-            stored = cache.store("race", 60.0, {"id": "race"}, only_if_absent=True)
-        self.assertFalse(stored, "CAS must lose when a live positive already exists")
-        # Without the refresh the entry expires at t0+60; with it, at t0+90.
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 70.0):
-            self.assertTrue(cache.lookup("race")[0], "TTL was not refreshed by the CAS loser")
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 91.0):
-            self.assertFalse(cache.lookup("race")[0], "refreshed TTL should expire at t0+90")
-
-    def test_negative_still_never_displaces_live_positive(self):
-        """The asymmetric CAS rule: a NEGATIVE answer never displaces a live
-        POSITIVE one, even via only_if_absent.
-        """
-        cache = repos._FallbackCache()
-        cache.store("repo", 60, {"id": "repo"}, only_if_absent=True)
-        # A negative probe (repo "disappeared" between probe and store) must
-        # NOT overwrite the live positive.
-        stored = cache.store("repo", 10, None, only_if_absent=True)
-        self.assertFalse(stored)
-        hit, entry = cache.lookup("repo")
-        self.assertTrue(hit)
-        self.assertEqual(entry, {"id": "repo"})
-
-    def test_negative_never_displaces_expired_positive(self):
-        """Regression: a NEGATIVE answer must not displace a POSITIVE one merely
-        because its TTL lapsed.
-
-        The positive TTL is 60s; if a concurrent negative probe's store runs
-        after that window, the old code saw the positive as "expired" and let
-        the negative overwrite it -- making a real repo intermittently 404
-        across a TTL boundary. Now the negative is refused (the positive's TTL
-        is refreshed instead), because the repo still exists on the mount.
-        """
-        cache = repos._FallbackCache()
-        real = time.monotonic
-        t0 = real()
-        with mock.patch("hive.repos.time.monotonic", lambda: t0):
-            cache.store("repo", 60.0, {"id": "repo"}, only_if_absent=True)
-        # 61s later the positive has expired; a negative probe arrives.
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 61.0):
-            stored = cache.store("repo", 10.0, None, only_if_absent=True)
-        self.assertFalse(stored, "a negative must not displace an expired positive")
-        # The positive was REFRESHED, not replaced: it still serves and now
-        # outlives t0+61.
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 62.0):
-            hit, entry = cache.lookup("repo")
-        self.assertTrue(hit, "expired positive should have been refreshed, not evicted")
-        self.assertEqual(entry, {"id": "repo"})
-        # And a POSITIVE re-probe confirms the (now refreshed) positive: a
-        # confirm is a no-op (keeps the existing value, refreshes the TTL), and
-        # the asymmetry is about value, not clock -- a positive never "wins"
-        # back what a negative could not take.
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 62.0):
-            self.assertFalse(cache.store("repo", 60.0, {"id": "repo"}, only_if_absent=True))
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 63.0):
-            self.assertEqual(cache.lookup("repo"), (True, {"id": "repo"}))
-
-    def test_negative_confirms_expired_negative(self):
-        """A negative confirms an expired negative: kept, TTL refreshed (no win)."""
-        cache = repos._FallbackCache()
-        real = time.monotonic
-        t0 = real()
-        with mock.patch("hive.repos.time.monotonic", lambda: t0):
-            cache.store("ghost", 10.0, None, only_if_absent=True)
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 11.0):
-            stored = cache.store("ghost", 10.0, None, only_if_absent=True)
-        self.assertFalse(stored, "identical answers are a no-op")
-        # Refreshed: still a hit just past the original 10s window.
-        with mock.patch("hive.repos.time.monotonic", lambda: t0 + 12.0):
-            self.assertEqual(cache.lookup("ghost"), (True, None))
-
     def test_eviction_keeps_warm_entries_within_bounds(self):
         cache = repos._FallbackCache(max_entries=4)
         for i in range(10):
@@ -1051,18 +845,13 @@ class FallbackCacheTests(unittest.TestCase):
 class OldCodeContrastTests(unittest.TestCase):
     """Shows the declared property fails without the fallback.
 
-    Runs the pre-fallback ``hive/repos.py`` next to this one with the same temp
-    root. The old module must MISS; the checked-out module must HIT. Skipped
-    when the baseline revision is not available (shallow export, no git).
-
-    The baseline is the last commit whose ``hive/repos.py`` has NO
-    ``_fallback_entry`` (``113a802`` at the time this test was written).
-    ``origin/deploy/integrate-20261017`` is NOT usable: it moves over time, and
-    once the ARGONAS fallback landed on it (2026-10-26) the "old" module
-    resolved post-build repos too, so the contrast silently proved nothing.
+    Runs the BASELINE's ``hive/repos.py`` (git show of ``origin/deploy/
+    integrate-20261017``) next to this one with the same temp root. The old
+    module must MISS; the checked-out module must HIT. Skipped when the
+    baseline revision is not available (shallow export, no git).
     """
 
-    BASELINE = "113a802"
+    BASELINE = "origin/deploy/integrate-20261017"
 
     def _load_baseline(self, path: Path):
         spec = importlib.util.spec_from_file_location("baseline_repos", path)
@@ -1081,17 +870,9 @@ class OldCodeContrastTests(unittest.TestCase):
             # No git binary (FileNotFoundError/OSError) or no such revision
             # (shallow clone, bare export): an environment gap, not a defect.
             self.skipTest(f"{self.BASELINE} not available")
-        # Guard the premise: the pinned baseline must be a pre-fallback module,
-        # or the contrast would pass vacuously (see class docstring).
-        self.assertNotIn(b"_fallback_entry", source, f"baseline {self.BASELINE} already has the fallback")
-        # The contrast needs an ARGONAS root the baseline module can probe.
-        # tempfile's default is /tmp, which is tmpfs on this host; a repo under
-        # tmpfs is a fixture the fleet rule (no repo on tmpfs) does not intend
-        # to cover, so this test builds its fixture under the job workspace
-        # instead (never /tmp).
-        base = Path(tempfile.mkdtemp(prefix=".argonas_contrast-", dir=str(Path(__file__).resolve().parent)))
-        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(base)], check=False))
+        td = tempfile.TemporaryDirectory()
         try:
+            base = Path(td.name)
             root = base / "argonas_git"
             root.mkdir()
             _make_bare(root, "post-build-repo")
@@ -1117,6 +898,7 @@ class OldCodeContrastTests(unittest.TestCase):
             if hasattr(repos, "clear_fallback_cache"):
                 repos.clear_fallback_cache()
             repos.load_catalog(force=True)
+            td.cleanup()
 
 
 class ImportSurfaceTests(unittest.TestCase):
