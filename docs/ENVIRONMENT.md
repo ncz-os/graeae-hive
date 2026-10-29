@@ -24,6 +24,27 @@ Unset `HIVE_URL`: the doctor warns once and its bus calls return "no answer"; a
 worker refuses to poll and exits `2`; the watcher skips bus calls; `bs_audit.py`
 refuses to run.
 
+### Agent deregistration and the stale-agent reaper
+
+`POST /v1/agents/{urn}/deregister` takes an agent offline and records why. Body
+(optional): `{"reason": "<text>"}`. Allowed for the admin tier
+(`Authorization: Bearer $HIVE_BUS_ADMIN_TOKEN`, with that variable set in the
+bus's own environment) or for the agent itself (`X-Hive-Actor` equal to the urn;
+`X-Hive-Token` too when `HIVE_SHARED_SECRET` is set). Any other caller gets
+`401`/`403`; an unknown urn gets `404`. With `HIVE_BUS_ADMIN_TOKEN` unset on the
+bus nobody is admin-tier, so only the agent itself can deregister.
+
+It is idempotent: the reason and time are stored in the agent's metadata under
+`deregistered`, and a repeat call on an agent already offline returns the same
+record with `200` and changes nothing (no second event). Unstarted
+(`offered`/`claimed`) jobs the agent held are released back to the queue, as the
+reaper does for a dead agent; running jobs are left to the orphan-claim sweep.
+`/v1/agents/stats` counts the agent under `offline`.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `HIVE_AGENT_STALE_SECONDS` | Reaper rule: an agent with no heartbeat for this many seconds becomes `offline` (the same transition as the built-in 300s rule). It can only shorten the window; unset, blank, non-numeric, non-positive, or above 300 leaves behaviour exactly as before (`stale` at 90s, `offline` at 300s). Read on every reaper pass. | unset |
+
 ## Fleet addresses
 
 | Variable | Meaning | Example |

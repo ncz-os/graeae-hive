@@ -278,6 +278,23 @@ async def require_mutation_actor(
     return str(x_hive_actor).strip()
 
 
+def is_admin_tier(authorization: str | None) -> bool:
+    """True when the request carries the bus ADMIN-tier bearer token.
+
+    The admin token is ``HIVE_BUS_ADMIN_TOKEN`` (the same variable the doctor and
+    the MCP bridge send as ``Authorization: Bearer`` for admin calls). Fail
+    closed: when the variable is unset nobody is admin-tier, so only an agent's
+    own identity (X-Hive-Actor) can use an admin-or-self route.
+    """
+    admin_token = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
+    if not admin_token or not authorization:
+        return False
+    scheme, _, supplied = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not supplied.strip():
+        return False
+    return hmac.compare_digest(supplied.strip(), admin_token)
+
+
 async def _cascade_delete_jobs(db, job_ids: list[str], *, allow_active: bool = False) -> list[str]:
     """Delete the given jobs and their job_audit_log rows. ATOMIC active-job guard.
 

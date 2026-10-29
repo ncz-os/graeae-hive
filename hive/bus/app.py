@@ -26,6 +26,7 @@ from hive.bus.deps import (
     release_dependencies,
 )
 
+
 async def _cancel_stale_jobs(db, repo, *, cutoff: float, now: float) -> int:
     """Cancel observed stale queued jobs and release their dependencies atomically."""
     candidates = await repo.stale_cancel_candidates(db, cutoff=cutoff)
@@ -46,10 +47,12 @@ from hive.bus.domain.capacity_ledger import flush_capacity_ledger, load_capacity
 from hive.bus.domain.reaper import select_orphan_claims
 from hive.bus.routers.admin import admin_requeue_jobs  # noqa: F401 (re-export for tests)
 from hive.bus.routers.admin import router as _admin_router
+
+# Compat re-exports — symbols moved into routers during Phase 1c, kept on the
+# agent_bus facade for tests + external callers that still import from here.
+from hive.bus.routers.agents import heartbeat, list_agents, register  # noqa: F401 (re-export)
 from hive.bus.routers.agents import router as _agents_router
 from hive.bus.routers.events import router as _events_router
-from hive.bus.routers.mcp import router as _mcp_router
-from hive.bus.routers.system import router as _system_router
 from hive.bus.routers.jobs import (  # noqa: F401 (re-export)
     auto_retry_job,
     claim_job,
@@ -60,18 +63,15 @@ from hive.bus.routers.jobs import (  # noqa: F401 (re-export)
     zcgate_release,
 )
 from hive.bus.routers.jobs import router as _jobs_router
+from hive.bus.routers.mcp import mcp_rpc  # noqa: F401 (re-export)
+from hive.bus.routers.mcp import router as _mcp_router
+from hive.bus.routers.messages import list_messages, publish_message  # noqa: F401 (re-export)
 from hive.bus.routers.messages import router as _messages_router
 from hive.bus.routers.repos import router as _repos_router
 from hive.bus.routers.schedules import router as _schedules_router
 from hive.bus.routers.stats import router as _stats_router
-
-# Compat re-exports — symbols moved into routers during Phase 1c, kept on the
-# agent_bus facade for tests + external callers that still import from here.
-from hive.bus.routers.agents import heartbeat, list_agents, register  # noqa: F401 (re-export)
-from hive.bus.routers.mcp import mcp_rpc  # noqa: F401 (re-export)
-from hive.bus.routers.messages import list_messages, publish_message  # noqa: F401 (re-export)
 from hive.bus.routers.system import dashboard, health  # noqa: F401 (re-export)
-from hive.persistence.sqlite import DDL as SCHEMA  # noqa: F401 (re-export: sqlite DDL lives in the backend)
+from hive.bus.routers.system import router as _system_router
 from hive.bus.schemas import (
     JobCreate,
     JobPurgeRequest,  # noqa: F401 (re-export for tests)
@@ -82,6 +82,7 @@ from hive.bus.schemas import (
 
 # Re-exported for back-compat: mcp_bridge consumers + tests read these off agent_bus.
 from hive.core.roles import ORCHESTRATOR_RUNTIMES, WORKER_ONLY_RUNTIMES  # noqa: F401
+from hive.persistence.sqlite import DDL as SCHEMA  # noqa: F401 (re-export: sqlite DDL lives in the backend)
 
 HIVE_BACKEND = os.environ.get("HIVE_BACKEND", "sqlite").lower()
 HEARTBEAT_REAP_INTERVAL = 30.0
@@ -245,52 +246,77 @@ CLAIM_HARD_MAX_AGE_BY_KIND = {
 }
 
 
+def agent_offline_after() -> float:
+    """Seconds without a heartbeat after which the reaper marks an agent offline.
+
+    ``HEARTBEAT_OFFLINE_AFTER`` (300s) unless ``HIVE_AGENT_STALE_SECONDS`` names
+    a SHORTER window. Unset, blank, non-numeric or non-positive values leave the
+    behaviour exactly as before; a value above 300 cannot relax the existing
+    rule. Read at call time so a restart is not needed to see the setting."""
+    raw = (os.environ.get("HIVE_AGENT_STALE_SECONDS") or "").strip()
+    if not raw:
+        return HEARTBEAT_OFFLINE_AFTER
+    try:
+        seconds = float(raw)
+    except ValueError:
+        print(f"HIVE_AGENT_STALE_SECONDS={raw!r} is not a number; ignored", flush=True)
+        return HEARTBEAT_OFFLINE_AFTER
+    if not seconds > 0:
+        print(f"HIVE_AGENT_STALE_SECONDS={raw!r} must be positive; ignored", flush=True)
+        return HEARTBEAT_OFFLINE_AFTER
+    return min(seconds, HEARTBEAT_OFFLINE_AFTER)
+
+
+async def reap_agent_heartbeats(db, now_ts: float) -> None:
+    # 1. Heartbeat reaper: online/idle -> stale after 90s, offline after 5m
+    # (sooner when HIVE_AGENT_STALE_SECONDS is set; see agent_offline_after).
+    stale_cutoff = now_ts - HEARTBEAT_STALE_AFTER
+    offline_cutoff = now_ts - agent_offline_after()
+    repo = hive_repo()
+    stale = await repo.select_stale_agent_urns(db, stale_cutoff=stale_cutoff, offline_cutoff=offline_cutoff)
+    if stale:
+        await repo.mark_agents_stale(db, stale)
+        await db.commit()
+        for urn in stale:
+            await emit_event(db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"})
+
+    dead = await repo.select_dead_agent_urns(db, offline_cutoff=offline_cutoff)
+    if dead:
+        for urn in dead:
+            # A MISSED HEARTBEAT IS NOT PROOF OF AN ABANDONED JOB.
+            # release_unstarted_jobs_for_agent releases only work that
+            # has not STARTED (offered/claimed) — no result can be lost.
+            # In-flight reclaim is step 2's job (staleness measured
+            # against COALESCE(last_update_at, claimed_at)).
+            assigned_jobs = await repo.release_unstarted_jobs_for_agent(db, urn)
+            await repo.mark_agent_offline(db, urn)
+            for job_id in assigned_jobs:
+                await emit_event(
+                    db,
+                    "job.unclaimed",
+                    {
+                        "id": job_id,
+                        "prior_claimer": urn,
+                        "reason": "agent_offline_heartbeat_timeout",
+                    },
+                )
+        await db.commit()
+        for urn in dead:
+            await emit_event(
+                db,
+                "agent.offline",
+                {"urn": urn, "reason": "heartbeat_timeout"},
+            )
+
+
 async def reaper_task(app: FastAPI):
     while True:
         await asyncio.sleep(HEARTBEAT_REAP_INTERVAL)
         try:
             async with connect_db() as db:
-                # 1. Heartbeat reaper: online/idle -> stale after 90s, offline after 5m.
-                now_ts = time.time()
-                stale_cutoff = now_ts - HEARTBEAT_STALE_AFTER
-                offline_cutoff = now_ts - HEARTBEAT_OFFLINE_AFTER
                 repo = hive_repo()
-                stale = await repo.select_stale_agent_urns(
-                    db, stale_cutoff=stale_cutoff, offline_cutoff=offline_cutoff
-                )
-                if stale:
-                    await repo.mark_agents_stale(db, stale)
-                    await db.commit()
-                    for urn in stale:
-                        await emit_event(db, "agent.stale", {"urn": urn, "reason": "heartbeat_stale"})
-
-                dead = await repo.select_dead_agent_urns(db, offline_cutoff=offline_cutoff)
-                if dead:
-                    for urn in dead:
-                        # A MISSED HEARTBEAT IS NOT PROOF OF AN ABANDONED JOB.
-                        # release_unstarted_jobs_for_agent releases only work that
-                        # has not STARTED (offered/claimed) — no result can be lost.
-                        # In-flight reclaim is step 2's job (staleness measured
-                        # against COALESCE(last_update_at, claimed_at)).
-                        assigned_jobs = await repo.release_unstarted_jobs_for_agent(db, urn)
-                        await repo.mark_agent_offline(db, urn)
-                        for job_id in assigned_jobs:
-                            await emit_event(
-                                db,
-                                "job.unclaimed",
-                                {
-                                    "id": job_id,
-                                    "prior_claimer": urn,
-                                    "reason": "agent_offline_heartbeat_timeout",
-                                },
-                            )
-                    await db.commit()
-                    for urn in dead:
-                        await emit_event(
-                            db,
-                            "agent.offline",
-                            {"urn": urn, "reason": "heartbeat_timeout"},
-                        )
+                now_ts = time.time()
+                await reap_agent_heartbeats(db, now_ts)
 
                 # 1b. AGENT PURGE: hard-delete agents offline beyond AGENT_PURGE_AFTER.
                 # Each worker restart registers a fresh session URN; without this the
