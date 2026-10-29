@@ -1813,6 +1813,7 @@ def apply_release(
     return _release_job(job_id, release_eligible_kinds)
 
 
+# The agent kinds that claim and run jobs; the sweeps below share this set.
 _WORKER_KINDS = ("zeroclaw", "codex", "opencode")
 
 
@@ -1835,7 +1836,7 @@ def _kinds_claimable(job: dict, live_kinds: set[str]) -> bool:
         try:
             kinds = json.loads(kinds)
         except ValueError:
-            kinds = None
+            return False  # corrupt eligibility: leave the row for a human, never loop it
     if not kinds:
         return True  # unset eligibility is claimable by any kind
     return bool({str(k) for k in kinds} & live_kinds)
@@ -1905,9 +1906,11 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         # exception must leave the base_kind unmarked so the next pass retries;
         # marking those is what made a real failure look "handled" for the TTL
         # (2026-10-28: the first sweep marked after a refused submit).
-        # action_resubmit_jobs reports a bus requeue as "requeued N jobs of ...":
-        # leaving that unmarked re-ran the same requeue every pass (2026-10-29,
-        # build:codex requeued once a minute).
+        # action_resubmit_jobs reports a bus requeue as "requeued N jobs of ...
+        # (api=<code>)": leaving that unmarked re-ran the same requeue every pass
+        # (2026-10-29, build:codex requeued once a minute). Only a 200/201 is a
+        # requeue that happened; any other code failed and must be retried, the
+        # same test the triage release path applies to this text.
         if (
             text.startswith(("resubmitted ", "no failed jobs"))
             or re.match(r"requeued \d+ jobs .*\(api=20[01]\)", text)
@@ -1945,7 +1948,7 @@ def sweep_unclaimable_queued(max_rows: int = 3) -> dict:
     worker_hosts = {
         str(a.get("host") or "").lower()
         for a in (aresp.get("agents") or [])
-        if str(a.get("kind") or "") in {"zeroclaw", "codex", "opencode"}
+        if str(a.get("kind") or "") in _WORKER_KINDS
     }
     now = time.time()
     acted, skipped = {}, []

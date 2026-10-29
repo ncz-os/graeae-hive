@@ -79,6 +79,12 @@ class OrphanSweepKindTests(unittest.TestCase):
         _, resubmitted, _ = _run([_failed(kind="build:zeroclaw", kinds=None)], [])
         self.assertEqual(resubmitted, ["build:zeroclaw"])
 
+    def test_corrupt_eligible_kinds_is_not_requeued(self):
+        row = _failed()
+        row["eligible_kinds"] = "[codex"
+        _, resubmitted, _ = _run([row], [{"kind": "codex"}])
+        self.assertEqual(resubmitted, [])
+
     def test_unknown_agent_list_does_not_block_the_sweep(self):
         _, resubmitted, _ = _run([_failed()], None)
         self.assertEqual(resubmitted, ["build:codex"])
