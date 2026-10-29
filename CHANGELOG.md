@@ -87,3 +87,6 @@ the control-host variables.
 - Merge sonnet/h5-20261029 (worker line)
 - Merge freebuff/g7-20261029 (worker line)
 - Merge freebuff/g4-20261029 (worker line)
+- Merge freebuff/g2-20261029
+- Merge freebuff/fb16-20261029
+- Merge freebuff/fb18-20261029
