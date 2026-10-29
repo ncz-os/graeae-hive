@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import importlib
 import inspect
 import pkgutil
@@ -85,16 +86,12 @@ def _raises_in_source(func) -> list[int]:
             if func_name != "HTTPException":
                 continue
             if node.exc.args and isinstance(node.exc.args[0], ast.Constant):
-                try:
+                with contextlib.suppress(TypeError, ValueError):
                     codes.add(int(node.exc.args[0].value))
-                except (TypeError, ValueError):
-                    pass
             for kw in node.exc.keywords:
                 if kw.arg == "status_code" and isinstance(kw.value, ast.Constant):
-                    try:
+                    with contextlib.suppress(TypeError, ValueError):
                         codes.add(int(kw.value.value))
-                    except (TypeError, ValueError):
-                        pass
     return sorted(codes)
 
 
