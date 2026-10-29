@@ -1,0 +1,33 @@
+{
+  "_comment": "MNEMOS search body (POST /v1/memories/search) for projects/zoder-loop-events of job 01a17c10-loop-timeout: ordered by metadata.seq, one garbled row, one row that belongs to a different job. Both must be survivable.",
+  "memories": [
+    {
+      "content": "{\"phase\": \"loop_start\", \"time\": \"2026-10-29T17:00:00Z\"}",
+      "metadata": { "job_id": "01a17c10-loop-timeout", "phase": "loop_start", "seq": 1 }
+    },
+    {
+      "content": "{\"phase\": \"author_start\", \"ts\": \"2026-10-29T17:00:05Z\"}",
+      "metadata": { "job_id": "01a17c10-loop-timeout", "phase": "author_start", "seq": 2 }
+    },
+    {
+      "content": "{\"phase\": \"review\", \"error\": \"reviewer_unavailable: no route answered\"}",
+      "metadata": { "job_id": "01a17c10-loop-timeout", "phase": "review", "seq": "3" }
+    },
+    {
+      "content": "{\"phase\": \"teardown\", \"reason\": \"timeout\", \"time\": \"2026-10-29T17:06:41Z\"}",
+      "metadata": { "job_id": "01a17c10-loop-timeout", "phase": "teardown", "seq": 4 }
+    },
+    {
+      "content": "this is not JSON at all {",
+      "metadata": { "job_id": "01a17c10-loop-timeout", "phase": "garbled", "seq": 5 }
+    },
+    {
+      "content": "{\"phase\": \"teardown\", \"reason\": \"approved\"}",
+      "metadata": { "job_id": "01a17c99-other-job", "phase": "teardown", "seq": 6 }
+    },
+    {
+      "content": 12345,
+      "metadata": { "job_id": "01a17c10-loop-timeout", "phase": "bad-content", "seq": 7 }
+    }
+  ]
+}

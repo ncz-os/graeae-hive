@@ -1,0 +1,61 @@
+{
+  "_comment": "Shape of GET /v1/jobs/<id> for scripts/explain_job.py, as the bus answers it (hive/bus/routers/jobs.py get_job): a single object with the result already parsed. Addresses are documentation placeholders, not live hosts.",
+  "id": "01a17c10-loop-timeout",
+  "submitter_urn": "urn:hive:agent:orchestrator",
+  "kind": "zeroclaw",
+  "description": "Explain-job fixture: a loop that timed out on its second attempt",
+  "priority": 10,
+  "status": "failed",
+  "claimed_by": "urn:hive:agent:worker-fixture",
+  "started_at": 1793300000.0,
+  "ended_at": 1793300400.0,
+  "retry_count": 1,
+  "max_retries": 3,
+  "project": "freebuff",
+  "repo": "ssh://git.example.invalid/mnt/datapool/git/graeae-hive.git",
+  "head_branch": "freebuff/h1-20261029",
+  "base_branch": "deploy/integrate-20261017",
+  "branch_created_from": null,
+  "claimed_model": "qwen38",
+  "claimed_provider": "local",
+  "result": {
+    "via": "hive_worker",
+    "driver": "zeroclaw",
+    "kind": "zeroclaw",
+    "exit_code": 1,
+    "elapsed_s": 401.2,
+    "tail": "loop did not finish before the deadline",
+    "workspace_preserved": "/var/lib/graeae-hive/workspaces/01a17c10-loop-timeout",
+    "loop_result": {
+      "teardown": { "reason": "timeout" },
+      "verdicts": ["request_changes"]
+    },
+    "base_sha": "1b7a986cf3892a4f3719712dcc33212024f490a3",
+    "head_sha": "9f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5f6071829",
+    "branch": "freebuff/h1-20261029",
+    "commits": ["9f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5f6071829"],
+    "files_changed": ["scripts/explain_job.py"],
+    "worktree_clean": true,
+    "remote_verified": false,
+    "remote_sha": "0000000000000000000000000000000000000000",
+    "pushed": false,
+    "models": {
+      "author": "qwen38",
+      "reviewers": ["nemotron-3-ultra"]
+    },
+    "reviewer": {
+      "model": "nemotron-3-ultra",
+      "models": ["nemotron-3-ultra"],
+      "verdict": "request_changes",
+      "source": "zoder_verdict"
+    },
+    "review_evidence": {
+      "reviewers": [{ "model": "nemotron-3-ultra", "verdict": "request_changes" }],
+      "warnings": []
+    },
+    "hive_reviews": [
+      { "stage": "brief", "review_text": "VERDICT: APPROVE — scope matches the brief" }
+    ],
+    "reviewer_findings": [{ "finding": "missing test" }]
+  }
+}
