@@ -3814,6 +3814,31 @@ def redact_secrets(text: str) -> str:
     return clean
 
 
+_LOOP_RESULT_PREFIX = "ZODER_LOOP_RESULT "
+_LOOP_RESULT_MAX = 16384
+
+
+def parse_zoder_loop_result(out: str | None) -> dict | None:
+    """The LAST ``ZODER_LOOP_RESULT {json}`` line of a zoder loop's output.
+
+    The loop prints one parseable result line so the bus row can carry the real
+    teardown reason and per-iteration verdicts; the 4000-char tail is dominated
+    by the echoed brief. None when absent or malformed (never raises).
+    """
+    found = None
+    for line in (out or "").splitlines():
+        line = line.strip()
+        if not line.startswith(_LOOP_RESULT_PREFIX) or len(line) > _LOOP_RESULT_MAX:
+            continue
+        try:
+            candidate = json.loads(line[len(_LOOP_RESULT_PREFIX):])
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(candidate, dict) and isinstance(candidate.get("teardown"), dict):
+            found = candidate
+    return found
+
+
 def _cap_text(text: str, limit: int = FAILURE_ERROR_MAX) -> str:
     """Redact, flatten to one bus-row-safe line, then bound the length."""
     flat = " | ".join(
@@ -6310,6 +6335,7 @@ def _run_job_inner(job: dict) -> None:
     # how verbose the run was.
     loop_record = ""
     raw_output = ""
+    loop_result: dict | None = None
 
     def _capture(out: str | None) -> None:
         # Same record parse_loop_models accepts (a dict naming a model or a
@@ -6317,7 +6343,8 @@ def _run_job_inner(job: dict) -> None:
         # loop verdict; the last such record wins. The raw text is kept too:
         # a quota wall reported outside the JSON verdict must still trigger
         # the cooldown.
-        nonlocal loop_record, raw_output
+        nonlocal loop_record, raw_output, loop_result
+        loop_result = parse_zoder_loop_result(out) or loop_result
         # 512 KB: the loop's pretty-printed record puts its reviewer verdicts BEFORE a
         # long echo of the task, so a short tail cuts the evidence off.
         raw_output = (out or "")[-524288:]
@@ -6635,6 +6662,8 @@ def _run_job_inner(job: dict) -> None:
         "attribution": attribution,
         **bus_evidence,
     }
+    if loop_result is not None:
+        result["loop_result"] = loop_result
     if run_models is not None:
         result["models"] = run_models
     if codex_delivery_result is not None:

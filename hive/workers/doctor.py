@@ -69,6 +69,7 @@ from hive.workers import remediation, retention
 # container still runs this module standalone.
 from hive.workers import doctor_gates, doctor_v2
 from hive.workers import doctor_decline_paths as decline_paths
+from hive.workers import loop_outcome
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "http://192.0.2.67:5005")
@@ -1322,7 +1323,11 @@ def action_restart_service(target_host: str | None, service: str | None) -> str:
         return f"SSH timeout to {host}"
 
 
-def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RESUBMITS_PER_ACTION) -> str:
+def action_resubmit_jobs(
+    base_kind: str | None,
+    max_resubmits: int = MAX_BULK_RESUBMITS_PER_ACTION,
+    exclude_ids: set[str] | None = None,
+) -> str:
     if not base_kind:
         return "resubmit_jobs missing base_kind"
     code, resp = _http("GET", "/v1/jobs?status=failed&limit=200")
@@ -1331,7 +1336,11 @@ def action_resubmit_jobs(base_kind: str | None, max_resubmits: int = MAX_BULK_RE
     failed = resp.get("jobs", [])
     strip_re = re.compile(r"\s*\[.*?\]\s*$")
     candidates = [
-        j for j in failed if strip_re.sub("", j.get("kind", "")).strip() == base_kind and not dlq_protected(j)
+        j
+        for j in failed
+        if strip_re.sub("", j.get("kind", "")).strip() == base_kind
+        and not dlq_protected(j)
+        and str(j.get("id") or "") not in (exclude_ids or set())
     ]
     # A job whose retry budget is spent (max_retries 0, or retry_count >= max_retries)
     # is never requeued by the doctor: it is reported for review, nothing else.
@@ -1845,6 +1854,58 @@ def _kinds_claimable(job: dict, live_kinds: set[str]) -> bool:
     return bool({str(k) for k in kinds} & live_kinds)
 
 
+LOOP_REQUEUE_TTL_SEC = 7 * 24 * 3600
+LOOP_PARK_TTL_SEC = 30 * 24 * 3600
+
+
+def _memoize(fn):
+    """Call ``fn`` at most once per sweep pass (a health probe, not per row)."""
+    box: list = []
+
+    def wrapper():
+        if not box:
+            box.append(fn())
+        return box[0]
+
+    return wrapper
+
+
+def _loop_requeue_count(job_id: str) -> int:
+    """How many automatic requeues this job has had (durable, one mark per requeue)."""
+    return sum(
+        1
+        for n in range(1, loop_outcome.MAX_AUTO_REQUEUES + 1)
+        if STATE.seen(f"loop_requeue:{job_id}:{n}", LOOP_REQUEUE_TTL_SEC)
+    )
+
+
+def _loop_requeue_record(job_id: str) -> None:
+    n = _loop_requeue_count(job_id) + 1
+    STATE.mark(f"loop_requeue:{job_id}:{n}", ttl=LOOP_REQUEUE_TTL_SEC)
+
+
+def _park_for_review(job: dict, cls: str) -> None:
+    """Move a row that automation cannot fix to needs-review, once, with the cause."""
+    jid = str(job.get("id") or "")
+    if not jid or STATE.seen(f"loop_park:{jid}", LOOP_PARK_TTL_SEC):
+        return
+    if DRY_RUN:
+        log.info("DRY_RUN: would park %s as needs-review (%s)", jid[:12], cls)
+        return
+    code, _resp = _http(
+        "POST", "/v1/admin/jobs/reclassify", {"job_ids": [jid], "status": "needs-review"}, timeout=15.0
+    )
+    if code in (200, 201):
+        STATE.mark(f"loop_park:{jid}", ttl=LOOP_PARK_TTL_SEC)
+        broadcast_doctor_message(
+            "doctor.needs-review",
+            {"host": AGENT_HOST, "job_ids": [jid], "reason": f"loop-outcome:{cls}"},
+        )
+        log.info("parked %s as needs-review (%s)", jid[:12], cls)
+    else:
+        log.warning("could not park %s as needs-review (http=%s)", jid[:12], code)
+
+
 def sweep_orphan_failures(max_bases: int = 5) -> dict:
     """Resubmit failed rows that nothing else will ever look at.
 
@@ -1885,12 +1946,35 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
     # kind, or into one that fails it at once. Skip rows whose eligible kinds have
     # no online agent; they resume on their own when such a worker comes back.
     live_kinds = _online_worker_kinds()
+    # 2026-10-29 (operator: "if it knows the failure outcome then the doctor should
+    # be able to act on it better and we shouldn't be filling up the queue"): act
+    # on WHY the loop failed, not only THAT it did. Rows whose cause is outside the
+    # job (reviewer down) wait for the cause to clear instead of burning a retry;
+    # rows that need a human are parked once; the rest requeue as before.
+    reviewer_probe = _memoize(loop_outcome.reviewer_healthy)
+    excluded: set[str] = set()
+    requeue_marks: list[str] = []
+    outcome_notes: dict[str, str] = {}
     bases: dict[str, int] = {}
     for j in failed:
         if j.get("parent_job_id") or dlq_protected(j):
             continue
         if live_kinds is not None and not _kinds_claimable(j, live_kinds):
             continue
+        jid = str(j.get("id") or "")
+        cls = loop_outcome.classify(j)
+        verdict = loop_outcome.decide(cls, _loop_requeue_count(jid), reviewer_probe)
+        if cls != loop_outcome.UNKNOWN:
+            outcome_notes[jid[:12]] = f"{cls}->{verdict}"
+        if verdict in ("hold", "skip"):
+            excluded.add(jid)
+            continue
+        if verdict == "needs_review":
+            excluded.add(jid)
+            _park_for_review(j, cls)
+            continue
+        if verdict == "requeue":
+            requeue_marks.append(jid)
         kind = re.sub(r"\s*\[.*?\]\s*$", "", str(j.get("kind") or "")).strip()
         if not kind:
             continue
@@ -1904,7 +1988,7 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             skipped.append(base_kind)
             continue
         try:
-            text = action_resubmit_jobs(base_kind)
+            text = action_resubmit_jobs(base_kind, exclude_ids=excluded)
         except Exception as exc:  # noqa: BLE001 - a sweep must not kill the loop
             text = f"error: {type(exc).__name__}: {exc}"
         acted[base_kind] = text
@@ -1923,9 +2007,16 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             or "already a replacement" in text
         ):
             STATE.mark("orphan_resubmit:" + base_kind, ttl=ORPHAN_RESUBMIT_TTL_SEC)
+            for jid in requeue_marks:
+                _loop_requeue_record(jid)
     if acted:
         log.info("orphan-failure sweep: %s", acted)
-    return {"scanned": len(failed), "bases": len(bases), "acted": acted, "skipped": skipped}
+    if outcome_notes:
+        log.info("orphan-failure sweep outcomes: %s", outcome_notes)
+    return {
+        "scanned": len(failed), "bases": len(bases), "acted": acted, "skipped": skipped,
+        "outcomes": outcome_notes,
+    }
 
 
 def sweep_unclaimable_queued(max_rows: int = 3) -> dict:
@@ -2368,6 +2459,13 @@ def scan_for_failure_clusters() -> list[dict]:
     clusters = []
     for bk, jobs in counts.items():
         if len(jobs) < CLUSTER_THRESHOLD:
+            continue
+        # A cluster whose every failure has a known loop outcome is handled
+        # deterministically by the orphan sweep; an LLM triage job for it only
+        # fills the queue (events are not fetched here: result/text only).
+        if loop_outcome.cluster_is_infrastructure(
+            [loop_outcome.classify(j, events_fetcher=lambda _id: None) for j in jobs]
+        ):
             continue
         # Durable since 2026-10-22: the cooldown lived in a module dict, so a pod
         # restart let every kind be re-triaged immediately.
