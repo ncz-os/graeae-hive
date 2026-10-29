@@ -1,0 +1,40 @@
+{
+  "_comment": "Sample of GET /v1/jobs?status=failed rows for scripts/replay_loop_outcomes.py. Shapes are the ones loop_outcome must survive: a full loop_result, no result at all, a JSON-string result, a loop_result missing fields, and a text-only failure.",
+  "jobs": [
+    {
+      "id": "01a17c00-approved",
+      "kind": "zeroclaw",
+      "status": "failed",
+      "result": {"loop_result": {"teardown": {"reason": "approved"}, "verdicts": ["approve"]}}
+    },
+    {
+      "id": "01a17c01-timeout-jsonstring",
+      "kind": "zeroclaw",
+      "status": "failed",
+      "result": "{\"loop_result\": {\"teardown\": {\"reason\": \"timeout\"}}}"
+    },
+    {
+      "id": "01a17c02-no-result",
+      "kind": "zeroclaw",
+      "status": "failed"
+    },
+    {
+      "id": "01a17c03-partial-teardown",
+      "kind": "zeroclaw",
+      "status": "failed",
+      "result": {"loop_result": {"teardown": {}}}
+    },
+    {
+      "id": "01a17c04-reviewer-text",
+      "kind": "zeroclaw",
+      "status": "failed",
+      "result": {"error": "reviewer_unavailable: cerberus llama-server refused the connection"}
+    },
+    {
+      "id": "01a17c05-nothing-to-commit",
+      "kind": "zeroclaw",
+      "status": "failed",
+      "result": {"failure_reason": "nothing_to_commit after a clean tree"}
+    }
+  ]
+}
