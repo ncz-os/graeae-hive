@@ -1,0 +1,14 @@
+{
+ "bs_audit.py": 1,
+ "deploy/hive_worker.py": 3,
+ "hive-auto-restore.py": 1,
+ "hive/core/config.py": 1,
+ "hive/mcp/bridge.py": 1,
+ "hive/registry.py": 1,
+ "hive/tools/deepseek_spend_alert.py": 1,
+ "hive/workers/doctor.py": 20,
+ "hive/workers/doctor_gates.py": 8,
+ "hive/workers/watcher.py": 2,
+ "scripts/build_repo_registry.py": 1,
+ "system_watcher.py": 2
+}
