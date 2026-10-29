@@ -1813,6 +1813,34 @@ def apply_release(
     return _release_job(job_id, release_eligible_kinds)
 
 
+_WORKER_KINDS = ("zeroclaw", "codex", "opencode")
+
+
+def _online_worker_kinds() -> set[str] | None:
+    """Kinds of the worker agents online now, or None when the bus cannot say."""
+    code, resp = _http("GET", "/v1/agents?status=online&limit=500", timeout=15.0)
+    if code != 200 or not isinstance(resp, dict):
+        return None
+    return {
+        str(a.get("kind") or "")
+        for a in (resp.get("agents") or [])
+        if str(a.get("kind") or "") in _WORKER_KINDS
+    }
+
+
+def _kinds_claimable(job: dict, live_kinds: set[str]) -> bool:
+    """False when the row names eligible kinds and none has an online worker."""
+    kinds = job.get("eligible_kinds")
+    if isinstance(kinds, str):
+        try:
+            kinds = json.loads(kinds)
+        except ValueError:
+            kinds = None
+    if not kinds:
+        return True  # unset eligibility is claimable by any kind
+    return bool({str(k) for k in kinds} & live_kinds)
+
+
 def sweep_orphan_failures(max_bases: int = 5) -> dict:
     """Resubmit failed rows that nothing else will ever look at.
 
@@ -1847,9 +1875,17 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             if res.get("infrastructure_parked"):
                 parked.append(j)
     failed = failed + parked
+    # 2026-10-29 (operator: "Codex is at quota for several days, so jobs should
+    # not go to codex"): a row only some worker KIND can take (eligible_kinds
+    # ["codex"]) was requeued every pass into a pool with no live worker of that
+    # kind, or into one that fails it at once. Skip rows whose eligible kinds have
+    # no online agent; they resume on their own when such a worker comes back.
+    live_kinds = _online_worker_kinds()
     bases: dict[str, int] = {}
     for j in failed:
         if j.get("parent_job_id") or dlq_protected(j):
+            continue
+        if live_kinds is not None and not _kinds_claimable(j, live_kinds):
             continue
         kind = re.sub(r"\s*\[.*?\]\s*$", "", str(j.get("kind") or "")).strip()
         if not kind:
@@ -1869,9 +1905,14 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         # exception must leave the base_kind unmarked so the next pass retries;
         # marking those is what made a real failure look "handled" for the TTL
         # (2026-10-28: the first sweep marked after a refused submit).
-        definitive = text.startswith("resubmitted ") or text.startswith("no failed jobs") \
-            or "already a replacement" in text or "could not resubmit" not in text and text.startswith("resubmitted")
-        if text.startswith("resubmitted ") or text.startswith("no failed jobs") or "already a replacement" in text:
+        # action_resubmit_jobs reports a bus requeue as "requeued N jobs of ...":
+        # leaving that unmarked re-ran the same requeue every pass (2026-10-29,
+        # build:codex requeued once a minute).
+        if (
+            text.startswith(("resubmitted ", "no failed jobs"))
+            or re.match(r"requeued \d+ jobs .*\(api=20[01]\)", text)
+            or "already a replacement" in text
+        ):
             STATE.mark("orphan_resubmit:" + base_kind, ttl=ORPHAN_RESUBMIT_TTL_SEC)
     if acted:
         log.info("orphan-failure sweep: %s", acted)
