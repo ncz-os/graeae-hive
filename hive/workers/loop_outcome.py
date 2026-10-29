@@ -122,8 +122,15 @@ def classify(job: dict, events_fetcher: Callable[[str], list[dict] | None] = fet
 
 
 def reviewer_healthy(url: str | None = None, timeout: float = 3.0) -> bool:
-    """Bounded probe of the production reviewer. Unreachable counts as unhealthy."""
-    url = url or os.environ.get("DOCTOR_REVIEWER_HEALTH_URL", "http://192.0.2.96:8080/health")
+    """Bounded probe of the production reviewer.
+
+    The URL comes from ``DOCTOR_REVIEWER_HEALTH_URL`` (no baked-in address). With
+    no URL configured there is nothing to probe, so the reviewer is assumed
+    healthy and the requeue cap alone bounds retries. Unreachable = unhealthy.
+    """
+    url = url or os.environ.get("DOCTOR_REVIEWER_HEALTH_URL", "").strip()
+    if not url:
+        return True
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - operator-configured URL
             return 200 <= resp.status < 300

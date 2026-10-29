@@ -73,6 +73,17 @@ class ClassifyTests(unittest.TestCase):
             self.assertIsNone(loop_outcome.fetch_loop_events("job-1", timeout=0.5))
 
 
+class HealthTests(unittest.TestCase):
+    def test_no_configured_url_means_nothing_to_probe(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("DOCTOR_REVIEWER_HEALTH_URL", None)
+            self.assertTrue(loop_outcome.reviewer_healthy())
+
+    def test_unreachable_configured_url_is_unhealthy(self):
+        with mock.patch.dict(os.environ, {"DOCTOR_REVIEWER_HEALTH_URL": "http://127.0.0.1:9/health"}):
+            self.assertFalse(loop_outcome.reviewer_healthy(timeout=0.5))
+
+
 class DecideTests(unittest.TestCase):
     def test_reviewer_unavailable_waits_for_a_healthy_reviewer(self):
         self.assertEqual(loop_outcome.decide("reviewer_unavailable", 0, lambda: False), "hold")
