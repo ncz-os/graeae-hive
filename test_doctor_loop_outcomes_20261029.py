@@ -376,6 +376,185 @@ class NewClassSweepTests(unittest.TestCase):
         self.assertTrue(any("class_counts" in line and "clone_failed" in line for line in cap.output))
 
 
+NO_CHUNKS = "review incomplete: no review chunks were generated"
+
+
+def _empty_row(jid="job-e", **kw):
+    """A loop that tore down reviewer_unavailable because the author changed nothing."""
+    row = _row(jid=jid, reason="reviewer_unavailable")
+    row["result"]["loop_result"]["iterations"] = [
+        {"check_passed": False, "files_changed": 0, "diff_lines": 0, "substance": "Empty"}
+    ]
+    row["result"]["commits"] = []
+    row["result"].update(kw)
+    return row
+
+
+class EmptyDiffClassifyTests(unittest.TestCase):
+    def test_teardown_text_is_empty_diff(self):
+        for text in (NO_CHUNKS, "no review chunks were generated", "Review incomplete: No review chunks"):
+            row = _row(reason="reviewer_unavailable")
+            row["result"]["loop_result"]["teardown"]["detail"] = text
+            self.assertEqual(loop_outcome.classify(row, NO_EVENTS), loop_outcome.EMPTY_DIFF, text)
+
+    def test_review_response_event_is_empty_diff(self):
+        for field in ("error", "summary", "tail"):
+            events = lambda _j, f=field: [  # noqa: E731
+                {"phase": "author_start"},
+                {"phase": "review_response", f: NO_CHUNKS},
+                {"phase": "teardown", "reason": "reviewer_unavailable"},
+            ]
+            self.assertEqual(loop_outcome.classify(_row(), events), loop_outcome.EMPTY_DIFF, field)
+            # also when the row's own teardown already says reviewer_unavailable
+            self.assertEqual(
+                loop_outcome.classify(_row(reason="reviewer_unavailable"), events), loop_outcome.EMPTY_DIFF, field
+            )
+
+    def test_result_text_is_empty_diff(self):
+        self.assertEqual(loop_outcome.classify(_row(tail=NO_CHUNKS), NO_EVENTS), loop_outcome.EMPTY_DIFF)
+
+    def test_empty_iterations_with_reviewer_unavailable_teardown(self):
+        self.assertEqual(loop_outcome.classify(_empty_row(), NO_EVENTS), loop_outcome.EMPTY_DIFF)
+        row = _empty_row()
+        row["result"]["loop_result"]["iterations"] = [{"check_passed": False, "files_changed": []}]
+        self.assertEqual(loop_outcome.classify(row, NO_EVENTS), loop_outcome.EMPTY_DIFF)
+
+    def test_iteration_shape_that_is_not_empty_stays_reviewer_unavailable(self):
+        cases = {
+            "files changed": [{"check_passed": False, "files_changed": 3}],
+            "check passed": [{"check_passed": True, "files_changed": 0}],
+            "no signal": [{"check_passed": False}],
+            "no iterations": [],
+            "one non-empty of two": [
+                {"check_passed": False, "files_changed": 0},
+                {"check_passed": False, "files_changed": 2},
+            ],
+        }
+        for name, its in cases.items():
+            row = _empty_row()
+            row["result"]["loop_result"]["iterations"] = its
+            self.assertEqual(loop_outcome.classify(row, NO_EVENTS), loop_outcome.REVIEWER_UNAVAILABLE, name)
+
+    def test_empty_iterations_with_commits_is_not_empty_diff(self):
+        row = _empty_row(commits=["abc123"])
+        self.assertEqual(loop_outcome.classify(row, NO_EVENTS), loop_outcome.REVIEWER_UNAVAILABLE)
+        row = _empty_row(finalizer={"committed": True, "pushed": False})
+        self.assertEqual(loop_outcome.classify(row, NO_EVENTS), loop_outcome.REVIEWER_UNAVAILABLE)
+
+    def test_empty_iterations_need_the_reviewer_unavailable_teardown(self):
+        row = _empty_row()
+        row["result"]["loop_result"]["teardown"]["reason"] = "author_failed"
+        self.assertEqual(loop_outcome.classify(row, NO_EVENTS), loop_outcome.AUTHOR_FAILED)
+
+    def test_real_reviewer_outage_is_still_reviewer_unavailable(self):
+        outage_events = lambda _j: [  # noqa: E731
+            {"phase": "review_response", "error": "HTTP 503 Service Unavailable from reviewer"},
+            {"phase": "review_response", "summary": "request timed out after 120s", "tail": "connection reset"},
+            {"phase": "teardown", "reason": "reviewer_unavailable"},
+        ]
+        self.assertEqual(loop_outcome.classify(_row(), outage_events), loop_outcome.REVIEWER_UNAVAILABLE)
+        row = _row(reason="reviewer_unavailable")
+        row["result"]["loop_result"]["teardown"]["detail"] = "reviewer HTTP 502: bad gateway"
+        self.assertEqual(loop_outcome.classify(row, outage_events), loop_outcome.REVIEWER_UNAVAILABLE)
+        self.assertEqual(
+            loop_outcome.classify(_row(tail="reviewer request timeout; reviewer_unavailable"), NO_EVENTS),
+            loop_outcome.REVIEWER_UNAVAILABLE,
+        )
+
+
+class EmptyDiffDecideTests(unittest.TestCase):
+    def test_never_requeued_whatever_the_reviewer_or_count(self):
+        for n in range(0, loop_outcome.MAX_AUTO_REQUEUES + 2):
+            for healthy in (True, False):
+                self.assertEqual(
+                    loop_outcome.decide("empty_diff", n, lambda h=healthy: h), "needs_review", (n, healthy)
+                )
+
+    def test_real_outage_is_still_held_and_requeued(self):
+        self.assertEqual(loop_outcome.decide("reviewer_unavailable", 0, lambda: False), "hold")
+        self.assertEqual(loop_outcome.decide("reviewer_unavailable", 0, lambda: True), "requeue")
+
+
+class EmptyDiffSweepTests(unittest.TestCase):
+    def _park_reasons(self, rows, state=None, healthy=True):
+        msgs = []
+        with mock.patch.object(
+            doctor, "broadcast_doctor_message", lambda kind, body, *a, **k: msgs.append((kind, body))
+        ):
+            out, calls, state = self._run(rows, state, healthy)
+        return out, calls, state, msgs
+
+    def _run(self, rows, state, healthy):
+        # Same wiring as _sweep, but recording the park reason sent to the bus.
+        calls = {"resubmit": [], "parked": [], "reasons": []}
+        state = state or _FakeState()
+
+        def fake_http(method, path, payload=None, timeout=10.0):
+            if path.startswith("/v1/jobs?status=failed"):
+                return 200, {"jobs": rows}
+            if path.startswith("/v1/jobs?status=queued"):
+                return 200, {"jobs": []}
+            if path.startswith("/v1/agents"):
+                return 200, {"agents": [{"kind": "zeroclaw"}]}
+            if path == "/v1/admin/jobs/reclassify":
+                calls["parked"].append(payload["job_ids"][0])
+                calls["reasons"].append(payload.get("reason"))
+            return 200, {}
+
+        with (
+            mock.patch.object(doctor, "_http", fake_http),
+            mock.patch.object(doctor, "dlq_protected", lambda j: False),
+            mock.patch.object(
+                doctor,
+                "action_resubmit_jobs",
+                lambda k, max_resubmits=None, exclude_ids=None: (
+                    calls["resubmit"].append(k) or "requeued 1 jobs of x (api=200)"
+                ),
+            ),
+            mock.patch.object(doctor, "STATE", state),
+            mock.patch.object(loop_outcome, "reviewer_healthy", lambda *a, **k: healthy),
+        ):
+            return doctor.sweep_orphan_failures(), calls, state
+
+    def test_parked_once_with_precise_reason_and_never_requeued(self):
+        row = _empty_row()
+        out, calls, state, msgs = self._park_reasons([row])
+        self.assertEqual(calls["parked"], ["job-e"])
+        self.assertEqual(calls["resubmit"], [])
+        self.assertEqual(calls["reasons"], ["loop-outcome:empty_diff: " + loop_outcome.EMPTY_DIFF_REASON])
+        self.assertIn("author made no changes; the branch may already satisfy the task", msgs[0][1]["reason"])
+        self.assertIn("empty_diff->needs_review", out["outcomes"].values())
+        # idempotent: later passes neither park again nor requeue, healthy reviewer or not
+        for healthy in (True, False):
+            _, calls2, _, msgs2 = self._park_reasons([row], state=state, healthy=healthy)
+            self.assertEqual(calls2["parked"], [])
+            self.assertEqual(calls2["resubmit"], [])
+            self.assertEqual(msgs2, [])
+
+    def test_empty_diff_is_not_held_for_an_unhealthy_reviewer(self):
+        _, calls, _, _ = self._park_reasons([_empty_row()], healthy=False)
+        self.assertEqual(calls["parked"], ["job-e"])
+
+    def test_real_outage_is_still_held_and_then_requeued(self):
+        row = _row(jid="job-r", reason="reviewer_unavailable", tail="reviewer HTTP 503")
+        out, calls, _, _ = self._park_reasons([row], healthy=False)
+        self.assertEqual((calls["parked"], calls["resubmit"]), ([], []))
+        self.assertIn("reviewer_unavailable->hold", out["outcomes"].values())
+        _, calls, _, _ = self._park_reasons([row], healthy=True)
+        self.assertEqual(calls["resubmit"], ["build:zeroclaw"])
+        self.assertEqual(calls["parked"], [])
+
+    def test_class_counts_include_empty_diff(self):
+        rows = [
+            _empty_row(jid="e1"),
+            _empty_row(jid="e2"),
+            _row(jid="r1", reason="reviewer_unavailable", tail="HTTP 503"),
+            _row(jid="u1", tail="boom"),
+        ]
+        out, _, _, _ = self._park_reasons(rows)
+        self.assertEqual(out["class_counts"], {"empty_diff": 2, "reviewer_unavailable": 1, "unknown": 1})
+
+
 class ClusterTests(unittest.TestCase):
     def test_cluster_of_known_outcomes_creates_no_triage(self):
         rows = [dict(_row(jid=f"j{i}", reason="reviewer_unavailable"), ended_at=9e12) for i in range(6)]

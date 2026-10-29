@@ -1928,19 +1928,23 @@ def _park_for_review(job: dict, cls: str, detail: str = "") -> None:
     jid = str(job.get("id") or "")
     if not jid or STATE.seen(f"loop_park:{jid}", LOOP_PARK_TTL_SEC):
         return
+    reason = f"loop-outcome:{cls}{detail}"
     if DRY_RUN:
-        log.info("DRY_RUN: would park %s as needs-review (%s)", jid[:12], cls)
+        log.info("DRY_RUN: would park %s as needs-review (%s)", jid[:12], reason)
         return
     code, _resp = _http(
-        "POST", "/v1/admin/jobs/reclassify", {"job_ids": [jid], "status": "needs-review"}, timeout=15.0
+        "POST",
+        "/v1/admin/jobs/reclassify",
+        {"job_ids": [jid], "status": "needs-review", "reason": reason},
+        timeout=15.0,
     )
     if code in (200, 201):
         STATE.mark(f"loop_park:{jid}", ttl=LOOP_PARK_TTL_SEC)
         broadcast_doctor_message(
             "doctor.needs-review",
-            {"host": AGENT_HOST, "job_ids": [jid], "reason": f"loop-outcome:{cls}{detail}"},
+            {"host": AGENT_HOST, "job_ids": [jid], "reason": reason},
         )
-        log.info("parked %s as needs-review (%s)", jid[:12], cls)
+        log.info("parked %s as needs-review (%s)", jid[:12], reason)
     else:
         log.warning("could not park %s as needs-review (http=%s)", jid[:12], code)
 
@@ -2016,7 +2020,10 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
             continue
         if verdict == "needs_review":
             excluded.add(jid)
-            _park_for_review(j, cls, ":local_commits_only" if local_only else "")
+            detail = ":local_commits_only" if local_only else ""
+            if cls == loop_outcome.EMPTY_DIFF:
+                detail = ": " + loop_outcome.EMPTY_DIFF_REASON
+            _park_for_review(j, cls, detail)
             continue
         if verdict == "requeue":
             requeue_marks.append(jid)

@@ -25,10 +25,18 @@ NOTHING_TO_COMMIT = "nothing_to_commit"
 APPROVED_UNMERGED = "approved_unmerged"
 KILLED_BY_SIGNAL = "killed_by_signal"
 CLONE_FAILED = "clone_failed"
+EMPTY_DIFF = "empty_diff"
 UNKNOWN = "unknown"
 
 # Cap on automatic requeues of one job for the classes that are not the job's fault.
 MAX_AUTO_REQUEUES = 2
+
+# Why an EMPTY_DIFF row is parked: the doctor puts this text on the parked-for-review message.
+EMPTY_DIFF_REASON = "author made no changes; the branch may already satisfy the task"
+
+# What zoder's loop says when the author left nothing to review. This is not a
+# reviewer outage, but the loop used to tear down as ``reviewer_unavailable``.
+_EMPTY_DIFF_MARKERS = ("no review chunks were generated", "review incomplete: no review chunks")
 
 _TEARDOWN_TO_CLASS = {
     "approved": APPROVED_UNMERGED,
@@ -121,6 +129,66 @@ def _structured_class(job: dict, res: dict) -> str | None:
     return None
 
 
+def _says_empty_diff(*values: object) -> bool:
+    """True when any string among ``values`` carries an empty-diff marker."""
+    return any(isinstance(v, str) and any(m in v.lower() for m in _EMPTY_DIFF_MARKERS) for v in values)
+
+
+def _teardown_says_empty_diff(teardown: object) -> bool:
+    if isinstance(teardown, dict):
+        return _says_empty_diff(*teardown.values())
+    return _says_empty_diff(teardown)
+
+
+def _events_say_empty_diff(events: list[dict] | None) -> bool:
+    """A ``review_response`` event whose error/summary/tail names the empty diff."""
+    for ev in events or []:
+        if (
+            isinstance(ev, dict)
+            and ev.get("phase") == "review_response"
+            and _says_empty_diff(ev.get("error"), ev.get("summary"), ev.get("tail"))
+        ):
+            return True
+    return False
+
+
+def _iteration_is_empty(it: object) -> bool:
+    """One loop iteration in which the author changed nothing.
+
+    Only fields the loop reports: ``check_passed`` must be explicitly false, and
+    the iteration must say no file/diff content exists (``files_changed`` 0 or an
+    empty list, ``diff_lines`` 0, or ``substance`` "empty"). A missing field proves
+    nothing, so an iteration with no such signal is not empty.
+    """
+    if not isinstance(it, dict) or it.get("check_passed") is not False:
+        return False
+    signals = []
+    fc = it.get("files_changed")
+    if isinstance(fc, list):
+        signals.append(len(fc) == 0)
+    elif isinstance(fc, int) and not isinstance(fc, bool):
+        signals.append(fc == 0)
+    dl = it.get("diff_lines")
+    if isinstance(dl, int) and not isinstance(dl, bool):
+        signals.append(dl == 0)
+    if isinstance(it.get("substance"), str):
+        signals.append(it["substance"].strip().lower() == "empty")
+    return bool(signals) and all(signals)
+
+
+def _empty_iterations_no_commits(res: dict, loop_result: dict) -> bool:
+    """Every iteration changed nothing and the row recorded no commits."""
+    its = loop_result.get("iterations") or loop_result.get("log")
+    if not isinstance(its, list) or not its or not all(_iteration_is_empty(i) for i in its):
+        return False
+    if res.get("commits") or loop_result.get("commits"):
+        return False
+    if _finalizer(res).get("committed") is True:
+        return False
+    # A spend cap also leaves empty iterations + reviewer_unavailable; that is a real outage.
+    return "budget exceeded" not in json.dumps(res, default=str).lower()
+
+
 def fetch_loop_events(job_id: str, timeout: float = 4.0) -> list[dict] | None:
     """The job's ``zoder-loop-events`` from MNEMOS, oldest first; None if unavailable."""
     base, token = os.environ.get("MNEMOS_URL"), os.environ.get("MNEMOS_TOKEN")
@@ -170,13 +238,27 @@ def classify(job: dict, events_fetcher: Callable[[str], list[dict] | None] = fet
     """One class for a failed loop row. Never raises."""
     try:
         res = _result_dict(job)
-        teardown = (res.get("loop_result") or {}).get("teardown")
-        if isinstance(teardown, dict) and teardown.get("reason") in _TEARDOWN_TO_CLASS:
-            return _TEARDOWN_TO_CLASS[teardown["reason"]]
+        loop_result = res.get("loop_result")
+        loop_result = loop_result if isinstance(loop_result, dict) else {}
+        teardown = loop_result.get("teardown")
+        # Empty diff first: the loop reports it as reviewer_unavailable, and every
+        # rule below would then wait for a reviewer that is not the problem.
+        if _teardown_says_empty_diff(teardown):
+            return EMPTY_DIFF
+        tear_reason = teardown.get("reason") if isinstance(teardown, dict) else None
+        if tear_reason == "reviewer_unavailable":
+            if _empty_iterations_no_commits(res, loop_result):
+                return EMPTY_DIFF
+            if _events_say_empty_diff(events_fetcher(str(job.get("id") or ""))):
+                return EMPTY_DIFF
+        if tear_reason in _TEARDOWN_TO_CLASS:
+            return _TEARDOWN_TO_CLASS[tear_reason]
         structured = _structured_class(job, res)
         if structured:
             return structured
         events = events_fetcher(str(job.get("id") or ""))
+        if _events_say_empty_diff(events):
+            return EMPTY_DIFF
         if events:
             for ev in reversed(events):
                 if ev.get("phase") == "teardown" and ev.get("reason") in _TEARDOWN_TO_CLASS:
@@ -185,6 +267,8 @@ def classify(job: dict, events_fetcher: Callable[[str], list[dict] | None] = fet
             if "teardown" not in phases:
                 return CRASH  # a trail with no teardown: the loop died mid-way
         text = " ".join(str(res.get(k) or "") for k in ("error", "failure_reason", "tail", "raw")).lower()
+        if _says_empty_diff(text):
+            return EMPTY_DIFF
         if "reviewer_unavailable" in text:
             return REVIEWER_UNAVAILABLE
         if "nothing_to_commit" in text:
@@ -247,7 +331,7 @@ def decide(
         return "requeue" if reviewer_ok() else "hold"
     if cls in (AUTHOR_FAILED, TIMEOUT, CRASH):
         return "needs_review" if requeues_so_far >= MAX_AUTO_REQUEUES else "requeue"
-    if cls in (EXHAUSTED, NOTHING_TO_COMMIT):
+    if cls in (EXHAUSTED, NOTHING_TO_COMMIT, EMPTY_DIFF):  # EMPTY_DIFF: a retry sees the same diff
         return "needs_review"
     if cls == APPROVED_UNMERGED:
         return "skip"
