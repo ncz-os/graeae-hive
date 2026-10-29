@@ -241,6 +241,15 @@
       "meaning": "SSH password for the cixmini host.",
       "example": "",
       "source": "hive/workers/doctor_gates.py:279"
+    },
+    {
+      "name": "HIVE_AGENT_STALE_SECONDS",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Shortens the window after which an agent with no heartbeat is marked offline; unset keeps the built-in 300 s rule.",
+      "meaning": "Seconds without a heartbeat before the bus reaper marks an agent offline (values above 300 are ignored).",
+      "example": "120",
+      "source": "hive/bus/app.py:agent_offline_after"
     }
   ]
 }
