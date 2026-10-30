@@ -69,6 +69,26 @@ All references are `hive/workers/doctor.py` unless noted, base
   commits, those are delivered work" (Source: needs-review follow-up header
   comment and `run_needs_review_sweep` docstring).
 
+### Review children that advance the branch
+
+A `review:*` child is a review-and-fix loop, not a read-only pass,
+whatever its description says. On the live bus every observed
+review child had `result.base_sha` equal to the parent's delivered
+`head_sha` and a different `result.head_sha`/`remote_sha`: it pushed
+new commits. Its approval therefore names a commit the parent never
+delivered. The bus consumer
+(`hive/bus/domain/review_dispatch.py:reconcile_review_parent`) reads
+the verdict from `result.reviewer.verdict` when `result.verdict` is
+null, closes the parent only when the reviewed head equals the
+delivered head, and otherwise keeps it `needs-review` with
+`review_evidence.head_matches: false`, `child_advanced_branch: true`
+and `approved_unmerged_tip` (the approved tip). `approved_unmerged_tip`
+is an evidence field, not a status. The doctor treats a row with
+`review_evidence` as reviewed (`review_followup_row_has_verdict`), so it
+will not submit a second review: confirming the tip before merging is
+for a human or the owner. Rules and outcomes: `docs/JOB_LIFECYCLE.md`,
+"Review reconcile outcomes".
+
 ## 2. Failure modes seen
 
 - Rows sit in `needs-review` forever: the sweep is report-only by design

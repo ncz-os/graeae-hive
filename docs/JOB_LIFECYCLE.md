@@ -142,6 +142,67 @@ stateDiagram-v2
     dead-letter --> [*]
 ```
 
+## Review reconcile outcomes (`review:*` children)
+
+A completed `review:*` child (status `done`, has `parent_job_id`) is
+consumed by `hive/bus/domain/review_dispatch.py:reconcile_review_parent`,
+called from the `done` branch of `hive/bus/routers/jobs.py:update_job`
+in the same transaction as the child's status write. It acts only on a
+parent that is `needs-review`; it never adds a job status. Rows it skips
+(untouched): parent not `needs-review`, `triage:*` parent, protected row
+(`doctor_decline_paths.review_is_never_act`), or a parent whose
+`result.auto_review_job_id` names a different review job.
+
+The child's verdict is normalised first
+(`review_dispatch.py:child_verdict`):
+
+- legacy shape: `result.verdict` is a dict with a string `verdict`; used
+  as is (`head` or `head_sha` names the reviewed commit).
+- worker shape: `result.verdict` is null and the verdict is
+  `result.reviewer.verdict` (string, case-insensitive; written by
+  `hive/review_record.py`). The reviewed head is `result.remote_sha`
+  when `result.remote_verified` is true, else `result.head_sha`.
+- neither: no usable verdict (see below).
+
+The close rule is unchanged: the parent becomes `done` only when the
+verdict is `approve` AND the reviewed head equals the parent's
+delivered `result.head_sha` AND
+`hive/bus/domain/jobs.py:valid_completion_proof` holds for the parent's
+result. Every outcome with a verdict writes `result.review_evidence`, sets
+`result.auto_review_job_id`, and appends one `job_audit_log` row and one
+`job.review_completed` event. Reconciling the same child again with
+identical evidence writes neither.
+
+| child result | parent status | `review_evidence` / reason |
+| ------------ | ------------- | -------------------------- |
+| approve, reviewed head == delivered head, parent proof valid | `done` | `head_matches: true`; "approved exact delivered HEAD" |
+| approve, reviewed head == delivered head, parent proof invalid | `needs-review` | `artifact_valid: false`; "parent artifact evidence incomplete" |
+| anything but approve | `needs-review` | "review did not approve" |
+| approve, no reviewed head or no delivered head | `needs-review` | `head_matches: false`; "review HEAD does not match delivered HEAD" |
+| approve, reviewed head != delivered head | `needs-review` | `head_matches: false`, `reviewed_head`, `delivered_head`, `child_advanced_branch`; reason below |
+| no usable verdict | unchanged | `{review_job_id, verdict: null, reason: "review result has no usable verdict"}`; one log line |
+
+Approved but a different head: the review job is a review-and-fix loop
+and may have pushed new commits. `child_advanced_branch` is `true` when
+the child's `result.base_sha` equals the delivered head (and its head
+differs); then the reason is "approved, but the review job advanced the
+branch: reviewed head <12 chars> differs from delivered head <12 chars>;
+a human or the owner must confirm the branch tip before merging" and
+`approved_unmerged_tip` carries the reviewed head. Without that base the
+bus cannot say the branch was advanced, and the reason omits that
+clause. In both cases `result.doctor_reason` equals the reason and
+`result.needs_review` is `true`. `approved_unmerged_tip` is an evidence
+field only, not a status.
+
+No usable verdict is never silent: one structured `WARNING` line from
+logger `hive.bus.review_dispatch` per distinct (review job id, reason),
+`review_reconcile review_job_id=... parent_job_id=... reason="..."
+outcome=...`, plus the evidence record on the parent (only when the
+parent is `needs-review` and not skipped). Status, `doctor_reason` and
+`auto_review_job_id` are left as they were. Because the parent now
+carries `review_evidence`, neither the bus dispatch nor the doctor
+submits another review for it; a human or the owner decides.
+
 ## Findings (code-path inconsistencies; production code untouched)
 
 1. `released` and `failed_completion` are members of
