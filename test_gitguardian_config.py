@@ -46,7 +46,8 @@ class GitGuardianConfigShapeTests(unittest.TestCase):
         try:
             import yaml  # local import: optional dep in some environments
         except ModuleNotFoundError:
-            self.skipTest("pyyaml not installed: cannot parse .gitguardian.yaml")
+            self.skipTest("pyyaml is not installed in this environment (and is not a declared "
+                        "project dependency): pip install pyyaml to run this config assertion")
 
         cfg = yaml.safe_load(_config_text())
         self.assertEqual(cfg.get("version"), 2, "version: 2 is required")
@@ -55,7 +56,8 @@ class GitGuardianConfigShapeTests(unittest.TestCase):
         try:
             import yaml
         except ModuleNotFoundError:
-            self.skipTest("pyyaml not installed: cannot parse .gitguardian.yaml")
+            self.skipTest("pyyaml is not installed in this environment (and is not a declared "
+                        "project dependency): pip install pyyaml to run this config assertion")
 
         cfg = yaml.safe_load(_config_text())
         secret = cfg.get("secret") or {}
@@ -71,7 +73,8 @@ class GitGuardianConfigShapeTests(unittest.TestCase):
         try:
             import yaml
         except ModuleNotFoundError:
-            self.skipTest("pyyaml not installed: cannot parse .gitguardian.yaml")
+            self.skipTest("pyyaml is not installed in this environment (and is not a declared "
+                        "project dependency): pip install pyyaml to run this config assertion")
 
         cfg = yaml.safe_load(_config_text())
         ignored = (cfg.get("secret") or {}).get("ignored-paths") or []
