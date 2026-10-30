@@ -1,0 +1,87 @@
+{
+  "dir": "~/.freebuff-inbox",
+  "allowModelOverride": true,
+  "allowedModels": ["<allowed-freebuff-model-key>"],
+  "maxCostMultiplier": 2,
+  "autoResume": false,
+  "sources": [
+    {
+      "type": "mcp",
+      "server": "hive",
+      "tool": "hive_job_next",
+      "args": { "agent_urn": "${HIVE_AGENT_URN}" },
+      "intervalSec": 30,
+      "claimsOnPoll": true,
+      "noWork": { "path": "$._status", "equals": 204 },
+      "map": {
+        "id": "$.id",
+        "from": "$.submitter_urn",
+        "text": {
+          "template": "{{$.description}}\n\nrepo: {{$.repo}}\nhead_branch: {{$.head_branch}}\n\npush your branch to the remote named in the brief, then report"
+        },
+        "model": "$.preferred_models[0]"
+      },
+      "allowFrom": ["${HIVE_ORCHESTRATOR_URN_1}", "${HIVE_ORCHESTRATOR_URN_2}"],
+      "sourceMeta": { "system": "graeae-hive", "queue": "freebuff" }
+    }
+  ],
+  "sinks": [
+    { "type": "file" },
+    {
+      "type": "mcp",
+      "server": "hive",
+      "tool": "hive_job_update",
+      "events": ["accepted", "started"],
+      "args": {
+        "id": "{{id}}",
+        "status": "{{event}}",
+        "result": { "event": "{{event}}" },
+        "claimed_by": "${HIVE_AGENT_URN}"
+      },
+      "valueMaps": {
+        "status": { "accepted": "claimed", "started": "running" }
+      }
+    },
+    {
+      "type": "mcp",
+      "server": "hive",
+      "tool": "hive_job_update",
+      "events": ["not_accepted"],
+      "args": {
+        "id": "{{id}}",
+        "status": "{{event}}",
+        "result": { "outcome": "not_accepted", "reason": "{{reason}}" },
+        "claimed_by": "${HIVE_AGENT_URN}"
+      },
+      "valueMaps": {
+        "status": { "not_accepted": "queued" }
+      }
+    },
+    {
+      "type": "mcp",
+      "server": "hive",
+      "tool": "hive_job_update",
+      "events": ["done"],
+      "includeText": false,
+      "args": {
+        "id": "{{id}}",
+        "status": "{{outcome}}",
+        "result": {
+          "outcome": "{{outcome}}",
+          "attempt": "{{attempt}}",
+          "model": "{{model}}",
+          "completedAt": "{{completedAt}}"
+        },
+        "claimed_by": "${HIVE_AGENT_URN}"
+      },
+      "valueMaps": {
+        "status": {
+          "completed": "done",
+          "error": "failed",
+          "interrupted": "failed",
+          "session_ended": "queued"
+        }
+      }
+    }
+  ]
+}
