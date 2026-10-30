@@ -1,0 +1,619 @@
+"""A needs-review row is only "reviewed" when the evidence covers its CURRENT head.
+
+Shape observed on the live bus (anonymised here, fake ids and fake shas): a zoder
+loop rescued unresolved work and parked the row in needs-review. Earlier rounds
+had a reviewer, who said request_changes; in the final round the reviewer went
+away. ``result.review_evidence`` and ``result.reviewer`` come from the earlier
+rounds, ``result.head_sha`` is the final pushed head, and the loop's teardown says
+``reviewer_unavailable`` and ``resolved: false``. The doctor used to read the old
+evidence as "already reviewed" and did nothing for as long as the row existed.
+
+No network: ``_http`` is a stateful in-memory fake of the bus.
+"""
+
+from __future__ import annotations
+
+import copy
+
+import pytest
+
+from hive.workers import doctor
+from hive.workers.doctor_state import DurableStateStore, MemoryBackend
+
+JOB_ID = "job-fake-0001"
+EARLIER = "ab" * 20
+MIDDLE = "cd" * 20
+FINAL = "fe" * 20
+CHILD_PREFIX = "review-child-"
+
+
+def live_row_result() -> dict:
+    """The needs-review row's result as the loop left it (fake ids and shas)."""
+    return {
+        "failure_reason": "loop_unresolved_work_rescued",
+        "reviewer": {"model": "fake-reviewer", "verdict": "request_changes", "source": "zoder_verdict"},
+        "review_evidence": {
+            "requested": "",
+            "reviewers": [{"model": "fake-reviewer", "role": "", "verdict": "request_changes", "ok": True}],
+            "first": {"model": "fake-reviewer", "verdict": "request_changes"},
+            "secondaries": [],
+            "skipped": [],
+            "warnings": [],
+        },
+        "loop_result": {
+            "verdicts": ["request_changes", "request_changes", "request_changes", "reviewer_unavailable"],
+            "teardown": {
+                "final_verdict": "reviewer_unavailable",
+                "resolved": False,
+                "last_good_head_sha": FINAL,
+            },
+        },
+        "head_sha": FINAL,
+        "commits": [EARLIER, MIDDLE, FINAL],
+    }
+
+
+def make_row(result: dict | None = None, **extra) -> dict:
+    row = {
+        "id": JOB_ID,
+        "kind": "build:fake-task",
+        "status": "needs-review",
+        "repo": "owner/fake-repo",
+        "head_branch": "feat/fake-branch",
+        "base_branch": "main",
+        "project": "fake-project",
+        "result": live_row_result() if result is None else result,
+    }
+    row.update(extra)
+    return row
+
+
+class FakeBus:
+    """Just enough bus for the follow-up sweep: listing, child listing, submit, patch."""
+
+    def __init__(self, row: dict):
+        self.row = row
+        self.children: list[dict] = []
+        self.calls: list[tuple] = []
+        self.posted: list[dict] = []
+        self.messages: list[tuple[str, dict]] = []
+
+    def http(self, method, path, body=None, **kwargs):
+        self.calls.append((method, path, body))
+        if method == "GET":
+            if "parent_job_id=" in path:
+                return 200, {"jobs": [dict(c) for c in self.children]}
+            return 200, {"jobs": [self.row], "total": 1}
+        if method == "POST" and path == "/v1/jobs":
+            self.posted.append(body)
+            child = {"id": f"{CHILD_PREFIX}{len(self.posted)}", "kind": body["kind"], "status": "queued"}
+            self.children.append(child)
+            return 201, {"id": child["id"]}
+        if method == "PATCH" and path == f"/v1/jobs/{self.row['id']}":
+            self.row["result"] = copy.deepcopy(body["result"])
+            return 200, {}
+        return 200, {}
+
+    def writes(self) -> list[tuple]:
+        return [c for c in self.calls if c[0] in {"POST", "PATCH", "PUT", "DELETE"}]
+
+
+@pytest.fixture
+def bus(monkeypatch):
+    fake = FakeBus(make_row())
+    monkeypatch.setattr(doctor, "_http", fake.http)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda topic, body: fake.messages.append((topic, body)))
+    return fake
+
+
+def sweep() -> dict:
+    return doctor.run_review_followup_sweep()
+
+
+def restart_doctor(monkeypatch) -> None:
+    """A fresh process: the durable markers of the old one are not there."""
+    monkeypatch.setattr(doctor, "STATE", DurableStateStore(MemoryBackend(), refresh_secs=0))
+
+
+# ── the live row ───────────────────────────────────────────────────────────
+
+
+def test_live_row_shape_gets_a_re_review(bus):
+    report = sweep()
+    assert report["submitted"] == 1 and report.get("skipped_verdict", 0) == 0
+    assert len(bus.posted) == 1
+    spec = bus.posted[0]
+    assert spec["parent_job_id"] == JOB_ID
+    assert spec["kind"].startswith("review:")
+    assert FINAL in spec["description"], "the review must name the final head"
+    assert spec["idempotency_key"] == f"needs-review-followup:{JOB_ID}:{FINAL[:12]}"
+    result = bus.row["result"]
+    assert result["auto_review_job_id"] == f"{CHILD_PREFIX}1"
+    assert result["re_review_head"] == FINAL
+    assert result["doctor_reason"].startswith("re-review: ")
+    assert "final round had no reviewer" in result["doctor_reason"]
+    assert result["review_evidence"] == live_row_result()["review_evidence"], "earlier evidence is kept"
+    announced = [body for topic, body in bus.messages if topic == "doctor.needs_review"]
+    assert announced and announced[0]["auto_review_job_id"] == f"{CHILD_PREFIX}1"
+    assert "re_review" in announced[0]
+
+
+def test_second_pass_is_a_no_op_even_after_a_doctor_restart(bus, monkeypatch):
+    assert sweep()["submitted"] == 1
+    writes_after_first = len(bus.writes())
+    again = sweep()
+    assert again["submitted"] == 0 and again["skipped_marker"] == 1
+    # a restarted doctor has no markers: the row itself (auto id + re_review_head) is the cap
+    restart_doctor(monkeypatch)
+    assert sweep()["submitted"] == 0, "child still queued: a review is in flight"
+    bus.children[0]["status"] = "failed"
+    restarted = sweep()
+    assert restarted["submitted"] == 0 and restarted["skipped_marker"] == 1, "one re-review per (row, head)"
+    assert len(bus.writes()) == writes_after_first
+    assert len(bus.posted) == 1
+
+
+def test_a_new_head_earns_a_new_re_review_once(bus, monkeypatch):
+    assert sweep()["submitted"] == 1
+    bus.children[0]["status"] = "failed"
+    newer = "99" * 20
+    bus.row["result"]["head_sha"] = newer
+    bus.row["result"]["commits"].append(newer)
+    restart_doctor(monkeypatch)
+    assert sweep()["submitted"] == 1
+    assert bus.posted[1]["idempotency_key"].endswith(newer[:12])
+    assert sweep()["submitted"] == 0
+    assert len(bus.posted) == 2
+
+
+def test_evidence_for_the_current_head_is_not_re_reviewed(bus):
+    bus.row["result"]["review_evidence"]["reviewed_head"] = FINAL
+    report = sweep()
+    assert report["submitted"] == 0 and report["skipped_verdict"] == 1
+    assert bus.writes() == []
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda r: r["review_evidence"].update(head_matches=True),
+        lambda r: r["review_evidence"].update(verdict={"verdict": "approve", "head": FINAL}),
+        lambda r: r["reviewer"].update(head=FINAL[:12]),
+        lambda r: r["loop_result"]["teardown"].update(resolved=True),
+        lambda r: r["loop_result"].update(
+            verdicts=["request_changes", "approve"], teardown={"final_verdict": "approve"}
+        ),
+        lambda r: r["review_evidence"].update(child_advanced_branch=True, reviewed_head=MIDDLE, head_matches=False),
+    ],
+)
+def test_evidence_that_covers_the_head_leaves_the_row_alone(bus, mutate):
+    mutate(bus.row["result"])
+    assert sweep()["submitted"] == 0
+    assert bus.writes() == []
+
+
+def test_same_row_with_no_loop_outage_and_no_head_info_is_still_treated_as_reviewed(bus):
+    # what the base code did for every row with evidence: unchanged when nothing says otherwise
+    result = bus.row["result"]
+    del result["loop_result"]
+    assert sweep()["skipped_verdict"] == 1
+    assert bus.writes() == []
+
+
+def test_evidence_for_an_older_head_is_re_reviewed(bus):
+    result = bus.row["result"]
+    del result["loop_result"]
+    result["review_evidence"]["reviewed_head"] = MIDDLE
+    assert sweep()["submitted"] == 1
+    assert "older head" in bus.row["result"]["doctor_reason"]
+
+
+def test_evidence_with_a_verdict_head_for_an_older_head_is_re_reviewed(bus):
+    result = bus.row["result"]
+    del result["loop_result"]
+    result["review_evidence"]["verdict"] = {"verdict": "approve", "head": EARLIER}
+    assert sweep()["submitted"] == 1
+    assert "older head" in bus.row["result"]["doctor_reason"]
+
+
+def test_last_verdict_alone_marks_the_final_round_as_unreviewed(bus):
+    result = bus.row["result"]
+    del result["loop_result"]["teardown"]
+    assert sweep()["submitted"] == 1
+    assert "final round had no reviewer" in bus.row["result"]["doctor_reason"]
+
+
+def test_request_changes_with_newer_commits_is_re_reviewed(bus):
+    result = bus.row["result"]
+    del result["loop_result"]
+    del result["head_sha"]
+    result["review_evidence"]["reviewed_head"] = MIDDLE
+    assert sweep()["submitted"] == 1
+    assert "newer commit" in bus.row["result"]["doctor_reason"]
+
+
+def test_request_changes_on_the_last_commit_is_not_re_reviewed(bus):
+    result = bus.row["result"]
+    del result["loop_result"]
+    del result["head_sha"]
+    result["review_evidence"]["reviewed_head"] = FINAL
+    assert sweep()["submitted"] == 0
+    assert bus.writes() == []
+
+
+def test_empty_diff_teardown_is_not_a_reviewer_outage(bus):
+    result = bus.row["result"]
+    result["loop_result"]["teardown"].update(reason="reviewer_unavailable", detail="no review chunks were generated")
+    assert sweep()["submitted"] == 0
+    assert bus.writes() == []
+
+
+def test_row_without_any_evidence_still_gets_the_plain_review(bus):
+    result = bus.row["result"]
+    for key in ("review_evidence", "reviewer", "loop_result"):
+        del result[key]
+    assert sweep()["submitted"] == 1
+    assert bus.posted[0]["idempotency_key"] == f"needs-review-followup:{JOB_ID}"
+    assert "re_review_head" not in bus.row["result"]
+    assert bus.row["result"]["doctor_reason"].startswith("auto review submitted")
+
+
+# ── never loops, never overrides a guard ───────────────────────────────────
+
+
+def test_a_review_in_flight_blocks_the_re_review(bus):
+    bus.children.append({"id": "review-child-existing", "kind": "review:fake", "status": "running"})
+    bus.row["result"]["auto_review_job_id"] = "review-child-existing"
+    assert sweep()["skipped_verdict"] == 1
+    assert bus.writes() == []
+
+
+def test_allow_submit_false_defers_and_writes_nothing(bus):
+    assert doctor.ensure_review_followup(bus.row, allow_submit=False) == "deferred"
+    assert bus.writes() == []
+
+
+def test_submitted_marker_blocks_the_re_review(bus):
+    doctor.STATE.mark(f"review:submitted:{JOB_ID}", ttl=doctor.REVIEW_FOLLOWUP_TTL_SEC)
+    assert sweep()["skipped_marker"] == 1
+    assert bus.writes() == []
+
+
+def test_durable_state_failure_refuses_the_re_review(bus, monkeypatch):
+    monkeypatch.setattr(doctor.STATE, "persist_ok", False)
+    report = sweep()
+    assert report["errors"] == 1 and report["submitted"] == 0
+    assert bus.writes() == []
+
+
+def test_failed_submit_is_retried_with_the_same_key_and_leaves_no_marker(bus, monkeypatch):
+    specs = []
+
+    def lost(method, path, body=None, **kwargs):
+        if (method, path) == ("POST", "/v1/jobs"):
+            specs.append(body)
+            return 0, None
+        return bus.http(method, path, body, **kwargs)
+
+    monkeypatch.setattr(doctor, "_http", lost)
+    sweep()
+    sweep()
+    assert len(specs) == 2 and specs[0]["idempotency_key"] == specs[1]["idempotency_key"]
+    assert not doctor.review_followup_submitted(JOB_ID)
+    assert "re_review_head" not in bus.row["result"]
+
+
+def test_protected_project_row_is_untouched(bus, monkeypatch):
+    monkeypatch.setattr(doctor, "DLQ_PROTECT_PROJECTS", frozenset({"fake-project"}))
+    assert sweep()["skipped_protected"] == 1
+    assert bus.writes() == []
+
+
+def test_protected_kind_row_is_untouched(bus, monkeypatch):
+    monkeypatch.setattr(doctor, "DLQ_PROTECT_KIND_PREFIXES", ("build:",))
+    assert sweep()["skipped_protected"] == 1
+    assert bus.writes() == []
+
+
+def test_routing_signal_row_is_untouched(bus):
+    bus.row["result"]["worker_error"] = "released_by_host"
+    assert sweep()["skipped_protected"] == 1
+    assert bus.writes() == []
+
+
+def test_triage_row_is_untouched(bus):
+    bus.row["kind"] = "triage:build:fake-task"
+    assert sweep()["skipped_triage"] == 1
+    assert bus.writes() == []
+
+
+def test_row_level_verdict_is_untouched(bus):
+    bus.row["result"]["verdict"] = {"verdict": "approve"}
+    assert sweep()["skipped_verdict"] == 1
+    assert bus.writes() == []
+
+
+# ── a review the bus already recorded for an older head ────────────────────
+
+
+def reconciled_old_head_row(bus: FakeBus, child_status: str = "done") -> dict:
+    """Parent after the bus reconciled a finished review of an OLDER head."""
+    proof = {"verdict": {"verdict": "approve", "head": MIDDLE}, "deliverable": "Reviewed."}
+    bus.children.append({"id": "review-child-old", "kind": "review:fake", "status": child_status, "result": proof})
+    result = bus.row["result"]
+    del result["loop_result"]
+    result["auto_review_job_id"] = "review-child-old"
+    result["review_evidence"] = {
+        "review_job_id": "review-child-old",
+        "verdict": proof["verdict"],
+        "head_matches": False,
+        "artifact_valid": True,
+        "reason": "review HEAD does not match delivered HEAD",
+    }
+    return proof
+
+
+def test_recorded_review_of_an_older_head_is_re_reviewed_not_replayed_forever(bus):
+    reconciled_old_head_row(bus)
+    report = sweep()
+    assert report.get("replayed_verdict", 0) == 0
+    assert report["submitted"] == 1
+    assert [c for c in bus.writes() if c[1] == "/v1/jobs/review-child-old"] == []
+    assert bus.posted[0]["idempotency_key"] == f"needs-review-followup:{JOB_ID}:{FINAL[:12]}"
+    assert bus.row["result"]["auto_review_job_id"] == f"{CHILD_PREFIX}1"
+    assert sweep()["submitted"] == 0, "and then it stops"
+
+
+def test_recorded_review_that_is_still_in_flight_is_not_duplicated(bus):
+    reconciled_old_head_row(bus, child_status="running")
+    assert sweep()["submitted"] == 0
+    assert bus.writes() == []
+
+
+# ── a finished review child, in either result shape, is replayed ────────────
+
+
+def worker_shaped_proof(verdict: str | None = "approve", head: str = FINAL) -> dict:
+    """A review child's result as the worker writes it: no top-level verdict."""
+    return {
+        "verdict": None,
+        "reviewer": {
+            "model": "fake-reviewer",
+            "models": ["fake-reviewer"],
+            "verdict": verdict,
+            "source": "zoder_verdict",
+        },
+        "review_evidence": {"reviewers": [], "first": None, "secondaries": [], "skipped": [], "warnings": []},
+        "head_sha": head,
+        "remote_sha": head,
+        "base_sha": head,
+        "remote_verified": True,
+        "exit_code": 0,
+        "commits": [head],
+    }
+
+
+def legacy_proof() -> dict:
+    return {"verdict": {"verdict": "approve", "head": FINAL}, "deliverable": "Reviewed."}
+
+
+def finished_child(bus: FakeBus, proof: dict) -> None:
+    bus.children.append({"id": "review-child-done", "kind": "review:fake", "status": "done", "result": proof})
+    bus.row["result"]["auto_review_job_id"] = "review-child-done"
+
+
+@pytest.mark.parametrize(
+    "proof",
+    [worker_shaped_proof(), worker_shaped_proof("APPROVE"), worker_shaped_proof("request_changes"), legacy_proof()],
+    ids=["worker", "worker-uppercase", "worker-request-changes", "legacy-dict"],
+)
+def test_finished_child_is_replayed_through_the_bus_verifier(bus, proof):
+    finished_child(bus, proof)
+    report = sweep()
+    assert report["replayed_verdict"] == 1 and report["submitted"] == 0
+    assert bus.writes() == [("PATCH", "/v1/jobs/review-child-done", {"status": "done", "result": proof})]
+
+
+def test_worker_shaped_child_without_a_verdict_is_not_replayed(bus):
+    finished_child(bus, worker_shaped_proof(None))
+    bus.row["result"]["review_evidence"]["reviewed_head"] = FINAL  # nothing else for the doctor to do
+    report = sweep()
+    assert report.get("replayed_verdict", 0) == 0
+    assert bus.writes() == []
+
+
+def test_worker_shaped_child_without_a_verdict_does_not_hide_an_evidence_gap(bus):
+    finished_child(bus, worker_shaped_proof(None))
+    report = sweep()
+    assert report.get("replayed_verdict", 0) == 0 and report["submitted"] == 1
+    assert [c for c in bus.writes() if c[1] == "/v1/jobs/review-child-done"] == []
+
+
+def test_worker_shaped_child_already_recorded_by_the_bus_is_not_replayed_again(bus):
+    finished_child(bus, worker_shaped_proof())
+    bus.row["result"]["review_evidence"] = {
+        "review_job_id": "review-child-done",
+        "verdict": {"verdict": "approve", "head": FINAL},
+        "head_matches": True,
+        "artifact_valid": True,
+    }
+    assert sweep()["skipped_verdict"] == 1
+    assert bus.writes() == []
+
+
+def test_worker_shaped_child_dispatched_by_the_bus_is_replayed_without_a_doctor_marker(bus):
+    # the child was dispatched by the bus (auto id set there), the doctor holds no marker
+    finished_child(bus, worker_shaped_proof())
+    assert sweep()["replayed_verdict"] == 1
+    assert not doctor.review_followup_submitted(JOB_ID)
+
+
+def test_doctor_and_bus_read_the_verdict_with_one_helper():
+    from hive import review_verdict
+    from hive.bus.domain import review_dispatch
+
+    assert review_dispatch.child_verdict is review_verdict.child_verdict
+    assert doctor.review_verdict.child_verdict is review_verdict.child_verdict
+    assert review_verdict.child_verdict(worker_shaped_proof("Approve")) == {"verdict": "approve", "head": FINAL}
+    assert review_verdict.child_verdict(legacy_proof()) == legacy_proof()["verdict"]
+
+
+# ── report-only sweep: log once per state, say "stuck" once, honest evidence ──
+
+import logging  # noqa: E402
+
+from hive.workers import doctor_v2  # noqa: E402
+
+CLOCK0 = 2_000_000_000.0
+ESCALATE = 1800.0
+
+
+class Clock:
+    now = CLOCK0
+
+
+@pytest.fixture
+def report_env(bus, monkeypatch):
+    """The bus fake plus a controllable clock; a stuck row: re-reviewed, child failed."""
+    Clock.now = CLOCK0
+    monkeypatch.setattr(doctor.time, "time", lambda: Clock.now)
+    monkeypatch.setattr(doctor, "NEEDS_REVIEW_ESCALATE_SECONDS", ESCALATE)
+    monkeypatch.setattr(doctor, "NEEDS_REVIEW_OLDER_HOURS", 0.0)
+    monkeypatch.setattr(doctor, "branch_merged_into_base", lambda _j: False)
+    monkeypatch.setattr(doctor, "_make_branch_jobs_fetcher", lambda: lambda _j: [])
+    monkeypatch.setattr(doctor, "complete_stuck_verdict_jobs", lambda jobs: {})
+    monkeypatch.setattr(doctor, "STATE", DurableStateStore(MemoryBackend(), refresh_secs=0))
+    doctor.reset_needs_review_report_state()
+    bus.row["updated_at"] = CLOCK0
+    return bus
+
+
+def make_stuck(bus) -> None:
+    """The follow-up already re-reviewed this head and its child is over: nothing left to do."""
+    assert sweep()["submitted"] == 1
+    bus.children[0]["status"] = "failed"
+
+
+def stuck_messages(bus) -> list[dict]:
+    return [body for topic, body in bus.messages if topic == "doctor.needs_review_stuck"]
+
+
+def test_a_stuck_row_is_announced_once_after_the_threshold(report_env):
+    bus = report_env
+    make_stuck(bus)
+    doctor.report_needs_review_sweep()
+    assert stuck_messages(bus) == [], "not stuck yet: the row is fresh"
+    Clock.now = CLOCK0 + ESCALATE + 60
+    report = doctor.report_needs_review_sweep()
+    assert report["escalated"] == [JOB_ID]
+    (message,) = stuck_messages(bus)
+    assert message["job_id"] == JOB_ID and message["classification"] == "stale"
+    assert "already submitted" in message["reason"] and "no automatic action" in message["reason"]
+    assert "loop_unresolved_work_rescued" in message["evidence_summary"]
+    assert message["idle_seconds"] >= ESCALATE
+    for later in (120, 3600, 7200):
+        Clock.now += later
+        assert doctor.report_needs_review_sweep()["escalated"] == []
+    assert len(stuck_messages(bus)) == 1, "quiet until the state changes"
+
+
+def test_a_changed_state_is_announced_again(report_env):
+    bus = report_env
+    make_stuck(bus)
+    Clock.now = CLOCK0 + ESCALATE + 60
+    doctor.report_needs_review_sweep()
+    bus.row["result"]["failure_reason"] = "loop_something_else"
+    doctor.report_needs_review_sweep()
+    messages = stuck_messages(bus)
+    assert len(messages) == 2
+    assert "loop_something_else" in messages[1]["evidence_summary"]
+
+
+def test_a_row_the_follow_up_can_still_act_on_is_not_called_stuck(report_env):
+    bus = report_env
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    report = doctor.report_needs_review_sweep()  # nothing was re-reviewed yet: the follow-up will act
+    assert report["escalated"] == [] and stuck_messages(bus) == []
+
+
+def test_a_row_touched_recently_is_not_called_stuck(report_env):
+    bus = report_env
+    make_stuck(bus)
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    bus.row["updated_at"] = Clock.now - 30
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+
+
+def test_triage_and_protected_rows_are_never_announced(report_env, monkeypatch):
+    bus = report_env
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    bus.row["kind"] = "triage:fake"
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+    bus.row["kind"] = "build:fake-task"
+    make_stuck(bus)
+    monkeypatch.setattr(doctor, "review_followup_protected", lambda _j: True)
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+    assert stuck_messages(bus) == []
+
+
+def test_escalation_can_be_switched_off(report_env, monkeypatch):
+    bus = report_env
+    make_stuck(bus)
+    monkeypatch.setattr(doctor, "NEEDS_REVIEW_ESCALATE_SECONDS", 0.0)
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+
+
+def test_the_threshold_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", "90")
+    assert doctor._env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0) == 90.0
+    monkeypatch.setenv("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", "soon")
+    assert doctor._env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0) == 1800.0
+    monkeypatch.setenv("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", " ")
+    assert doctor._env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0) == 1800.0
+
+
+def report_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("needs-review report-only:")]
+
+
+def test_the_report_line_is_logged_once_per_state(report_env, caplog):
+    bus = report_env
+    make_stuck(bus)
+    caplog.set_level(logging.INFO, logger="doctor")
+    for _ in range(5):
+        Clock.now += 60
+        doctor.report_needs_review_sweep()
+    assert len(report_lines(caplog)) == 1
+    bus.row["result"]["failure_reason"] = "loop_something_else"
+    doctor.report_needs_review_sweep()
+    doctor.report_needs_review_sweep()
+    assert len(report_lines(caplog)) == 2
+    # the row still goes out on the bus every sweep: only the log is deduplicated
+    assert len([t for t, _ in bus.messages if t == "doctor.needs_review"]) >= 7
+
+
+def test_the_report_line_never_says_none_for_a_row_that_has_evidence(report_env, caplog):
+    caplog.set_level(logging.INFO, logger="doctor")
+    report = doctor.report_needs_review_sweep()
+    (row,) = report["rows"]
+    note = row["orchestrator_note"]
+    assert "evidence=none" not in note
+    assert "loop_unresolved_work_rescued" in note
+    assert "review=request_changes@" in note
+    assert f"head={FINAL[:7]}" in note and "final_round=reviewer_unavailable" in note
+
+
+def test_evidence_none_is_only_for_a_row_that_carries_nothing():
+    old = {"id": "j", "status": "needs-review", "kind": "build:x", "updated_at": 1.0}
+    (empty,) = doctor_v2.sweep_needs_review([old], now=1e9)
+    assert empty["orchestrator_note"].endswith("evidence=none")
+    with_reason = dict(old, failure_reason="codex_delivery_failed")
+    (row,) = doctor_v2.sweep_needs_review([with_reason], now=1e9)
+    assert row["orchestrator_note"].endswith("evidence=codex_delivery_failed")
+    reviewed = dict(old, result={"reviewer": {"verdict": "request_changes"}, "head_sha": FINAL})
+    (row,) = doctor_v2.sweep_needs_review([reviewed], now=1e9)
+    assert "evidence=none" not in row["orchestrator_note"] and "request_changes" in row["orchestrator_note"]
+    as_json = dict(old, result='{"failure_reason": "from_result"}')
+    (row,) = doctor_v2.sweep_needs_review([as_json], now=1e9)
+    assert row["orchestrator_note"].endswith("evidence=from_result")

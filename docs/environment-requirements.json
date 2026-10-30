@@ -250,6 +250,15 @@
       "meaning": "Seconds without a heartbeat before the bus reaper marks an agent offline (values above 300 are ignored).",
       "example": "120",
       "source": "hive/bus/app.py:agent_offline_after"
+    },
+    {
+      "name": "DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Sets how long a needs-review row may sit untouched, with no automatic review action left, before the doctor announces it once; unset keeps 1800 s.",
+      "meaning": "Seconds before an untouched needs-review row the doctor cannot act on gets one doctor.needs_review_stuck message (zero or negative turns it off).",
+      "example": "1800",
+      "source": "hive/workers/doctor.py:NEEDS_REVIEW_ESCALATE_SECONDS"
     }
   ]
 }

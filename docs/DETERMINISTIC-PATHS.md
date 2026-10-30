@@ -58,6 +58,19 @@ named branch — this branch must not double-implement them.
 | `branch_not_found` | v2 rule R1: escalate to submitter | existing (`test_doctor_triage_actions.py`) |
 | `invalid_base_branch` | job-level unschedulable: count toward decline dead-letter | existing (`test_decline_reasons.py`) |
 
+## Needs-review rows: the review evidence must cover the head
+
+These are not decline reasons: they are what the doctor does with a
+`needs-review` row that already carries review evidence. The tests are in
+`test_doctor_needs_review_head_aware_20261030.py`; the full policy is
+`docs/NEEDS_REVIEW_POLICY.md`.
+
+| Row state | Doctor action |
+|---|---|
+| evidence for another head, or a loop whose final round was `reviewer_unavailable`, or `request_changes` with newer commits | one re-review per (row, delivered head); `result.re_review_head`, `result.doctor_reason`; never while a review child is running |
+| evidence covers the delivered head, or `child_advanced_branch` | none; a human confirms |
+| no action left and untouched longer than `DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS` | one `doctor.needs_review_stuck` message until the row's state changes |
+
 ## Known worker-side bugs (needs_operator)
 
 These are NOT doctor failures. The doctor's deterministic job for them is to

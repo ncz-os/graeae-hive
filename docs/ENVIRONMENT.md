@@ -95,6 +95,7 @@ serves which model is exactly the sort of address that goes stale in source.
 | `DOCTOR_OPENWEIGHT_MODEL` | Model id for the open-weight path. | `gpt-oss-20b` |
 | `DOCTOR_OPENWEIGHT_API_KEY` | Key for the open-weight path, when the server wants one. | — |
 | `DOCTOR_REVIEWER_HEALTH_URL` | Optional bounded probe used by the loop sweep before an automatic requeue. Unset means "assume healthy"; the requeue cap still applies. | `http://<cerberus-host>:8080/health` |
+| `DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS` | Seconds a `needs-review` row may sit untouched, with no automatic review action left, before the doctor publishes ONE `doctor.needs_review_stuck` message for it (again only when the row's state changes). Zero or negative turns the message off; unset, blank or non-numeric means `1800`. Read when the doctor starts. | `1800` |
 
 Unset `DOCTOR_OPENWEIGHT_BASE_URL` (and no phase override): `invoke_doctor_agent`
 returns `disabled: no base URL configured` and logs one line; it never POSTs to a

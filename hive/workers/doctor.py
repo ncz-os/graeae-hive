@@ -64,6 +64,7 @@ import uuid
 from collections import deque
 
 # Fleet addresses come from operator config (HIVE_FLEET_INVENTORY), never source.
+from hive import review_verdict
 from hive.core import fleet_inventory
 from hive.workers import remediation, retention
 
@@ -298,6 +299,23 @@ _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
 NEEDS_REVIEW_SCAN_INTERVAL = float(os.environ.get("NEEDS_REVIEW_SCAN_INTERVAL", "3600"))
 NEEDS_REVIEW_OLDER_HOURS = float(os.environ.get("NEEDS_REVIEW_OLDER_HOURS", "24"))
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A float from the environment; a blank or malformed value is the default."""
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# A needs-review row nobody has touched for this long, and for which the doctor has
+# no automatic action, is announced ONCE on doctor.needs_review_stuck (and again only
+# when its state changes). Zero or negative disables the message.
+NEEDS_REVIEW_ESCALATE_SECONDS = _env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0)
+# A first sweep over a long backlog must not flood the channel; the rest follow on
+# the next sweeps (a row is only marked once its message went out).
+NEEDS_REVIEW_ESCALATE_MAX_PER_SWEEP = 10
 
 # ── Verdict-completion recovery for codex_delivery_failed rows ──────────────
 # The codex delivery path can hold a row in needs-review with
@@ -3083,12 +3101,17 @@ def _needs_review_child_review_jobs(job: dict) -> list[dict]:
     return [j for j in resp["jobs"] if str(j.get("kind") or "").startswith(REVIEW_FOLLOWUP_KIND_PREFIX)]
 
 
-def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
+def _submit_review_followup(job: dict, *, rereview_reason: str = "") -> tuple[str, dict | None, str]:
     """Submit ONE review job for a needs-review row. Returns (job_id, spec, note).
 
     Any reviewer family may claim this high-priority read-only job. Preserve
     the branch and exact delivered SHA separately; stable idempotency closes
-    the submit/marker crash window. No commits expected (read-only)."""
+    the submit/marker crash window. No commits expected (read-only).
+
+    ``rereview_reason`` marks a re-review of a row whose existing evidence does not
+    cover the delivered head: the idempotency key then carries the head, so the
+    bus can never hand back the earlier review for it and there is at most one
+    re-review per (row, head)."""
     jid = str(job.get("id") or "")
     res = _job_result_dict(job)
     kind = str(job.get("kind") or "").strip()
@@ -3110,6 +3133,11 @@ def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
         "(approve | request-changes | blocked), a 'head_sha' field containing the exact reviewed commit, and a 'reason' field. "
         f"Reviewed job id: {jid}. No commits expected."
     ).strip()
+    if rereview_reason:
+        desc += f" This is a re-review: {rereview_reason}."
+    key = f"needs-review-followup:{jid}"
+    if rereview_reason:
+        key += f":{head_sha[:12] or 'nohead'}"
     spec = {
         "kind": review_kind,
         "description": desc,
@@ -3122,7 +3150,7 @@ def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
         "priority": max(REVIEW_FOLLOWUP_PRIORITY, job.get("priority") or 0),
         "project": job.get("project"),
         "parent_job_id": jid,
-        "idempotency_key": f"needs-review-followup:{jid}",
+        "idempotency_key": key,
     }
     code, resp = submit_job_spec(spec)
     new_id = (resp or {}).get("id") if isinstance(resp, dict) else None
@@ -3131,21 +3159,28 @@ def _submit_review_followup(job: dict) -> tuple[str, dict | None, str]:
     return "", spec, f"submit FAILED code={code} resp={str(resp)[:160]}"
 
 
-def _record_auto_review(job: dict, review_job_id: str) -> None:
+def _record_auto_review(job: dict, review_job_id: str, *, rereview_reason: str = "") -> None:
     """Record the submission on the original row (result.auto_review_job_id +
     doctor_reason) AND keep the durable marker, so a second sweep (or a
-    restarted doctor) does not submit a second review for the same row."""
+    restarted doctor) does not submit a second review for the same row.
+
+    A re-review also records ``result.re_review_head`` (the head it covers) and a
+    per-head marker: the cap of one re-review per (row, head), durable on the row
+    and in STATE."""
     jid = str(job.get("id") or "")
     STATE.mark(f"{KEY_REVIEW}:submitted:{jid}", ttl=REVIEW_FOLLOWUP_TTL_SEC)
+    extra: dict = {}
+    reason = f"auto review submitted {review_job_id[:12]}"
+    if rereview_reason:
+        head = review_verdict.delivered_head(job, _job_result_dict(job)) or ""
+        STATE.mark(_rereview_key(jid, head), ttl=REVIEW_FOLLOWUP_TTL_SEC)
+        extra["re_review_head"] = head
+        reason = f"re-review: {rereview_reason}; {reason}"
     try:
         res = _job_result_dict(job)
         body = {
             "status": "needs-review",
-            "result": {
-                **res,
-                "auto_review_job_id": review_job_id,
-                "doctor_reason": f"auto review submitted {review_job_id[:12]}",
-            },
+            "result": {**res, "auto_review_job_id": review_job_id, "doctor_reason": reason, **extra},
         }
         if job.get("claimed_by"):
             body["claimed_by"] = job["claimed_by"]
@@ -3157,6 +3192,99 @@ def _record_auto_review(job: dict, review_job_id: str) -> None:
     except Exception as exc:
         log.warning("review followup: could not annotate row %s: %s", jid[:12], exc)
         broadcast_doctor_message("doctor.sweep_error", {"sweep": "review-annotation", "job_id": jid, "error": str(exc)})
+
+
+def _rereview_key(job_id: str, head: str) -> str:
+    return f"{KEY_REVIEW}:rereview:{job_id}:{head[:12] or 'nohead'}"
+
+
+_REVIEW_CHILD_TERMINAL = frozenset({"done", "failed", "cancelled", "dead-letter", "needs-review"})
+
+
+def _commit_shas(result: dict) -> list[str]:
+    """``result.commits`` as a list of shas, oldest first (dict entries use ``sha``)."""
+    commits = result.get("commits")
+    out = []
+    for entry in commits if isinstance(commits, list) else []:
+        sha = entry.get("sha") if isinstance(entry, dict) else entry
+        if isinstance(sha, str) and sha.strip():
+            out.append(sha.strip())
+    return out
+
+
+def _final_round_had_no_reviewer(job: dict, result: dict) -> bool:
+    """True when the loop's final round ended with no reviewer and did not resolve.
+
+    ``loop_result.teardown.final_verdict`` (or, without a teardown verdict, the last
+    entry of ``loop_result.verdicts``) is ``reviewer_unavailable`` and
+    ``teardown.resolved`` is not true. An empty diff is reported by the loop with the
+    same word but is not an outage (nothing existed to review): ``loop_outcome``
+    tells the two apart, and the empty-diff row is left alone.
+    """
+    loop = result.get("loop_result")
+    if not isinstance(loop, dict):
+        return False
+    teardown = loop.get("teardown") if isinstance(loop.get("teardown"), dict) else {}
+    verdicts = loop.get("verdicts") if isinstance(loop.get("verdicts"), list) else []
+    last = verdicts[-1] if verdicts else None
+    if isinstance(last, dict):
+        last = last.get("verdict")
+    unavailable = loop_outcome.REVIEWER_UNAVAILABLE
+    if unavailable not in (
+        review_verdict.normalize_verdict(teardown.get("final_verdict")),
+        review_verdict.normalize_verdict(last),
+    ):
+        return False
+    if teardown.get("resolved") is True:
+        return False
+    try:
+        return loop_outcome.classify(job, events_fetcher=lambda _job_id: None) != loop_outcome.EMPTY_DIFF
+    except Exception:  # noqa: BLE001 - classification is advisory
+        return True
+
+
+def review_evidence_gap(job: dict, result: dict | None = None) -> str | None:
+    """Why the review evidence on this row does not cover its CURRENT delivered head.
+
+    None means "nothing to say": there is no evidence, or it covers the delivered
+    head (or the bus recorded that the review job itself advanced the branch, which
+    is a human's call, see docs/NEEDS_REVIEW_POLICY.md). Otherwise a short reason,
+    for the cases where evidence from an earlier loop round must not count as a
+    review of what was finally delivered:
+
+    * the evidence names a reviewed head that differs from ``result.head_sha``;
+    * the loop's final round had no reviewer (``reviewer_unavailable``, unresolved);
+    * the reviewer asked for changes and the row has commits newer than the
+      reviewed head.
+
+    A reviewed head equal to the delivered head (or ``head_matches: true`` from the
+    bus's reconcile) is proof the head was reviewed and ends the inquiry.
+    """
+    result = _job_result_dict(job) if result is None else result
+    evidence = result.get("review_evidence")
+    if not evidence:  # no evidence: the row is simply unreviewed, which the caller handles
+        return None
+    evidence = evidence if isinstance(evidence, dict) else {}
+    delivered = review_verdict.delivered_head(job, result)
+    heads = review_verdict.reviewed_heads(result)
+    covers = bool(delivered) and any(review_verdict.same_sha(h, delivered) for h in heads)
+    if evidence.get("head_matches") is True or covers:
+        return None
+    if evidence.get("child_advanced_branch") is True:
+        return None
+    if delivered and heads:
+        return (
+            f"evidence is for an older head ({review_verdict.short_sha(heads[0])}, "
+            f"delivered {review_verdict.short_sha(delivered)})"
+        )
+    if _final_round_had_no_reviewer(job, result):
+        return "final round had no reviewer (reviewer_unavailable, unresolved)"
+    if review_verdict.row_verdict(result) == "request_changes" and heads:
+        commits = _commit_shas(result)
+        at = [i for i, sha in enumerate(commits) if any(review_verdict.same_sha(sha, h) for h in heads)]
+        if at and max(at) < len(commits) - 1:
+            return f"reviewer asked for changes and {len(commits) - 1 - max(at)} newer commit(s) exist"
+    return None
 
 
 def review_followup_submitted(job_id: str) -> bool:
@@ -4417,15 +4545,136 @@ def needs_review_evidence_fn(*, merged_fn=None, branch_jobs_fn=None):
     return lambda job: gather_needs_review_evidence(job, merged_fn=merged_fn, branch_jobs_fn=branch_jobs_fn, now=now)
 
 
+_NEEDS_REVIEW_LOGGED: dict[str, tuple] = {}
+
+
+def reset_needs_review_report_state() -> None:
+    """Forget what the report-only sweep already logged (tests; a restart does it too)."""
+    _NEEDS_REVIEW_LOGGED.clear()
+
+
+def _log_report_row_once(row: dict) -> bool:
+    """Log a report-only row only when its (classification, evidence summary) changed.
+
+    The same row used to be logged on every scan for as long as it existed. The
+    first sight of a row, and every change to what the line says, still log.
+    """
+    jid = str(row.get("job_id") or "")
+    state = (row.get("classification"), row.get("evidence_summary"))
+    if _NEEDS_REVIEW_LOGGED.get(jid) == state:
+        return False
+    _NEEDS_REVIEW_LOGGED[jid] = state
+    log.info("needs-review report-only: %s", row)
+    return True
+
+
+def _row_touched_at(job: dict) -> float | None:
+    """When the row last changed, as far as the listing says (None: unknown)."""
+    stamps = [_as_float(job.get(k)) for k in ("updated_at", "last_update_at", "ended_at", "created_at")]
+    stamps = [s for s in stamps if s]
+    return max(stamps) if stamps else None
+
+
+def review_followup_blocker(job: dict) -> str | None:
+    """Why the review follow-up will NOT act on this needs-review row (None: it will).
+
+    Read-only and without a bus call, so it can say "stuck" without a listing per
+    row: it mirrors the order of ``ensure_review_followup``. A non-None reason is
+    the reason a human is needed.
+    """
+    if str(job.get("kind") or "").startswith("triage:"):
+        return "a triage report: it needs a human, not a code review"
+    result = _job_result_dict(job)
+    if result.get("verdict"):
+        return "the row already carries a verdict"
+    jid = str(job.get("id") or "")
+    if STATE.seen(KEY_VERDICT_COMPLETION + ":" + jid, ttl=VERDICT_COMPLETION_TTL):
+        return "verdict completion was already attempted"
+    if review_followup_submitted(jid):
+        return "a review was already submitted and has not produced a verdict"
+    if not result.get("review_evidence"):
+        if result.get("auto_review_job_id"):
+            return "a review job is recorded and has not produced a verdict"
+        return None
+    gap = review_evidence_gap(job, result)
+    if gap is None:
+        return "its review evidence covers the delivered head"
+    head = review_verdict.delivered_head(job, result) or ""
+    if result.get("re_review_head") == head or STATE.seen(_rereview_key(jid, head), ttl=REVIEW_FOLLOWUP_TTL_SEC):
+        return f"already re-reviewed for this head ({gap})"
+    return None
+
+
+def escalate_stuck_needs_review(jobs: list[dict], *, evidence_fn, now: float | None = None) -> list[str]:
+    """ONE ``doctor.needs_review_stuck`` message per row that is stuck, until it changes.
+
+    Stuck: needs-review, not a triage report or protected lane, untouched for more than
+    ``DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS``, and the review follow-up has nothing
+    to do for it. The message names the row, its classification and the reason. The
+    (classification, evidence, blocker) the message was sent for is kept durably
+    (``review:stuck:<id>:<state hash>``), so the next sweep, and a restarted doctor, stay quiet
+    until that state changes. Protected lanes and routing signals are never
+    announced. Returns the ids announced.
+    """
+    if NEEDS_REVIEW_ESCALATE_SECONDS <= 0:
+        return []
+    now = time.time() if now is None else now
+    classified = {
+        str(r.get("job_id")): r
+        for r in doctor_v2.sweep_needs_review(
+            jobs, now=now, older_than_hours=0, summarize=review_verdict.evidence_summary
+        )
+    }
+    sent: list[str] = []
+    for job in jobs:
+        jid = str(job.get("id") or "")
+        row = classified.get(jid)
+        if not jid or row is None or review_followup_protected(job):
+            continue
+        if str(job.get("kind") or "").startswith("triage:"):
+            continue  # a triage report is meant to wait for a human; one message each would be noise
+        touched = _row_touched_at(job)
+        if touched is None or now - touched <= NEEDS_REVIEW_ESCALATE_SECONDS:
+            continue
+        blocker = review_followup_blocker(job)
+        if blocker is None:
+            continue
+        state = "|".join([str(row["classification"]), str(row["evidence_summary"]), blocker])
+        key = f"{KEY_REVIEW}:stuck:{jid}:{hashlib.sha1(state.encode()).hexdigest()[:12]}"
+        if STATE.seen(key, ttl=REVIEW_FOLLOWUP_TTL_SEC):
+            continue
+        if len(sent) >= NEEDS_REVIEW_ESCALATE_MAX_PER_SWEEP:
+            break
+        suggestion = needs_review_suggestion(evidence_fn(job))
+        broadcast_doctor_message(
+            "doctor.needs_review_stuck",
+            {
+                "host": AGENT_HOST,
+                "job_id": jid,
+                "kind": job.get("kind"),
+                "classification": row["classification"],
+                "reason": f"{suggestion}; no automatic action: {blocker}",
+                "evidence_summary": row["evidence_summary"],
+                "idle_seconds": int(now - touched),
+            },
+        )
+        STATE.mark(key, ttl=REVIEW_FOLLOWUP_TTL_SEC)
+        sent.append(jid)
+    return sent
+
+
 def report_needs_review_sweep() -> dict:
     """Classify old needs-review jobs without cancelling, deleting, or retagging,
     and complete the stuck ``codex_delivery_failed`` rows whose verdict JSON is
     already in ``result.tail`` (one ``doctor.verdict_completed`` message per
     row, dry-run via ``DOCTOR_VERDICT_COMPLETION_DRY_RUN=1``)."""
     jobs = fetch_needs_review_jobs()
-    rows = doctor_v2.sweep_needs_review(jobs, older_than_hours=NEEDS_REVIEW_OLDER_HOURS)
+    rows = doctor_v2.sweep_needs_review(
+        jobs, older_than_hours=NEEDS_REVIEW_OLDER_HOURS, summarize=review_verdict.evidence_summary
+    )
     # Step 1 of docs/NEEDS_REVIEW_POLICY.md: evidence and a suggested action per
-    # row, report only. Nothing below this line writes to the bus or to STATE.
+    # row, report only. The only write below is the once-per-state stuck message
+    # (escalate_stuck_needs_review), which marks STATE after it was broadcast.
     by_id = {str(j.get("id")): j for j in jobs if j.get("id")}
     rows = [dict(row) for row in rows]
     evidence_fn = needs_review_evidence_fn()
@@ -4434,11 +4683,15 @@ def report_needs_review_sweep() -> dict:
         row["evidence"] = evidence
         row["suggested_action"] = needs_review_suggestion(evidence)
     for row in rows:
-        log.info("needs-review report-only: %s", row)
+        _log_report_row_once(row)
         broadcast_doctor_message("doctor.needs_review", {"host": AGENT_HOST, **row})
+    seen_ids = {str(r.get("job_id")) for r in rows}
+    for jid in [k for k in _NEEDS_REVIEW_LOGGED if k not in seen_ids]:
+        del _NEEDS_REVIEW_LOGGED[jid]  # a row that left the report is logged afresh if it returns
     verdicts = complete_stuck_verdict_jobs(jobs)
     log.info("needs-review verdict completion: %s", verdicts)
-    return {"scanned": len(rows), "rows": rows, "verdict_completion": verdicts}
+    escalated = escalate_stuck_needs_review(jobs, evidence_fn=evidence_fn)
+    return {"scanned": len(rows), "rows": rows, "verdict_completion": verdicts, "escalated": escalated}
 
 
 def run_needs_review_sweep() -> dict:
@@ -4501,21 +4754,35 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     if result.get("verdict"):
         return "skipped_verdict"
     children = _needs_review_child_review_jobs(job)
+    gap = review_evidence_gap(job, result)
     for child in children:
         if result.get("auto_review_job_id") and result["auto_review_job_id"] != child.get("id"):
             continue
         proof = _row_result_dict(child)
-        if child.get("status") != "done" or not isinstance(proof.get("verdict"), dict):
+        # The bus's own normalisation: the legacy dict ``result.verdict`` and the
+        # worker's ``result.reviewer.verdict`` are the same review.
+        verdict = review_verdict.child_verdict(proof)
+        if child.get("status") != "done" or verdict is None:
             continue
         previous = result.get("review_evidence")
         if (
             isinstance(previous, dict)
             and previous.get("review_job_id") == child.get("id")
-            and previous.get("verdict") == proof["verdict"]
+            and previous.get("verdict") == verdict
             and previous.get("artifact_valid") is True
             and previous.get("head_matches") is True
         ):
             return "skipped_verdict"
+        # The bus already recorded exactly this review and it does not cover the
+        # delivered head: replaying it would change nothing, on every sweep, and
+        # the evidence gap below would never be reached.
+        if (
+            gap is not None
+            and isinstance(previous, dict)
+            and previous.get("review_job_id") == child.get("id")
+            and previous.get("verdict") == verdict
+        ):
+            continue
         # Replay the child completion through the bus's transactional verifier.
         # The doctor never manufactures parent artifact proof or approval.
         body = {"status": "done", "result": proof}
@@ -4528,17 +4795,32 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     if review_followup_submitted(jid) or STATE.seen(KEY_VERDICT_COMPLETION + ":" + jid, ttl=VERDICT_COMPLETION_TTL):
         return "skipped_marker"
     if children or result.get("auto_review_job_id") or result.get("review_evidence"):
-        return "skipped_verdict"
+        # Evidence only counts as "reviewed" when it applies to the head that was
+        # delivered. An evidence gap earns ONE re-review per (row, head): never while
+        # a review is in flight, never twice for the same head, and never past the
+        # markers/caps above.
+        if gap is None or any(c.get("status") not in _REVIEW_CHILD_TERMINAL for c in children):
+            return "skipped_verdict"
+        head = review_verdict.delivered_head(job, result) or ""
+        if result.get("re_review_head") == head or STATE.seen(_rereview_key(jid, head), ttl=REVIEW_FOLLOWUP_TTL_SEC):
+            return "skipped_marker"
     if not allow_submit:
         return "deferred"
-    review_id, spec, note = _submit_review_followup(job)
+    rereview_reason = gap or ""
+    review_id, spec, note = _submit_review_followup(job, rereview_reason=rereview_reason)
     if not review_id:
         raise RuntimeError(note)
-    _record_auto_review(job, review_id)
-    broadcast_doctor_message(
-        "doctor.needs_review",
-        {"host": AGENT_HOST, "job_id": jid, "auto_review_job_id": review_id, "review_kind": spec["kind"], "note": note},
-    )
+    _record_auto_review(job, review_id, rereview_reason=rereview_reason)
+    payload = {
+        "host": AGENT_HOST,
+        "job_id": jid,
+        "auto_review_job_id": review_id,
+        "review_kind": spec["kind"],
+        "note": note,
+    }
+    if rereview_reason:
+        payload["re_review"] = rereview_reason
+    broadcast_doctor_message("doctor.needs_review", payload)
     return "submitted"
 
 

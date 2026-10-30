@@ -169,7 +169,8 @@ parent that is `needs-review`; it never adds a job status. Rows it skips
 `result.auto_review_job_id` names a different review job.
 
 The child's verdict is normalised first
-(`review_dispatch.py:child_verdict`):
+(`hive/review_verdict.py:child_verdict`, also used by the doctor's replay of a
+finished child, so both read the same two shapes):
 
 - legacy shape: `result.verdict` is a dict with a string `verdict`; used
   as is (`head` or `head_sha` names the reviewed commit).
@@ -214,9 +215,17 @@ logger `hive.bus.review_dispatch` per distinct (review job id, reason),
 `review_reconcile review_job_id=... parent_job_id=... reason="..."
 outcome=...`, plus the evidence record on the parent (only when the
 parent is `needs-review` and not skipped). Status, `doctor_reason` and
-`auto_review_job_id` are left as they were. Because the parent now
-carries `review_evidence`, neither the bus dispatch nor the doctor
-submits another review for it; a human or the owner decides.
+`auto_review_job_id` are left as they were. A record with no verdict and no
+reviewed head tells the doctor nothing about the delivered head, so it
+submits no second review for it; a human or the owner decides.
+
+Review evidence is for one head. When the parent carries evidence that does
+not cover its delivered head (a different reviewed head, a loop whose final
+round had no reviewer, or `request_changes` with newer commits) the doctor
+submits one re-review per (row, head) and records `result.re_review_head`;
+a row it can do nothing more for and that nobody touched for
+`DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS` gets one `doctor.needs_review_stuck`
+message. Details: `docs/NEEDS_REVIEW_POLICY.md`.
 
 ## Findings (code-path inconsistencies; production code untouched)
 
