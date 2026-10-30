@@ -43,6 +43,7 @@ from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 import agent_bus
 from hive.bus import deps
 from hive.bus.domain.jobs import STATUS_TRANSITIONS
+from hive.bus.domain.reaper import select_orphan_claims
 from hive.bus.routers import jobs as jobs_router
 
 DOC = Path(__file__).parent / "docs" / "JOB_LIFECYCLE.md"
@@ -210,7 +211,20 @@ class LifecycleMachine(RuleBasedStateMachine):
 
     @rule(i=st.integers(min_value=0, max_value=20), retryable=st.booleans())
     def fail(self, i, retryable):
-        self.patch_job(i, "failed", {"retryable": retryable, "error": "ordinary failure"})
+        jid = self.select(i)
+        before = self.row(jid) if jid else None
+        code = self.patch_job(i, "failed", {"retryable": retryable, "error": "ordinary failure"})
+        if jid is None or code != 200 or before["status"] not in ("claimed", "running"):
+            return
+        after = self.row(jid)
+        if retryable and before["retry_count"] < before["max_retries"]:
+            # Documented auto-retry: retryable failure with budget left requeues
+            # immediately and spends one retry.
+            assert after["status"] == "queued", after
+            assert after["retry_count"] == before["retry_count"] + 1, after
+        else:
+            # Non-retryable, or the retry budget is already spent.
+            assert after["status"] == "failed", after
 
     @rule(i=st.integers(min_value=0, max_value=20))
     def cancel(self, i):
@@ -218,6 +232,9 @@ class LifecycleMachine(RuleBasedStateMachine):
 
     @rule(i=st.integers(min_value=0, max_value=20), reason=st.sampled_from(["host_declines_kind", "invalid_head_branch"]))
     def release(self, i, reason):
+        # Documented PATCH release: JOB_LIFECYCLE.md lists claimed|running ->
+        # queued as "PATCH (release; claimant must match)", and the FB35 matrix
+        # drives both cells through this endpoint successfully.
         self.patch_job(i, "queued", {"worker_error": reason})
 
     @rule(i=st.integers(min_value=0, max_value=20))
@@ -240,6 +257,39 @@ class LifecycleMachine(RuleBasedStateMachine):
     def advance_clock(self, seconds):
         self.clock += seconds
         self.last_action = "clock"
+
+    @rule()
+    def reaper_view(self):
+        """The reaper's pure selector sees exactly the expired leases.
+
+        Long stale/hard TTLs isolate the lease rule, so a claim is selected if
+        and only if its lease has expired at the fake clock. Requeuing itself is
+        the reaper loop's job and is covered by FB37.
+        """
+        rows = self.snapshot()
+        candidates = [
+            (
+                jid,
+                row["kind"],
+                row["claimed_by"],
+                row["claimed_at"],
+                row["last_update_at"],
+                row["claim_lease_expires_at"],
+            )
+            for jid, row in rows.items()
+            if row["status"] in ("claimed", "running")
+        ]
+        selected = {
+            jid
+            for jid, _ in select_orphan_claims(
+                candidates, now=self.clock, stale_after=10**9, hard_max_age=10**9
+            )
+        }
+        for jid, _kind, _claimer, _claimed_at, _updated_at, lease in candidates:
+            expired = lease is not None and lease <= self.clock
+            assert (jid in selected) == expired, (
+                f"{jid}: reaper selected={jid in selected} but lease expired={expired}"
+            )
 
     @invariant()
     def lifecycle_properties(self):
@@ -338,6 +388,23 @@ def test_dead_letter_reclassification_is_terminal():
         )
         assert code == 200, result
         assert machine.row(jid)["status"] == "dead-letter"
+    finally:
+        machine.teardown()
+
+
+def test_completion_gate_parks_a_fix_job_as_needs_review():
+    """Documented gate: done without proof answers 409 and stores needs-review."""
+    machine = LifecycleMachine()
+    try:
+        code, data = machine.request("POST", "/v1/jobs", {
+            "kind": "fix:stateful", "description": "gate",
+            "submitter_urn": machine.submitter, "max_retries": 2,
+        }, machine.submitter)
+        assert code in (200, 201), data
+        machine.ids.append(data["id"])
+        machine.claim(0, 0)
+        assert machine.patch_job(0, "done", {}) == 409
+        assert machine.row(data["id"])["status"] == "needs-review"
     finally:
         machine.teardown()
 
