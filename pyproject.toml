@@ -24,7 +24,7 @@ dependencies = [
 # Backend-specific drivers — installed only where that backend is used.
 oracle = ["oracledb"]
 db2 = ["ibm_db_dbi"]
-dev = ["pytest>=7", "ruff"]
+dev = ["pytest>=7", "ruff", "hypothesis"]
 
 [tool.setuptools]
 packages = [

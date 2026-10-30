@@ -36,15 +36,18 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from hypothesis import settings
-from hypothesis import strategies as st
-from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
 import agent_bus
 from hive.bus import deps
 from hive.bus.domain.jobs import STATUS_TRANSITIONS
 from hive.bus.domain.reaper import select_orphan_claims
 from hive.bus.routers import jobs as jobs_router
+
+hypothesis = pytest.importorskip("hypothesis", reason="stateful lifecycle test needs the dev extra (hypothesis)")
+settings = hypothesis.settings
+st = pytest.importorskip("hypothesis.strategies")
+_stateful = pytest.importorskip("hypothesis.stateful")
+RuleBasedStateMachine, invariant, rule = _stateful.RuleBasedStateMachine, _stateful.invariant, _stateful.rule
 
 DOC = Path(__file__).parent / "docs" / "JOB_LIFECYCLE.md"
 
@@ -88,14 +91,17 @@ class LifecycleMachine(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
         self.temp = tempfile.TemporaryDirectory()
-        self.env = patch.dict(os.environ, {
-            "AGENT_BUS_DB": str(Path(self.temp.name) / "bus.db"),
-            "HIVE_BACKEND": "sqlite",
-            "MNEMOS_URL": "",
-            "MNEMOS_TOKEN": "",
-            "HIVE_SHARED_SECRET": "",
-            "HIVE_BUS_ADMIN_TOKEN": "",
-        })
+        self.env = patch.dict(
+            os.environ,
+            {
+                "AGENT_BUS_DB": str(Path(self.temp.name) / "bus.db"),
+                "HIVE_BACKEND": "sqlite",
+                "MNEMOS_URL": "",
+                "MNEMOS_TOKEN": "",
+                "HIVE_SHARED_SECRET": "",
+                "HIVE_BUS_ADMIN_TOKEN": "",
+            },
+        )
         self.env.start()
         self.repo_patch = patch.object(deps, "_HIVE_REPO", None)
         self.repo_patch.start()
@@ -121,13 +127,22 @@ class LifecycleMachine(RuleBasedStateMachine):
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=agent_bus.app), base_url="http://test") as c:
                 response = await c.request(method, path, json=body, headers=headers)
                 return response.status_code, response.json()
+
         return run(send())
 
     def register(self, kind, capabilities):
-        code, data = self.request("POST", "/v1/agents/register", {
-            "kind": kind, "host": "stateful", "runtime": kind,
-            "capabilities": capabilities, "cost_tier": "B", "auth_method": "api",
-        })
+        code, data = self.request(
+            "POST",
+            "/v1/agents/register",
+            {
+                "kind": kind,
+                "host": "stateful",
+                "runtime": kind,
+                "capabilities": capabilities,
+                "cost_tier": "B",
+                "auth_method": "api",
+            },
+        )
         assert code == 200, data
         return data["urn"]
 
@@ -152,10 +167,17 @@ class LifecycleMachine(RuleBasedStateMachine):
     def submit(self):
         if len(self.ids) >= 5:
             return
-        code, data = self.request("POST", "/v1/jobs", {
-            "kind": "e2e:stateful", "description": f"stateful {len(self.ids)}",
-            "submitter_urn": self.submitter, "max_retries": 2,
-        }, self.submitter)
+        code, data = self.request(
+            "POST",
+            "/v1/jobs",
+            {
+                "kind": "e2e:stateful",
+                "description": f"stateful {len(self.ids)}",
+                "submitter_urn": self.submitter,
+                "max_retries": 2,
+            },
+            self.submitter,
+        )
         assert code in (200, 201), data
         self.ids.append(data["id"])
         self.last_action = "submit"
@@ -230,7 +252,9 @@ class LifecycleMachine(RuleBasedStateMachine):
     def cancel(self, i):
         self.patch_job(i, "cancelled")
 
-    @rule(i=st.integers(min_value=0, max_value=20), reason=st.sampled_from(["host_declines_kind", "invalid_head_branch"]))
+    @rule(
+        i=st.integers(min_value=0, max_value=20), reason=st.sampled_from(["host_declines_kind", "invalid_head_branch"])
+    )
     def release(self, i, reason):
         # Documented PATCH release: JOB_LIFECYCLE.md lists claimed|running ->
         # queued as "PATCH (release; claimant must match)", and the FB35 matrix
@@ -249,7 +273,9 @@ class LifecycleMachine(RuleBasedStateMachine):
     def reclassify(self, i, status):
         jid = self.select(i)
         if jid:
-            code, data = self.request("POST", "/v1/admin/jobs/reclassify", {"job_ids": [jid], "status": status}, self.submitter)
+            code, data = self.request(
+                "POST", "/v1/admin/jobs/reclassify", {"job_ids": [jid], "status": status}, self.submitter
+            )
             assert code == 200, data
             self.last_action = "reclassify"
 
@@ -280,16 +306,11 @@ class LifecycleMachine(RuleBasedStateMachine):
             if row["status"] in ("claimed", "running")
         ]
         selected = {
-            jid
-            for jid, _ in select_orphan_claims(
-                candidates, now=self.clock, stale_after=10**9, hard_max_age=10**9
-            )
+            jid for jid, _ in select_orphan_claims(candidates, now=self.clock, stale_after=10**9, hard_max_age=10**9)
         }
         for jid, _kind, _claimer, _claimed_at, _updated_at, lease in candidates:
             expired = lease is not None and lease <= self.clock
-            assert (jid in selected) == expired, (
-                f"{jid}: reaper selected={jid in selected} but lease expired={expired}"
-            )
+            assert (jid in selected) == expired, f"{jid}: reaper selected={jid in selected} but lease expired={expired}"
 
     @invariant()
     def lifecycle_properties(self):
@@ -321,8 +342,7 @@ class LifecycleMachine(RuleBasedStateMachine):
                     )
                 if before["status"] == "dead-letter":
                     assert self.last_action == "reclassify", (
-                        f"{jid}: dead-letter became {row['status']!r} via {self.last_action!r} "
-                        f"({FINDING_DEAD_LETTER})"
+                        f"{jid}: dead-letter became {row['status']!r} via {self.last_action!r} ({FINDING_DEAD_LETTER})"
                     )
 
             old_reviews = (before.get("result") or {}).get("hive_reviews")
@@ -396,10 +416,17 @@ def test_completion_gate_parks_a_fix_job_as_needs_review():
     """Documented gate: done without proof answers 409 and stores needs-review."""
     machine = LifecycleMachine()
     try:
-        code, data = machine.request("POST", "/v1/jobs", {
-            "kind": "fix:stateful", "description": "gate",
-            "submitter_urn": machine.submitter, "max_retries": 2,
-        }, machine.submitter)
+        code, data = machine.request(
+            "POST",
+            "/v1/jobs",
+            {
+                "kind": "fix:stateful",
+                "description": "gate",
+                "submitter_urn": machine.submitter,
+                "max_retries": 2,
+            },
+            machine.submitter,
+        )
         assert code in (200, 201), data
         machine.ids.append(data["id"])
         machine.claim(0, 0)
