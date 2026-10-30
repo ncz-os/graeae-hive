@@ -3,8 +3,7 @@
 **Date:** 2026-10-16  **Status:** proposed (kickoff)  **Phase:** refactor-plan Phase 6
 **Owner:** opencode  **Depends on:** FleetOps `gitops/fleet/zoder-config/`, `gitops/zeroclaw/config.audited.toml`
 
-> **Update 2026-10-26:** the bus's KNEMON router (`hive/bus/routers/knemon.py`,
-> `/v1/knemon/*`) and the bus `KNEMON_PROVIDERS` table were removed. The
+> **Update 2026-10-26:** the bus's KNEMON router (formerly under `hive/bus/routers/`, route `/v1/knemon/*`) and the bus `KNEMON_PROVIDERS` table were removed. The
 > registry's `"knemon"` route data still generates the `[router.providers]`
 > section of each host's zoder.toml. The text below is the original record.
 
@@ -13,7 +12,7 @@
 Model/provider routing facts live in **three** places that drift independently:
 
 1. **Bus tables** — `hive/core/models.py`: `PROVIDER_COST_TIER`, `LLM_RATES`,
-   `KNEMON_PROVIDERS` (consumed by `hive/bus/routers/knemon.py`).
+   `KNEMON_PROVIDERS` (consumed by the former KNEMON router, removed 2026-10-26).
 2. **Per-host zoder TOMLs** — FleetOps `gitops/fleet/zoder-config/config.toml` +
    `config.fleet.toml` (the engine `coder`/`reviewer` agents + router providers).
 3. **Per-host zeroclaw TOML** — FleetOps `gitops/zeroclaw/config.audited.toml`
@@ -107,4 +106,4 @@ session starts from a fixed target instead of re-deriving it.
 
 - `docs/refactor-plan-20261015.md` (Phase 6)
 - CLAUDE.md fleet/provider rules (DeepSeek window, Nemotron placement, zoder routes)
-- `hive/core/models.py`, `hive/bus/routers/knemon.py`
+- `hive/core/models.py`, the former KNEMON router (removed 2026-10-26)

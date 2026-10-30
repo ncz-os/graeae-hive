@@ -250,6 +250,213 @@
       "meaning": "Seconds without a heartbeat before the bus reaper marks an agent offline (values above 300 are ignored).",
       "example": "120",
       "source": "hive/bus/app.py:agent_offline_after"
+    },
+    {
+      "name": "AGENT_BUS_DB",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Overrides the sqlite database path; unset keeps /srv/agent-bus/agents.db.",
+      "meaning": "SQLite bus database file used when HIVE_BACKEND=sqlite.",
+      "example": "/srv/agent-bus/agents.db",
+      "source": "hive/persistence/factory.py:15"
+    },
+    {
+      "name": "HIVE_BACKEND",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Selects the persistence backend; unset keeps sqlite.",
+      "meaning": "Persistence backend: sqlite, oracle, or db2.",
+      "example": "sqlite",
+      "source": "hive/bus/app.py:87"
+    },
+    {
+      "name": "ORACLE_DSN",
+      "kind": "secret",
+      "required": false,
+      "why": "Only needed for HIVE_BACKEND=oracle; unset and oracle rows cannot be read.",
+      "meaning": "Oracle connection string for the oracle backend.",
+      "example": "<oracle-dsn>",
+      "source": "hive/persistence/factory.py:24"
+    },
+    {
+      "name": "DB2_DSN",
+      "kind": "secret",
+      "required": false,
+      "why": "Only needed for HIVE_BACKEND=db2; HIVE_DB2_DSN is honoured as a fallback.",
+      "meaning": "Db2 connection string for the db2 backend.",
+      "example": "<db2-dsn>",
+      "source": "hive/persistence/factory.py:30"
+    },
+    {
+      "name": "CLAIM_LEASE_SECONDS",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 1800.",
+      "meaning": "Claim lease lifetime in seconds.",
+      "example": "1800",
+      "source": "hive/bus/domain/jobs.py:224"
+    },
+    {
+      "name": "CLAIM_SCAN_WINDOW",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 10000.",
+      "meaning": "Maximum queued rows scanned per claim pass.",
+      "example": "10000",
+      "source": "hive/bus/deps.py:155"
+    },
+    {
+      "name": "HIVE_HOST_DENYLIST",
+      "kind": "text_list",
+      "required": false,
+      "why": "Optional. Empty (unset) denies nothing.",
+      "meaning": "Comma-separated hostnames never eligible for claims.",
+      "example": "<host-a>,<host-b>",
+      "source": "hive/bus/deps.py:46"
+    },
+    {
+      "name": "HIVE_LLM_CAP_GATE",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset (or 0) disables the gate.",
+      "meaning": "Set to 1/true/yes/on to exclude hosts with no llm-* provider from LLM work instead of maintaining HIVE_HOST_DENYLIST by hand.",
+      "example": "1",
+      "source": "hive/bus/domain/eligibility.py:136"
+    },
+    {
+      "name": "AGENT_HOST",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Defaults to the short hostname.",
+      "meaning": "Agent hostname announced at registration.",
+      "example": "<worker-host>",
+      "source": "hive/workers/doctor.py:96"
+    },
+    {
+      "name": "DOCTOR_TRIAGE_MODEL",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps cerberus-reviewer.",
+      "meaning": "Model id for the doctor triage phase.",
+      "example": "cerberus-reviewer",
+      "source": "hive/workers/doctor.py:132"
+    },
+    {
+      "name": "DOCTOR_REVIEW_MODEL",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps cerberus-reviewer.",
+      "meaning": "Model id for the doctor review phase.",
+      "example": "cerberus-reviewer",
+      "source": "hive/workers/doctor.py:133"
+    },
+    {
+      "name": "DOCTOR_FIX_MODEL",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps qwen38.",
+      "meaning": "Model id for the in-doctor fix phase.",
+      "example": "qwen38",
+      "source": "hive/workers/doctor.py:134"
+    },
+    {
+      "name": "DOCTOR_VERDICT_COMPLETION_DRY_RUN",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset (or anything but 1) performs the call.",
+      "meaning": "Set to 1 to log the verdict-completion call without performing it.",
+      "example": "1",
+      "source": "hive/workers/doctor.py:310"
+    },
+    {
+      "name": "LOOP_WINDOW_SEC",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 1800 (30 min).",
+      "meaning": "Loop-outcome window in seconds for escalation counting.",
+      "example": "1800",
+      "source": "hive/workers/doctor.py:110"
+    },
+    {
+      "name": "LOOP_ESCALATE_THRESHOLD",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 3.",
+      "meaning": "Failures within the loop window before a loop escalates.",
+      "example": "3",
+      "source": "hive/workers/doctor.py:111"
+    },
+    {
+      "name": "MAX_SSH_PER_HOUR",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 3.",
+      "meaning": "Cap on SSH recovery attempts per host per hour.",
+      "example": "3",
+      "source": "hive/workers/doctor.py:100"
+    },
+    {
+      "name": "MIN_HOST_COOLDOWN",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 1800.",
+      "meaning": "Seconds a host stays cooled down after a recovery attempt.",
+      "example": "1800",
+      "source": "hive/workers/doctor.py:104"
+    },
+    {
+      "name": "MAX_TOKEN_FIX_PER_HOST",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 3.",
+      "meaning": "Cap on token-fix attempts per host.",
+      "example": "3",
+      "source": "hive/workers/doctor.py:436"
+    },
+    {
+      "name": "NEEDS_REVIEW_SCAN_INTERVAL",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 3600.",
+      "meaning": "Seconds between needs-review follow-up sweeps.",
+      "example": "3600",
+      "source": "hive/workers/doctor.py:299"
+    },
+    {
+      "name": "NEEDS_REVIEW_OLDER_HOURS",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 24.",
+      "meaning": "Only follow up needs-review rows older than this many hours.",
+      "example": "24",
+      "source": "hive/workers/doctor.py:300"
+    },
+    {
+      "name": "REVIEW_FOLLOWUP_MAX_PER_SWEEP",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset keeps 3.",
+      "meaning": "Maximum review follow-ups performed per sweep.",
+      "example": "3",
+      "source": "hive/workers/doctor.py:354"
+    },
+    {
+      "name": "HIVE_ARGONAS_GIT_ROOT",
+      "kind": "text",
+      "required": false,
+      "why": "Optional. Unset uses the registry's NFS mount constant.",
+      "meaning": "Local root of the ARGONAS git mirror.",
+      "example": "<argonas-git-root>",
+      "source": "hive/repos.py:298"
+    },
+    {
+      "name": "HIVE_SHARED_SECRET",
+      "kind": "secret",
+      "required": false,
+      "why": "Optional. Unset disables shared-token auth on the bus.",
+      "meaning": "Shared token the bus compares against the X-Hive-Token header.",
+      "example": "",
+      "source": "hive/bus/deps.py:269"
     }
   ]
 }
