@@ -436,6 +436,26 @@ async def jobs_summary():
     }
 
 
+@router.get("/v1/jobs/metrics")
+async def job_metrics():
+    counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}
+    async with (
+        connect_db() as db,
+        db.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status") as cur,
+    ):
+        async for status, count in cur:
+            counts["total"] += count
+            if status in {"queued", "offered"}:
+                counts["pending"] += count
+            elif status in {"claimed", "running"}:
+                counts["running"] += count
+            elif status == "done":
+                counts["completed"] += count
+            elif status == "failed":
+                counts["failed"] += count
+    return counts
+
+
 @router.get("/v1/jobs/{job_id}")
 async def get_job(job_id: str):
     """Fetch a single job by id (previously 405 -> callers had to scan the list
@@ -494,26 +514,6 @@ async def get_job(job_id: str):
     }
     out.update(_result_reason_fields(_result))
     return out
-
-
-@router.get("/v1/jobs/metrics")
-async def job_metrics():
-    counts = {"pending": 0, "running": 0, "completed": 0, "failed": 0, "total": 0}
-    async with (
-        connect_db() as db,
-        db.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status") as cur,
-    ):
-        async for status, count in cur:
-            counts["total"] += count
-            if status in {"queued", "offered"}:
-                counts["pending"] += count
-            elif status in {"claimed", "running"}:
-                counts["running"] += count
-            elif status == "done":
-                counts["completed"] += count
-            elif status == "failed":
-                counts["failed"] += count
-    return counts
 
 
 @router.get("/v1/jobs/{job_id}/preview")
