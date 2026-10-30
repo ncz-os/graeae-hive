@@ -330,23 +330,24 @@ class LiveContractTests(unittest.TestCase):
         self.assertIsNotNone(got, "SSE stream closed before the published event arrived")
 
     # ---- pinned live defects (base line; fixed on freebuff/fb22-fixes-20261029) ----
-    def test_pinned_defect_metrics_shadowed(self):
-        # /v1/jobs/{job_id} is registered before static /v1/jobs/metrics,
-        # so metrics is captured as job_id="metrics" -> 404. The doc still
-        # promises 200: that drift is the finding.
+    def test_metrics_route_is_not_shadowed(self):
+        # FB22 pinned this as a defect (static /v1/jobs/metrics was registered
+        # after /v1/jobs/{job_id}, so it answered 404). Fixed on
+        # freebuff/fb22-fixes: the static route is registered first.
         code = self._req("GET", "/v1/jobs/metrics", actor=None)
-        self.assertEqual(code, 404, f"metrics shadowing changed: {code}")
+        self.assertEqual(code, 200, f"metrics route is shadowed again: {code}")
         self.assertIn(200, self.doc[("GET", "/v1/jobs/metrics")]["codes"])
 
-    def test_pinned_defect_costs_json_value(self):
-        # cost_stats_rows uses JSON_VALUE(), absent from stock sqlite.
+    def test_costs_endpoint_works_on_stock_sqlite(self):
+        # FB22 pinned a 500 here (cost_stats_rows used JSON_VALUE(), absent
+        # from stock sqlite). Fixed on freebuff/fb22-fixes with json_extract().
         async def _do():
             transport = httpx.ASGITransport(app=agent_bus.app, raise_app_exceptions=False)
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
                 r = await c.get("/v1/stats/costs")
                 return r.status_code
         code = _run(_do)
-        self.assertEqual(code, 500, f"costs failure mode changed: {code}")
+        self.assertEqual(code, 200, f"costs endpoint broken on stock sqlite: {code}")
 
     # ---- bad bodies -> 422 ----
     def test_bad_bodies_are_rejected_with_422(self):
