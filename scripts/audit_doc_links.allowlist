@@ -1,0 +1,17 @@
+# audit_doc_links.allowlist -- names the audit must not flag.
+# Every entry needs a comment saying why the reference is correct as-is.
+# (Broken references get fixed in the docs instead; this file is only for
+# references that are correct but unresolvable in this tree.)
+
+# Lane-B product tree: docs/LINEAGE_RECONCILIATION.md compares the A and B
+# trees, so the B-tree paths below are out-of-repo by design, not broken.
+hive/codex_delivery.py
+hive/llm_roles.py
+hive/push_policy.py
+hive/review_evidence.py
+# Planned paths in docs/refactor-proposal-harness-agnostic-20261015.md (a
+# design proposal, items C1-C4); hive/auth/ does not exist yet.
+hive/auth/api_key.py
+hive/auth/bearer.py
+hive/auth/none.py
+hive/auth/oauth.py
