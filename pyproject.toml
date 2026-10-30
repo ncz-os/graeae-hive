@@ -69,5 +69,8 @@ testpaths = ["tests", "."]
 python_files = ["test_*.py"]
 python_classes = ["*Tests"]
 python_functions = ["test_*"]
+# ``slow`` marks the loop tests that repeat a race hundreds of times; they run
+# by default only when asked for (``-m slow``) but must always be green.
+markers = ["slow: repeated-loop race test (run with -m slow)"]
 # Async tests use unittest.IsolatedAsyncioTestCase — no pytest-asyncio required.
 addopts = "-q"
