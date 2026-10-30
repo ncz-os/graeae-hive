@@ -164,7 +164,6 @@ VALID_JOB_STATUSES = {
     "cancelled",
     "dead-letter",
     "needs-review",
-    "released",
 }
 TERMINAL_JOB_STATUSES = {"done", "failed", "cancelled", "dead-letter"}
 

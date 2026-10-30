@@ -5,7 +5,10 @@ Citations are `file:function`. Placeholders only; no addresses, no tokens.
 
 Status set: `hive/bus/deps.py:VALID_JOB_STATUSES` — `cancelled`,
 `dead-letter`, `done`, `failed`, `failed_completion`, `needs-review`,
-`offered`, `queued`, `released`, `running`, `claimed` (11).
+`offered`, `queued`, `running`, `claimed` (10). `released` is not a
+stored status (FB21: removed from the valid set; the doctor used the
+word as an in-memory variable only, and the sqlite CHECK never
+accepted it).
 
 Terminal: `hive/bus/deps.py:TERMINAL_JOB_STATUSES` — `done`, `failed`,
 `cancelled`, `dead-letter`. In-flight: `IN_FLIGHT_JOB_STATUSES` —
@@ -68,10 +71,8 @@ status strings; the test parses this table.
 | ---- | -- | --- |
 | queued | queued | PATCH |
 | queued | offered | PATCH |
-| queued | claimed | claim endpoint only (PATCH refuses: claim bypass) |
 | queued | cancelled | PATCH |
 | offered | queued | PATCH |
-| offered | claimed | claim endpoint only (PATCH refuses: claim bypass) |
 | offered | cancelled | PATCH |
 | claimed | queued | PATCH (release; claimant must match) |
 | claimed | claimed | PATCH |
@@ -96,6 +97,20 @@ status strings; the test parses this table.
 | failed | cancelled | PATCH (retire superseded failures) |
 | cancelled | cancelled | PATCH |
 | dead-letter | dead-letter | PATCH |
+| failed_completion | failed_completion | PATCH (legacy terminal; same-status only) |
+
+### Claim-only transitions (not PATCH cells)
+
+Claiming never goes through PATCH: `queued`/`offered` to `claimed`
+happens only via `POST /v1/jobs/next` (atomic next-claim CAS) and
+`POST /v1/jobs/{id}/claim` (direct CAS), not via `STATUS_TRANSITIONS`.
+PATCH refuses these pairs with 409 (claim bypass rule). They are listed
+here, outside the parsed table above, so the doc stays honest both ways.
+
+| source | target | endpoint |
+| ------ | ------ | -------- |
+| queued | claimed | POST /v1/jobs/next, POST /v1/jobs/{id}/claim |
+| offered | claimed | POST /v1/jobs/next, POST /v1/jobs/{id}/claim |
 
 Notes: `queued`/`offered` to `running` is refused everywhere except
 through a claim first (claim bypass rule,
