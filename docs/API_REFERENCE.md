@@ -25,7 +25,7 @@ Parameters: none.
 
 Body: none.
 
-Status codes: 200
+Status codes: 200, 404 (raised explicitly in code: 404)
 
 Example: `curl http://<bus-host>:5005/`
 
@@ -39,7 +39,7 @@ Parameters: none.
 
 Body: none.
 
-Status codes: 200
+Status codes: 200, 503 (raised explicitly in code: 503)
 
 Example: `curl http://<bus-host>:5005/health`
 
@@ -53,7 +53,7 @@ Parameters: none.
 
 Body type: object.
 
-Status codes: 200, 422
+Status codes: 200, 400, 403, 404, 409, 422 (raised explicitly in code: 400, 403, 404, 409, 422)
 
 Example: `curl http://<bus-host>:5005/mcp`
 
@@ -77,7 +77,7 @@ Body (`PurgeRequest`):
 | `job_ids` | True | array |
 | `reason` | False | string (default 'doctor-dlq-remove') |
 
-Status codes: 200, 422
+Status codes: 200, 401, 403, 422 (raised explicitly in code: 401, 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/admin/jobs/purge`
 
@@ -104,7 +104,7 @@ Body (`ReclassifyRequest`):
 | `reason` | False | string (default 'doctor-dlq-reclassify') |
 | `status` | True | string |
 
-Status codes: 200, 422 (raised explicitly in code: 422)
+Status codes: 200, 401, 403, 422 (raised explicitly in code: 401, 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/admin/jobs/reclassify`
 
@@ -130,7 +130,7 @@ Body (`RequeueRequest`):
 | `override_reason` | False | string | null |
 | `reason` | False | string (default 'manual-requeue') |
 
-Status codes: 200, 422
+Status codes: 200, 401, 403, 422 (raised explicitly in code: 401, 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/admin/jobs/requeue`
 
@@ -259,7 +259,7 @@ Parameters:
 
 Body type: AgentDeregister | null.
 
-Status codes: 200, 404, 409, 422 (raised explicitly in code: 404, 409)
+Status codes: 200, 401, 403, 404, 409, 422 (raised explicitly in code: 401, 403, 404, 409)
 
 Example: `curl http://<bus-host>:5005/v1/agents/{urn_path}/deregister`
 
@@ -356,6 +356,28 @@ Example: `curl http://<bus-host>:5005/v1/hosts`
 
 ## `GET /v1/jobs`
 
+Handler: `list_jobs`. List Jobs
+
+Auth: none
+
+Parameters:
+
+| name | in | required | type |
+| --- | --- | --- | --- |
+| `agent_urn` | query | False | string | null |
+| `include_result` | query | False | boolean (default True) |
+| `limit` | query | False | integer (default 100) |
+| `parent_job_id` | query | False | string | null |
+| `reason_prefix` | query | False | string | null |
+| `since` | query | False | number | null |
+| `status` | query | False | string | null |
+
+Body: none.
+
+Status codes: 200, 400, 422 (raised explicitly in code: 400)
+
+Example: `curl http://<bus-host>:5005/v1/jobs`
+
 ## `POST /v1/jobs`
 
 Handler: `create_job`. Create Job — Submit work to the triage queue. No agent assignment — workers self-claim via /v1/jobs/next. ROLE ENFORCEMENT (user directive 2026-05-23): Worker runtimes (opencode/codex/hermes/claw-family/ic-engine)
@@ -394,7 +416,7 @@ Body (`JobCreate`):
 | `target_workspace` | False | string | null |
 | `zero_retry_reason` | False | string | null |
 
-Status codes: 200, 422 (raised explicitly in code: 422)
+Status codes: 200, 403, 422 (raised explicitly in code: 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/jobs`
 
@@ -426,7 +448,7 @@ Parameters:
 
 Body: none.
 
-Status codes: 200, 409, 422, 500 (raised explicitly in code: 409, 500)
+Status codes: 200, 204, 409, 422, 500 (raised explicitly in code: 204, 409, 500)
 
 Example: `curl http://<bus-host>:5005/v1/jobs/next`
 
@@ -457,7 +479,7 @@ Body (`JobPurgeRequest`):
 | `statuses` | False | array | null |
 | `submitter_urn` | False | string | null |
 
-Status codes: 200, 422 (raised explicitly in code: 422)
+Status codes: 200, 401, 403, 422 (raised explicitly in code: 401, 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/jobs/purge`
 
@@ -476,6 +498,22 @@ Status codes: 200
 Example: `curl http://<bus-host>:5005/v1/jobs/summary`
 
 ## `GET /v1/jobs/{job_id}`
+
+Handler: `get_job`. Get Job — Fetch a single job by id (previously 405 -> callers had to scan the list or query the DB directly to find one job, e.g. a just-submitted build).
+
+Auth: none
+
+Parameters:
+
+| name | in | required | type |
+| --- | --- | --- | --- |
+| `job_id` | path | True | string |
+
+Body: none.
+
+Status codes: 200, 404, 422 (raised explicitly in code: 404)
+
+Example: `curl http://<bus-host>:5005/v1/jobs/{job_id}`
 
 ## `PATCH /v1/jobs/{job_id}`
 
@@ -581,11 +619,30 @@ Parameters:
 
 Body: none.
 
-Status codes: 200, 404, 409, 422, 503 (raised explicitly in code: 404, 409, 503)
+Status codes: 200, 404, 409, 422, 503 (raised explicitly in code: 404, 409, 422, 503)
 
 Example: `curl http://<bus-host>:5005/v1/jobs/{job_id}/release`
 
 ## `GET /v1/messages`
+
+Handler: `list_messages`. List Messages
+
+Auth: none
+
+Parameters:
+
+| name | in | required | type |
+| --- | --- | --- | --- |
+| `limit` | query | False | integer (default 100) |
+| `since` | query | False | number | null |
+| `to_urn` | query | False | string | null |
+| `topic` | query | False | string | null |
+
+Body: none.
+
+Status codes: 200, 422
+
+Example: `curl http://<bus-host>:5005/v1/messages`
 
 ## `POST /v1/messages`
 
@@ -605,7 +662,7 @@ Body (`MessagePublish`):
 | `to_urn` | False | string | null |
 | `topic` | True | string |
 
-Status codes: 200, 422
+Status codes: 200, 403, 422 (raised explicitly in code: 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/messages`
 
@@ -671,6 +728,18 @@ Example: `curl http://<bus-host>:5005/v1/repos/{repo_id}`
 
 ## `GET /v1/schedules`
 
+Handler: `list_schedules`. List Schedules
+
+Auth: none
+
+Parameters: none.
+
+Body: none.
+
+Status codes: 200
+
+Example: `curl http://<bus-host>:5005/v1/schedules`
+
 ## `POST /v1/schedules`
 
 Handler: `create_schedule`. Create Schedule — Create a recurring scheduled job. Re-fires every `interval_seconds`. job_template is the JobCreate body that will be submitted each tick. Submitter_urn auto-injected from caller — they take responsibi
@@ -693,11 +762,29 @@ Body (`ScheduleCreate`):
 | `job_template` | True | object |
 | `name` | True | string |
 
-Status codes: 200, 422 (raised explicitly in code: 422)
+Status codes: 200, 401, 403, 422 (raised explicitly in code: 401, 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/schedules`
 
 ## `DELETE /v1/schedules/{sid}`
+
+Handler: `delete_schedule`. Delete Schedule
+
+Auth: X-Hive-Actor (must name a registered, active agent)
+
+Parameters:
+
+| name | in | required | type |
+| --- | --- | --- | --- |
+| `X-Hive-Actor` | header | False | string | null |
+| `X-Hive-Token` | header | False | string | null |
+| `sid` | path | True | string |
+
+Body: none.
+
+Status codes: 200, 401, 403, 404, 422 (raised explicitly in code: 401, 403, 404, 422)
+
+Example: `curl http://<bus-host>:5005/v1/schedules/{sid}`
 
 ## `PATCH /v1/schedules/{sid}`
 
@@ -717,7 +804,7 @@ Parameters:
 
 Body: none.
 
-Status codes: 200, 404, 422 (raised explicitly in code: 404, 422)
+Status codes: 200, 401, 403, 404, 422 (raised explicitly in code: 401, 403, 404, 422)
 
 Example: `curl http://<bus-host>:5005/v1/schedules/{sid}`
 

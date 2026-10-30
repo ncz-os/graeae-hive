@@ -1720,13 +1720,13 @@ class SqliteHiveRepository(HiveMindRepository):
         elif group_by == "provider":
             sel = (
                 "CASE "
-                "WHEN JSON_VALUE(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
-                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
-                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
-                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
-                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_minimax%' THEN 'minimax' "
-                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
-                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
+                "WHEN json_extract(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
+                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
+                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
+                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
+                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_minimax%' THEN 'minimax' "
+                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
+                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
                 "ELSE COALESCE(claimed_provider,'unknown') END"
             )
         elif group_by == "model":
