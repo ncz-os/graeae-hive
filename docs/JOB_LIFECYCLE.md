@@ -5,7 +5,10 @@ Citations are `file:function`. Placeholders only; no addresses, no tokens.
 
 Status set: `hive/bus/deps.py:VALID_JOB_STATUSES` — `cancelled`,
 `dead-letter`, `done`, `failed`, `failed_completion`, `needs-review`,
-`offered`, `queued`, `released`, `running`, `claimed` (11).
+`offered`, `queued`, `running`, `claimed` (10). `released` is not a
+stored status (FB21: removed from the valid set; the doctor used the
+word as an in-memory variable only, and the sqlite CHECK never
+accepted it).
 
 Terminal: `hive/bus/deps.py:TERMINAL_JOB_STATUSES` — `done`, `failed`,
 `cancelled`, `dead-letter`. In-flight: `IN_FLIGHT_JOB_STATUSES` —
