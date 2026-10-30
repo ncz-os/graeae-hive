@@ -4617,13 +4617,16 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
         if result.get("auto_review_job_id") and result["auto_review_job_id"] != child.get("id"):
             continue
         proof = _row_result_dict(child)
-        if child.get("status") != "done" or not isinstance(proof.get("verdict"), dict):
+        # The bus's own normalisation: the legacy dict ``result.verdict`` and the
+        # worker's ``result.reviewer.verdict`` are the same review.
+        verdict = review_verdict.child_verdict(proof)
+        if child.get("status") != "done" or verdict is None:
             continue
         previous = result.get("review_evidence")
         if (
             isinstance(previous, dict)
             and previous.get("review_job_id") == child.get("id")
-            and previous.get("verdict") == proof["verdict"]
+            and previous.get("verdict") == verdict
             and previous.get("artifact_valid") is True
             and previous.get("head_matches") is True
         ):
@@ -4632,7 +4635,7 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
         # delivered head: replaying it would change nothing, on every sweep, and
         # the evidence gap below would never be reached.
         if gap is not None and isinstance(previous, dict) and previous.get("review_job_id") == child.get("id"):
-            if previous.get("verdict") == proof["verdict"]:
+            if previous.get("verdict") == verdict:
                 continue
         # Replay the child completion through the bus's transactional verifier.
         # The doctor never manufactures parent artifact proof or approval.

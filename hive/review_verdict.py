@@ -26,6 +26,27 @@ def text_value(value) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
+def child_verdict(child_result: dict) -> dict | None:
+    """The review child's verdict as ``{"verdict": str, "head": str | None}``, or None.
+
+    Two producer shapes exist. The legacy one is a top-level ``result.verdict``
+    dict with a string ``verdict`` (returned unchanged). The real worker result
+    has ``result.verdict`` null and the verdict at ``result.reviewer.verdict``
+    (``hive/review_record.py``), next to the shas of the commit the review job
+    left the branch at: ``remote_sha`` when ``remote_verified`` is true (what
+    the remote really holds), else ``head_sha``. Anything else is unusable.
+    """
+    verdict = child_result.get("verdict")
+    if isinstance(verdict, dict) and text_value(verdict.get("verdict")):
+        return verdict
+    reviewer = child_result.get("reviewer")
+    text = text_value(reviewer.get("verdict")) if isinstance(reviewer, dict) else None
+    if not text:
+        return None
+    remote = text_value(child_result.get("remote_sha")) if child_result.get("remote_verified") is True else None
+    return {"verdict": text.lower(), "head": remote or text_value(child_result.get("head_sha"))}
+
+
 def normalize_verdict(value) -> str:
     """Lower-case verdict with ``-`` read as ``_`` (``request-changes`` == ``request_changes``)."""
     return (text_value(value) or "").lower().replace("-", "_")

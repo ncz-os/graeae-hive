@@ -10,6 +10,8 @@ import json
 import logging
 import uuid
 
+from hive.review_verdict import child_verdict
+from hive.review_verdict import text_value as _text
 from hive.workers import doctor_decline_paths
 from queue_logic import dedup_key
 
@@ -128,31 +130,6 @@ def _log_once(review_job_id: str, parent_id: str, reason: str, outcome: str) -> 
         json.dumps(reason),
         outcome,
     )
-
-
-def _text(value) -> str | None:
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def child_verdict(child_result: dict) -> dict | None:
-    """The review child's verdict as ``{"verdict": str, "head": str | None}``, or None.
-
-    Two producer shapes exist. The legacy one is a top-level ``result.verdict``
-    dict with a string ``verdict`` (returned unchanged). The real worker result
-    has ``result.verdict`` null and the verdict at ``result.reviewer.verdict``
-    (``hive/review_record.py``), next to the shas of the commit the review job
-    left the branch at: ``remote_sha`` when ``remote_verified`` is true (what
-    the remote really holds), else ``head_sha``. Anything else is unusable.
-    """
-    verdict = child_result.get("verdict")
-    if isinstance(verdict, dict) and _text(verdict.get("verdict")):
-        return verdict
-    reviewer = child_result.get("reviewer")
-    text = _text(reviewer.get("verdict")) if isinstance(reviewer, dict) else None
-    if not text:
-        return None
-    remote = _text(child_result.get("remote_sha")) if child_result.get("remote_verified") is True else None
-    return {"verdict": text.lower(), "head": remote or _text(child_result.get("head_sha"))}
 
 
 def _parent_skip_reason(parent, result: dict, review_job_id: str) -> str | None:

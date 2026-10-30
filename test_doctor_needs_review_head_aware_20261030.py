@@ -368,3 +368,91 @@ def test_recorded_review_that_is_still_in_flight_is_not_duplicated(bus):
     reconciled_old_head_row(bus, child_status="running")
     assert sweep()["submitted"] == 0
     assert bus.writes() == []
+
+
+# ── a finished review child, in either result shape, is replayed ────────────
+
+
+def worker_shaped_proof(verdict: str | None = "approve", head: str = FINAL) -> dict:
+    """A review child's result as the worker writes it: no top-level verdict."""
+    return {
+        "verdict": None,
+        "reviewer": {
+            "model": "fake-reviewer",
+            "models": ["fake-reviewer"],
+            "verdict": verdict,
+            "source": "zoder_verdict",
+        },
+        "review_evidence": {"reviewers": [], "first": None, "secondaries": [], "skipped": [], "warnings": []},
+        "head_sha": head,
+        "remote_sha": head,
+        "base_sha": head,
+        "remote_verified": True,
+        "exit_code": 0,
+        "commits": [head],
+    }
+
+
+def legacy_proof() -> dict:
+    return {"verdict": {"verdict": "approve", "head": FINAL}, "deliverable": "Reviewed."}
+
+
+def finished_child(bus: FakeBus, proof: dict) -> None:
+    bus.children.append({"id": "review-child-done", "kind": "review:fake", "status": "done", "result": proof})
+    bus.row["result"]["auto_review_job_id"] = "review-child-done"
+
+
+@pytest.mark.parametrize(
+    "proof",
+    [worker_shaped_proof(), worker_shaped_proof("APPROVE"), worker_shaped_proof("request_changes"), legacy_proof()],
+    ids=["worker", "worker-uppercase", "worker-request-changes", "legacy-dict"],
+)
+def test_finished_child_is_replayed_through_the_bus_verifier(bus, proof):
+    finished_child(bus, proof)
+    report = sweep()
+    assert report["replayed_verdict"] == 1 and report["submitted"] == 0
+    assert bus.writes() == [("PATCH", "/v1/jobs/review-child-done", {"status": "done", "result": proof})]
+
+
+def test_worker_shaped_child_without_a_verdict_is_not_replayed(bus):
+    finished_child(bus, worker_shaped_proof(None))
+    bus.row["result"]["review_evidence"]["reviewed_head"] = FINAL  # nothing else for the doctor to do
+    report = sweep()
+    assert report.get("replayed_verdict", 0) == 0
+    assert bus.writes() == []
+
+
+def test_worker_shaped_child_without_a_verdict_does_not_hide_an_evidence_gap(bus):
+    finished_child(bus, worker_shaped_proof(None))
+    report = sweep()
+    assert report.get("replayed_verdict", 0) == 0 and report["submitted"] == 1
+    assert [c for c in bus.writes() if c[1] == "/v1/jobs/review-child-done"] == []
+
+
+def test_worker_shaped_child_already_recorded_by_the_bus_is_not_replayed_again(bus):
+    finished_child(bus, worker_shaped_proof())
+    bus.row["result"]["review_evidence"] = {
+        "review_job_id": "review-child-done",
+        "verdict": {"verdict": "approve", "head": FINAL},
+        "head_matches": True,
+        "artifact_valid": True,
+    }
+    assert sweep()["skipped_verdict"] == 1
+    assert bus.writes() == []
+
+
+def test_worker_shaped_child_dispatched_by_the_bus_is_replayed_without_a_doctor_marker(bus):
+    # the child was dispatched by the bus (auto id set there), the doctor holds no marker
+    finished_child(bus, worker_shaped_proof())
+    assert sweep()["replayed_verdict"] == 1
+    assert not doctor.review_followup_submitted(JOB_ID)
+
+
+def test_doctor_and_bus_read_the_verdict_with_one_helper():
+    from hive import review_verdict
+    from hive.bus.domain import review_dispatch
+
+    assert review_dispatch.child_verdict is review_verdict.child_verdict
+    assert doctor.review_verdict.child_verdict is review_verdict.child_verdict
+    assert review_verdict.child_verdict(worker_shaped_proof("Approve")) == {"verdict": "approve", "head": FINAL}
+    assert review_verdict.child_verdict(legacy_proof()) == legacy_proof()["verdict"]
