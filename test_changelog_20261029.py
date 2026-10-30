@@ -47,24 +47,17 @@ def listed_merges(text: str) -> list[str]:
 
 
 def check_range(sources: list[str], today: list[str], marker_count: int) -> list[str]:
-    """Subjects in the marker range that are not listed. Empty means covered."""
+    """Listed sources must be exactly the marker count, and every listed
+    subject must be a real merge from today's list. No slicing, no sorting:
+    taking ``today[:marker_count]`` of a lexicographically sorted list would
+    select an arbitrary subset, not the covered range. A dropped subject
+    fails the count; an invented subject fails the reality check; merges
+    beyond the marker are simply not required yet."""
+    problems = []
     if len(sources) != marker_count:
-        return [f"count mismatch: marker says {marker_count}, listed {len(sources)}"]
-    # The range is the marker_count oldest? No: the marker pins what is
-    # listed, so a missing subject is any today merge that the marker
-    # claims to cover but Sources omits. Since the marker count equals the
-    # listed count, coverage means every listed subject is real; a removed
-    # subject breaks the count AND leaves a real merge uncovered.
-    # For fixtures: missing = today[:marker_count] not in sources.
-    want = sorted(set(today[:marker_count])) if len(today) >= marker_count else sorted(set(today))
-    # In the live repo today is the full day list; the marker covers the
-    # listed set, so require listed == the marker-count subset that is real.
-    # Simplest honest rule: every listed subject must be real, and the
-    # listed count must equal the marker. A dropped subject fails the
-    # count; an invented subject fails the reality check.
-    missing = [s for s in want if s not in sources]
-    invented = [s for s in sources if s not in today]
-    return missing + [f"not a real merge: {s}" for s in invented]
+        problems.append(f"count mismatch: marker says {marker_count}, listed {len(sources)}")
+    problems.extend(f"not a real merge: {s}" for s in sources if s not in today)
+    return problems
 
 
 def test_marker_present_with_date_and_count():
@@ -89,6 +82,26 @@ def test_missing_subject_inside_range_fails():
     sources = ["Merge freebuff/a-20261029", "Merge sonnet/b-20261029"]  # c dropped
     problems = check_range(sources, today, 3)
     assert problems, "a dropped subject inside the range must fail"
+
+
+def test_more_merges_than_marker_covers_does_not_fail():
+    # Four merges landed; the marker covers two listed ones. The extra two
+    # are beyond the marker and must not fail.
+    today = [
+        "Merge freebuff/a-20261029",
+        "Merge sonnet/b-20261029",
+        "Merge freebuff/c-20261029",
+        "Merge sonnet/d-20261029",
+    ]
+    sources = ["Merge freebuff/a-20261029", "Merge sonnet/b-20261029"]
+    assert check_range(sources, today, 2) == []
+
+
+def test_invented_subject_fails():
+    today = ["Merge freebuff/a-20261029", "Merge sonnet/b-20261029"]
+    sources = ["Merge freebuff/a-20261029", "Merge freebuff/made-up-20261029"]
+    problems = check_range(sources, today, 2)
+    assert any("not a real merge" in p for p in problems), problems
 
 
 def test_new_merge_after_marker_does_not_fail():
