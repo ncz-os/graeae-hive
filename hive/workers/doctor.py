@@ -300,6 +300,23 @@ DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
 NEEDS_REVIEW_SCAN_INTERVAL = float(os.environ.get("NEEDS_REVIEW_SCAN_INTERVAL", "3600"))
 NEEDS_REVIEW_OLDER_HOURS = float(os.environ.get("NEEDS_REVIEW_OLDER_HOURS", "24"))
 
+
+def _env_seconds(name: str, default: float) -> float:
+    """A float from the environment; a blank or malformed value is the default."""
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+# A needs-review row nobody has touched for this long, and for which the doctor has
+# no automatic action, is announced ONCE on doctor.needs_review_stuck (and again only
+# when its state changes). Zero or negative disables the message.
+NEEDS_REVIEW_ESCALATE_SECONDS = _env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0)
+# A first sweep over a long backlog must not flood the channel; the rest follow on
+# the next sweeps (a row is only marked once its message went out).
+NEEDS_REVIEW_ESCALATE_MAX_PER_SWEEP = 10
+
 # ── Verdict-completion recovery for codex_delivery_failed rows ──────────────
 # The codex delivery path can hold a row in needs-review with
 # failure_reason ``codex_delivery_failed`` (e.g. "produced no workspace edits")
@@ -4528,15 +4545,136 @@ def needs_review_evidence_fn(*, merged_fn=None, branch_jobs_fn=None):
     return lambda job: gather_needs_review_evidence(job, merged_fn=merged_fn, branch_jobs_fn=branch_jobs_fn, now=now)
 
 
+_NEEDS_REVIEW_LOGGED: dict[str, tuple] = {}
+
+
+def reset_needs_review_report_state() -> None:
+    """Forget what the report-only sweep already logged (tests; a restart does it too)."""
+    _NEEDS_REVIEW_LOGGED.clear()
+
+
+def _log_report_row_once(row: dict) -> bool:
+    """Log a report-only row only when its (classification, evidence summary) changed.
+
+    The same row used to be logged on every scan for as long as it existed. The
+    first sight of a row, and every change to what the line says, still log.
+    """
+    jid = str(row.get("job_id") or "")
+    state = (row.get("classification"), row.get("evidence_summary"))
+    if _NEEDS_REVIEW_LOGGED.get(jid) == state:
+        return False
+    _NEEDS_REVIEW_LOGGED[jid] = state
+    log.info("needs-review report-only: %s", row)
+    return True
+
+
+def _row_touched_at(job: dict) -> float | None:
+    """When the row last changed, as far as the listing says (None: unknown)."""
+    stamps = [_as_float(job.get(k)) for k in ("updated_at", "last_update_at", "ended_at", "created_at")]
+    stamps = [s for s in stamps if s]
+    return max(stamps) if stamps else None
+
+
+def review_followup_blocker(job: dict) -> str | None:
+    """Why the review follow-up will NOT act on this needs-review row (None: it will).
+
+    Read-only and without a bus call, so it can say "stuck" without a listing per
+    row: it mirrors the order of ``ensure_review_followup``. A non-None reason is
+    the reason a human is needed.
+    """
+    if str(job.get("kind") or "").startswith("triage:"):
+        return "a triage report: it needs a human, not a code review"
+    result = _job_result_dict(job)
+    if result.get("verdict"):
+        return "the row already carries a verdict"
+    jid = str(job.get("id") or "")
+    if STATE.seen(KEY_VERDICT_COMPLETION + ":" + jid, ttl=VERDICT_COMPLETION_TTL):
+        return "verdict completion was already attempted"
+    if review_followup_submitted(jid):
+        return "a review was already submitted and has not produced a verdict"
+    if not result.get("review_evidence"):
+        if result.get("auto_review_job_id"):
+            return "a review job is recorded and has not produced a verdict"
+        return None
+    gap = review_evidence_gap(job, result)
+    if gap is None:
+        return "its review evidence covers the delivered head"
+    head = review_verdict.delivered_head(job, result) or ""
+    if result.get("re_review_head") == head or STATE.seen(_rereview_key(jid, head), ttl=REVIEW_FOLLOWUP_TTL_SEC):
+        return f"already re-reviewed for this head ({gap})"
+    return None
+
+
+def escalate_stuck_needs_review(jobs: list[dict], *, evidence_fn, now: float | None = None) -> list[str]:
+    """ONE ``doctor.needs_review_stuck`` message per row that is stuck, until it changes.
+
+    Stuck: needs-review, not a triage report or protected lane, untouched for more than
+    ``DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS``, and the review follow-up has nothing
+    to do for it. The message names the row, its classification and the reason. The
+    (classification, evidence, blocker) the message was sent for is kept durably
+    (``review:stuck:<id>:<state hash>``), so the next sweep, and a restarted doctor, stay quiet
+    until that state changes. Protected lanes and routing signals are never
+    announced. Returns the ids announced.
+    """
+    if NEEDS_REVIEW_ESCALATE_SECONDS <= 0:
+        return []
+    now = time.time() if now is None else now
+    classified = {
+        str(r.get("job_id")): r
+        for r in doctor_v2.sweep_needs_review(
+            jobs, now=now, older_than_hours=0, summarize=review_verdict.evidence_summary
+        )
+    }
+    sent: list[str] = []
+    for job in jobs:
+        jid = str(job.get("id") or "")
+        row = classified.get(jid)
+        if not jid or row is None or review_followup_protected(job):
+            continue
+        if str(job.get("kind") or "").startswith("triage:"):
+            continue  # a triage report is meant to wait for a human; one message each would be noise
+        touched = _row_touched_at(job)
+        if touched is None or now - touched <= NEEDS_REVIEW_ESCALATE_SECONDS:
+            continue
+        blocker = review_followup_blocker(job)
+        if blocker is None:
+            continue
+        state = "|".join([str(row["classification"]), str(row["evidence_summary"]), blocker])
+        key = f"{KEY_REVIEW}:stuck:{jid}:{hashlib.sha1(state.encode()).hexdigest()[:12]}"
+        if STATE.seen(key, ttl=REVIEW_FOLLOWUP_TTL_SEC):
+            continue
+        if len(sent) >= NEEDS_REVIEW_ESCALATE_MAX_PER_SWEEP:
+            break
+        suggestion = needs_review_suggestion(evidence_fn(job))
+        broadcast_doctor_message(
+            "doctor.needs_review_stuck",
+            {
+                "host": AGENT_HOST,
+                "job_id": jid,
+                "kind": job.get("kind"),
+                "classification": row["classification"],
+                "reason": f"{suggestion}; no automatic action: {blocker}",
+                "evidence_summary": row["evidence_summary"],
+                "idle_seconds": int(now - touched),
+            },
+        )
+        STATE.mark(key, ttl=REVIEW_FOLLOWUP_TTL_SEC)
+        sent.append(jid)
+    return sent
+
+
 def report_needs_review_sweep() -> dict:
     """Classify old needs-review jobs without cancelling, deleting, or retagging,
     and complete the stuck ``codex_delivery_failed`` rows whose verdict JSON is
     already in ``result.tail`` (one ``doctor.verdict_completed`` message per
     row, dry-run via ``DOCTOR_VERDICT_COMPLETION_DRY_RUN=1``)."""
     jobs = fetch_needs_review_jobs()
-    rows = doctor_v2.sweep_needs_review(jobs, older_than_hours=NEEDS_REVIEW_OLDER_HOURS)
+    rows = doctor_v2.sweep_needs_review(
+        jobs, older_than_hours=NEEDS_REVIEW_OLDER_HOURS, summarize=review_verdict.evidence_summary
+    )
     # Step 1 of docs/NEEDS_REVIEW_POLICY.md: evidence and a suggested action per
-    # row, report only. Nothing below this line writes to the bus or to STATE.
+    # row, report only. The only write below is the once-per-state stuck message
+    # (escalate_stuck_needs_review), which marks STATE after it was broadcast.
     by_id = {str(j.get("id")): j for j in jobs if j.get("id")}
     rows = [dict(row) for row in rows]
     evidence_fn = needs_review_evidence_fn()
@@ -4545,11 +4683,15 @@ def report_needs_review_sweep() -> dict:
         row["evidence"] = evidence
         row["suggested_action"] = needs_review_suggestion(evidence)
     for row in rows:
-        log.info("needs-review report-only: %s", row)
+        _log_report_row_once(row)
         broadcast_doctor_message("doctor.needs_review", {"host": AGENT_HOST, **row})
+    seen_ids = {str(r.get("job_id")) for r in rows}
+    for jid in [k for k in _NEEDS_REVIEW_LOGGED if k not in seen_ids]:
+        del _NEEDS_REVIEW_LOGGED[jid]  # a row that left the report is logged afresh if it returns
     verdicts = complete_stuck_verdict_jobs(jobs)
     log.info("needs-review verdict completion: %s", verdicts)
-    return {"scanned": len(rows), "rows": rows, "verdict_completion": verdicts}
+    escalated = escalate_stuck_needs_review(jobs, evidence_fn=evidence_fn)
+    return {"scanned": len(rows), "rows": rows, "verdict_completion": verdicts, "escalated": escalated}
 
 
 def run_needs_review_sweep() -> dict:
@@ -4634,9 +4776,13 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
         # The bus already recorded exactly this review and it does not cover the
         # delivered head: replaying it would change nothing, on every sweep, and
         # the evidence gap below would never be reached.
-        if gap is not None and isinstance(previous, dict) and previous.get("review_job_id") == child.get("id"):
-            if previous.get("verdict") == verdict:
-                continue
+        if (
+            gap is not None
+            and isinstance(previous, dict)
+            and previous.get("review_job_id") == child.get("id")
+            and previous.get("verdict") == verdict
+        ):
+            continue
         # Replay the child completion through the bus's transactional verifier.
         # The doctor never manufactures parent artifact proof or approval.
         body = {"status": "done", "result": proof}

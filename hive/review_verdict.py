@@ -122,3 +122,31 @@ def row_verdict(result: dict) -> str:
             if text:
                 return text
     return ""
+
+
+def evidence_summary(job: dict, result: dict) -> str:
+    """One short line of what the row actually carries, ``"none"`` only when nothing.
+
+    ``<failure_reason>, review=<verdict>@<reviewed sha7 or ?> head=<delivered sha7>,
+    final_round=reviewer_unavailable``. The review part is printed whenever the row
+    has review evidence of any kind, so a line that says ``evidence=none`` is true.
+    """
+    parts: list[str] = []
+    reason = text_value(job.get("failure_reason")) or text_value(result.get("failure_reason"))
+    if reason:
+        parts.append(reason)
+    verdict = row_verdict(result)
+    heads = reviewed_heads(result)
+    evidence = result.get("review_evidence")
+    if verdict or heads or evidence:
+        review = f"review={verdict or 'unknown'}@{short_sha(heads[0]) if heads else '?'}"
+        delivered = delivered_head(job, result)
+        if delivered:
+            review += f" head={short_sha(delivered)}"
+        parts.append(review)
+        loop = result.get("loop_result")
+        teardown = loop.get("teardown") if isinstance(loop, dict) else None
+        final = normalize_verdict(teardown.get("final_verdict")) if isinstance(teardown, dict) else ""
+        if final == "reviewer_unavailable":
+            parts.append("final_round=reviewer_unavailable")
+    return ", ".join(parts) or "none"

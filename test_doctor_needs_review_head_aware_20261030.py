@@ -456,3 +456,164 @@ def test_doctor_and_bus_read_the_verdict_with_one_helper():
     assert doctor.review_verdict.child_verdict is review_verdict.child_verdict
     assert review_verdict.child_verdict(worker_shaped_proof("Approve")) == {"verdict": "approve", "head": FINAL}
     assert review_verdict.child_verdict(legacy_proof()) == legacy_proof()["verdict"]
+
+
+# ── report-only sweep: log once per state, say "stuck" once, honest evidence ──
+
+import logging  # noqa: E402
+
+from hive.workers import doctor_v2  # noqa: E402
+
+CLOCK0 = 2_000_000_000.0
+ESCALATE = 1800.0
+
+
+class Clock:
+    now = CLOCK0
+
+
+@pytest.fixture
+def report_env(bus, monkeypatch):
+    """The bus fake plus a controllable clock; a stuck row: re-reviewed, child failed."""
+    Clock.now = CLOCK0
+    monkeypatch.setattr(doctor.time, "time", lambda: Clock.now)
+    monkeypatch.setattr(doctor, "NEEDS_REVIEW_ESCALATE_SECONDS", ESCALATE)
+    monkeypatch.setattr(doctor, "NEEDS_REVIEW_OLDER_HOURS", 0.0)
+    monkeypatch.setattr(doctor, "branch_merged_into_base", lambda _j: False)
+    monkeypatch.setattr(doctor, "_make_branch_jobs_fetcher", lambda: lambda _j: [])
+    monkeypatch.setattr(doctor, "complete_stuck_verdict_jobs", lambda jobs: {})
+    monkeypatch.setattr(doctor, "STATE", DurableStateStore(MemoryBackend(), refresh_secs=0))
+    doctor.reset_needs_review_report_state()
+    bus.row["updated_at"] = CLOCK0
+    return bus
+
+
+def make_stuck(bus) -> None:
+    """The follow-up already re-reviewed this head and its child is over: nothing left to do."""
+    assert sweep()["submitted"] == 1
+    bus.children[0]["status"] = "failed"
+
+
+def stuck_messages(bus) -> list[dict]:
+    return [body for topic, body in bus.messages if topic == "doctor.needs_review_stuck"]
+
+
+def test_a_stuck_row_is_announced_once_after_the_threshold(report_env):
+    bus = report_env
+    make_stuck(bus)
+    doctor.report_needs_review_sweep()
+    assert stuck_messages(bus) == [], "not stuck yet: the row is fresh"
+    Clock.now = CLOCK0 + ESCALATE + 60
+    report = doctor.report_needs_review_sweep()
+    assert report["escalated"] == [JOB_ID]
+    (message,) = stuck_messages(bus)
+    assert message["job_id"] == JOB_ID and message["classification"] == "stale"
+    assert "already submitted" in message["reason"] and "no automatic action" in message["reason"]
+    assert "loop_unresolved_work_rescued" in message["evidence_summary"]
+    assert message["idle_seconds"] >= ESCALATE
+    for later in (120, 3600, 7200):
+        Clock.now += later
+        assert doctor.report_needs_review_sweep()["escalated"] == []
+    assert len(stuck_messages(bus)) == 1, "quiet until the state changes"
+
+
+def test_a_changed_state_is_announced_again(report_env):
+    bus = report_env
+    make_stuck(bus)
+    Clock.now = CLOCK0 + ESCALATE + 60
+    doctor.report_needs_review_sweep()
+    bus.row["result"]["failure_reason"] = "loop_something_else"
+    doctor.report_needs_review_sweep()
+    messages = stuck_messages(bus)
+    assert len(messages) == 2
+    assert "loop_something_else" in messages[1]["evidence_summary"]
+
+
+def test_a_row_the_follow_up_can_still_act_on_is_not_called_stuck(report_env):
+    bus = report_env
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    report = doctor.report_needs_review_sweep()  # nothing was re-reviewed yet: the follow-up will act
+    assert report["escalated"] == [] and stuck_messages(bus) == []
+
+
+def test_a_row_touched_recently_is_not_called_stuck(report_env):
+    bus = report_env
+    make_stuck(bus)
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    bus.row["updated_at"] = Clock.now - 30
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+
+
+def test_triage_and_protected_rows_are_never_announced(report_env, monkeypatch):
+    bus = report_env
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    bus.row["kind"] = "triage:fake"
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+    bus.row["kind"] = "build:fake-task"
+    make_stuck(bus)
+    monkeypatch.setattr(doctor, "review_followup_protected", lambda _j: True)
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+    assert stuck_messages(bus) == []
+
+
+def test_escalation_can_be_switched_off(report_env, monkeypatch):
+    bus = report_env
+    make_stuck(bus)
+    monkeypatch.setattr(doctor, "NEEDS_REVIEW_ESCALATE_SECONDS", 0.0)
+    Clock.now = CLOCK0 + 10 * ESCALATE
+    assert doctor.report_needs_review_sweep()["escalated"] == []
+
+
+def test_the_threshold_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", "90")
+    assert doctor._env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0) == 90.0
+    monkeypatch.setenv("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", "soon")
+    assert doctor._env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0) == 1800.0
+    monkeypatch.setenv("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", " ")
+    assert doctor._env_seconds("DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS", 1800.0) == 1800.0
+
+
+def report_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("needs-review report-only:")]
+
+
+def test_the_report_line_is_logged_once_per_state(report_env, caplog):
+    bus = report_env
+    make_stuck(bus)
+    caplog.set_level(logging.INFO, logger="doctor")
+    for _ in range(5):
+        Clock.now += 60
+        doctor.report_needs_review_sweep()
+    assert len(report_lines(caplog)) == 1
+    bus.row["result"]["failure_reason"] = "loop_something_else"
+    doctor.report_needs_review_sweep()
+    doctor.report_needs_review_sweep()
+    assert len(report_lines(caplog)) == 2
+    # the row still goes out on the bus every sweep: only the log is deduplicated
+    assert len([t for t, _ in bus.messages if t == "doctor.needs_review"]) >= 7
+
+
+def test_the_report_line_never_says_none_for_a_row_that_has_evidence(report_env, caplog):
+    caplog.set_level(logging.INFO, logger="doctor")
+    report = doctor.report_needs_review_sweep()
+    (row,) = report["rows"]
+    note = row["orchestrator_note"]
+    assert "evidence=none" not in note
+    assert "loop_unresolved_work_rescued" in note
+    assert "review=request_changes@" in note
+    assert f"head={FINAL[:7]}" in note and "final_round=reviewer_unavailable" in note
+
+
+def test_evidence_none_is_only_for_a_row_that_carries_nothing():
+    old = {"id": "j", "status": "needs-review", "kind": "build:x", "updated_at": 1.0}
+    (empty,) = doctor_v2.sweep_needs_review([old], now=1e9)
+    assert empty["orchestrator_note"].endswith("evidence=none")
+    with_reason = dict(old, failure_reason="codex_delivery_failed")
+    (row,) = doctor_v2.sweep_needs_review([with_reason], now=1e9)
+    assert row["orchestrator_note"].endswith("evidence=codex_delivery_failed")
+    reviewed = dict(old, result={"reviewer": {"verdict": "request_changes"}, "head_sha": FINAL})
+    (row,) = doctor_v2.sweep_needs_review([reviewed], now=1e9)
+    assert "evidence=none" not in row["orchestrator_note"] and "request_changes" in row["orchestrator_note"]
+    as_json = dict(old, result='{"failure_reason": "from_result"}')
+    (row,) = doctor_v2.sweep_needs_review([as_json], now=1e9)
+    assert row["orchestrator_note"].endswith("evidence=from_result")

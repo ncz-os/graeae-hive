@@ -12,9 +12,10 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any
 
 try:
     import tomllib
@@ -262,7 +263,43 @@ def residual_decision(evidence: Evidence, call: Callable[[str], dict[str, Any]],
                     (time.monotonic() - started) * 1000)
 
 
-def sweep_needs_review(jobs: Iterable[dict[str, Any]], *, now: float | None = None, older_than_hours: float = 24) -> list[dict[str, Any]]:
+def _row_result(job: dict[str, Any]) -> dict[str, Any]:
+    value = job.get("result")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def default_evidence_summary(job: dict[str, Any], result: dict[str, Any]) -> str:
+    """What the row carries, in one phrase; ``none`` only when it carries nothing.
+
+    The failure reason lives on the row or, for a worker result, in ``result``; a
+    review record in ``result`` is evidence too (the caller may pass a richer
+    summariser that names the verdict and head).
+    """
+    parts = []
+    reason = job.get("failure_reason") or result.get("failure_reason")
+    if isinstance(reason, str) and reason.strip():
+        parts.append(reason.strip())
+    reviewer = result.get("reviewer")
+    verdict = reviewer.get("verdict") if isinstance(reviewer, dict) else None
+    if isinstance(verdict, str) and verdict.strip():
+        parts.append(f"review={verdict.strip().lower()}")
+    elif result.get("review_evidence"):
+        parts.append("review_evidence")
+    return ", ".join(parts) or "none"
+
+
+def sweep_needs_review(
+    jobs: Iterable[dict[str, Any]],
+    *,
+    now: float | None = None,
+    older_than_hours: float = 24,
+    summarize: Callable[[dict[str, Any], dict[str, Any]], str] = default_evidence_summary,
+) -> list[dict[str, Any]]:
     """Report-only classification of old needs-review jobs; never mutates jobs."""
     cutoff = (now or time.time()) - older_than_hours * 3600
     rows = list(jobs)
@@ -273,6 +310,8 @@ def sweep_needs_review(jobs: Iterable[dict[str, Any]], *, now: float | None = No
         kind = job.get("base_kind") or job.get("kind")
         later_done = any(other is not job and (other.get("base_kind") or other.get("kind")) == kind and other.get("status") == "done" for other in rows)
         reason = "superseded by later completed job" if later_done else ("stale" if job.get("head_branch") else "actionable")
+        summary = summarize(job, _row_result(job))
         out.append({"job_id": job.get("id"), "classification": "superseded" if later_done else reason,
-                    "orchestrator_note": f"report-only needs-review sweep: {reason}; evidence={job.get('failure_reason') or 'none'}"})
+                    "evidence_summary": summary,
+                    "orchestrator_note": f"report-only needs-review sweep: {reason}; evidence={summary}"})
     return out
