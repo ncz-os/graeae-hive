@@ -213,6 +213,9 @@ STATUS_TRANSITIONS: dict[str, set[str]] = {
     # superseded failure stayed "failed" forever (2026-10-03).
     "failed": {"failed", "cancelled"},
     "cancelled": {"cancelled"},
+    "failed_completion": {"failed_completion"},  # legacy terminal (FB21):
+    # stored (DB CHECK, DEP_DEAD, SWEEPABLE) but nothing transitions into or
+    # out of it anymore; idempotent same-status PATCH only, like dead-letter.
     "dead-letter": {"dead-letter"},  # terminal; idempotent same-status PATCH only
 }
 CLAIM_LEASE_SECONDS = float(os.environ.get("CLAIM_LEASE_SECONDS", "1800"))

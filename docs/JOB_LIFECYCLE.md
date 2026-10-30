@@ -99,6 +99,7 @@ status strings; the test parses this table.
 | failed | cancelled | PATCH (retire superseded failures) |
 | cancelled | cancelled | PATCH |
 | dead-letter | dead-letter | PATCH |
+| failed_completion | failed_completion | PATCH (legacy terminal; same-status only) |
 
 Notes: `queued`/`offered` to `running` is refused everywhere except
 through a claim first (claim bypass rule,
