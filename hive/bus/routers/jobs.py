@@ -44,12 +44,12 @@ from hive.bus.domain import branch_admission as _ba_mod
 from hive.bus.domain.branch_admission import branch_admission
 from hive.bus.domain.capacity_ledger import _capacity_ledger
 from hive.bus.domain.eligibility import (
-    host_pin_warnings,
     THROTTLE_HEADROOM,
     _norm_str,
     _norm_str_set,
     agent_kind_aliases,
     heavy_repo_required_for_kind,
+    host_pin_warnings,
     job_agent_eligible,
 )
 from hive.bus.domain.failure import engine_unavailable, infrastructure_failure
@@ -1383,12 +1383,16 @@ async def update_job(job_id: str, req: JobUpdate):
         if claimed_by_was_set and req.claimed_by is None:
             raise HTTPException(422, "claimed_by=null is not accepted; provide the current claimant urn")
 
-        if claimed_by_was_set and req.claimed_by is not None:
-            if old_claimed_by and req.claimed_by != old_claimed_by:
-                raise HTTPException(
-                    403,
-                    f"claimed_by overwrite rejected: current={old_claimed_by!r} requested={req.claimed_by!r}",
-                )
+        if (
+            claimed_by_was_set
+            and req.claimed_by is not None
+            and old_claimed_by
+            and req.claimed_by != old_claimed_by
+        ):
+            raise HTTPException(
+                403,
+                f"claimed_by overwrite rejected: current={old_claimed_by!r} requested={req.claimed_by!r}",
+            )
 
         # DEFECT 2026-10-25: this was the wall that made a submitter unable to
         # cancel its own claimed job ("job update requires claimed_by to match
@@ -1401,9 +1405,9 @@ async def update_job(job_id: str, req: JobUpdate):
             old_claimed_by
             and req.status in {"claimed", "running", "done", "failed", "cancelled"}
             and not submitted_cancel
+            and (not claimed_by_was_set or req.claimed_by != old_claimed_by)
         ):
-            if not claimed_by_was_set or req.claimed_by != old_claimed_by:
-                raise HTTPException(403, "job update requires claimed_by to match the current claimant")
+            raise HTTPException(403, "job update requires claimed_by to match the current claimant")
 
         effective_claimed_by = None if release_to_queue else (req.claimed_by or old_claimed_by)
         if req.status in {"claimed", "running"} and not effective_claimed_by:
