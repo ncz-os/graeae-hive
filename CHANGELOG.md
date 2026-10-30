@@ -68,6 +68,8 @@ the control-host variables.
   contract.
 
 ## Sources
+
+Sources-through: 2026-10-29 (20 freebuff/sonnet merges listed below)
 - Merge freebuff/fb13-20261029
 - Merge freebuff/fb12-20261029
 - Merge freebuff/fb11-20261029
