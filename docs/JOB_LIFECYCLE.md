@@ -71,10 +71,8 @@ status strings; the test parses this table.
 | ---- | -- | --- |
 | queued | queued | PATCH |
 | queued | offered | PATCH |
-| queued | claimed | claim endpoint only (NOT a PATCH cell; see map note) |
 | queued | cancelled | PATCH |
 | offered | queued | PATCH |
-| offered | claimed | claim endpoint only (NOT a PATCH cell; see map note) |
 | offered | cancelled | PATCH |
 | claimed | queued | PATCH (release; claimant must match) |
 | claimed | claimed | PATCH |
@@ -100,6 +98,19 @@ status strings; the test parses this table.
 | cancelled | cancelled | PATCH |
 | dead-letter | dead-letter | PATCH |
 | failed_completion | failed_completion | PATCH (legacy terminal; same-status only) |
+
+### Claim-only transitions (not PATCH cells)
+
+Claiming never goes through PATCH: `queued`/`offered` to `claimed`
+happens only via `POST /v1/jobs/next` (atomic next-claim CAS) and
+`POST /v1/jobs/{id}/claim` (direct CAS), not via `STATUS_TRANSITIONS`.
+PATCH refuses these pairs with 409 (claim bypass rule). They are listed
+here, outside the parsed table above, so the doc stays honest both ways.
+
+| source | target | endpoint |
+| ------ | ------ | -------- |
+| queued | claimed | POST /v1/jobs/next, POST /v1/jobs/{id}/claim |
+| offered | claimed | POST /v1/jobs/next, POST /v1/jobs/{id}/claim |
 
 Notes: `queued`/`offered` to `running` is refused everywhere except
 through a claim first (claim bypass rule,
