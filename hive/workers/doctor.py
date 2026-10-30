@@ -4628,6 +4628,12 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
             and previous.get("head_matches") is True
         ):
             return "skipped_verdict"
+        # The bus already recorded exactly this review and it does not cover the
+        # delivered head: replaying it would change nothing, on every sweep, and
+        # the evidence gap below would never be reached.
+        if gap is not None and isinstance(previous, dict) and previous.get("review_job_id") == child.get("id"):
+            if previous.get("verdict") == proof["verdict"]:
+                continue
         # Replay the child completion through the bus's transactional verifier.
         # The doctor never manufactures parent artifact proof or approval.
         body = {"status": "done", "result": proof}

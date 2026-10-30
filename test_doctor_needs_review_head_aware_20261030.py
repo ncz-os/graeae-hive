@@ -331,3 +331,40 @@ def test_row_level_verdict_is_untouched(bus):
     bus.row["result"]["verdict"] = {"verdict": "approve"}
     assert sweep()["skipped_verdict"] == 1
     assert bus.writes() == []
+
+
+# ── a review the bus already recorded for an older head ────────────────────
+
+
+def reconciled_old_head_row(bus: FakeBus, child_status: str = "done") -> dict:
+    """Parent after the bus reconciled a finished review of an OLDER head."""
+    proof = {"verdict": {"verdict": "approve", "head": MIDDLE}, "deliverable": "Reviewed."}
+    bus.children.append({"id": "review-child-old", "kind": "review:fake", "status": child_status, "result": proof})
+    result = bus.row["result"]
+    del result["loop_result"]
+    result["auto_review_job_id"] = "review-child-old"
+    result["review_evidence"] = {
+        "review_job_id": "review-child-old",
+        "verdict": proof["verdict"],
+        "head_matches": False,
+        "artifact_valid": True,
+        "reason": "review HEAD does not match delivered HEAD",
+    }
+    return proof
+
+
+def test_recorded_review_of_an_older_head_is_re_reviewed_not_replayed_forever(bus):
+    reconciled_old_head_row(bus)
+    report = sweep()
+    assert report.get("replayed_verdict", 0) == 0
+    assert report["submitted"] == 1
+    assert [c for c in bus.writes() if c[1] == "/v1/jobs/review-child-old"] == []
+    assert bus.posted[0]["idempotency_key"] == f"needs-review-followup:{JOB_ID}:{FINAL[:12]}"
+    assert bus.row["result"]["auto_review_job_id"] == f"{CHILD_PREFIX}1"
+    assert sweep()["submitted"] == 0, "and then it stops"
+
+
+def test_recorded_review_that_is_still_in_flight_is_not_duplicated(bus):
+    reconciled_old_head_row(bus, child_status="running")
+    assert sweep()["submitted"] == 0
+    assert bus.writes() == []
