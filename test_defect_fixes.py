@@ -257,9 +257,11 @@ class McpBridgeTests(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skip(
-    "Bus bearer-token auth (require_bus_auth / browser sessions) is not "
-    "implemented on the argonas line — the fleet is local-LAN only and does not "
-    "require auth (operator 2026-10-15). These tests target the forge lineage."
+    "Bus bearer-token auth is not implemented on the argonas line: "
+    "agent_bus.require_bus_auth does not exist here, so these tests target the "
+    "forge lineage only. The fleet is local-LAN only and does not require auth "
+    "(operator 2026-10-15). To run: check out the forge lineage where "
+    "require_bus_auth exists."
 )
 class AuthTests(unittest.IsolatedAsyncioTestCase):
     async def _request(self, path, token=None, method="GET", cookie=None, call_next=None):
@@ -1812,8 +1814,10 @@ class ServiceTests(unittest.TestCase):
         )
 
     @unittest.skip(
-        "auto-restore creds-gated fail-fast targets the forge's bus-auth design; "
-        "the fleet is local-LAN only and does not require auth (operator 2026-10-15)."
+        "auto-restore creds-gated fail-fast targets the forge's bus-auth design: "
+        "hive-auto-restore.main() on this line runs without tokens (fleet is "
+        "local-LAN only, operator 2026-10-15) and has no missing-credentials "
+        "fatal path to assert. To run: the forge lineage's token-gated auto-restore."
     )
     def test_auto_restore_missing_credentials_is_fatal_before_poll(self):
         with (
@@ -1826,8 +1830,10 @@ class ServiceTests(unittest.TestCase):
         fetch.assert_not_called()
 
     @unittest.skip(
-        "auto-restore creds-gated fail-fast targets the forge's bus-auth design; "
-        "the fleet is local-LAN only and does not require auth (operator 2026-10-15)."
+        "auto-restore creds-gated fail-fast targets the forge's bus-auth design: "
+        "hive-auto-restore.main() on this line runs without tokens (fleet is "
+        "local-LAN only, operator 2026-10-15) and has no missing-credentials "
+        "fatal path to assert. To run: the forge lineage's token-gated auto-restore."
     )
     def test_auto_restore_queue_read_failure_is_fatal(self):
         with (

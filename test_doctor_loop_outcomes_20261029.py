@@ -583,13 +583,55 @@ class ClusterTests(unittest.TestCase):
 class WorkerParseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # deploy/hive_worker.py imports the worker-lineage sidecars
+        # (hive_budget, provenance, hive.codex_delivery/llm_roles/push_policy/
+        # review_evidence), which are absent from this checkout; the parser
+        # under test is pure stdlib, so only those unrelated import-time
+        # dependencies are stubbed (the same set tests/test_worker_build_busy.py
+        # uses). The stubs are removed in tearDownClass so no other test can
+        # see them.
+        import sys
+        import types
+
+        budget = types.ModuleType("hive_budget")
+        budget.FAILURE_REASON = "budget_exceeded"
+        provenance = types.ModuleType("provenance")
+        provenance.STATIC_AGENT_MODELS = {}
+        provenance.KNOWN_COST_TIERS = set()
+        cls._stubs = {"hive_budget": budget, "provenance": provenance}
+        for name in ("codex_delivery", "llm_roles", "push_policy", "review_evidence"):
+            module = types.ModuleType("hive." + name)
+            if name == "codex_delivery":
+                module.fleet_git_env = lambda *a, **kw: {}
+            if name == "push_policy":
+                module.argonas_url_for_slug = lambda slug: slug
+            cls._stubs["hive." + name] = module
+        cls._replaced = {}
+        for name, module in cls._stubs.items():
+            cls._replaced[name] = sys.modules.get(name)
+            sys.modules[name] = module
         path = pathlib.Path(__file__).parent / "deploy" / "hive_worker.py"
         spec = importlib.util.spec_from_file_location("hive_worker_under_test", path)
         cls.mod = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(cls.mod)
-        except BaseException as exc:  # noqa: BLE001 - worker import needs env on some hosts
-            raise unittest.SkipTest(f"hive_worker not importable here: {exc}")
+        except BaseException as exc:  # noqa: BLE001 - import must surface real breakage
+            raise unittest.SkipTest(
+                "hive_worker not importable even with the deployed sidecars "
+                f"stubbed: {exc}. This test needs the worker lineage's sidecar "
+                "modules (hive_budget.py et al. from deploy/hive-canonical-*) "
+                "on the import path."
+            ) from exc
+
+    @classmethod
+    def tearDownClass(cls):
+        import sys
+
+        for name, previous in cls._replaced.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
 
     def test_last_result_line_wins_and_garbage_is_ignored(self):
         out = "\n".join(

@@ -60,7 +60,8 @@ def test_pidless_marker_expires_after_ttl(worker, tmp_path, monkeypatch):
     assert worker.build_busy(now=time.time() + worker.BUSY_MARKER_TTL + 5) == ''
 
 
-@pytest.mark.skipif(not os.path.isdir('/proc'), reason='process scan reads /proc (the workers are Linux)')
+@pytest.mark.skipif(not os.path.isdir('/proc'), reason='needs a Linux host: the worker process scan reads /proc, absent on macOS; '
+       'run on a Linux worker host')
 def test_running_build_orchestrator_makes_the_host_busy(worker, tmp_path, monkeypatch):
     """The real-process path: a script named like a build orchestrator, run via
     its interpreter, is seen through argv[1]."""
@@ -79,7 +80,8 @@ def test_running_build_orchestrator_makes_the_host_busy(worker, tmp_path, monkey
     assert worker.build_busy() == ''
 
 
-needs_proc = pytest.mark.skipif(not os.path.isdir('/proc'), reason='process scan reads /proc (the workers are Linux)')
+needs_proc = pytest.mark.skipif(not os.path.isdir('/proc'), reason='needs a Linux host: the worker process scan reads /proc, absent on macOS; '
+       'run on a Linux worker host')
 
 
 @needs_proc

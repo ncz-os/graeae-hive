@@ -29,12 +29,15 @@ import asyncio
 import os
 import re
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
 os.environ.setdefault("HIVE_BACKEND", "sqlite")
 
 import httpx  # noqa: E402
+import uvicorn  # noqa: E402
 
 import agent_bus  # noqa: E402
 from hive.bus import deps as _deps  # noqa: E402
@@ -280,25 +283,29 @@ class LiveContractTests(unittest.TestCase):
         # uniquely-tagged message (the bus fans published messages out to
         # live EVENT_QUEUE subscribers), and read until the tag arrives.
         # The read is bounded: silence fails the test, never hangs it.
-        self.skipTest(
-            "SSE skipped (finding FB22-SSE): under httpx ASGITransport the "
-            "response start for GET /v1/events never arrives — verified with "
-            "a bare stream-enter that stalls before headers, so no test-side "
-            "read timeout can bound it. sse-starlette 3.6.0 serves the route "
-            "through an anyio task group (_stream_response/_ping/disconnect "
-            "watchers); that machinery does not progress in-process here. "
-            "The route works under uvicorn; live event coverage comes from "
-            "GET /v1/events/log polling, which this file does exercise."
-        )
+        #
+        # Served over loopback TCP (uvicorn in a thread), not the ASGI
+        # transport: EventSourceResponse's anyio task-group machinery never
+        # emits the response start through httpx ASGITransport (finding
+        # FB22-SSE), but production serves this route under uvicorn, so the
+        # test exercises exactly the production path.
         marker = f"sse-probe-{os.getpid()}-{id(self):x}"
+        config = uvicorn.Config(agent_bus.app, host="127.0.0.1", port=0, log_level="warning")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        for _ in range(100):
+            if server.started:
+                break
+            time.sleep(0.1)
+        if not server.started or not server.servers:
+            server.should_exit = True
+            self.fail("loopback SSE server did not start within 10 s")
+        base = f"http://127.0.0.1:{server.servers[0].sockets[0].getsockname()[1]}"
 
         async def _do():
             timeout = httpx.Timeout(10.0, read=10.0)
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=agent_bus.app),
-                base_url="http://t",
-                timeout=timeout,
-            ) as c:
+            async with httpx.AsyncClient(base_url=base, timeout=timeout) as c:
                 async with c.stream("GET", "/v1/events") as r:
                     self.assertEqual(r.status_code, 200, "SSE /v1/events status")
                     self.assertIn(
@@ -327,6 +334,9 @@ class LiveContractTests(unittest.TestCase):
             got = _run(_do)
         except (TimeoutError, httpx.TimeoutException) as e:
             self.fail(f"SSE stream yielded no tagged event within 10 s (must not hang): {e}")
+        finally:
+            server.should_exit = True
+            thread.join(timeout=10)
         self.assertIsNotNone(got, "SSE stream closed before the published event arrived")
 
     # ---- pinned live defects (base line; fixed on freebuff/fb22-fixes-20261029) ----

@@ -509,7 +509,8 @@ class IdContractTests(_FallbackCase):
         import sys
 
         if sys.platform == "darwin":
-            self.skipTest("case-sensitive filesystem required: macOS APFS is case-insensitive")
+            self.skipTest("needs a case-sensitive filesystem (macOS APFS is case-insensitive): "
+                        "run on Linux or a case-sensitive volume")
         _make_bare(self.root, "lowercase")
         self.assertIsNone(repos.find_exact("LowerCase"))
         self.assertIsNone(repos.get_repo("LOWERCASE"))
