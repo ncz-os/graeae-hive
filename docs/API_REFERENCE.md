@@ -780,7 +780,7 @@ Example: `curl http://<bus-host>:5005/v1/stats/workers`
 
 ## Status values
 
-- `VALID_JOB_STATUSES`: cancelled, claimed, dead-letter, done, failed, failed_completion, needs-review, offered, queued, released, running
+- `VALID_JOB_STATUSES`: cancelled, claimed, dead-letter, done, failed, failed_completion, needs-review, offered, queued, running
 - `TERMINAL_JOB_STATUSES`: cancelled, dead-letter, done, failed
 - `IN_FLIGHT_JOB_STATUSES`: claimed, offered, queued, running
 - `DEP_DEAD_STATUSES`: cancelled, dead-letter, failed, failed_completion
