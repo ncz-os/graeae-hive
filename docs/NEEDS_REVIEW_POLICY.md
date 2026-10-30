@@ -19,10 +19,17 @@ All references are `hive/workers/doctor.py` unless noted, base
   `broadcast_doctor_message("doctor.needs_review", ...)` (Source:
   `report_needs_review_sweep`, constants at top of `doctor.py`).
   `doctor_v2.sweep_needs_review` itself never mutates jobs; it emits
-  `{job_id, classification, orchestrator_note}` where classification is
+  `{job_id, classification, evidence_summary, orchestrator_note}` where classification is
   `superseded` (same `base_kind`/`kind` has a later `done` row),
   `stale` (old, no `head_branch`), or `actionable` (Source:
-  `hive/workers/doctor_v2.py:sweep_needs_review`).
+  `hive/workers/doctor_v2.py:sweep_needs_review`). `evidence_summary` says what
+  the row carries (`hive/review_verdict.py:evidence_summary`):
+  `<failure_reason>, review=<verdict>@<reviewed sha7|?> head=<delivered sha7>[,
+  final_round=reviewer_unavailable]`. `evidence=none` appears only for a row
+  that carries no failure reason and no review record.
+  The report line is logged once per (job id, classification, evidence
+  summary) and again only when that changes; the `doctor.needs_review`
+  broadcast is unchanged and still goes out every sweep.
 - Verdict completion (the only writer on this sweep):
   `complete_stuck_verdict_jobs(jobs)` → `complete_verdict_job(job)` heals
   rows where `failure_reason == codex_delivery_failed` (or tail says
@@ -41,11 +48,14 @@ All references are `hive/workers/doctor.py` unless noted, base
   `ensure_review_followup`).
   - Skips: non-needs-review status; `triage:*` kinds; `dlq_protected` or
     routing-only rows (`review_followup_protected`); no durable state;
-    rows with `result.verdict`/`review_evidence`/`auto_review_job_id`/child
-    `review:*` jobs (Source: `ensure_review_followup`,
+    rows with `result.verdict`, a review child, or review evidence that
+    covers the delivered head (Source: `ensure_review_followup`,
     `review_followup_row_has_verdict`, `_needs_review_child_review_jobs`).
+    Review evidence only counts for the head it was made for, see
+    "Evidence is for a head" below.
   - Else submits ONE read-only review via `_submit_review_followup` with
-    stable `idempotency_key: needs-review-followup:<jid>`, then
+    stable `idempotency_key: needs-review-followup:<jid>` (a re-review adds
+    the delivered head: `needs-review-followup:<jid>:<head12>`), then
     `_record_auto_review` (durable `STATE.mark("review:submitted:<jid>")`
     TTL 30 d + PATCH `result.auto_review_job_id`/`doctor_reason`) and
     broadcasts `doctor.needs_review` (Source: `_submit_review_followup`,
@@ -83,11 +93,57 @@ null, closes the parent only when the reviewed head equals the
 delivered head, and otherwise keeps it `needs-review` with
 `review_evidence.head_matches: false`, `child_advanced_branch: true`
 and `approved_unmerged_tip` (the approved tip). `approved_unmerged_tip`
-is an evidence field, not a status. The doctor treats a row with
-`review_evidence` as reviewed (`review_followup_row_has_verdict`), so it
-will not submit a second review: confirming the tip before merging is
-for a human or the owner. Rules and outcomes: `docs/JOB_LIFECYCLE.md`,
-"Review reconcile outcomes".
+is an evidence field, not a status. The doctor does not submit a second
+review for it (`child_advanced_branch` is one of the exceptions below):
+confirming the tip before merging is for a human or the owner. Rules and
+outcomes: `docs/JOB_LIFECYCLE.md`, "Review reconcile outcomes".
+
+### Evidence is for a head
+
+A row can carry `result.review_evidence` and `result.reviewer` from earlier
+rounds of a loop while `result.head_sha` is a later commit, and the loop's
+last round may have had no reviewer (`loop_result.teardown.final_verdict:
+reviewer_unavailable`, `resolved: false`). Reading that evidence as "already
+reviewed" parked the row for as long as it existed. The doctor now compares
+the evidence with the delivered head (`review_evidence_gap`):
+
+| Row | Doctor |
+|---|---|
+| evidence names a reviewed head that differs from the delivered head | re-review that head |
+| final loop round `reviewer_unavailable` and not resolved | re-review the delivered head |
+| last verdict `request_changes` and the row has newer commits | re-review the delivered head |
+| evidence covers the delivered head (`head_matches: true`, `reviewed_head`, `reviewer.head`, a resolved loop) | leave it alone |
+| `child_advanced_branch: true` (an approved review that pushed commits) | leave it alone, a human confirms the tip |
+| no head information and no loop outage | leave it alone, as before |
+
+A re-review is capped at one per (row, delivered head): it writes
+`result.re_review_head` and `result.doctor_reason` ("re-review: ..."), and
+sets `review:rereview:<jid>:<head12>`. It is never submitted while a review
+child is not yet in a terminal state, never repeated for the same head after
+a doctor restart (the row itself carries the cap) and a new head earns one
+new re-review. A review the bus already recorded for an older head is not
+replayed every sweep. The `doctor.needs_review` message gains `re_review`.
+
+A finished review child is replayed through the bus verifier in either
+result shape (legacy `result.verdict` dict, or the worker's
+`result.reviewer.verdict`); both are read by the one shared helper
+`hive/review_verdict.py:child_verdict`.
+
+### A stuck row is announced once
+
+A row the sweep cannot act on is `needs-review` and `triage:*`-free,
+unprotected, untouched for longer than `DOCTOR_NEEDS_REVIEW_ESCALATE_SECONDS`
+(default `1800`; zero or negative switches it off; see
+`docs/ENVIRONMENT.md`) and has no follow-up action left: a review is in
+flight or already submitted without a verdict, the head was already
+re-reviewed, or its evidence covers the delivered head
+(`review_followup_blocker`). The doctor publishes ONE
+`doctor.needs_review_stuck` message with `{host, job_id, kind,
+classification, reason, evidence_summary, idle_seconds}`, then stays quiet
+for that row until its (classification, evidence summary, blocker) changes.
+The marker `review:stuck:<jid>:<state hash>` is durable, so a restarted
+doctor does not repeat it. At most 10 rows are announced per sweep. It
+writes nothing to the bus.
 
 ## 2. Failure modes seen
 
@@ -180,7 +236,8 @@ DELETE); status change is the only mutation.
 
 ## 6. First conservative step (report before any write)
 
-Ship only a reporter first: extend `report_needs_review_sweep` output rows
+(Implemented so far: the report, the head-aware re-review and the single
+stuck message above; the writers below are not.) Ship only a reporter first: extend `report_needs_review_sweep` output rows
 with `{proposed_action, evidence, confidence}` for (1)-(3) and broadcast
 `doctor.needs_review_proposal`; take no PATCH path. The operator reviews
 proposals against the bus for at least one week of sweeps before enabling
