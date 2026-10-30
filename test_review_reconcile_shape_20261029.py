@@ -448,7 +448,7 @@ class NoUsableVerdictTests(ReviewReconcileShapeBase):
             "reviewer verdict null": lambda r: r["reviewer"].update(verdict=None),
             "reviewer verdict blank": lambda r: r["reviewer"].update(verdict="  "),
             "reviewer verdict not a string": lambda r: r["reviewer"].update(verdict=3),
-            "legacy verdict without string": lambda r: r.update(verdict={"verdict": None}),
+            "legacy verdict without string": lambda r: r.update(verdict={"verdict": None}, reviewer=None),
             "no reviewer key": lambda r: r.pop("reviewer"),
         }.items():
             with self.subTest(label):
@@ -535,7 +535,9 @@ class IdempotencyTests(ReviewReconcileShapeBase):
         self.assertEqual(audits, 1)
         self.assertEqual(events, 1)
         self.repatch_child_done(child, result)
-        self.assertEqual(self.reconcile_directly(child), parent)
+        # A parent that already closed is no longer reconcilable (None); otherwise it reports the parent.
+        expected = None if row["status"] == "done" else parent
+        self.assertEqual(self.reconcile_directly(child), expected)
         self.assertEqual(self.audit_count(parent), audits, "no second audit row")
         self.assertEqual(self.event_count(parent), events, "no second event")
         self.assertEqual(self._get(parent)["result"], row["result"])
