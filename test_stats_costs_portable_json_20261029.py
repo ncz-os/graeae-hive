@@ -1,10 +1,9 @@
-"""FB22-fix: GET /v1/stats/costs must work on stock sqlite builds.
+"""GET /v1/stats/costs must work on stock sqlite builds.
 
-The provider-breakdown query used ``JSON_VALUE()``, which this repo's
-sqlite build does not provide (``no such function: JSON_VALUE``), so the
-route 500s. ``json_extract()`` is available wherever JSON1 is and behaves
-the same for these scalar lookups. Fails on the base line (500), passes
-with the portable function (200).
+The provider-breakdown query uses the SQL/JSON function ``JSON_VALUE()``. Stock SQLite does not
+provide it, so the route used to 500 there; the SQLite backend now registers a JSON_VALUE function
+on every connection. The shared SQL must keep the standard spelling because the other backends
+(Oracle in production) translate it; see test_json_value_dialect_20261030.py.
 """
 
 from __future__ import annotations

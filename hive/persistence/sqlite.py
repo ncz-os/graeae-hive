@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -243,6 +244,43 @@ CREATE INDEX IF NOT EXISTS idx_cap_usage_service_ts ON capacity_usage(service, t
 """
 
 
+_JSON_PATH_TOKEN = re.compile(r"\.([^.\[\]]+)|\[(\d+)\]")
+
+
+def _json_value(doc: Any, path: Any) -> Any:
+    """SQL ``JSON_VALUE(doc, '$.a.b[0]')`` for stock SQLite, which does not provide it.
+
+    The repository SQL is written once in the common dialect and the other backends
+    (Oracle, PostgreSQL, MySQL, DB2) translate it to engines that all have the SQL/JSON
+    ``JSON_VALUE``. SQLite supplies the same function here, so the shared SQL never has to
+    switch to a SQLite-only spelling that the other backends cannot run.
+    Scalars come back as scalars, objects and arrays as compact JSON text, booleans as
+    'true'/'false' (as the other engines return them); a missing key, bad path or invalid
+    JSON is NULL.
+    """
+    if doc is None or not isinstance(path, str) or not path.startswith("$"):
+        return None
+    try:
+        value = json.loads(doc) if isinstance(doc, (str, bytes)) else doc
+    except (TypeError, ValueError):
+        return None
+    for key, index in _JSON_PATH_TOKEN.findall(path[1:]):
+        if key:
+            if not isinstance(value, dict) or key not in value:
+                return None
+            value = value[key]
+        else:
+            i = int(index)
+            if not isinstance(value, list) or i >= len(value):
+                return None
+            value = value[i]
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"))
+    return value
+
+
 class SqliteHiveRepository(HiveMindRepository):
     #: The reference dialect can express the reason prefix filter: case-
     #: insensitive prefix match on the result JSON text (LIKE is
@@ -479,6 +517,7 @@ class SqliteHiveRepository(HiveMindRepository):
             check_same_thread=False,
         )
         try:
+            await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA synchronous=NORMAL")
             await db.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
@@ -1720,13 +1759,13 @@ class SqliteHiveRepository(HiveMindRepository):
         elif group_by == "provider":
             sel = (
                 "CASE "
-                "WHEN json_extract(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
-                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
-                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
-                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
-                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_minimax%' THEN 'minimax' "
-                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
-                "WHEN json_extract(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') IN ('hive_deepseek_pro_1','hive_groq_1','hive_xai_1','hive_nvidia_1') THEN 'codex' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_deepseek%' THEN 'deepseek-direct' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_siliconflow%' THEN 'siliconflow' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_xai%' THEN 'xai' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_minimax%' THEN 'minimax' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_groq%' THEN 'groq' "
+                "WHEN JSON_VALUE(result,'$.agent_alias') LIKE 'hive_nvidia%' THEN 'nvidia' "
                 "ELSE COALESCE(claimed_provider,'unknown') END"
             )
         elif group_by == "model":

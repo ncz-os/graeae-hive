@@ -340,7 +340,7 @@ class LiveContractTests(unittest.TestCase):
 
     def test_costs_endpoint_works_on_stock_sqlite(self):
         # FB22 pinned a 500 here (cost_stats_rows used JSON_VALUE(), absent
-        # from stock sqlite). Fixed on freebuff/fb22-fixes with json_extract().
+        # from stock sqlite). Fixed in the SQLite backend by registering JSON_VALUE.
         async def _do():
             transport = httpx.ASGITransport(app=agent_bus.app, raise_app_exceptions=False)
             async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
