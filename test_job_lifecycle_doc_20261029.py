@@ -6,6 +6,11 @@ table, status list, or findings);
 ``STATUS_TRANSITIONS`` map, a sample is also exercised against the real
 PATCH endpoint in-process, and sampled transitions NOT listed are
 refused by both the map and the endpoint.
+(c) the FULL matrix: every (from-status, to-status) pair of the valid
+statuses is driven through the real PATCH endpoint with an authorised
+actor, accepted exactly where the doc table lists the pair and refused
+elsewhere. Genuine code-vs-doc disagreements stay pinned as
+``xfail(strict=True)`` with a finding id; nothing else may diverge.
 """
 
 from __future__ import annotations
@@ -15,8 +20,11 @@ import os
 import re
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
+
+import pytest
 
 os.environ.setdefault("HIVE_BACKEND", "sqlite")
 
@@ -228,3 +236,219 @@ class LifecycleEndpointTests(unittest.TestCase):
             "PATCH", f"/v1/jobs/{jid2}", {"status": "queued", "claimed_by": self.worker}, actor=self.worker
         )
         self.assertEqual(code, 409)
+
+
+MATRIX_STATUSES = sorted(_deps.VALID_JOB_STATUSES)
+
+#: The doc's PATCH table as a set of accepted (from, to) pairs.
+DOC_ACCEPTED = {(src, dst) for src, dst, _ in parse_table(DOC.read_text())}
+
+#: Commit evidence that satisfies valid_completion_proof for commit-requiring
+#: kinds (fabricated SHAs: the gate checks shape, not history).
+VALID_PROOF = {
+    "head_sha": "a" * 40,
+    "commits": ["a" * 40],
+    "files_changed": ["matrix.py"],
+    "worktree_clean": True,
+}
+
+#: Genuine code-vs-doc disagreements. A pair listed here must keep diverging
+#: (pinned as xfail) until code and doc agree; a pair NOT listed here must
+#: behave exactly as the doc table says.
+MATRIX_DIVERGENCES: dict[tuple[str, str], str] = {
+    ("offered", "queued"): (
+        "FB35-FINDING-1: doc ACCEPTS, endpoint 409s unclaimed offered rows "
+        "('cannot release a job with no current claimant'); the cell holds only "
+        "for a claimant-bearing offered row, which no endpoint in this tree "
+        "produces (nothing assigns offered with a claimant)"
+    ),
+}
+
+
+def _matrix_marks(frm: str, to: str):
+    reason = MATRIX_DIVERGENCES.get((frm, to))
+    if reason is None:
+        return ()
+    return pytest.mark.xfail(strict=True, reason=reason)
+
+
+MATRIX_PARAMS = [
+    pytest.param(frm, to, marks=_matrix_marks(frm, to))
+    for frm in MATRIX_STATUSES
+    for to in MATRIX_STATUSES
+]
+MATRIX_IDS = [f"{frm}->{to}" for frm in MATRIX_STATUSES for to in MATRIX_STATUSES]
+
+
+class MatrixHarness:
+    """One fresh temp-sqlite bus per matrix pair, with real endpoints."""
+
+    def __init__(self):
+        self.worker = ""
+        self.submitter = ""
+        self.kinds: dict[str, str] = {}
+
+    def request(self, method, path, body=None, actor=None):
+        async def _do():
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=agent_bus.app), base_url="http://t"
+            ) as c:
+                headers = {"X-Hive-Actor": actor} if actor and method in ("POST", "PATCH", "PUT", "DELETE") else None
+                resp = await c.request(method, path, json=body, headers=headers)
+                try:
+                    return resp.status_code, resp.json()
+                except Exception:
+                    return resp.status_code, resp.text
+
+        return _run(_do())
+
+    def register(self, payload):
+        code, data = self.request("POST", "/v1/agents/register", payload)
+        assert code == 200, data
+        return data["urn"]
+
+    def submit(self, frm: str, to: str, kind: str = "e2e:x") -> str:
+        code, data = self.request(
+            "POST",
+            "/v1/jobs",
+            {
+                "kind": kind,
+                "description": f"LIFECYCLE MATRIX {frm}->{to} {uuid.uuid4().hex}",
+                "submitter_urn": self.submitter,
+                "priority": 200,
+            },
+            actor=self.worker,
+        )
+        assert code in (200, 201), data
+        jid = data["id"]
+        self.kinds[jid] = kind
+        return jid
+
+    def claim(self, jid: str) -> None:
+        code, data = self.request("POST", f"/v1/jobs/{jid}/claim?by={self.worker}", None, actor=self.worker)
+        assert code == 200, data
+
+    def direct(self, jid: str, status: str) -> None:
+        async def _do():
+            async with hive_repo().connection() as tx:
+                await tx.execute("UPDATE jobs SET status=? WHERE id=?", (status, jid))
+                await tx.commit()
+
+        _run(_do())
+
+    def status(self, jid: str) -> str:
+        code, job = self.request("GET", f"/v1/jobs/{jid}")
+        assert code == 200, job
+        return job["status"]
+
+    def stage(self, frm: str, to: str) -> str:
+        """A fresh job sitting in ``frm``; raises loudly if the setup path broke."""
+        if frm in ("dead-letter", "failed_completion"):
+            # No endpoint stores these; stage the row directly (same technique
+            # as test_lifecycle_findings_20261029) and PATCH through the
+            # endpoint under test.
+            jid = self.submit(frm, to)
+            self.direct(jid, frm)
+        elif frm == "offered":
+            # Nothing in this tree assigns offered; offered rows arrive
+            # unclaimed from outside the bus.
+            jid = self.submit(frm, to)
+            self.direct(jid, "offered")
+        else:
+            kind = "fix:matrix-nr" if frm == "needs-review" else "e2e:x"
+            jid = self.submit(frm, to, kind=kind)
+            if frm == "queued":
+                pass
+            elif frm == "claimed":
+                self.claim(jid)
+            elif frm == "running":
+                self.claim(jid)
+                code, data = self.request(
+                    "PATCH", f"/v1/jobs/{jid}", {"status": "running", "claimed_by": self.worker}, actor=self.worker
+                )
+                assert code == 200, data
+            elif frm == "needs-review":
+                # Commit-requiring kind + empty proof parks the row (409 is
+                # the gate's answer; the row is what matters).
+                self.claim(jid)
+                self.request("PATCH", f"/v1/jobs/{jid}", {"status": "done", "claimed_by": self.worker}, actor=self.worker)
+            elif frm == "done":
+                self.claim(jid)
+                code, data = self.request(
+                    "PATCH", f"/v1/jobs/{jid}", {"status": "done", "claimed_by": self.worker, "result": {}}, actor=self.worker
+                )
+                assert code == 200, data
+            elif frm == "failed":
+                self.claim(jid)
+                code, data = self.request(
+                    "PATCH",
+                    f"/v1/jobs/{jid}",
+                    {"status": "failed", "claimed_by": self.worker, "result": {"retryable": False}},
+                    actor=self.worker,
+                )
+                assert code == 200, data
+            elif frm == "cancelled":
+                self.claim(jid)
+                code, data = self.request(
+                    "PATCH", f"/v1/jobs/{jid}", {"status": "cancelled", "claimed_by": self.worker}, actor=self.worker
+                )
+                assert code == 200, data
+            else:  # pragma: no cover - MATRIX_STATUSES is the closed set
+                raise AssertionError(f"no staging path for {frm!r}")
+        got = self.status(jid)
+        assert got == frm, f"staging broke: wanted from={frm!r}, row is {got!r}"
+        return jid
+
+
+@pytest.fixture
+def matrix_harness(tmp_path, monkeypatch):
+    monkeypatch.setitem(os.environ, "AGENT_BUS_DB", str(tmp_path / "matrix.db"))
+    monkeypatch.setitem(os.environ, "HIVE_BACKEND", "sqlite")
+    for var in ("MNEMOS_URL", "MNEMOS_TOKEN", "HIVE_SHARED_SECRET", "HIVE_BUS_ADMIN_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(_deps, "_HIVE_REPO", None)
+    _run(hive_repo().init())
+    harness = MatrixHarness()
+    harness.submitter = harness.register(
+        {"kind": "opencode", "host": "mx", "runtime": "opencode",
+         "status": "online", "capabilities": ["code", "orchestrate"],
+         "cost_tier": "C", "auth_method": "api"}
+    )
+    harness.worker = harness.register(
+        {"kind": "zeroclaw", "host": "mx", "runtime": "zeroclaw",
+         "status": "online", "capabilities": ["code"],
+         "cost_tier": "B", "auth_method": "api"}
+    )
+    yield harness
+
+
+def test_matrix_covers_every_valid_pair():
+    assert len(MATRIX_STATUSES) == 10, MATRIX_STATUSES
+    assert len(MATRIX_PARAMS) == 100, len(MATRIX_PARAMS)
+    assert len(DOC_ACCEPTED) == 29, sorted(DOC_ACCEPTED)
+
+
+@pytest.mark.parametrize("frm,to", MATRIX_PARAMS, ids=MATRIX_IDS)
+def test_lifecycle_matrix_pair(matrix_harness, frm, to):
+    """One cell of the FULL lifecycle matrix through the real PATCH endpoint."""
+    harness = matrix_harness
+    jid = harness.stage(frm, to)
+    body: dict = {"status": to, "claimed_by": harness.worker}
+    if to == "done" and harness.kinds[jid].startswith("fix:"):
+        body["result"] = dict(VALID_PROOF)
+    elif to == "done":
+        body["result"] = {}
+    elif to == "failed":
+        body["result"] = {"retryable": False}
+    code, _ = harness.request("PATCH", f"/v1/jobs/{jid}", body, actor=harness.worker)
+    final = harness.status(jid)
+    if (frm, to) in DOC_ACCEPTED:
+        assert code in (200, 201) and final == to, (
+            f"pair {frm!r} -> {to!r}: doc ACCEPTS but PATCH answered {code} "
+            f"and the row is {final!r} (wanted {to!r})"
+        )
+    else:
+        assert code not in (200, 201) and final == frm, (
+            f"pair {frm!r} -> {to!r}: doc REFUSES but PATCH answered {code} "
+            f"and the row is {final!r} (wanted unchanged {frm!r})"
+        )
