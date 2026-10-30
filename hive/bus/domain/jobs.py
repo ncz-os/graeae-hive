@@ -186,8 +186,11 @@ def repo_in_catalog(job_repo: str | None) -> bool:
 
 
 STATUS_TRANSITIONS: dict[str, set[str]] = {
-    "queued": {"queued", "offered", "claimed", "cancelled"},
-    "offered": {"queued", "claimed", "cancelled"},
+    # NB: queued->claimed and offered->claimed are NOT PATCH transitions (FB21):
+    # PATCH refuses them (claim bypass); only POST /v1/jobs/next and
+    # POST /v1/jobs/{id}/claim perform them, via direct CAS, not this map.
+    "queued": {"queued", "offered", "cancelled"},
+    "offered": {"queued", "cancelled"},
     "claimed": {
         "queued",
         "claimed",

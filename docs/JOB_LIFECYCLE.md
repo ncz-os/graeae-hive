@@ -71,10 +71,10 @@ status strings; the test parses this table.
 | ---- | -- | --- |
 | queued | queued | PATCH |
 | queued | offered | PATCH |
-| queued | claimed | claim endpoint only (PATCH refuses: claim bypass) |
+| queued | claimed | claim endpoint only (NOT a PATCH cell; see map note) |
 | queued | cancelled | PATCH |
 | offered | queued | PATCH |
-| offered | claimed | claim endpoint only (PATCH refuses: claim bypass) |
+| offered | claimed | claim endpoint only (NOT a PATCH cell; see map note) |
 | offered | cancelled | PATCH |
 | claimed | queued | PATCH (release; claimant must match) |
 | claimed | claimed | PATCH |
