@@ -45,6 +45,36 @@ reaper does for a dead agent; running jobs are left to the orphan-claim sweep.
 |---|---|---|
 | `HIVE_AGENT_STALE_SECONDS` | Reaper rule: an agent with no heartbeat for this many seconds becomes `offline` (the same transition as the built-in 300s rule). It can only shorten the window; unset, blank, non-numeric, non-positive, or above 300 leaves behaviour exactly as before (`stale` at 90s, `offline` at 300s). Read on every reaper pass. | unset |
 
+## Backend, claim, and sweep tuning (all optional)
+
+Every variable below has a compiled-in default: unset keeps current behaviour. They are documented here because the code reads them from the environment.
+
+| Variable | Meaning | Example |
+|---|---|---|
+| `AGENT_BUS_DB` | SQLite bus database file used when HIVE_BACKEND=sqlite. Optional. Overrides the sqlite database path; unset keeps /srv/agent-bus/agents.db. | `/srv/agent-bus/agents.db` |
+| `HIVE_BACKEND` | Persistence backend: sqlite, oracle, or db2. Optional. Selects the persistence backend; unset keeps sqlite. | `sqlite` |
+| `ORACLE_DSN` | Oracle connection string for the oracle backend. Only needed for HIVE_BACKEND=oracle; unset and oracle rows cannot be read. | `<oracle-dsn>` |
+| `DB2_DSN` | Db2 connection string for the db2 backend. Only needed for HIVE_BACKEND=db2; HIVE_DB2_DSN is honoured as a fallback. | `<db2-dsn>` |
+| `CLAIM_LEASE_SECONDS` | Claim lease lifetime in seconds. Optional. Unset keeps 1800. | `1800` |
+| `CLAIM_SCAN_WINDOW` | Maximum queued rows scanned per claim pass. Optional. Unset keeps 10000. | `10000` |
+| `HIVE_HOST_DENYLIST` | Comma-separated hostnames never eligible for claims. Optional. Empty (unset) denies nothing. | `<host-a>,<host-b>` |
+| `HIVE_LLM_CAP_GATE` | Set to 1/true/yes/on to exclude hosts with no llm-* provider from LLM work instead of maintaining HIVE_HOST_DENYLIST by hand. Optional. Unset (or 0) disables the gate. | `1` |
+| `AGENT_HOST` | Agent hostname announced at registration. Optional. Defaults to the short hostname. | `<worker-host>` |
+| `DOCTOR_TRIAGE_MODEL` | Model id for the doctor triage phase. Optional. Unset keeps cerberus-reviewer. | `cerberus-reviewer` |
+| `DOCTOR_REVIEW_MODEL` | Model id for the doctor review phase. Optional. Unset keeps cerberus-reviewer. | `cerberus-reviewer` |
+| `DOCTOR_FIX_MODEL` | Model id for the in-doctor fix phase. Optional. Unset keeps qwen38. | `qwen38` |
+| `DOCTOR_VERDICT_COMPLETION_DRY_RUN` | Set to 1 to log the verdict-completion call without performing it. Optional. Unset (or anything but 1) performs the call. | `1` |
+| `LOOP_WINDOW_SEC` | Loop-outcome window in seconds for escalation counting. Optional. Unset keeps 1800 (30 min). | `1800` |
+| `LOOP_ESCALATE_THRESHOLD` | Failures within the loop window before a loop escalates. Optional. Unset keeps 3. | `3` |
+| `MAX_SSH_PER_HOUR` | Cap on SSH recovery attempts per host per hour. Optional. Unset keeps 3. | `3` |
+| `MIN_HOST_COOLDOWN` | Seconds a host stays cooled down after a recovery attempt. Optional. Unset keeps 1800. | `1800` |
+| `MAX_TOKEN_FIX_PER_HOST` | Cap on token-fix attempts per host. Optional. Unset keeps 3. | `3` |
+| `NEEDS_REVIEW_SCAN_INTERVAL` | Seconds between needs-review follow-up sweeps. Optional. Unset keeps 3600. | `3600` |
+| `NEEDS_REVIEW_OLDER_HOURS` | Only follow up needs-review rows older than this many hours. Optional. Unset keeps 24. | `24` |
+| `REVIEW_FOLLOWUP_MAX_PER_SWEEP` | Maximum review follow-ups performed per sweep. Optional. Unset keeps 3. | `3` |
+| `HIVE_ARGONAS_GIT_ROOT` | Local root of the ARGONAS git mirror. Optional. Unset uses the registry's NFS mount constant. | `<argonas-git-root>` |
+| `HIVE_SHARED_SECRET` | Shared token the bus compares against the X-Hive-Token header. Optional. Unset disables shared-token auth on the bus. | — |
+
 ## Fleet addresses
 
 | Variable | Meaning | Example |

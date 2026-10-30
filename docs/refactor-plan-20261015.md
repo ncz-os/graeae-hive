@@ -104,7 +104,7 @@ scripts/                     build_repo_registry.py
 ### Phase 5 — Capacity ledger + admission control
 See `docs/decision-capacity-ledger-20261015.md`. Per-service capacity
 (slots / rate / credits / cost×time) declared in the registry; enforced by a
-`hive/bus/capacity` module in the claim path; fed by worker-side per-response
+`hive/bus/capacity.py` module in the claim path; fed by worker-side per-response
 capture (token counts + rate-limit headers + optional `count_tokens` pre-flight).
 Replaces KNEMON's per-agent budget bookkeeping. First instance = the MiniMax
 slot cap (currently missing from `dequeue_next_job`).
