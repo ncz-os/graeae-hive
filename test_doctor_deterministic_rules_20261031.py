@@ -358,6 +358,32 @@ def test_a_slot_found_taken_more_than_three_times_in_an_hour_alerts_once(tmp_pat
     assert ledger.record(rung="c", phase="triage", latency_ms=1, outcome="ok", slot_taken=True)["alert"] is False
 
 
+def test_a_slot_taken_call_is_one_call_and_one_slot_event_never_two_calls(tmp_path):
+    """A call that found its free slot taken is ONE call plus ONE slot event.
+
+    This is the invariant a chunked reviewer misread in ``CallLedger.record``:
+    the appended entry is the entry for THIS call (carrying ``slot_taken``),
+    not an additional synthetic one, so ``calls_last_hour`` must count calls
+    and ``slot_taken_last_hour`` must count the flag -- never twice."""
+    ledger = doctor_rules.CallLedger(str(tmp_path / "l.jsonl"), clock=lambda: 900.0)
+    for _ in range(5):
+        ledger.record(rung="c", phase="triage", latency_ms=1, outcome="ok", slot_taken=True)
+    counter = ledger.counter()
+    assert counter["calls_last_hour"] == 5, "a slot-taken call must not count as two calls"
+    assert counter["slot_taken_last_hour"] == 5
+
+    # Mixed hour: N real calls, half of them slot-taken.
+    mixed = doctor_rules.CallLedger(str(tmp_path / "m.jsonl"), clock=lambda: 910.0)
+    n = doctor_rules.ALERT_CALLS_PER_HOUR + 1
+    for i in range(n):
+        mixed.record(rung="c", phase="triage", latency_ms=1, outcome="ok", slot_taken=(i % 2 == 0))
+    counter = mixed.counter()
+    assert counter["calls_last_hour"] == n
+    assert counter["slot_taken_last_hour"] == (n + 1) // 2
+    # The CALL ceiling is what tripped -- not a double-counted slot event.
+    assert counter["alert_reason"] == "calls_per_hour"
+
+
 def test_slot_taken_survives_a_restart_without_double_counting_calls(tmp_path):
     """A new ledger process must still see the hour's slot-taken events.
 
