@@ -297,8 +297,19 @@ def ledger_path(env: dict[str, str] | None = None) -> str:
     return os.path.join(os.path.expanduser(root), "hive-doctor", LEDGER_FILENAME)
 
 
-def model_call_counter(entries: list[dict[str, Any]], *, now: float) -> dict[str, Any]:
-    """The last-hour counter the status line and the alert read."""
+def model_call_counter(
+    entries: list[dict[str, Any]],
+    *,
+    now: float,
+    slot_entries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The last-hour counter the status line and the alert read.
+
+    ``slot_entries`` carries slot-taken events restored from the ledger's
+    sidecar (they survive a restart); they count toward the SLOT threshold
+    only, never toward the call count -- a slot-taken event is a record ABOUT
+    a call, not a second call.
+    """
     cutoff = float(now) - WINDOW_SECS
     live = [
         entry
@@ -309,7 +320,14 @@ def model_call_counter(entries: list[dict[str, Any]], *, now: float) -> dict[str
         and float(entry["at"]) > cutoff
     ]
     calls = len(live)
+    restored = [
+        entry
+        for entry in (slot_entries or [])
+        if isinstance(entry, dict) and isinstance(entry.get("at"), int | float) and float(entry["at"]) > cutoff
+    ]
+    seen = {float(entry["at"]) for entry in live if entry.get("slot_taken")}
     taken = sum(1 for entry in live if entry.get("slot_taken"))
+    taken += sum(1 for entry in restored if float(entry["at"]) not in seen)
     alert_reason = None
     if calls > ALERT_CALLS_PER_HOUR:
         alert_reason = "calls_per_hour"
@@ -354,6 +372,10 @@ class CallLedger:
         self._lock = threading.Lock()
         self._entries: list[dict[str, Any]] | None = None
         self._alerted_reason: str | None = None
+        # ``slot_taken`` is not one of the six line fields, but losing it on a
+        # restart would hide exactly the sustained pattern the alert exists to
+        # catch, so the timestamps live in a sidecar beside the ledger.
+        self._slot_path = f"{self.path}.slot-taken"
 
     # -- storage ---------------------------------------------------------
     def _load(self) -> list[dict[str, Any]]:
@@ -373,6 +395,25 @@ class CallLedger:
             entries = []
         self._entries = entries[-self.max_lines :]
         return self._entries
+
+    def _append_slot_taken(self, now: float) -> None:
+        try:
+            directory = os.path.dirname(self._slot_path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(self._slot_path, "a", encoding="utf-8") as fh:
+                fh.write(f"{now}\n")
+        except OSError:
+            pass
+
+    def _slot_taken_entries(self, now: float) -> list[dict[str, Any]]:
+        """The sidecar's timestamps inside the window, as counter entries."""
+        try:
+            with open(self._slot_path, encoding="utf-8") as fh:
+                stamps = [float(line) for line in fh if line.strip()]
+        except (OSError, ValueError):
+            return []
+        return [{"at": at, "outcome": "slot_taken", "slot_taken": True} for at in stamps if now - at < WINDOW_SECS]
 
     def _append(self, entry: dict[str, Any]) -> None:
         try:
@@ -415,6 +456,8 @@ class CallLedger:
         with self._lock:
             entries = self._load()
             entries.append({**persisted, **({"slot_taken": True} if slot_taken else {})})
+            if slot_taken:
+                self._append_slot_taken(now)
             if len(entries) > self.max_lines:
                 del entries[: len(entries) - self.max_lines]
             self._append(persisted)
@@ -430,7 +473,10 @@ class CallLedger:
 
     def counter(self, now: float | None = None) -> dict[str, Any]:
         now = self.clock() if now is None else float(now)
-        return model_call_counter(self._load(), now=now)
+        # The sidecar carries the slot-taken history across a restart. Merge it
+        # with the in-memory flags, one event per ``at``, so an event is never
+        # counted twice within this process nor lost across a restart.
+        return model_call_counter(self._load(), now=now, slot_entries=self._slot_taken_entries(now))
 
 
 # ── the default chain order ───────────────────────────────────────────────

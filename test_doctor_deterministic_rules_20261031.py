@@ -60,7 +60,10 @@ def _row(reason=None, *, result=..., kind="fix:thing", **extra):
 #: name -> (row, expected deterministic action, why)
 ROW_SHAPES = {
     "empty_result": (_row(result={}, failure_reason=""), "escalate"),
-    "loop_teardown_author_failed": (_row(result={"loop_result": {"teardown": {"reason": "author_failed"}}}), "release_to_queue"),
+    "loop_teardown_author_failed": (
+        _row(result={"loop_result": {"teardown": {"reason": "author_failed"}}}),
+        "release_to_queue",
+    ),
     "loop_teardown_reviewer_unavailable": (
         _row(result={"loop_result": {"teardown": {"reason": "reviewer_unavailable"}}}),
         "release_to_queue",
@@ -170,9 +173,7 @@ class FakeServer:
         self.requests = []
 
     def __call__(self, request, timeout=0):
-        self.requests.append(
-            {"url": request.full_url, "body": json.loads(request.data.decode())}
-        )
+        self.requests.append({"url": request.full_url, "body": json.loads(request.data.decode())})
         body = self.bodies.pop(0)
         resp = io.BytesIO(_reply(body))
         resp.__enter__ = lambda: resp  # noqa: SLF001 -- context manager shape
@@ -197,9 +198,7 @@ def test_a_model_call_carries_the_grammar_and_the_json_schema():
 
 
 def test_a_reply_outside_the_enum_is_rejected():
-    ok, parsed = doctor_rules.parse_constrained(
-        '{"action_type": "restart_everything", "reason": "trust me"}'
-    )
+    ok, parsed = doctor_rules.parse_constrained('{"action_type": "restart_everything", "reason": "trust me"}')
     assert ok is False
     assert "action_type" in parsed["error"]
 
@@ -232,7 +231,9 @@ def test_a_rejected_reply_moves_the_call_to_the_next_rung(monkeypatch):
     """When the first rung's reply does not parse, the next rung is tried."""
     from hive.workers import doctor
 
-    monkeypatch.setattr(doctor, "_chain", lambda: _fake_chain([("r1", "prose"), ("r2", '{"action_type":"no_action","reason":"ok"}')]))
+    monkeypatch.setattr(
+        doctor, "_chain", lambda: _fake_chain([("r1", "prose"), ("r2", '{"action_type":"no_action","reason":"ok"}')])
+    )
     ok, text = doctor.invoke_doctor_agent("p", phase="triage")
     assert ok
     action = doctor.parse_doctor_response(text)
@@ -357,6 +358,28 @@ def test_a_slot_found_taken_more_than_three_times_in_an_hour_alerts_once(tmp_pat
     assert ledger.record(rung="c", phase="triage", latency_ms=1, outcome="ok", slot_taken=True)["alert"] is False
 
 
+def test_slot_taken_survives_a_restart_without_double_counting_calls(tmp_path):
+    """A new ledger process must still see the hour's slot-taken events.
+
+    ``slot_taken`` is not one of the six persisted line fields, so it rides in
+    a sidecar; the regression this guards is BOTH halves: the events survive
+    (a restart must not hide a sustained pattern) and the restored events are
+    never counted as extra model CALLS."""
+    path = tmp_path / "calls.jsonl"
+    first = doctor_rules.CallLedger(str(path), clock=lambda: 7000.0)
+    for _ in range(doctor_rules.ALERT_SLOT_TAKEN_PER_HOUR + 1):
+        first.record(rung="c", phase="triage", latency_ms=1, outcome="ok", slot_taken=True)
+
+    restarted = doctor_rules.CallLedger(str(path), clock=lambda: 7000.0)
+    counter = restarted.counter()
+    assert counter["slot_taken_last_hour"] == doctor_rules.ALERT_SLOT_TAKEN_PER_HOUR + 1
+    assert counter["calls_last_hour"] == doctor_rules.ALERT_SLOT_TAKEN_PER_HOUR + 1
+    assert counter["alert"] is True and counter["alert_reason"] == "free_slot_taken"
+    # And the persisted lines still carry exactly the six enumerated fields.
+    for line in path.read_text().splitlines():
+        assert set(json.loads(line)) == set(doctor_rules.LEDGER_FIELDS)
+
+
 def test_the_counter_is_exposed_and_formatted_for_the_status_line():
     counter = doctor_rules.model_call_counter([{"at": 10.0, "outcome": "ok"}], now=20.0)
     assert counter["calls_last_hour"] == 1
@@ -413,8 +436,11 @@ def test_weekend_triage_renders_the_doctor_call_counter():
 def test_weekend_triage_renders_an_alert_visibly():
     from scripts import hive_status
 
-    rows = {"jobs": [], "agents": [], "doctor": {"model_calls": {"calls_last_hour": 31, "alert": True,
-                                                                "alert_reason": "calls_per_hour"}}}
+    rows = {
+        "jobs": [],
+        "agents": [],
+        "doctor": {"model_calls": {"calls_last_hour": 31, "alert": True, "alert_reason": "calls_per_hour"}},
+    }
     text = hive_status.render_text(hive_status.build_status(rows, now=1000.0))
     assert "doctor.light_model_needed" in text
 
