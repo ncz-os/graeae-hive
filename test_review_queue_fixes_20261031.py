@@ -1,7 +1,10 @@
 """Review-queue defects found in review of hv/gh-review-queue-20261031.
 
-Each test here pins one defect the branch shipped with (every one failed on the
-branch head before its fix):
+Each test here pins one defect the branch shipped with and failed on the branch
+head before its fix -- except the positive controls kept beside them (names that
+already resolved, an unknown model staying unknown, a valid cross-family approval
+reaching the merge path, a row with attempts left not being escalated), which
+guard the fixes against over-reaching:
 
 * the family table left real model names outside every family (lower-cased
   ``minimax-m3.1-flash-preview``, ``MiniMax-M4``, the ``minimax_flash`` alias,
