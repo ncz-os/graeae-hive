@@ -87,15 +87,17 @@ class DeterminismTests(unittest.TestCase):
         """Invariant: no set-ordering hazard — two fresh interpreters with
         different PYTHONHASHSEED emit identical bytes (overlay-only inputs,
         so no network is possible)."""
-        helper = (
-            "import json,sys; sys.path.insert(0, %r); "
-            "from hive.registry import build_registry; "
-            "reg = build_registry(overlay_path=%r, skip=('gitlab','github','argonas','buildkite','r2')); "
-            "sys.stdout.write(json.dumps(reg, indent=2, sort_keys=True) + chr(10))"
-        )
         with tempfile.TemporaryDirectory() as td:
             op = Path(td) / "overlay.json"
             op.write_text(json.dumps(OVERLAY))
+            # Concatenation, not % formatting: a % in a temp path must not break it.
+            helper = (
+                "import json,sys; sys.path.insert(0, " + json.dumps(str(ROOT)) + "; "
+                "from hive.registry import build_registry; "
+                "reg = build_registry(overlay_path=" + json.dumps(str(op)) + ", "
+                "skip=('gitlab','github','argonas','buildkite','r2')); "
+                "sys.stdout.write(json.dumps(reg, indent=2, sort_keys=True) + chr(10))"
+            )
             home = Path(td) / "home"
             home.mkdir()
             outs = []
@@ -108,7 +110,7 @@ class DeterminismTests(unittest.TestCase):
                     "HIVE_REPO_CATALOG": os.devnull,
                 }
                 r = subprocess.run(
-                    [sys.executable, "-c", helper % (str(ROOT), str(op))],
+                    [sys.executable, "-c", helper],
                     capture_output=True,
                     text=True,
                     env=env,
