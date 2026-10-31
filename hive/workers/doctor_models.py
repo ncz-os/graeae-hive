@@ -714,7 +714,13 @@ def _acceptable(text: str, structured: bool) -> bool:
         return True
     from hive.workers.doctor import parse_doctor_response  # local: avoid an import cycle
 
-    return bool(parse_doctor_response(body))
+    obj = parse_doctor_response(body)
+    if not obj:
+        return False
+    # doctor.parse_doctor_response falls back to the largest braced span, so a
+    # TRUNCATED '{"action_type": "release_to_queue", "reason": "trunc' parses
+    # as a bare object. A structured action needs its action_type.
+    return bool(str(obj.get("action_type") or "").strip())
 
 
 # ── the env entry point ────────────────────────────────────────────────────

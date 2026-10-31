@@ -580,6 +580,15 @@ def test_a_failed_reply_falls_through_within_the_same_call(fake, chain, reply, s
     assert fake.chats_to(TYDEUS) == 1
 
 
+def test_a_fenced_action_reply_is_usable(fake, chain):
+    from hive.workers import doctor_models
+
+    assert doctor_models._acceptable('```json\n{"action_type": "release_to_queue"}\n```', True)
+    assert not doctor_models._acceptable("I think the job should be released.", True)
+    assert not doctor_models._acceptable('{"action_type": "release_to_queue", "reason": "trunc', True)
+    assert not doctor_models._acceptable("   \n ", True)
+
+
 def test_a_prose_reply_succeeds_for_a_prose_phase(fake, chain):
     fake.slots = {CERBERUS: 0}
     fake.chat[CERBERUS] = "plain prose is fine here"
