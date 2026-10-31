@@ -384,6 +384,41 @@ def test_a_slot_taken_call_is_one_call_and_one_slot_event_never_two_calls(tmp_pa
     assert counter["alert_reason"] == "calls_per_hour"
 
 
+def test_doctor_module_symbols_the_reviewer_called_undefined_are_defined():
+    """Guard the public helper surface process_triage_job depends on.
+
+    A chunked reviewer claimed _is_unschedulable, _classify_triage_state,
+    doctor_model_call_counter and the ``time`` import were undefined in
+    hive/workers/doctor.py. All exist; this test fails loudly if a future
+    edit drops one, which would be a genuine NameError at runtime."""
+    from hive.workers import doctor
+
+    for name in (
+        "_is_unschedulable",
+        "_classify_triage_state",
+        "doctor_model_call_counter",
+        "process_triage_job",
+        "time",
+    ):
+        assert hasattr(doctor, name), f"hive.workers.doctor lost {name!r}"
+    # And they are callable with the shapes process_triage_job passes.
+    assert doctor._is_unschedulable([]) is None
+    assert isinstance(doctor._classify_triage_state({}), dict)
+    assert "calls_last_hour" in doctor.doctor_model_call_counter()
+    # doctor_rules attributes referenced from doctor.py must exist.
+    for attr in ("CLASSES", "ALERT_TOPIC", "classify_row", "model_call_counter"):
+        assert hasattr(doctor_rules, attr), f"doctor_rules lost {attr!r}"
+
+
+def test_teardown_reason_tolerates_a_missing_or_none_loop_result():
+    """A row with no loop_result / None / a non-dict must not raise."""
+    for result in ({}, {"loop_result": None}, {"loop_result": "str"}, {"loop_result": {"teardown": None}}):
+        assert doctor_rules._teardown_reason(result) == ""
+    assert doctor_rules._teardown_reason({"loop_result": {"teardown": "boom"}}) == "boom"
+    assert doctor_rules._teardown_reason({"loop_result": {"teardown": {"reason": "x"}}}) == "x"
+    assert doctor_rules._teardown_reason({"loop_result": {"teardown": {"error": "y"}}}) == "y"
+
+
 def test_slot_taken_survives_a_restart_without_double_counting_calls(tmp_path):
     """A new ledger process must still see the hour's slot-taken events.
 
