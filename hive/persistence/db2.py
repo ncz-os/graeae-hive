@@ -24,6 +24,7 @@ _TABLE_MAP = {
     "scheduled_jobs": "hive_scheduled_jobs",
     "worker_kind_stats": "hive_worker_kind_stats",
     "job_audit_log": "hive_job_audit_log",
+    "job_result_history": "hive_job_result_history",
 }
 
 
@@ -208,6 +209,19 @@ CREATE TABLE scheduled_jobs (
 CREATE TABLE hive_schema_migrations (
   version INTEGER PRIMARY KEY,
   applied_at DOUBLE NOT NULL
+);
+
+-- FB51: append-only archive of result payloads cleared by an admin requeue.
+CREATE TABLE job_result_history (
+  id VARCHAR(64) PRIMARY KEY,
+  job_id VARCHAR(64) NOT NULL,
+  attempt INTEGER NOT NULL,
+  prior_status VARCHAR(32),
+  archived_at DOUBLE NOT NULL,
+  actor_urn VARCHAR(512),
+  reason VARCHAR(2000),
+  action VARCHAR(32),
+  payload CLOB NOT NULL
 );
 """
 
@@ -741,6 +755,21 @@ class Db2HiveRepository(SqliteHiveRepository):
     async def _apply_migrations(self, db: Any) -> None:
         async with db.execute("SELECT version FROM hive_schema_migrations") as cur:
             applied = {int(row[0]) for row in await cur.fetchall()}
+
+        # FB51: the result archive is additive, so a database created before it
+        # existed gets the table converged in on the next start.
+        async with db.execute(
+            "SELECT tabname FROM syscat.tables "
+            "WHERE tabschema = CURRENT SCHEMA AND tabname = 'HIVE_JOB_RESULT_HISTORY'"
+        ) as cur:
+            has_result_history = await cur.fetchall()
+        if not has_result_history:
+            await db.execute(
+                "CREATE TABLE hive_job_result_history ("
+                "id VARCHAR(64) PRIMARY KEY, job_id VARCHAR(64) NOT NULL, attempt INTEGER NOT NULL, "
+                "prior_status VARCHAR(32), archived_at DOUBLE NOT NULL, actor_urn VARCHAR(512), "
+                "reason VARCHAR(2000), action VARCHAR(32), payload CLOB NOT NULL)"
+            )
 
         # Version 1 converges every additive runtime column. It is safe for a
         # populated database because nullable columns and non-null counters with

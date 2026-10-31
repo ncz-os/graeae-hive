@@ -86,6 +86,20 @@ def _actor_name(actor: Any) -> str:
 RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
 
 
+@router.get("/v1/admin/jobs/{job_id}/history")
+async def admin_job_result_history(job_id: str, limit: int = 50):
+    """Read-only view of the result payloads an admin requeue archived (FB51).
+
+    Before this existed there was no way to see the ``hive_reviews`` evidence a
+    force-requeue had destroyed; now every cleared payload is listed newest
+    first with the attempt, prior status, actor, reason and action."""
+    if limit < 1 or limit > 500:
+        raise HTTPException(422, f"limit must be between 1 and 500, got {limit}")
+    async with hive_repo().connection() as tx:
+        rows = await hive_repo().list_job_result_history(tx, job_id=job_id, limit=limit)
+    return {"job_id": job_id, "count": len(rows), "history": rows}
+
+
 @router.post("/v1/admin/jobs/requeue")
 async def admin_requeue_jobs(req: RequeueRequest, actor: str = Depends(require_mutation_actor)):
     """Force-requeue terminal (failed/cancelled) or any non-done jobs back to queued.
@@ -135,29 +149,17 @@ async def admin_requeue_jobs(req: RequeueRequest, actor: str = Depends(require_m
                         "override_reason": req.override_reason,
                     }
                 )
-            changed = await hive_repo().patch_job_status(
+            # FB51: one repository operation archives the result payload
+            # (review evidence included) and then requeues, so the endpoint no
+            # longer clears `result` on its own.
+            changed = await hive_repo().archive_and_requeue_job(
                 tx,
-                job_id,
-                sets={
-                    "status": "queued",
-                    "claimed_by": None,
-                    "claimed_at": None,
-                    "ended_at": None,
-                    "result": None,
-                    "claimed_runtime": None,
-                    "claimed_model": None,
-                    "claimed_provider": None,
-                    "claimed_cost_tier": None,
-                    "claimed_host_caps": None,
-                    "claim_lease_expires_at": None,
-                    "tokens_in": None,
-                    "tokens_out": None,
-                    "estimated_cost_usd": None,
-                    "result_mnemos_id": None,
-                    "retry_count": 0,
-                    "retry_backoff_until": None,
-                },
+                job_id=job_id,
+                actor=actor,
+                reason=req.reason,
+                archived_at=time.time(),
                 expected_status=row[0],
+                action="requeue",
             )
             if changed != 1:
                 results["skipped_conflict"].append(job_id)

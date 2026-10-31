@@ -135,6 +135,34 @@ class HiveMindRepository(ABC):
     ) -> int: ...
 
     @abstractmethod
+    async def archive_and_requeue_job(
+        self,
+        tx: Transaction,
+        *,
+        job_id: str,
+        actor: str,
+        reason: str | None,
+        archived_at: float,
+        expected_status: str | None = None,
+        action: str = "requeue",
+    ) -> int:
+        """Archive the job's result payload, then requeue the row, in ONE transaction.
+
+        The only operation that clears ``result``: the previous admin requeue
+        wrote ``result=NULL`` directly and destroyed the review evidence stored
+        there (FB51). An empty result adds no history entry; a lost
+        compare-and-set returns 0 and leaves no history row behind.
+        """
+        ...
+
+    @abstractmethod
+    async def list_job_result_history(
+        self, tx: Transaction, *, job_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        """The archived result payloads for one job, newest first (read-only)."""
+        ...
+
+    @abstractmethod
     async def get_job(self, tx: Transaction, *, job_id: str) -> Row | None: ...
 
     @abstractmethod
