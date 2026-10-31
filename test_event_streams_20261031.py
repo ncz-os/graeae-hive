@@ -52,18 +52,24 @@ def _run(coro):
 
 
 def parse_frames(text):
-    """Split SSE text into [{event, id, data}] (data raw string)."""
+    """Split SSE text into [{event, id, data}]. Per the SSE spec, multiple
+    data: lines join with newline; the bus emits single-line JSON data."""
     out = []
     for chunk in text.replace("\r\n", "\n").split("\n\n"):
         frame = {}
+        datas = []
         for line in chunk.splitlines():
             if line.startswith(":"):
                 continue
             if ":" not in line:
                 continue
             k, v = line.split(":", 1)
-            if k in ("event", "id", "data"):
-                frame[k] = v.strip() if k != "data" else v.lstrip(" ")
+            if k in ("event", "id"):
+                frame[k] = v.strip()
+            elif k == "data":
+                datas.append(v.lstrip(" "))
+        if datas:
+            frame["data"] = "\n".join(datas)
         if frame:
             out.append(frame)
     return out
@@ -174,8 +180,15 @@ class StreamCase(unittest.TestCase):
 
     # ---- tests ----
     def _last_id(self):
-        _, body = self._log()
-        return body["last_id"] or 0
+        """True table max: the endpoint's ``last_id`` is the last id OF THE
+        PAGE (tail_events is ORDER BY id ASC LIMIT n), so walk the cursor to
+        the end instead of trusting one default-limit page."""
+        cursor = 0
+        while True:
+            _, body = self._log(since_id=cursor, limit=10**9)
+            if not body["events"]:
+                return cursor
+            cursor = body["events"][-1]["id"]
 
     def test_catchup_ordering(self):
         """Invariant: catch-up frames arrive in id order (tail_events ORDER BY id ASC)."""
@@ -245,6 +258,17 @@ class StreamCase(unittest.TestCase):
         _, frames = self._stream_until(f"/v1/events?since_id={base}", lambda f: len(f) >= 2)
         self.assertEqual([f.get("id") for f in frames[:2]], [str(base + 1), str(base + 2)])
 
+    def _stream_status(self, path):
+        """Open the stream and return the status without reading the body."""
+
+        async def _do():
+            tout = httpx.Timeout(10.0, read=10.0)
+            async with httpx.AsyncClient(base_url=self.base, timeout=tout) as c:
+                async with c.stream("GET", path) as r:
+                    return r.status_code
+
+        return _run(_do())
+
     def test_subscriber_cap_is_503_and_recovers(self):
         """Invariant: the 101st concurrent subscriber is refused with 503;
         after cleanup the stream opens again."""
@@ -253,14 +277,10 @@ class StreamCase(unittest.TestCase):
         for i in range(MAX_EVENT_SUBSCRIBERS):
             EVENT_QUEUE[f"dummy-{i}"] = _asyncio.Queue()
         try:
-            code, _ = self._stream_until("/v1/events", lambda f: True)
-            self.fail(f"expected 503, stream opened: {code}")
-        except AssertionError as e:
-            self.assertIn("503", str(e))
+            self.assertEqual(self._stream_status("/v1/events"), 503)
         finally:
             EVENT_QUEUE.clear()
-        code, _ = self._stream_until("/v1/events?since_id=0", lambda f: True)
-        self.assertEqual(code, 200)
+        self.assertEqual(self._stream_status("/v1/events?since_id=0"), 200)
 
     def test_log_limit_clamp_and_empty(self):
         """Invariant: limit=0/negative falls back to the default, huge limits
@@ -276,6 +296,12 @@ class StreamCase(unittest.TestCase):
         code, body = self._log(limit=10**9)
         self.assertEqual(code, 200)
         self.assertEqual(body["count"], total)
+        # The clamp itself, end to end: 1005 rows in, at most 1000 out.
+        self._publish("log-flood", n=1005)
+        code, body = self._log(limit=10**9)
+        self.assertEqual(code, 200)
+        self.assertEqual(body["count"], 1000)
+        self.assertEqual(body["events"][-1]["id"], body["last_id"])
 
 
 if __name__ == "__main__":
