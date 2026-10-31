@@ -41,8 +41,12 @@ satisfied by `DEP_DEAD_STATUSES` — `failed`, `failed_completion`,
   (`hive/bus/domain/failure.py:infrastructure_failure`).
 - Requeue: `POST /v1/admin/jobs/requeue` moves terminal or queued rows
   back to `queued`, resetting claim/retry/backoff
-  (`hive/bus/routers/admin.py:admin_requeue_jobs`). Budget-spent rows are
-  skipped unless `override_max_retries` with a reason is set.
+  (`hive/bus/routers/admin.py:admin_requeue_jobs`). Before clearing it,
+  the previous non-empty `result` (review evidence included) is archived
+  in the append-only `job_result_history` table and exposed read-only at
+  `GET /v1/admin/jobs/{job_id}/history`
+  (`hive/persistence/sqlite.py:archive_and_requeue_job`). Budget-spent
+  rows are skipped unless `override_max_retries` with a reason is set.
 - Cancel: `PATCH` to `cancelled` by the claimant, the submitter, or an
   orchestrator-capable agent
   (`hive/bus/routers/jobs.py:update_job`); `done`/`failed` may only be
@@ -52,12 +56,19 @@ satisfied by `DEP_DEAD_STATUSES` — `failed`, `failed_completion`,
 - Reclassify: `POST /v1/admin/jobs/reclassify` overrides to
   `needs-review`, `cancelled`, or `queued`
   (`hive/bus/routers/admin.py:admin_reclassify_jobs`;
-  `RECLASSIFY_ALLOWED_TARGETS`).
+  `RECLASSIFY_ALLOWED_TARGETS`). Reopening `dead-letter` as `queued`
+  requires `override_max_retries: true` with a non-empty
+  `override_reason` (otherwise HTTP 422, row untouched); the cleared
+  result is archived through the same repository operation and an audit
+  row records actor, time, before/after status, retry counters and
+  reason.
 - Retry budget: `max_retries`/`retry_count`; the doctor and the bus
   refuse requeues when spent (`hive/bus/routers/admin.py:_budget_row`,
   `hive/workers/doctor.py:retry_budget_exhausted`).
 - Dead letter: terminal quarantine; only an idempotent same-status
   `PATCH` is accepted (`hive/bus/domain/jobs.py:STATUS_TRANSITIONS`).
+  The one way out is an explicit admin reclassify to `queued` with the
+  dead-letter override (archived result + audit row, see above).
 
 ## PATCH transition table
 
@@ -154,6 +165,7 @@ stateDiagram-v2
     done --> [*]
     cancelled --> [*]
     dead-letter --> dead-letter
+    dead-letter --> queued: admin reclassify (override)
     dead-letter --> [*]
 ```
 

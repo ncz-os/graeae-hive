@@ -94,7 +94,7 @@ def _actor_name(actor: Any) -> str:
 RECLASSIFY_ALLOWED_TARGETS = {"needs-review", "cancelled", "queued"}
 
 
-@router.get("/v1/admin/jobs/{job_id}/history")
+@router.get("/v1/admin/jobs/{job_id}/history", dependencies=[Depends(require_mutation_actor)])
 async def admin_job_result_history(job_id: str, limit: int = 50):
     """Read-only view of the result payloads an admin requeue archived (FB51).
 
