@@ -4678,8 +4678,9 @@ def report_needs_review_sweep() -> dict:
     # BEFORE the report so the row it prints is the state the sweep just left
     # (submitted / parked / approved / backoff), never a stale one.
     try:
+        # The sweep records each outcome on the row object it was handed, so
+        # the report below reads the post-sweep state without a second fetch.
         review_queue_summary = run_review_queue_sweep(rows=jobs)
-        jobs = fetch_needs_review_jobs()
     except Exception as exc:  # noqa: BLE001 -- the report still has to run
         log.error("review queue sweep failed: %s", exc)
         broadcast_doctor_message("doctor.sweep_error", {"sweep": "review-queue", "error": str(exc)})
@@ -5101,6 +5102,14 @@ def _patch_review_state(job: dict, state: dict, *, verdict: dict | None = None) 
             "doctor.sweep_error", {"sweep": "review-queue", "job_id": jid, "error": f"annotation failed http={code}"}
         )
         return False
+    # Mirror the accepted state onto the in-memory row, so the report built from
+    # THIS listing prints what the queue just left -- without a second GET of
+    # the same rows (the report is read-only: exactly one listing fetch).
+    if isinstance(job, dict):
+        job["result"] = body_result
+        job["status"] = "needs-review"
+        if body.get("claimed_by"):
+            job["claimed_by"] = body["claimed_by"]
     return True
 
 
