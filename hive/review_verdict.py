@@ -133,24 +133,33 @@ def reviewed_heads(result: dict) -> list[str]:
 def row_verdict(result: dict) -> str:
     """The reviewer's verdict on the row, normalised ('' when none is recorded).
 
-    Never raises: a non-dict root records no verdict.
+    Never raises: a non-dict root records no verdict. An ``approve`` surfaces
+    only from a slot that also names the approving model (FB40): a bare
+    verdict string or a model-less reviewer entry is not approval.
     """
     if not isinstance(result, dict):
         return ""
     reviewer = result.get("reviewer")
     if isinstance(reviewer, dict):
         text = normalize_verdict(reviewer.get("verdict"))
-        if text:
+        if text and (text != "approve" or named_model(reviewer.get("model"))):
             return text
     evidence = result.get("review_evidence")
     if isinstance(evidence, dict):
         verdict = evidence.get("verdict")
-        text = normalize_verdict(verdict.get("verdict") if isinstance(verdict, dict) else verdict)
-        if text:
-            return text
+        if isinstance(verdict, dict):
+            text = normalize_verdict(verdict.get("verdict"))
+            if text and (text != "approve" or named_model(verdict.get("model"))):
+                return text
+        else:
+            text = normalize_verdict(verdict)
+            if text and text != "approve":
+                return text
         for entry in (evidence.get("first"), *(evidence.get("reviewers") or [])):
-            text = normalize_verdict(entry.get("verdict")) if isinstance(entry, dict) else ""
-            if text:
+            if not isinstance(entry, dict):
+                continue
+            text = normalize_verdict(entry.get("verdict"))
+            if text and (text != "approve" or named_model(entry.get("model"))):
                 return text
     return ""
 

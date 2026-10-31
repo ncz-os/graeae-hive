@@ -205,6 +205,38 @@ def test_duplicate_keys_last_wins_never_approves_phantom():
     assert rv.row_verdict({"reviewer": {"verdict": "approve"}}) in ("", "approve")
 
 
+@given(st.lists(reviewer_entry, min_size=1, max_size=20))
+def test_no_phantom_approval_without_a_named_model(entries):
+    """row_verdict says approve only when the input holds a named-model approve."""
+    result = {"review_evidence": {"reviewers": entries}}
+    if rv.row_verdict(result) == "approve":
+        assert _has_named_approval(entries), entries
+
+
+def test_legitimate_structured_approvals_still_surface():
+    """Positive controls: named-model approves must keep working."""
+    assert rv.row_verdict({"reviewer": {"model": "nemotron-3", "verdict": "approve"}}) == "approve"
+    assert (
+        rv.row_verdict({"review_evidence": {"reviewers": [{"model": "nemotron-3", "verdict": "APPROVE"}]}}) == "approve"
+    )
+    assert rv.child_verdict({"verdict": {"verdict": "approve"}}) == {"verdict": "approve"}
+    worker = rv.child_verdict({"reviewer": {"verdict": "approve", "model": "nemotron-3"}})
+    assert worker is not None and worker["verdict"] == "approve"
+
+
+def test_shrunk_phantom_approvals_stay_non_approval():
+    """Regression pins: the shrunk minima the fuzz found for model-less approve."""
+    assert rv.row_verdict("approve") == ""
+    assert rv.row_verdict({"review_evidence": {"verdict": "approve"}}) == ""
+    assert rv.row_verdict({"review_evidence": {"reviewers": [{"verdict": "APPROVE"}]}}) == ""
+    assert rv.row_verdict({"review_evidence": {"reviewers": [{"model": None, "verdict": "APPROVE"}]}}) == ""
+    assert rv.row_verdict({"reviewer": {"model": "auto", "verdict": "approve"}}) == ""
+    assert rv.row_verdict({"reviewer": {"model": "(auto)", "verdict": "approve"}}) == ""
+    # Non-approve verdicts are untouched by the model gate.
+    assert rv.row_verdict({"review_evidence": {"reviewers": [{"verdict": "request-changes"}]}}) == "request_changes"
+    assert rv.row_verdict({"review_evidence": {"verdict": "blocked"}}) == "blocked"
+
+
 def test_503_and_error_shapes_are_never_approval():
     for result in (
         {"error": "request failed: 503 Service Unavailable"},
