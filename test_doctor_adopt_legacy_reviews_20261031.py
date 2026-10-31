@@ -666,3 +666,37 @@ def test_a_non_terminal_autoreview_child_blocks_a_second_submission(bus):
     summary = doctor.submit_adopted_reviews(rows=[row], now=1000.0)
     assert summary["submitted"] == 0
     assert bus.posts() == [], "a running review child is never reviewed a second time"
+
+
+def test_signature_accepts_the_new_keyword_and_a_default_call(bus):
+    """Regression (review 2026-10-31): ``allow_submit`` must be OPTIONAL.
+
+    ``run_review_queue_sweep`` and ``submit_adopted_reviews`` pass
+    ``allow_submit=`` by keyword. If the parameter is missing from the
+    definition every call would raise ``TypeError`` and the review queue would
+    stop reviewing the triage queue -- the exact outage this task fixes. So the
+    keyword must be accepted AND a bare call (no ``allow_submit``) must still
+    advance the row by submitting a review.
+    """
+    import inspect
+
+    from hive.workers import doctor
+
+    params = inspect.signature(doctor.process_awaiting_review_row).parameters
+    assert "allow_submit" in params
+    assert params["allow_submit"].default is True
+
+    row = _legacy_row()
+    # Called with no allow_submit at all: the sweep's default path.
+    outcome, state, _verdict = doctor.process_awaiting_review_row(row, now=1000.0, roster=load_roster())
+    assert outcome == "submitted", outcome
+    assert state and state.get("review_job_id") == "review-1"
+    assert len(bus.posts()) == 1
+
+    # And explicitly False spends no attempt: the row just waits.
+    other = _legacy_row(jid="legacy-capped")
+    outcome, state, _verdict = doctor.process_awaiting_review_row(
+        other, now=1000.0, allow_submit=False, roster=load_roster()
+    )
+    assert outcome == "capped", outcome  # the per-sweep cap spent, no attempt spent
+    assert len(bus.posts()) == 1
