@@ -28,6 +28,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from hive import review_queue  # noqa: E402
 from hive.workers import loop_outcome  # noqa: E402
 
 ACTIVE_JOB_STATUSES = ("claimed", "running")
@@ -141,17 +142,29 @@ def build_status(rows: dict, *, older_than_hours: float = 24.0, now: float | Non
             cls = loop_outcome.classify(job, events_fetcher=lambda _jid: None)
             local_only = cls == loop_outcome.KILLED_BY_SIGNAL and loop_outcome.has_local_only_commits(job)
             action = loop_outcome.decide(cls, 0, reviewer_ok=lambda: True, local_commits_only=local_only)
-            attention.append(
-                {
-                    "id": str(job.get("id") or ""),
-                    "kind": str(job.get("kind") or ""),
-                    "status": str(job.get("status") or ""),
-                    "class": cls,
-                    "doctor_action": action,
-                    "age": _age_str(_job_ts(job), now),
-                    "head_branch": str(job.get("head_branch") or "-"),
-                }
-            )
+            row = {
+                "id": str(job.get("id") or ""),
+                "kind": str(job.get("kind") or ""),
+                "status": str(job.get("status") or ""),
+                "class": cls,
+                "doctor_action": action,
+                "age": _age_str(_job_ts(job), now),
+                "head_branch": str(job.get("head_branch") or "-"),
+            }
+            # The review queue IS the triage queue: an awaiting_review row is an
+            # ordinary needs-review row that also says why it is waiting.
+            state = review_queue.review_state(job)
+            if state is not None:
+                row.update(
+                    {
+                        "review_state": review_queue.AWAITING_REVIEW,
+                        "family": state.get("author_family"),
+                        "review_reason": review_queue.awaiting_review_reason(job),
+                        "next_attempt_at": state.get("next_attempt_at"),
+                        "review_attempt": int(state.get("attempt") or 0),
+                    }
+                )
+            attention.append(row)
     cutoff = now - float(older_than_hours) * 3600
     stale = [
         {"id": str(j.get("id") or ""), "status": str(j.get("status") or ""), "age": _age_str(_job_ts(j), now)}
@@ -200,10 +213,13 @@ def render_text(snapshot: dict) -> str:
     if not snapshot["attention"]:
         lines.append("  (none)")
     for row in snapshot["attention"]:
-        lines.append(
+        line = (
             f"  {row['id'][:12]} {row['status']} {row['kind']} class={row['class']} "
             f"doctor={row['doctor_action']} age={row['age']}"
         )
+        if row.get("review_state"):
+            line += f" review={row['review_state']} reason={row['review_reason']}"
+        lines.append(line)
     lines.append("flags:")
     if not snapshot["flags"]["stale"] and not snapshot["flags"]["offline_claiming"]:
         lines.append("  (none)")

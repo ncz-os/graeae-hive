@@ -23,7 +23,7 @@ try:
 except ModuleNotFoundError:
     from hive.persistence import _sqlite_async as aiosqlite
 
-from hive import review_record
+from hive import review_queue, review_record
 from hive import scheduler as sched
 from hive.bus.deps import (
     ACTIVE_AGENT_STATUSES,
@@ -258,8 +258,21 @@ async def list_jobs(
     limit: int = 100,
     include_result: bool = True,
     reason_prefix: str | None = None,
+    review_state: str | None = None,
 ):
     limit = clamp_limit(limit, default=100, max_limit=1000)
+    if review_state is not None:
+        # The review queue IS the triage queue: this is a FILTER over the same
+        # needs-review rows, never a separate status namespace. Only the one
+        # real value exists today, and an unknown value is a 400 -- never
+        # silently "everything", which would hide a typo from an operator.
+        wanted = review_state.strip().lower().replace("-", "_")
+        if wanted != review_queue.AWAITING_REVIEW:
+            raise HTTPException(
+                400,
+                f"unknown review_state {review_state!r}; valid: {[review_queue.AWAITING_REVIEW]}",
+            )
+        review_state = wanted
     if status:
         # Normalize separator variants (dead_letter -> dead-letter,
         # failed-completion -> failed_completion) and reject unknown values
@@ -300,6 +313,9 @@ async def list_jobs(
         # PRE-FILTER count so callers can see `total > count` and know the
         # filter ran client-side over the fetched window.
         rows = _reason_prefix_filter(rows, reason_prefix)
+    if review_state:
+        rows = [row for row in rows if review_queue.review_state(row) is not None]
+        return {"count": len(rows), "total": len(rows), "jobs": rows}
     return {"count": len(rows), "total": total, "jobs": rows}
 
 
@@ -362,6 +378,7 @@ async def jobs_summary():
           "dead_by_reason": {<60-char reason prefix>: n, "other": n?, "(none)": n?},
           "triage": {"queued", "done", "oldest_age_sec"},
           "needs_review": {"n", "oldest_age_sec"},
+          "awaiting_review": {"n", "oldest_age_sec"},
           "oldest_queued_sec"
         }
 
@@ -371,6 +388,8 @@ async def jobs_summary():
       ``other``; dead rows with no reason count under ``(none)``.
     * triage = ``triage:*`` work orders: queued vs done/cancelled/failed/
       dead-letter (a processed work order), aged from ended/last_update.
+    * awaiting_review is the review-queue slice of needs_review (rows carrying
+      result.review_state), NOT a separate status.
     * ages are seconds at the caller's clock, null when no row carries a
       usable timestamp.
     """
@@ -409,6 +428,10 @@ async def jobs_summary():
 
     nr_rows = [r for r in rows if r["status"] == "needs-review"]
     nr_ages = [_retention._age_at(r, now) for r in nr_rows]
+    # The review queue is a SLICE of needs-review, not a status of its own:
+    # these rows are already counted in needs_review above.
+    awaiting_rows = [r for r in nr_rows if review_queue.review_state(r) is not None]
+    awaiting_ages = [_retention._age_at(r, now) for r in awaiting_rows]
     queued_ages = [_retention._age_at(r, now) for r in rows if r["status"] == "queued"]
 
     return {
@@ -431,6 +454,10 @@ async def jobs_summary():
         "needs_review": {
             "n": len(nr_rows),
             "oldest_age_sec": max((a for a in nr_ages if a is not None), default=None),
+        },
+        "awaiting_review": {
+            "n": len(awaiting_rows),
+            "oldest_age_sec": max((a for a in awaiting_ages if a is not None), default=None),
         },
         "oldest_queued_sec": max((a for a in queued_ages if a is not None), default=None),
     }

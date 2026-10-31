@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "THE cross-family reviewer roster (operator rule 2026-10-31). One row per",
+    "reviewer-capable route: every local route and every provider model. The",
+    "family column must agree with hive/core/model-families.json (checked by",
+    "test_review_queue_20261031.py). role_id names the fleet role id the route",
+    "is served under (llm-roles map: /etc/fleet/llm-roles.json); roles lists",
+    "every role id that resolves to the route (CERBERUS serves gpt-oss-20b as",
+    "both cerberus-reviewer and cerberus-narrator).",
+    "flags.priority orders bulk picks (higher first; the EIH Nemotron route is",
+    "marked 'slow' -- measured 39 s for a one-word reply -- and sorts last).",
+    "flags.contributor_tier lists the operator-approved repos for the StepFun",
+    "and Meta contributor tiers. MiMo is never a reviewer and is NOT listed."
+  ],
+  "routes": [
+    {
+      "id": "tydeus-qwen38",
+      "provider_id": "tydeus-coder",
+      "model_id": "qwen38",
+      "family": "alibaba",
+      "location": "local",
+      "host": "tydeus",
+      "base_url": "http://tydeus:8006/v1",
+      "server": "vllm",
+      "concurrency": 4,
+      "cost_class": "A",
+      "flags": {
+        "priority": 0
+      }
+    },
+    {
+      "id": "cerberus-gemma",
+      "provider_id": "local",
+      "role_id": "gemma4-31b",
+      "model_id": "gemma4-31b",
+      "family": "google",
+      "location": "local",
+      "host": "cerberus",
+      "base_url": "http://cerberus:8080/v1",
+      "server": "llama-server",
+      "concurrency": 2,
+      "cost_class": "A",
+      "flags": {
+        "priority": 0,
+        "provider": true
+      }
+    },
+    {
+      "id": "cerberus-gpt-oss",
+      "provider_id": "local",
+      "roles": [
+        "cerberus-reviewer",
+        "cerberus-narrator"
+      ],
+      "model_id": "gpt-oss-20b",
+      "family": "openai",
+      "location": "local",
+      "host": "cerberus",
+      "base_url": "http://cerberus:8080/v1",
+      "server": "llama-server",
+      "concurrency": 8,
+      "cost_class": "A",
+      "flags": {
+        "priority": 0,
+        "provider": true
+      }
+    },
+    {
+      "id": "minimax-m3",
+      "provider_id": "minimax",
+      "role_id": "minimax",
+      "model_id": "MiniMax-M3",
+      "family": "minimax",
+      "location": "provider",
+      "host": null,
+      "base_url": "https://api.minimax.io/v1",
+      "server": null,
+      "concurrency": 2,
+      "cost_class": "B",
+      "flags": {
+        "priority": 0,
+        "provider": true
+      }
+    },
+    {
+      "id": "minimax-m3-1-flash",
+      "provider_id": "minimax",
+      "role_id": "minimax_flash",
+      "model_id": "MiniMax-M3.1-Flash-Preview",
+      "family": "minimax",
+      "location": "provider",
+      "host": null,
+      "base_url": "https://api.minimax.io/v1",
+      "server": null,
+      "concurrency": 2,
+      "cost_class": "B",
+      "flags": {
+        "priority": 0,
+        "provider": true
+      }
+    },
+    {
+      "id": "deepseek-flash",
+      "provider_id": "deepseek",
+      "model_id": "deepseek-flash",
+      "family": "deepseek",
+      "location": "provider",
+      "host": null,
+      "base_url": "https://api.deepseek.com/v1",
+      "server": null,
+      "concurrency": 2,
+      "cost_class": "B",
+      "flags": {
+        "priority": 0,
+        "provider": true
+      }
+    },
+    {
+      "id": "muse-spark-1.3",
+      "provider_id": "meta",
+      "model_id": "muse-spark-1.3",
+      "family": "meta",
+      "location": "provider",
+      "host": null,
+      "base_url": null,
+      "server": null,
+      "concurrency": 2,
+      "cost_class": "B",
+      "flags": {
+        "priority": 0,
+        "contributor_tier": {
+          "repos": [
+            "graeae-hive",
+            "fleet-ops",
+            "tokenomics",
+            "ncz-screensavers",
+            "zoder"
+          ]
+        },
+        "provider": true
+      }
+    },
+    {
+      "id": "stepfun-3.5",
+      "provider_id": "stepfun",
+      "model_id": "stepfun-3.5",
+      "family": "stepfun",
+      "location": "provider",
+      "host": null,
+      "base_url": null,
+      "server": null,
+      "concurrency": 2,
+      "cost_class": "B",
+      "flags": {
+        "priority": 0,
+        "contributor_tier": {
+          "repos": [
+            "graeae-hive",
+            "fleet-ops",
+            "tokenomics",
+            "ncz-screensavers",
+            "zoder"
+          ]
+        },
+        "provider": true
+      }
+    },
+    {
+      "id": "eih-nemotron",
+      "provider_id": "nvidia-eih",
+      "role_id": "nvidia/nemotron-3-ultra-550b-a55b",
+      "model_id": "nvidia/nemotron-3-ultra-550b-a55b",
+      "family": "nvidia",
+      "location": "eih",
+      "host": null,
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "server": null,
+      "concurrency": 1,
+      "cost_class": "B",
+      "flags": {
+        "priority": -10,
+        "slow": {
+          "measured_latency_s": 39,
+          "note": "one-word reply took 39 s: lowest priority for bulk"
+        },
+        "provider": true
+      }
+    }
+  ]
+}

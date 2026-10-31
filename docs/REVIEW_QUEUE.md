@@ -1,167 +1,214 @@
-# Review Queue and Cross-Family Reviewer Roster
+# The review queue
 
-Operator rule 2026-10-31:
+*Operator rule 2026-10-31: always have an alternate review protocol or a review
+queue, and always pair reviewer and author from different model families.*
 
-> always have an alternate review protocol or a review queue; the roster is
-> every local and provider model; always pair reviewer and author from
-> different model families.
+## Why this exists
 
-The queue exists because of one night's failure mode: all 8 slots of the
-CERBERUS `gpt-oss-20b` endpoint were busy, about 20 loops ended
-`reviewer_unavailable` and were recorded as **failed** even though the work
-had been authored, committed and pushed. The queue turns that into a state:
-the row waits for a reviewer instead of dying.
+A loop whose reviewer endpoint is busy used to end `reviewer_unavailable` and
+**fail**. On the night of 2026-10-30 all 8 slots of the CERBERUS
+`gpt-oss-20b` endpoint were busy and about 20 loops failed with work that was
+already committed and pushed. The reviewer being unavailable says nothing about
+the author's work, so it must never fail the job.
 
-Code: `hive/workers/reviewer_roster.py` (roster + pairing),
-`hive/workers/review_queue.py` (queue states, retry, load probe),
-`hive/workers/doctor.py` (needs-review sweep and dashboard counts).
-Data: `hive/workers/model_families.json`, `hive/workers/reviewer_roster.json`.
+## There is no separate queue
 
-## 1. Model family table
+The review queue **is** the triage queue (operator, 2026-10-31: *"queue should
+be part of triage queue"*). There is no separate queue, table or status
+namespace. The queue is:
 
-`hive/workers/model_families.json` is the **one source of truth**. The roster
-never re-states a family by hand: every route's `family` must equal
-`family_of(route.model)` (a unit test enforces it).
+> the Hive job rows in `needs-review` (and the `failed` / `dead-letter` rows the
+> doctor's needs-review sweep already reads) that carry a
+> `result.review_state` block.
 
-| pattern | family |
+Everything that shows needs-review rows — the weekend triage check
+(`scripts/hive_status.py`), `GET /v1/jobs`, `GET /v1/jobs/summary`, the
+dashboard and the doctor's logs — shows these rows too. No new listing exists.
+
+### The `awaiting_review` row state
+
+When a loop finishes authoring and the reviewer cannot answer (busy, timeout,
+prose-only or empty output, truncation, a 503), the worker pushes the branch and
+leaves the row `needs-review` with:
+
+```json
+{
+  "review_state": {
+    "state": "awaiting_review",
+    "author": "qwen38",
+    "author_family": "alibaba",
+    "tried": [{"model_id": "gpt-oss-20b", "family": "openai",
+               "failure": "review_busy", "at": 1793422499.5}],
+    "attempt": 1,
+    "max_attempts": 3,
+    "next_attempt_at": 1793423399.5,
+    "last_failure": "reviewer_unavailable",
+    "updated_at": 1793422499.5
+  }
+}
+```
+
+`suggested_action` in the triage view, and `review_queue_triage_row()` in
+`hive/workers/doctor.py`, translate that block into one line an operator can act
+on (`awaiting cross-family review: ...`). The doctor never classifies these rows
+stale while attempts remain.
+
+## 1. The model family table
+
+`hive/core/model-families.json` is the **one** source of truth. The family of
+every roster model is answered here and nowhere else; a unit test asserts every
+roster model has exactly one family.
+
+| Pattern | Family |
 | --- | --- |
 | `qwen38`, `Qwen*` | alibaba |
 | `gemma*` | google |
 | `gpt-oss*`, `gpt-6*`, `codex*` | openai |
 | `nemotron*` | nvidia |
-| `MiniMax-M3`, `MiniMax-M3.1*`, `minimax*` | minimax |
+| `MiniMax-M3`, `M3.1` | minimax |
 | `deepseek*` | deepseek |
 | `muse-spark*` | meta |
-| `mimo*` | xiaomi |
+| `mimo*` | xiaomi (never a reviewer) |
 | `stepfun*` | stepfun |
 | `claude*` | anthropic |
-| anything else | `unknown:<model-id>` |
+| anything else | its own family (`model:<id>`) — matches nothing |
 
-An unknown model is **its own family**. It never matches anything, including
-itself: a reviewer whose family is unknown, and an author whose family is
-unknown, are both refused (`family_of` / `families_pair`).
+The **longest** matching pattern wins, so a specific id is never shadowed by a
+broader pattern. An unknown model is its own family and therefore never shares a
+family with anything: it fails closed rather than guessing.
 
-## 2. Reviewer roster
+## 2. The reviewer roster
 
-`hive/workers/reviewer_roster.json`, one row per reviewer-capable route:
+`hive/core/reviewer-roster.json` lists every reviewer-capable route: provider,
+model id, family, location (`local` / `provider` / `eih`), concurrency limit,
+cost class and flags. It was written from the real zoder route config and
+`deploy/hive_worker.py`, not invented.
 
-| id | provider | model | family | location | conc. | cost | notes |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `tydeus-qwen38` | tydeus | `qwen38` | alibaba | local `192.0.2.73:8006` | 8 | A | |
-| `cerberus-gemma4-31b` | cerberus | `gemma4-31b` | google | local `192.0.2.96:8080` | 4 | A | standing local reviewer |
-| `cerberus-gpt-oss-20b-reviewer` | cerberus | `gpt-oss-20b` | openai | local `192.0.2.96:8080` | 8 | A | served as `cerberus-reviewer` |
-| `cerberus-gpt-oss-20b-narrator` | cerberus | `gpt-oss-20b` | openai | local `192.0.2.96:8080` | 8 | A | served as `cerberus-narrator`, same endpoint |
-| `provider-minimax-m3` | minimax | `MiniMax-M3` | minimax | provider | 2 | B | |
-| `provider-minimax-m3-1-flash` | minimax | `MiniMax-M3.1-Flash-Preview` | minimax | provider | 2 | B | |
-| `provider-deepseek-flash` | deepseek | `deepseek-flash` | deepseek | provider | 2 | B | |
-| `provider-muse-spark-1-3` | meta | `muse-spark-1.3` | meta | provider | 2 | B | contributor tier: approved repos only |
-| `provider-stepfun-3` | stepfun | `stepfun-3` | stepfun | provider | 2 | B | contributor tier: approved repos only |
-| `eih-nemotron` | nvidia-eih | `nvidia/nemotron-3-ultra-550b-a55b` | nvidia | eih | 2 | A | **slow** (measured 39 s for a one-word reply): last for bulk work |
-| `provider-mimo-v2-6-flash` | xiaomi | `mimo-v2.6-flash` | xiaomi | provider | 2 | B | **never reviews** |
-| `provider-mimo-v2-6-pro` | xiaomi | `mimo-v2.6-pro` | xiaomi | provider | 2 | B | **never reviews** |
+| Route | Model | Family | Location | Concurrency | Notes |
+| --- | --- | --- | --- | --- | --- |
+| `tydeus-qwen38` | `qwen38` | alibaba | local | 4 | TYDEUS `192.0.2.73:8006`, vLLM |
+| `cerberus-gemma` | `gemma4-31b` | google | local | 2 | CERBERUS `192.0.2.96:8080` |
+| `cerberus-gpt-oss` | `gpt-oss-20b` | openai | local | 8 | CERBERUS; serves roles `cerberus-reviewer` **and** `cerberus-narrator` |
+| `minimax-m3` | `MiniMax-M3` | minimax | provider | 2 | |
+| `minimax-m3-1-flash` | `MiniMax-M3.1-Flash-Preview` | minimax | provider | 2 | |
+| `deepseek-flash` | `deepseek-flash` | deepseek | provider | 2 | |
+| `muse-spark-1.3` | `muse-spark-1.3` | meta | provider | 2 | contributor tier |
+| `stepfun-3.5` | `stepfun-3.5` | stepfun | provider | 2 | contributor tier |
+| `eih-nemotron` | `nvidia/nemotron-3-ultra-550b-a55b` | nvidia | eih | 1 | **slow** (39 s for a one-word reply); bulk priority lowest |
 
-Flags:
+Rules encoded in the flags:
 
-* `never_reviewer` — MiMo is listed for completeness but is never picked.
-* `approved_repo` — StepFun and Meta contributor tiers review only the
-  operator-approved repos: `graeae-hive`, `fleet-ops`, `tokenomics`,
-  `ncz-screensavers`, `zoder`. A row without a recognised repo is refused.
-* `slow` — lowest priority for bulk (the queue sorts `slow` last).
+* **MiMo is never a reviewer.** It is not in the roster at all, and
+  `_reviewable()` rejects any `mimo*` route as a second line of defence.
+* **StepFun and Meta are contributor tiers**, allowed only on operator-approved
+  repos: `graeae-hive`, `fleet-ops`, `tokenomics`, `ncz-screensavers`, `zoder`.
+  On any other repo they are not picked.
+* **EIH Nemotron is allowed but slow**, so it sorts last for bulk work.
 
-The CERBERUS `reviewer` and `narrator` route ids front **one** 8-slot
-llama-server. `route_capacity()` therefore shares one budget across routes with
-the same `base_url` (the lowest concurrency among them wins), so the queue can
-never send more work to an endpoint than the endpoint has slots.
+## 3. Pairing
 
-## 3. Pairing rules (`pick_reviewers`)
+`hive.review_queue.pick_reviewers(author_model, roster, health, load)`:
 
-`pick_reviewers(author_model, roster, health, load, *, author_family,
-co_author_models, repo, bulk, include_expensive)` returns an **ordered** list of
-reviewers, or an **empty list**.
+1. drops every route whose family equals the author's family (and every known
+   co-author's family);
+2. drops unhealthy routes (`health(route) -> bool`);
+3. drops saturated routes (`load(route) >= concurrency`);
+4. applies the contributor-tier repo rule;
+5. sorts with a deterministic tie-break — cost class, then family load, then
+   route id — so a repeated call returns the same order.
 
-1. Cross-family only: the reviewer's family must differ from the author's
-   family and from every known co-author family. Same-family pairs are never
-   returned.
-2. Unhealthy routes (`health[route_id]` in `down`/`unhealthy`/`unavailable`/
-   `failed`) and saturated routes (`load >= route_capacity`) are skipped.
-3. Flags: `never_reviewer` skipped; `approved_repo` only for approved repos;
-   cost class C only with `include_expensive`.
-4. No cross-family reviewer available -> **empty list** -> the row is PARKED.
-   A job is never reviewed by its own family, and never self-reviewed.
-5. Deterministic tie-break: `slow` last (bulk), then cost class A -> B -> C,
-   then location local -> provider -> eih, then `priority_rank`, then route id.
+**An empty list is a verdict.** With no cross-family reviewer available the row
+is **parked** (`parked_reason: no_cross_family_reviewer`): never self-reviewed,
+never failed, never sent to a same-family reviewer.
 
-## 4. Queue states
+The worker exposes the same pick as `review_queue_roster()` /
+`review_queue_reviewers(...)` so both sides share one implementation. A review
+is only an **approval** when it is a structured JSON verdict naming
+`reviewers[].model` **and** the head sha it reviewed. Prose-only, empty,
+truncated, 503 or non-JSON output is never an approval — it is a retryable
+failure kind (`review_busy`, `review_timeout`, `review_prose_only`,
+`review_empty`, `review_truncated`, `review_http_503`).
 
-The queue entry lives in the row's own `result.awaiting_review`, so the row
-keeps the `needs-review` status every existing guard protects.
+## 4. The sweep
 
-| state | meaning |
+The doctor's **existing** needs-review sweep (`report_needs_review_sweep` →
+`run_review_queue_sweep`) consumes awaiting rows on the same pass:
+
+| Row state | Action |
 | --- | --- |
-| `queued` | waiting for the next cross-family reviewer |
-| `submitted` | a review job id is recorded; awaiting a verdict |
-| `parked` | no cross-family reviewer exists (needs a human) |
-| `exhausted` | retries exhausted (needs a human) |
-| `approved` | a structured JSON verdict approved the head |
+| awaiting, budget left, no reviewer available | **parked** — `no_cross_family_reviewer` |
+| awaiting, budget left, cross-family pick exists | submit ONE read-only review job naming the pick |
+| child returned a structured **approve** for the delivered head | record `approved`, hand to the merge path |
+| child returned **request-changes** | record it, back to the author path |
+| child failed / prose-only | `attempt + 1`, schedule with exponential backoff |
+| attempts exhausted | stay `needs-review` with `attempts_exhausted_owner_wait` |
 
-Transitions: `queued -> submitted` on a successful submit; `submitted` /
-`queued -> queued` (with backoff) on failure; `-> parked` when the pairing is
-empty; `-> exhausted` after `max_attempts`; `submitted -> approved` only from a
-structured verdict.
-
-**A review only counts as an approval when it is a structured JSON verdict whose
-`reviewers[].model` names a cross-family model** and whose head matches the
-delivered head. Prose-only, empty, truncated, 503 and non-JSON reviews are
-never approvals: they are recorded as a failed attempt and retried.
+The row always stays `needs-review`. Outcomes are counted per row, so one bad
+row cannot stop the sweep.
 
 ## 5. Load awareness
 
-`LoadProbe` reads the local endpoint's own counters, cheaply, cached for 30 s
-(strictly: a cache entry is reused while `now - cached_at <= 30` and re-read
-afterwards, so a slot freed at the 30 s boundary is visible on the next read):
+`route_load_fn()` reads llama-server `/slots` (count of `is_processing` slots)
+for local llama-server routes and vLLM `/metrics` for vLLM routes — by the
+route's declared `server` kind, so each probe is one request. Reads are cached
+for **30 s** (cheap). Provider routes have no slot endpoint and return 0; their
+concurrency cap is enforced at dispatch. The sweep never sends more than a
+route's configured concurrency to that route.
 
-* llama-server: `GET <base>/slots`, counting slots with `is_processing: true`;
-* vLLM: `GET <base>/metrics`, `vllm:num_requests_running`.
+## 6. Visibility
 
-A probe failure (connection refused, non-JSON, HTML error page) yields **None**
-(*unknown*), never `0`: an unknown load must not be mistaken for an idle
-endpoint.
+* `scripts/hive_status.py` — the weekend triage listing shows `review=<state>`
+  and `reason=<...>` on the attention row.
+* `GET /v1/jobs?review_state=awaiting_review` — a filter over the same
+  `needs-review` rows. An unknown value is a **400**, never "everything".
+* `GET /v1/jobs/summary` — `awaiting_review: {n, oldest_age_sec}`, counted as a
+  slice of `needs_review`.
+* Doctor logs/broadcasts: `doctor.review_approved`, `doctor.review_request_changes`,
+  `doctor.review_retry`, `doctor.review_queue_exhausted`, `doctor.sweep_error`.
 
-`RouteInflight` caps concurrent review calls per endpoint. A submitted review
-keeps its slot (`hold`) until the review job is terminal
-(`release_hold`/`reset`), so a second sweep cannot oversubscribe the endpoint.
+## Config knobs
 
-## 6. Configuration knobs
-
-| knob | default | meaning |
+| Knob | Where | Meaning |
 | --- | --- | --- |
-| `LOAD_CACHE_SECONDS` | `30` | load probe cache lifetime |
-| `LOAD_TIMEOUT_SECONDS` | `2` | per-request probe timeout |
-| `DEFAULT_BASE_SECONDS` | `30` | first retry delay |
-| `DEFAULT_MAX_SECONDS` | `900` | backoff ceiling |
-| `DEFAULT_JITTER` | `0.2` | +/- jitter on the delay |
-| `DEFAULT_MAX_ATTEMPTS` | `6` | attempts before `exhausted` |
+| `AWAITING_REVIEW` | `hive/review_queue.py` | the one state value (`awaiting_review`) |
+| `MAX_REVIEW_ATTEMPTS` | `hive/review_queue.py` | attempts before owner-wait (3) |
+| `REVIEW_BACKOFF_SEC` | `hive/review_queue.py` | first backoff step (900 s), doubling |
+| `MAX_BACKOFF_SEC` | `hive/review_queue.py` | backoff ceiling (7200 s) |
+| `LOAD_CACHE_SEC` | `hive/review_queue.py` | load read cache (30 s) |
+| `APPROVED_REPOS` | `hive/review_queue.py` | contributor-tier repos |
+| `REVIEW_QUEUE_ROUTE_HEALTH` | `hive/workers/doctor.py` | per-route health overrides (unlisted = healthy) |
+| `REVIEW_QUEUE_ROUTE_LOAD` | `hive/workers/doctor.py` | override for the load reader |
+| `HIVE_ZODER_REVIEWER_ALT` | `deploy/hive_worker.py` | quiet-window backup reviewer (EIH Nemotron) |
+| `HIVE_ZODER_REVIEWER_QUIET_WINDOWS` | `deploy/hive_worker.py` | publish-burst windows routed to the backup |
+| `reviewer-roster.json` | `hive/core/` | concurrency, cost class, flags per route |
 
-The roster JSON is data, not code: adding a provider route is a new row plus
-a family rule (or an `unknown` family is derived automatically).
+## Rollback
 
-## 7. Doctor integration
+Nothing here is deployed by this change; deployment to PYTHIA needs the
+operator. If the behaviour must be reverted:
 
-* `doctor.needs_review_queue_counts(rows)` adds `queued`, `submitted`,
-  `parked`, `exhausted` and `unreviewed` counts for the dashboard.
-* `doctor.review_followup_blocker(row)` names the queue when a row is awaiting
-  review, so the sweep never calls a queued row stale and never escalates it as
-  stuck; `escalate_stuck_needs_review` skips queued rows.
+1. **Worker side** — remove the review-queue section from
+   `deploy/hive_worker.py` and the `review_queue` import. Rows then fall back to
+   the old `resolve_delivery_status` disposition (`reviewer_unavailable`
+   fails the job again). No data migration is needed: `result.review_state` is
+   an additive key the old code ignores.
+2. **Doctor side** — remove the review-queue section from
+   `hive/workers/doctor.py`; the sweep stops consuming awaiting rows and they
+   simply stay `needs-review` (visible, not failed). Remove the `review_state`
+   filter and `awaiting_review` summary key from
+   `hive/bus/routers/jobs.py` if the API surface must shrink too.
+3. **Data files** — `hive/core/model-families.json` and
+   `hive/core/reviewer-roster.json` can stay: they are pure data and harmless
+   without the code.
+4. **Rows already awaiting** — patch `result.review_state` off the affected
+   rows (or set them to `done`/`failed`) to return them to ordinary needs-review
+   handling.
 
-## 8. Rollback
+## Tests
 
-No deployment is part of this change; the worker keeps its existing
-`reviewer_unavailable` behaviour until the queue consumer is wired in. To roll
-back:
-
-1. Revert the commit(s) on `hv/gh-review-queue-20261031`.
-2. The queue only ever writes a `result` field; rows already carrying
-   `awaiting_review` degrade to plain `needs-review` rows (the blocker text
-   disappears when the module is absent), so no data migration is needed.
-3. Delete `docs/REVIEW_QUEUE.md` and the two JSON data files if the code goes
-   away; nothing else reads them.
+* `test_review_queue_20261031.py` — family table, roster, pairing matrix, the
+  sweep table, verdict parsing, load probe.
+* `test_triage_awaiting_review_20261031.py` — triage listing, `?review_state=`
+  filter, summary counts.
+* `test_worker_review_queue_20261031.py` — the worker seams: cross-family pick,
+  failure classification, disposition, resume delay.
