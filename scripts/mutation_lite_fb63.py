@@ -481,6 +481,9 @@ def run_one(mutant: dict, with_killers: bool = False) -> str:
         shutil.copytree(
             ROOT, tmp / "repo", ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache"), symlinks=False
         )
+        for t in mutant["tests"]:
+            if not (tmp / "repo" / t).exists():
+                return f"HARNESS-FAIL: test file {t} missing"
         target = tmp / "repo" / mutant["path"]
         text = target.read_text()
         if text.count(mutant["old"]) != 1:
