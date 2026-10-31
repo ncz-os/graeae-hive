@@ -73,7 +73,7 @@ from hive.core import fleet_inventory
 # container still runs this module standalone.
 from hive.review_queue import pick_reviewers
 from hive.workers import doctor_decline_paths as decline_paths
-from hive.workers import doctor_gates, doctor_v2, loop_outcome, remediation, retention
+from hive.workers import doctor_gates, doctor_models, doctor_v2, loop_outcome, remediation, retention
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "")
@@ -1168,6 +1168,25 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     gateway is never called automatically. Remote/paid providers are never a
     fallback rung — every rung is an on-prem llama-server."""
     global _codex_alias_warned
+    # Slot-aware model chain (operator 2026-10-31): a DOCTOR_MODEL_CHAIN file
+    # opts in. Unset means `chain_from_env` returns None and the legacy
+    # single-base-per-phase chain below runs exactly as before.
+    # `is not None` is load-bearing: tests patch chain_from_env with a falsy
+    # sentinel to assert the legacy path consults no chain at all.
+    model_chain = doctor_models.chain_from_env()
+    if model_chain is not None:
+        outcome = model_chain.call(
+            phase,
+            system=DOCTOR_SYSTEM,
+            prompt=prompt,
+            structured=phase != "fix",
+            timeout=DOCTOR_OPENWEIGHT_TIMEOUT,
+        )
+        if outcome.ok:
+            log.info("doctor phase=%s answered by chain rung=%s attempts=%s", phase, outcome.rung, outcome.attempts)
+            return True, outcome.text
+        return False, f"model chain failed for phase {phase}; tried {outcome.attempts}: {outcome.text}"
+
     model_alias = _PHASE_MODELS.get(phase, DOCTOR_TRIAGE_MODEL)
     if _is_codex_alias(model_alias):
         if not _codex_alias_warned:
