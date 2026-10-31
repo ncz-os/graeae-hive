@@ -5462,7 +5462,8 @@ def review_queue_triage_row(job: dict, now: float | None = None) -> dict | None:
         action = f"changes requested by {', '.join(state['request_changes'].get('reviewers') or [])}; back to the author path"
     elif review_queue.is_parked(state):
         action = f"awaiting cross-family review: parked, no cross-family reviewer is available ({reason})"
-    elif state.get("parked_reason") == "attempts_exhausted_owner_wait":
+    elif state.get("parked_reason") == "attempts_exhausted_owner_wait" or not review_queue.attempts_remain(state):
+        # No attempt budget left (whether or not a sweep already recorded it).
         action = f"awaiting cross-family review: attempts spent, waiting for an owner ({reason})"
     elif review_queue.in_backoff(state, now=now):
         action = f"awaiting cross-family review: next attempt scheduled ({reason})"

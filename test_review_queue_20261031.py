@@ -25,6 +25,7 @@ These tests pin the five pieces:
 """
 
 import json
+import time
 
 import pytest
 from hive.review_queue import (
@@ -423,12 +424,23 @@ def test_reviewer_failure_schedules_exponential_backoff(bus):
     nxt = [c[2] for c in calls if c[0] == "PATCH"][-1]["result"]["review_state"]["next_attempt_at"]
     calls.clear()
     rows["source"]["result"]["review_state"] = state(
-        "qwen38", [{"model_id": "gemma4-31b", "failure": "review_busy"}], attempt=1, now=0
+        "qwen38",
+        [{"model_id": "gemma4-31b", "failure": "review_busy"}],
+        attempt=1,
+        next_attempt_at=nxt,
+        now=0,
     )
-    second = doctor.run_review_queue_sweep(rows=list(rows.values()))
+    # A row still inside its backoff window waits: no second submission.
+    second = doctor.run_review_queue_sweep(rows=list(rows.values()), now=nxt - 1)
+    assert second["deferred"] == 1 and second["submitted"] == 0
+    # Once the window passes the next attempt runs and its delay doubles.
+    calls.clear()
+    third = doctor.run_review_queue_sweep(rows=list(rows.values()), now=nxt + 1)
     later = [c[2] for c in calls if c[0] == "PATCH"][-1]["result"]["review_state"]["next_attempt_at"]
-    assert first["parked"] == 1 and second["deferred"] == 1
-    assert later == 2 * nxt and later > 0
+    assert third["parked"] == 1
+    # The delay doubles per attempt (15 min, 30 min, ...) and is bounded.
+    assert later - (nxt + 1) == backoff_seconds(1) == 2 * backoff_seconds(0)
+    assert later > nxt
 
 
 def test_attempts_exhausted_stays_needs_review_with_owner_wait_reason(bus):
@@ -506,7 +518,14 @@ def test_awaiting_review_row_is_visible_in_triage_and_not_stale(bus):
     from hive.workers import doctor
 
     rows, calls, messages, _ = bus
-    rows["source"]["result"]["review_state"] = make_review_state("qwen38", [], attempt=1, now=0)
+    rows["source"]["result"]["review_state"] = make_review_state(
+        "qwen38",
+        [{"model_id": "gpt-oss-20b", "failure": "review_busy"}],
+        attempt=1,
+        next_attempt_at=time.time() + 900,
+        last_failure="reviewer_unavailable",
+        now=0,
+    )
     report = doctor.report_needs_review_sweep()
     assert report["scanned"] == 1
     row = report["rows"][0]
@@ -524,7 +543,9 @@ def test_doctor_does_not_call_an_awaiting_row_stale_while_attempts_remain(bus):
     from hive.workers import doctor
 
     rows, calls, messages, _ = bus
-    rows["source"]["result"]["review_state"] = make_review_state("qwen38", [], attempt=1, now=0)
+    rows["source"]["result"]["review_state"] = make_review_state(
+        "qwen38", [], attempt=1, next_attempt_at=time.time() + 900, now=0
+    )
     doctor.report_needs_review_sweep()
     assert not any(topic == "doctor.needs_review_stuck" for topic, _ in messages)
 

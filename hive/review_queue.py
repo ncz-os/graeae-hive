@@ -296,10 +296,12 @@ class _Probe:
         base = str(route.get("base_url") or "").rstrip("/")
         if not base:
             return LOAD_UNKNOWN
+        # The server kind is declared on the route, so a llama-server is never
+        # probed with a vLLM metrics request (and vice versa): one request per
+        # probe, and a 404 body cannot be mistaken for load.
         try:
-            metrics = self._fetch_json(base + "/metrics")
-            if isinstance(metrics, str) and "vllm" in metrics:
-                return _vllm_load(metrics)
+            if str(route.get("server") or "") == "vllm":
+                return _vllm_load(self._fetch_json(base + "/metrics"))
             slots = self._fetch_json(base + "/slots")
         except Exception:  # noqa: BLE001 -- any probe failure is "unknown"
             return LOAD_UNKNOWN
@@ -576,6 +578,10 @@ def awaiting_review_reason(job: dict) -> str:
     text = f"{base}: author family {family}"
     if tried:
         text += f"; tried {tried}"
+    # The last recorded outcome (``reviewer_unavailable``, ``review_busy``, ...)
+    # is what an operator reading the triage listing needs most.
+    if state.get("last_failure"):
+        text += f"; last failure {state['last_failure']}"
     if state.get("parked_reason"):
         text += f"; {state['parked_reason']}"
     next_at = state.get("next_attempt_at")
