@@ -624,9 +624,12 @@ def test_route_load_reads_llama_slots_with_a_30s_cache(monkeypatch):
     assert len(fetches) == 2
 
 
-def test_route_load_reads_vllm_metrics_for_the_tydeus_server():
+def test_route_load_reads_vllm_metrics_for_the_tydeus_server(monkeypatch, tmp_path):
     from hive import review_queue as rq
 
+    inventory = tmp_path / "fleet.json"
+    inventory.write_text(json.dumps({"schema_version": 1, "hosts": {"tydeus": {"address": "192.0.2.73"}}}))
+    monkeypatch.setenv("HIVE_FLEET_INVENTORY", str(inventory))
     route = [e for e in rq.load_roster() if e["server"] == "vllm"][0]
     metrics = 'vllm:num_requests_running{model_name="q"} 3\nvllm:num_requests_waiting{model_name="q"} 2\n'
     fetches = []
@@ -637,8 +640,13 @@ def test_route_load_reads_vllm_metrics_for_the_tydeus_server():
             return _FakeResponse(metrics)
         return _FakeResponse("not found")
 
+    from hive.core import fleet_inventory
+
     assert rq.route_load_fn(urlopen=fake_urlopen, clock=lambda: 1.0)(route) == 5
-    assert fetches == [route["base_url"].rstrip("/") + "/metrics"]
+    # vLLM's /metrics lives at the server root; the address is the inventory's.
+    address = fleet_inventory.address(route["host"])
+    assert address
+    assert fetches == [f"http://{address}:{route['port']}/metrics"]
 
 
 def test_route_load_of_an_unreachable_route_is_a_failure_not_zero(monkeypatch):

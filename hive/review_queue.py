@@ -81,8 +81,9 @@ FORBIDDEN_FAMILIES = frozenset({"anthropic"})
 #: model's family is refused even if a roster row were added by mistake.
 NEVER_REVIEW_FAMILIES = frozenset({"xiaomi"})
 
-_EXACT_CACHE: dict = {"key": None, "values": {}, "patterns": ()}
+_EXACT_CACHE: dict = {"key": None, "values": {}, "patterns": (), "lower": {}, "families": frozenset()}
 _ROSTER_CACHE: dict = {"key": None, "routes": ()}
+_ALIAS_CACHE: dict = {"key": None, "aliases": {}}
 _SEED_LOCK = threading.Lock()
 
 _ALIAS_RE = re.compile(r"^[a-z0-9]+([._-][a-z0-9]+)*$")
@@ -135,8 +136,10 @@ def _load_exact(path: Path = FAMILY_TABLE_PATH) -> tuple[dict, tuple]:
             pattern_owner[pattern] = family
         values[name] = {"family": family, "patterns": patterns}
     patterns = tuple(sorted(pattern_owner.items(), key=lambda item: len(item[0]), reverse=True))
+    lower = {name.lower(): entry["family"] for name, entry in values.items()}
+    families = frozenset(entry["family"] for entry in values.values())
     with _SEED_LOCK:
-        _EXACT_CACHE.update(key=key, values=values, patterns=patterns)
+        _EXACT_CACHE.update(key=key, values=values, patterns=patterns, lower=lower, families=families)
     return values, patterns
 
 
@@ -146,53 +149,117 @@ def load_family_table() -> dict:
     return {"schema_version": 1, "exact": values}
 
 
+def _table_family(name: str) -> str | None:
+    """The table's family for ``name`` (case-insensitive), or None: not listed."""
+    _load_exact()
+    low = str(name or "").strip().lower()
+    if not low:
+        return None
+    hit = _EXACT_CACHE["lower"].get(low)
+    if hit:
+        return hit
+    for needle, family in _EXACT_CACHE["patterns"]:
+        if fnmatch.fnmatchcase(low, needle):
+            return family
+    return None
+
+
+def _roster_aliases(path: Path = ROSTER_PATH) -> dict:
+    """``{lower-cased route id / role id / unique provider id: model id}``.
+
+    Read straight from the roster file (not ``load_roster``, which validates
+    each route through ``family_of`` and would recurse). A row may name the
+    route it ran on (``tydeus-qwen38``) or the fleet role id it was served
+    under (``cerberus-reviewer``) instead of the model: both are the route's
+    model, and therefore its family.
+    """
+    try:
+        st = path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if _ALIAS_CACHE["key"] == key:
+        return _ALIAS_CACHE["aliases"]
+    try:
+        routes = _read_json(path).get("routes") or []
+    except (OSError, ValueError):
+        return {}
+    aliases: dict[str, str] = {}
+    providers: dict[str, set] = {}
+    for route in routes:
+        if not isinstance(route, dict) or not route.get("model_id"):
+            continue
+        model = str(route["model_id"])
+        for name in [route.get("id"), route.get("role_id"), *(route.get("roles") or [])]:
+            if str(name or "").strip():
+                aliases[str(name).strip().lower()] = model
+        if str(route.get("provider_id") or "").strip():
+            providers.setdefault(str(route["provider_id"]).strip().lower(), set()).add(model)
+    for provider, models in providers.items():
+        # ``local`` backs two CERBERUS models: a shared provider id names no model.
+        if len(models) == 1:
+            aliases.setdefault(provider, next(iter(models)))
+    with _SEED_LOCK:
+        _ALIAS_CACHE.update(key=key, aliases=aliases)
+    return aliases
+
+
 @functools.lru_cache(maxsize=2048)
 def _family_of_cached(raw: str) -> str:
-    exact, patterns = _load_exact()
-    name = raw.lower()
-    hit = exact.get(raw)
-    if hit is not None:
-        return hit["family"]
-    for needle, family in patterns:
-        if fnmatch.fnmatchcase(name, needle):
+    # 1. the table itself (model ids, any letter case, any listed pattern);
+    family = _table_family(raw)
+    if family:
+        return family
+    # 2. a roster route id or role id -> the route's model;
+    model = _roster_aliases().get(raw.lower())
+    if model:
+        family = _table_family(model)
+        if family:
             return family
-    return UNKNOWN_FAMILY_PREFIX + name
+    # 3. the deployed role map / agent aliases, when importable.
+    family = _resolve_role_or_alias(raw)
+    if family:
+        return family
+    return UNKNOWN_FAMILY_PREFIX + raw.lower()
 
 
 def family_of(model: str) -> str:
     """The operator's family for ``model``, or its own family when unknown.
 
-    Accepts a model id (``gpt-oss-20b``), a fleet role id (``cerberus-reviewer``)
-    or an agent alias (``minimax_flash``). Role ids resolve through the llm-roles
-    map first: the map's ``family`` names the backing model's family, and its
-    ``model`` is then resolved by this table. Aliases resolve through
-    ``provenance`` when that module is importable (it is on the worker; the
-    bus resolves the role map only). An unknown model returns
+    Accepts a model id (``gpt-oss-20b``, any letter case), a roster route id or
+    fleet role id (``tydeus-qwen38``, ``cerberus-reviewer``) or an agent alias
+    (``minimax_flash``). The table is asked first, so a known name never
+    depends on which optional resolver modules happen to be importable; role
+    ids then resolve through the roster, and only then through the deployed
+    llm-roles map and ``provenance`` aliases. An unknown model returns
     ``model:<lower-cased id>`` -- never a guessed family, so it can never pair
     with anything but itself.
     """
     raw = str(model or "").strip()
     if not raw:
         return ""
-    residue = _resolve_role_or_alias(raw)
-    return _family_of_cached(residue) if residue else UNKNOWN_FAMILY_PREFIX + raw.lower()
+    return _family_of_cached(raw)
 
 
-def _resolve_role_or_alias(raw: str) -> str:
-    """Resolve a role id or agent alias to a model id; else ``raw`` itself."""
+def _resolve_role_or_alias(raw: str) -> str | None:
+    """A family through the deployed role map or agent aliases; None: no answer."""
     try:
         from hive import llm_roles
 
         if llm_roles.is_role_id(raw):
             backing = llm_roles.backing_model(raw)
-            if backing:
-                return backing
-            mapped = llm_roles.family(raw)
+            family = _table_family(backing) if backing else None
+            if family:
+                return family
+            mapped = str(llm_roles.family(raw) or "").strip().lower()
             if mapped:
-                # The map knows the family but not a model this table lists;
-                # answer with a name the table's patterns resolve (gemma* ->
-                # google, minimax* -> minimax...). No answer: unknown role.
-                return {"gemma": "gemma", "gemini": "gemma"}.get(mapped, mapped)
+                # The map knows the family but not a model this table lists.
+                mapped = {"gemini": "gemma"}.get(mapped, mapped)
+                family = _table_family(mapped)
+                if family:
+                    return family
+                if mapped in _EXACT_CACHE["families"]:
+                    return mapped
     except Exception:  # noqa: BLE001 -- the map is optional
         pass
     if _ALIAS_RE.match(raw.lower()) and raw.lower() not in _ALIAS_STOPWORDS:
@@ -200,11 +267,12 @@ def _resolve_role_or_alias(raw: str) -> str:
             import provenance
 
             resolved = provenance.primary_model(raw)
-            if resolved:
-                return str(resolved)
+            family = _table_family(str(resolved)) if resolved else None
+            if family:
+                return family
         except Exception:  # noqa: BLE001 -- provenance ships on the worker only
             pass
-    return raw
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +361,7 @@ class _Probe:
         return value
 
     def _fetch(self, route: dict) -> Any:
-        base = str(route.get("base_url") or "").rstrip("/")
+        base = _server_root(route)
         if not base:
             return LOAD_UNKNOWN
         # The server kind is declared on the route, so a llama-server is never
@@ -320,6 +388,33 @@ class _Probe:
             return json.loads(text)
         except ValueError:
             return text
+
+
+def _server_root(route: dict) -> str:
+    """``http://<inventory address>:<port>`` for a local route; ``""``: unknown.
+
+    llama-server's ``/slots`` and vLLM's ``/metrics`` live at the server ROOT,
+    not under the OpenAI ``/v1`` prefix. The address comes from the operator's
+    fleet inventory (``HIVE_FLEET_INVENTORY``) by the route's ``host`` name --
+    never from the roster, never the bare hostname, never a guess.
+    """
+    try:
+        port = int(route.get("port"))
+    except (TypeError, ValueError):
+        return ""
+    if not 0 < port < 65536:
+        return ""
+    try:
+        from hive.core import fleet_inventory
+
+        addr = fleet_inventory.address(route.get("host"))
+    except Exception:  # noqa: BLE001 -- no inventory: the load is unknown
+        return ""
+    if not addr:
+        return ""
+    if ":" in addr and not addr.startswith("["):
+        addr = f"[{addr}]"  # IPv6 literal
+    return f"http://{addr}:{port}"
 
 
 def _vllm_load(text: str) -> Any:
@@ -411,6 +506,10 @@ def pick_reviewers(
     means there is NO cross-family reviewer: the caller PARKS the row -- it must
     never fall back to the author's own family or to a self-review.
     """
+    if not str(author_model or "").strip():
+        # No author means no family to exclude: there is no cross-family
+        # guarantee to give, so the row PARKS (never "any route will do").
+        return []
     routes = list(roster if roster is not None else load_roster())
     authors = [m for m in [author_model, *(co_authors or [])] if str(m or "").strip()]
     backer = str(author_model or "").split(":", 1)[-1].lower()
@@ -533,6 +632,12 @@ def make_review_state(
 def review_state(job: dict) -> dict | None:
     """The ``awaiting_review`` block of a row, or None when the row is not one."""
     result = job.get("result") if isinstance(job, dict) else None
+    if isinstance(result, (str, bytes)):
+        # Some bus dialects hand ``result`` back as JSON text.
+        try:
+            result = json.loads(result)
+        except ValueError:
+            result = None
     result = result if isinstance(result, dict) else {}
     state = result.get("review_state")
     if not isinstance(state, dict):

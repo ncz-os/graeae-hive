@@ -50,8 +50,11 @@ leaves the row `needs-review` with:
 
 `suggested_action` in the triage view, and `review_queue_triage_row()` in
 `hive/workers/doctor.py`, translate that block into one line an operator can act
-on (`awaiting cross-family review: ...`). The doctor never classifies these rows
-stale while attempts remain.
+on (`awaiting cross-family review: ...`). While attempts remain (or a review is
+in flight) the report classifies the row `awaiting_review`, never `stale`, and it
+is never escalated. Once the attempts are spent and nothing is in flight the row
+is `stale`, its suggested action names the owner, and
+`escalate_stuck_needs_review` sends ONE `doctor.needs_review_stuck` for it.
 
 ## 1. The model family table
 
@@ -63,9 +66,9 @@ roster model has exactly one family.
 | --- | --- |
 | `qwen38`, `Qwen*` | alibaba |
 | `gemma*` | google |
-| `gpt-oss*`, `gpt-6*`, `codex*` | openai |
+| `gpt-oss*`, `gpt-6*`, `codex*`, `*-codex*` | openai |
 | `nemotron*` | nvidia |
-| `MiniMax-M3`, `M3.1` | minimax |
+| `minimax*` (M3, M3.1, M3.1-Flash-Preview, M4, ...) | minimax |
 | `deepseek*` | deepseek |
 | `muse-spark*` | meta |
 | `mimo*` | xiaomi (never a reviewer) |
@@ -73,9 +76,15 @@ roster model has exactly one family.
 | `claude*` | anthropic |
 | anything else | its own family (`model:<id>`) — matches nothing |
 
-The **longest** matching pattern wins, so a specific id is never shadowed by a
-broader pattern. An unknown model is its own family and therefore never shares a
-family with anything: it fails closed rather than guessing.
+Names match **case-insensitively** (`minimax-m3.1-flash-preview` and
+`MiniMax-M3.1-Flash-Preview` are one model). The **longest** matching pattern
+wins, so a specific id is never shadowed by a broader pattern. A roster route id
+or fleet role id (`tydeus-qwen38`, `cerberus-reviewer`, `cerberus-narrator`)
+resolves to its route's model through `reviewer-roster.json` first; only then
+are the deployed llm-roles map and `provenance` aliases (`minimax_flash`) asked,
+so a known name never depends on which optional modules are importable. An
+unknown model is its own family and therefore never shares a family with
+anything: it fails closed rather than guessing.
 
 ## 2. The reviewer roster
 
@@ -86,8 +95,8 @@ cost class and flags. It was written from the real zoder route config and
 
 | Route | Model | Family | Location | Concurrency | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `tydeus-qwen38` | `qwen38` | alibaba | local | 4 | TYDEUS `192.0.2.73:8006`, vLLM |
-| `cerberus-gemma` | `gemma4-31b` | google | local | 2 | CERBERUS `192.0.2.96:8080` |
+| `tydeus-qwen38` | `qwen38` | alibaba | local | 4 | host `tydeus`, port 8006, vLLM |
+| `cerberus-gemma` | `gemma4-31b` | google | local | 2 | host `cerberus`, port 8080, llama-server |
 | `cerberus-gpt-oss` | `gpt-oss-20b` | openai | local | 8 | CERBERUS; serves roles `cerberus-reviewer` **and** `cerberus-narrator` |
 | `minimax-m3` | `MiniMax-M3` | minimax | provider | 2 | |
 | `minimax-m3-1-flash` | `MiniMax-M3.1-Flash-Preview` | minimax | provider | 2 | |
@@ -103,18 +112,25 @@ Rules encoded in the flags:
 * **StepFun and Meta are contributor tiers**, allowed only on operator-approved
   repos: `graeae-hive`, `fleet-ops`, `tokenomics`, `ncz-screensavers`, `zoder`.
   On any other repo they are not picked.
-* **EIH Nemotron is allowed but slow**, so it sorts last for bulk work.
+* **EIH Nemotron is allowed but slow** (`priority: -10`), so it sorts last for
+  bulk work — load reorders routes only within a priority tier, never above it.
+* **Local routes carry `host` + `port`, never an address.** The address comes
+  from the operator's fleet inventory (`HIVE_FLEET_INVENTORY`, see
+  `hive/core/fleet_inventory.py`); with no inventory entry the route's load is
+  unknown and it is not picked.
 
 ## 3. Pairing
 
 `hive.review_queue.pick_reviewers(author_model, roster, health, load)`:
 
-1. drops every route whose family equals the author's family (and every known
+1. returns `[]` (park) when there is no author at all — no family to exclude
+   means no cross-family guarantee;
+2. drops every route whose family equals the author's family (and every known
    co-author's family);
-2. drops unhealthy routes (`health(route) -> bool`);
-3. drops saturated routes (`load(route) >= concurrency`);
-4. applies the contributor-tier repo rule;
-5. sorts with a deterministic tie-break — cost class, then family load, then
+3. drops unhealthy routes (`health(route) -> bool`);
+4. drops saturated routes (`load(route) >= concurrency`);
+5. applies the contributor-tier repo rule;
+6. sorts with a deterministic tie-break — cost class, then family load, then
    route id — so a repeated call returns the same order.
 
 **An empty list is a verdict.** With no cross-family reviewer available the row
@@ -124,10 +140,16 @@ never failed, never sent to a same-family reviewer.
 The worker exposes the same pick as `review_queue_roster()` /
 `review_queue_reviewers(...)` so both sides share one implementation. A review
 is only an **approval** when it is a structured JSON verdict naming
-`reviewers[].model` **and** the head sha it reviewed. Prose-only, empty,
-truncated, 503 or non-JSON output is never an approval — it is a retryable
-failure kind (`review_busy`, `review_timeout`, `review_prose_only`,
-`review_empty`, `review_truncated`, `review_http_503`).
+`reviewers[].model` **and** the head sha it reviewed, and that head is the
+source row's delivered head (never the head the child itself claims). Only
+CROSS-family entries count: a reviewer in the author's (or a co-author's)
+family is ignored, and a verdict with no cross-family entry is
+`review_same_family`. A head that differs is `review_head_mismatch`; a verdict
+or row naming no head is `review_head_missing`. Any cross-family
+request-changes outweighs an approve. Prose-only, empty, truncated, 503 or
+non-JSON output is never an approval — it is a retryable failure kind
+(`review_busy`, `review_timeout`, `review_prose_only`, `review_empty`,
+`review_truncated`, `review_http_503`).
 
 ## 4. The sweep
 
@@ -138,22 +160,30 @@ The doctor's **existing** needs-review sweep (`report_needs_review_sweep` →
 | --- | --- |
 | awaiting, budget left, no reviewer available | **parked** — `no_cross_family_reviewer` |
 | awaiting, budget left, cross-family pick exists | submit ONE read-only review job naming the pick |
+| awaiting, cross-family routes exist but all at their cap | wait unchanged (`capacity`): no attempt spent, no park |
 | child returned a structured **approve** for the delivered head | record `approved`, hand to the merge path |
 | child returned **request-changes** | record it, back to the author path |
-| child failed / prose-only | `attempt + 1`, schedule with exponential backoff |
-| attempts exhausted | stay `needs-review` with `attempts_exhausted_owner_wait` |
+| child failed / prose-only / same-family / wrong head | clear the dead child, schedule with exponential backoff; the next submit is `attempt + 1` |
+| attempts exhausted | stay `needs-review` with `attempts_exhausted_owner_wait`, recorded ONCE (later sweeps neither PATCH nor broadcast) |
 
 The row always stays `needs-review`. Outcomes are counted per row, so one bad
 row cannot stop the sweep.
 
 ## 5. Load awareness
 
-`route_load_fn()` reads llama-server `/slots` (count of `is_processing` slots)
-for local llama-server routes and vLLM `/metrics` for vLLM routes — by the
-route's declared `server` kind, so each probe is one request. Reads are cached
-for **30 s** (cheap). Provider routes have no slot endpoint and return 0; their
-concurrency cap is enforced at dispatch. The sweep never sends more than a
-route's configured concurrency to that route.
+`route_load_fn()` reads llama-server `http://<address>:<port>/slots` (count of
+`is_processing` slots) for local llama-server routes and vLLM
+`http://<address>:<port>/metrics` for vLLM routes — both at the server ROOT,
+not under `/v1` — by the route's declared `server` kind, so each probe is one
+request. `<address>` is the fleet inventory's entry for the route's `host`.
+Reads are cached for **30 s** (cheap). Provider routes have no slot endpoint and
+return 0.
+
+The sweep never sends more than a route's configured concurrency to that route:
+across one pass it adds the reviews already in flight on that route plus the
+ones this pass submitted to the probed load. A queued review is not yet visible
+to the probe; a running one may be counted twice, which errs on the side of the
+cap.
 
 ## 6. Visibility
 
@@ -212,3 +242,8 @@ operator. If the behaviour must be reverted:
   filter, summary counts.
 * `test_worker_review_queue_20261031.py` — the worker seams: cross-family pick,
   failure classification, disposition, resume delay.
+* `test_review_queue_fixes_20261031.py` — the defects found in review: name
+  resolution (case, aliases, role ids, newer MiniMax), parking with no author,
+  cross-family and head-bound approvals, retry/exhaust progression, per-route
+  caps, EIH ordering, inventory-resolved root probe URLs, JSON-text results,
+  report classification and owner escalation.

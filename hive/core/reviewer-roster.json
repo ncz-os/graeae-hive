@@ -11,7 +11,9 @@
     "flags.priority orders bulk picks (higher first; the EIH Nemotron route is",
     "marked 'slow' -- measured 39 s for a one-word reply -- and sorts last).",
     "flags.contributor_tier lists the operator-approved repos for the StepFun",
-    "and Meta contributor tiers. MiMo is never a reviewer and is NOT listed."
+    "and Meta contributor tiers. MiMo is never a reviewer and is NOT listed.",
+    "Local routes carry host + port only: the address comes from the fleet",
+    "inventory (HIVE_FLEET_INVENTORY), never from this file."
   ],
   "routes": [
     {
@@ -21,7 +23,7 @@
       "family": "alibaba",
       "location": "local",
       "host": "tydeus",
-      "base_url": "http://tydeus:8006/v1",
+      "port": 8006,
       "server": "vllm",
       "concurrency": 4,
       "cost_class": "A",
@@ -37,7 +39,7 @@
       "family": "google",
       "location": "local",
       "host": "cerberus",
-      "base_url": "http://cerberus:8080/v1",
+      "port": 8080,
       "server": "llama-server",
       "concurrency": 2,
       "cost_class": "A",
@@ -57,7 +59,7 @@
       "family": "openai",
       "location": "local",
       "host": "cerberus",
-      "base_url": "http://cerberus:8080/v1",
+      "port": 8080,
       "server": "llama-server",
       "concurrency": 8,
       "cost_class": "A",

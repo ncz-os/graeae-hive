@@ -3148,7 +3148,7 @@ def _awaiting_review_state_key(job: dict) -> str:
         return "request_changes"
     if review_queue.is_parked(state):
         return "parked"
-    if not review_queue.attempts_remain(state):
+    if _review_queue_exhausted(state):
         return "exhausted"
     if review_queue.in_backoff(state):
         return "backoff"
@@ -4744,19 +4744,27 @@ def escalate_stuck_needs_review(jobs: list[dict], *, evidence_fn, now: float | N
             continue
         if str(job.get("kind") or "").startswith("triage:"):
             continue  # a triage report is meant to wait for a human; one message each would be noise
+        exhausted = False
         if is_awaiting_review(job) and not review_queue.is_resolved(awaiting_review_entry(job)):
             # Operator rule 2026-10-31: an awaiting-review row is QUEUED work for
             # the review queue (it retries with backoff), not a row a human must
-            # chase, so it is never escalated as stuck.
-            continue
+            # chase -- until its attempts are spent. Then only the owner can act,
+            # and the row is escalated to them once like any other stuck row.
+            if review_queue_stuck_owned(job, now=now):
+                continue
+            exhausted = True
         touched = _row_touched_at(job)
         if touched is None or now - touched <= NEEDS_REVIEW_ESCALATE_SECONDS:
             continue
-        blocker = review_followup_blocker(job)
+        if exhausted:
+            entry = awaiting_review_entry(job) or {}
+            blocker = (
+                f"cross-family review attempts exhausted ({int(entry.get('attempt') or 0)} tried, "
+                f"last failure {entry.get('last_failure') or 'unknown'}): waiting for the owner"
+            )
+        else:
+            blocker = review_followup_blocker(job)
         if blocker is None:
-            continue
-        if review_queue_stuck_owned(job, now=now):
-            # The review queue still has an attempt to make: never stale.
             continue
         state = "|".join([str(row["classification"]), str(row["evidence_summary"]), blocker])
         key = f"{KEY_REVIEW}:stuck:{jid}:{hashlib.sha1(state.encode()).hexdigest()[:12]}"
@@ -5066,7 +5074,9 @@ def _excluded_families(author: str, *others: Any) -> set:
     return families
 
 
-def interpret_review_outcome(raw: Any, *, head_sha: str | None = None) -> dict:
+def interpret_review_outcome(
+    raw: Any, *, head_sha: str | None = None, author_families: set | frozenset | None = None
+) -> dict:
     """Read a review job's output as a structured verdict -- or refuse it.
 
     Only a structured JSON verdict naming ``reviewers[].model`` counts
@@ -5074,8 +5084,13 @@ def interpret_review_outcome(raw: Any, *, head_sha: str | None = None) -> dict:
     503-style error object or JSON without a reviewer list is NOT an approval:
     every one raises ValueError with the failure kind the sweep records on the
     row (``review_prose_only``, ``review_empty``, ``review_truncated``,
-    ``review_http_503``, ``review_non_json``). An approve for a head other than
-    the delivered one is ``review_head_mismatch``.
+    ``review_http_503``, ``review_non_json``).
+
+    Only CROSS-family reviewers count: an entry whose model is in one of
+    ``author_families`` is the author grading itself and is ignored; a verdict
+    with no cross-family entry left is ``review_same_family``. An approve must
+    name the delivered head: a different head is ``review_head_mismatch``, a
+    verdict (or a row) that names no head is ``review_head_missing``.
     """
     payload = raw
     if isinstance(payload, str):
@@ -5083,7 +5098,9 @@ def interpret_review_outcome(raw: Any, *, head_sha: str | None = None) -> dict:
         if not text:
             raise ValueError("review_empty")
         if text[:1] not in "{[":
-            raise ValueError("review_truncated" if text[-1:] not in "}]" else "review_prose_only")
+            # Text that never started a JSON document is prose, whatever its
+            # last character; only a cut-off JSON document is "truncated".
+            raise ValueError("review_prose_only")
         try:
             payload = json.loads(text)
         except ValueError:
@@ -5107,14 +5124,21 @@ def interpret_review_outcome(raw: Any, *, head_sha: str | None = None) -> dict:
             raise ValueError("review_no_reviewers")
         reviewers.append(model)
         verdicts.append(verdict)
-    unreviewed = all(not review_queue.family_of(m) for m in reviewers)
-    reviewing = [v for m, v in zip(reviewers, verdicts, strict=True) if review_queue.family_of(m)]
+    blocked = {f for f in (author_families or ()) if f}
+    cross = [(m, v) for m, v in zip(reviewers, verdicts, strict=True) if review_queue.family_of(m) not in blocked]
+    if not cross:
+        raise ValueError("review_same_family")
+    unreviewed = False
+    reviewers = [m for m, _ in cross]
+    verdicts = [v for _, v in cross]
+    reviewing = verdicts
     reviewed_head = str(payload.get("head_sha") or "").strip()
-    if "approve" in reviewing:
-        if not head_sha or review_verdict.same_sha(reviewed_head, head_sha):
-            kind = "approve"
-        else:
+    if "approve" in reviewing and "request_changes" not in reviewing:
+        if not head_sha or not reviewed_head:
+            raise ValueError("review_head_missing")
+        if not review_verdict.same_sha(reviewed_head, head_sha):
             raise ValueError("review_head_mismatch")
+        kind = "approve"
     # ``normalize_verdict`` returns ``request_changes`` (``-`` read as ``_``),
     # so the comparison is against the normalized spelling, not the prose one.
     elif (
@@ -5159,8 +5183,14 @@ def _review_queue_rows(rows: list[dict]) -> list[dict]:
     return [row for row in rows if review_queue.review_state(row) is not None]
 
 
-def _review_child_outcome(child: dict) -> dict | None:
-    """Read one child review job's output; None while it has not finished."""
+def _review_child_outcome(child: dict, *, head_sha: str = "", author_families: set | None = None) -> dict | None:
+    """Read one child review job's output; None while it has not finished.
+
+    ``head_sha`` is the SOURCE row's delivered head and ``author_families`` the
+    families that may not review it. Neither is read from the child: the
+    child's own ``head_sha`` is whatever the reviewer claims it reviewed, so
+    checking a verdict against it would accept a review of any commit.
+    """
     status = str(child.get("status") or "")
     if status not in _REVIEW_CHILD_TERMINAL:
         return None
@@ -5185,15 +5215,10 @@ def _review_child_outcome(child: dict) -> dict | None:
     failure = None
     for candidate in sources:
         try:
-            return interpret_review_outcome(candidate, head_sha=_review_head_by_state(child))
+            return interpret_review_outcome(candidate, head_sha=head_sha, author_families=author_families)
         except ValueError as exc:
             failure = str(exc)
     return {"kind": "reviewer_failure", "failure": failure or "review_no_reviewers", "reviewers": []}
-
-
-def _review_head_by_state(source: dict) -> str:
-    result = _row_result_dict(source)
-    return str(result.get("head_sha") or source.get("head_sha") or "")
 
 
 def _tried_entry(entry: dict, failure: str, now: float) -> dict:
@@ -5374,7 +5399,13 @@ def process_awaiting_review_row(
             return "awaited", state, None
         child = next((c for c in children if str(c.get("id")) == in_flight), None)
         if child is not None:
-            outcome = _review_child_outcome(child)
+            outcome = _review_child_outcome(
+                child,
+                head_sha=head,
+                author_families=_excluded_families(
+                    state.get("author") or _author_model(job, result), *(state.get("co_authors") or [])
+                ),
+            )
             if outcome is None:
                 return "awaited", state, None
             if outcome["kind"] == "approve":
@@ -5468,7 +5499,13 @@ def process_awaiting_review_row(
     roster = list(roster if roster is not None else review_queue.load_roster())
     health = health or _review_route_health()
     load = load or review_queue_load_reader()
-    picked = _pick_routes(author, job, roster, health, load, [str(m) for m in co_authors if str(m or "").strip()])
+    co_authors = [str(m) for m in co_authors if str(m or "").strip()]
+    picked = _pick_routes(author, job, roster, health, load, co_authors)
+    if not picked and _pick_routes(author, job, roster, health, lambda _route: 0, co_authors):
+        # A cross-family reviewer EXISTS but every one is at its concurrency
+        # cap (in-flight reviews included). That is not a park and costs no
+        # attempt: the row waits unchanged for the next sweep.
+        return "capacity", state, None
     if not picked:
         # Same count, more attempts spent: a parked row still ages toward the
         # owner instead of sitting at attempt 0 forever.
@@ -5537,16 +5574,28 @@ def process_awaiting_review_row(
 
 
 def _sort_routes_by_family_load(routes: list[dict], load) -> list[dict]:
-    """Keep the roster's deterministic order; it already sorts slow routes last."""
+    """Least-loaded first WITHIN a priority tier; a lower tier is always later.
+
+    The roster's ``flags.priority`` (EIH Nemotron is -10: 39 s for a one-word
+    reply) and location class come first, so load can reorder routes of the
+    same tier but never lift a slow route above a usable faster one. Ties keep
+    ``pick_reviewers``' deterministic order.
+    """
 
     def family_load(route):
         try:
             value = load(route)
         except Exception:  # noqa: BLE001
             return 1e9
-        return value if isinstance(value, (int, float)) else 1e9
+        return value if review_queue.finite_load(value) else 1e9
 
-    return sorted(routes, key=lambda r: family_load(r))
+    def key(item):
+        index, route = item
+        priority = int((route.get("flags") or {}).get("priority") or 0)
+        location = {"local": 0, "provider": 1, "eih": 2}.get(str(route.get("location")), 3)
+        return (-priority, location == "eih", family_load(route), index)
+
+    return [route for _, route in sorted(enumerate(routes), key=key)]
 
 
 def _schedule_retry(
@@ -5554,12 +5603,14 @@ def _schedule_retry(
 ) -> tuple[str, dict, None]:
     attempt = int(state.get("attempt") or 0)
     if attempt >= int(state.get("max_attempts") or review_queue.MAX_REVIEW_ATTEMPTS):
-        return _park_exhausted(job, {**state, "tried": tried, "last_failure": failure}, now)
+        return _park_exhausted(job, {**state, "tried": tried, "last_failure": failure, "review_job_id": None}, now)
     new_state = {
         **_resume_state(state),
         "tried": tried,
         "last_failure": failure,
-        "review_job_id": None if review_job_id else state.get("review_job_id"),
+        # The failed child answered (badly) or was never created: it is not in
+        # flight any more, so the next sweep after the backoff submits a NEW one.
+        "review_job_id": None,
         "claimed_failure": failure,
         "next_attempt_at": now + review_queue.backoff_seconds(attempt),
         "updated_at": now,
@@ -5579,7 +5630,15 @@ def _schedule_retry(
 
 
 def _park_exhausted(job: dict, state: dict, now: float) -> tuple[str, dict, None]:
-    """Attempts spent: stay needs-review, with the owner-wait reason visible."""
+    """Attempts spent: stay needs-review, with the owner-wait reason visible.
+
+    Recorded once. A row already parked for its owner is left exactly as it
+    is: rewriting it on every sweep would be a PATCH (and a broadcast) per row
+    per pass for rows nobody can act on but the owner -- whom the needs-review
+    escalation names.
+    """
+    if state.get("parked_reason") == "attempts_exhausted_owner_wait" and not state.get("review_job_id"):
+        return "exhausted", state, None
     new_state = {
         **_resume_state(state),
         "parked_reason": "attempts_exhausted_owner_wait",
@@ -5618,6 +5677,7 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
         "submitted": 0,
         "awaited": 0,
         "deferred": 0,
+        "capacity": 0,
         "parked": 0,
         "exhausted": 0,
         "approved": 0,
@@ -5625,9 +5685,29 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
         "review_failed": 0,
         "resolved": 0,
     }
+    # Per-route concurrency cap across the whole pass: reviews already in
+    # flight on the bus plus the ones this pass submits count against each
+    # route's ``concurrency`` on top of the probed server load (a queued review
+    # is not yet visible to the probe). Counting a running review twice errs
+    # on the side of the cap; exceeding it is what overloaded CERBERUS.
+    in_flight: dict[str, int] = {}
     for job in rows:
+        state = review_queue.review_state(job) or {}
+        if state.get("review_job_id") and state.get("review_route") and not review_queue.is_resolved(state):
+            in_flight[str(state["review_route"])] = in_flight.get(str(state["review_route"]), 0) + 1
+    base_load = kwargs.pop("load", None) or review_queue_load_reader()
+
+    def load(route: dict):
+        value = base_load(route)
+        if not review_queue.finite_load(value):
+            return value
+        return value + in_flight.get(str(route.get("id")), 0)
+
+    for job in rows:
+        before = review_queue.review_state(job) or {}
+        held = str(before.get("review_route") or "") if before.get("review_job_id") else ""
         try:
-            outcome, _, _ = process_awaiting_review_row(job, now=now, **kwargs)
+            outcome, new_state, _ = process_awaiting_review_row(job, now=now, load=load, **kwargs)
         except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
             summary["errors"] = summary.get("errors", 0) + 1
             log.error("review queue failed job=%s: %s", str(job.get("id"))[:12], exc)
@@ -5635,8 +5715,20 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
                 "doctor.sweep_error", {"sweep": "review-queue", "job_id": job.get("id"), "error": str(exc)}
             )
             continue
+        if held and outcome != "awaited" and in_flight.get(held):
+            in_flight[held] -= 1  # the child finished: its slot is free
+        if outcome == "submitted" and new_state and new_state.get("review_route"):
+            route_id = str(new_state["review_route"])
+            in_flight[route_id] = in_flight.get(route_id, 0) + 1
         summary[outcome] = summary.get(outcome, 0) + 1
     return summary
+
+
+def _review_queue_exhausted(state: dict | None) -> bool:
+    """Attempts spent and nothing in flight: only the owner can move the row."""
+    if not state or review_queue.is_resolved(state) or state.get("review_job_id"):
+        return False
+    return state.get("parked_reason") == "attempts_exhausted_owner_wait" or not review_queue.attempts_remain(state)
 
 
 def review_queue_triage_row(job: dict, now: float | None = None) -> dict | None:
@@ -5652,28 +5744,41 @@ def review_queue_triage_row(job: dict, now: float | None = None) -> dict | None:
         action = f"changes requested by {', '.join(state['request_changes'].get('reviewers') or [])}; back to the author path"
     elif review_queue.is_parked(state):
         action = f"awaiting cross-family review: parked, no cross-family reviewer is available ({reason})"
-    elif state.get("parked_reason") == "attempts_exhausted_owner_wait" or not review_queue.attempts_remain(state):
-        # No attempt budget left (whether or not a sweep already recorded it).
-        action = f"awaiting cross-family review: attempts spent, waiting for an owner ({reason})"
-    elif review_queue.in_backoff(state, now=now):
-        action = f"awaiting cross-family review: next attempt scheduled ({reason})"
     elif state.get("review_job_id"):
         action = f"awaiting cross-family review: review job {state['review_job_id'][:12]} in flight"
+    elif _review_queue_exhausted(state):
+        # No attempt budget left (whether or not a sweep already recorded it).
+        action = f"review attempts exhausted: the owner must review or re-queue this row ({reason})"
+    elif review_queue.in_backoff(state, now=now):
+        action = f"awaiting cross-family review: next attempt scheduled ({reason})"
     else:
         action = f"awaiting cross-family review ({reason})"
-    return {
+    exhausted = _review_queue_exhausted(state)
+    view = {
         "review_state": review_queue.AWAITING_REVIEW,
         "review_reason": reason,
         "next_attempt_at": state.get("next_attempt_at"),
         "review_attempt": int(state.get("attempt") or 0),
         "review_parked": review_queue.is_parked(state),
-        "review_exhausted": state.get("parked_reason") == "attempts_exhausted_owner_wait",
+        "review_exhausted": exhausted,
         "review_in_backoff": review_queue.in_backoff(state, now=now),
         "suggested_action": action,
         # Attempts remain (backoff not elapsed, a review in flight, or a parked
         # pick to retry): NOT stale, never escalated while the queue owns it.
-        "stale": False,
+        # Spent attempts with nothing in flight: stale, and the owner's move.
+        "stale": exhausted,
     }
+    if not review_queue.is_resolved(state):
+        view["classification"] = "stale" if exhausted else review_queue.AWAITING_REVIEW
+        attempts = (
+            f"attempt {view['review_attempt']}/{int(state.get('max_attempts') or review_queue.MAX_REVIEW_ATTEMPTS)}"
+        )
+        view["orchestrator_note"] = (
+            f"report-only needs-review sweep: review attempts exhausted ({attempts}), waiting for the owner"
+            if exhausted
+            else f"report-only needs-review sweep: awaiting cross-family review ({attempts})"
+        )
+    return view
 
 
 def review_queue_stuck_owned(job: dict, now: float | None = None) -> bool:
@@ -5685,7 +5790,7 @@ def review_queue_stuck_owned(job: dict, now: float | None = None) -> bool:
     state = review_queue.review_state(job)
     if state is None or review_queue.is_resolved(state):
         return False
-    return review_queue.attempts_remain(state)
+    return not _review_queue_exhausted(state)
 
 
 def _gate_review_queue_stuck(row: dict, job: dict, now: float | None) -> None:
@@ -5693,6 +5798,8 @@ def _gate_review_queue_stuck(row: dict, job: dict, now: float | None) -> None:
     view = review_queue_triage_row(job, now=now)
     if view is None:
         return
+    if "orchestrator_note" in view and row.get("evidence_summary"):
+        view["orchestrator_note"] += f"; evidence={row['evidence_summary']}"
     row.update({k: v for k, v in view.items() if k != "suggested_action"})
     row["suggested_action"] = view["suggested_action"]
 
