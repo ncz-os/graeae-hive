@@ -3131,10 +3131,6 @@ def awaiting_review_entry(job: dict) -> dict | None:
     'awaiting_review'`` marks where a row is inside it. This helper is how the
     sweep tells "waiting for a reviewer" from "waiting for a human".
     """
-    # review_state reads the row's own ``result`` block, so it gets the JOB, not
-    # a ``{"result": ...}`` wrapper: the wrapper is a dict with no "result" key
-    # of its own and every awaiting-review row would silently drop out of the
-    # queue (and be escalated as stale by the sweep).
     return review_queue.review_state({"result": _job_result_dict(job)})
 
 
@@ -3145,13 +3141,7 @@ def is_awaiting_review(job: dict) -> bool:
 
 def _awaiting_review_state_key(job: dict) -> str:
     """Which of the dashboard buckets an awaiting_review row belongs in."""
-    state = awaiting_review_entry(job)
-    if not state:
-        # No usable review state: the row cannot prove it is queued, parked or
-        # exhausted, so say so instead of reporting it as healthy "queued" work
-        # (that classification would hide a broken/unwritten state from the
-        # dashboard and the stuck-row sweep).
-        return "exhausted" if is_awaiting_review(job) else "unreviewed"
+    state = awaiting_review_entry(job) or {}
     if state.get("approved"):
         return "approved"
     if state.get("request_changes"):
