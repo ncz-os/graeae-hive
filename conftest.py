@@ -69,10 +69,16 @@ def _doctor_starts_with_no_safety_history(monkeypatch, tmp_path):
     # in scratch too, so a reloaded module cannot write a configured live file.
     monkeypatch.setenv("DOCTOR_STATE_BACKEND", "file")
     monkeypatch.setenv("DOCTOR_STATE_PATH", str(tmp_path / "runtime-state.json"))
+    # The per-call model ledger is process-wide too. A test that recorded into
+    # the operator's real ledger would (a) leave evidence behind and (b) trip
+    # the >30-calls/hour restoration alert inside an unrelated test.
+    monkeypatch.setenv("DOCTOR_MODEL_CALL_LEDGER", str(tmp_path / "model-calls.jsonl"))
     from hive.workers import doctor
     from hive.workers.doctor_state import DurableStateStore, MemoryBackend
 
     monkeypatch.setattr(doctor, "STATE", DurableStateStore(MemoryBackend(), refresh_secs=0.0))
+    # The ledger object is cached on the module; drop it so the path above wins.
+    monkeypatch.setattr(doctor, "_MODEL_CALL_LEDGER", None)
     # The gate reads the same store, and the approval it holds is what a test's
     # refusal depends on, so the two are swapped together.
     monkeypatch.setattr(doctor, "APPROVALS", doctor.doctor_gates.ApprovalGate(doctor.STATE, gate_enabled=True))

@@ -22,6 +22,15 @@ NOW = time.time()
 class SchedulerReaperTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await hive_repo().init()
+        # This module's tests share one sqlite file for the whole import, so a
+        # schedule an earlier test left behind is still due for the next one
+        # (``test_firing_the_template_creates_a_job`` asserts exactly one due
+        # row and only held because unittest runs it before the test that adds
+        # one). Start each test from an empty schedule table so the result does
+        # not depend on execution order.
+        async with hive_repo().connection() as tx:
+            await tx.execute("DELETE FROM scheduled_jobs")
+            await tx.commit()
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=agent_bus.app), base_url="http://t"
         )

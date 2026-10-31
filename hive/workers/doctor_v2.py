@@ -190,6 +190,7 @@ def decide_rules(evidence: Evidence, rules: list[dict[str, Any]], *, retry_cap: 
 
 
 def evidence_lines(evidence: Evidence) -> str:
+    """First evidence line, the stable verbatim quote for decisions."""
     return evidence.evidence_lines[0] if evidence.evidence_lines else ""
 
 
@@ -228,6 +229,7 @@ def bs_audit_signal(job: dict[str, Any]) -> str:
 
 
 def shadow_compare(old: dict[str, Any], new: Decision | None) -> dict[str, Any]:
+    """Side-by-side old vs new action with an agreement flag."""
     old_action = old.get("action") or old.get("action_type") or "unknown"
     new_action = new.action if new else "llm"
     return {"old_action": old_action, "new_action": new_action, "agree": old_action == new_action}
@@ -246,6 +248,7 @@ def shadow_report(records: Iterable[dict[str, Any]]) -> dict[str, int]:
 
 
 def residual_decision(evidence: Evidence, call: Callable[[str], dict[str, Any]], *, rule_cap: int = 2) -> Decision:
+    """Ask the residual LLM for the cases no deterministic rule covers."""
     started = time.monotonic()
     payload = {
         "failure_reason": evidence.failure_reason, "error": evidence.error,

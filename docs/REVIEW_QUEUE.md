@@ -283,6 +283,91 @@ operator. If the behaviour must be reverted:
    rows (or set them to `done`/`failed`) to return them to ordinary needs-review
    handling.
 
+## The queue reviews the rows the older worker line left (2026-10-31)
+
+Production showed the gap the operator named: every doctor sweep logged
+`review_queue scanned=0 submitted=0` while thirteen needs-review rows sat
+unapproved. The queue above only scanned rows that already carried
+`result.review_state`, and only the NEW worker code writes that block — workers
+still run the older `deploy/hive-canonical` line. The needs-review sweep was
+report-only, so nothing ever reviewed those rows.
+
+`submit_adopted_reviews` (`hive/workers/doctor.py`) closes it each sweep:
+
+1. **Adopt.** A `needs-review` row with a pushed `head_branch` whose `result`
+   carries no structured approve for the CURRENT head becomes an
+   `awaiting_review` row. That covers `reviewer_unavailable`, request-changes at
+   an OLDER head, a review that did not approve, no reviewer at all, and
+   prose-only/empty evidence. `review_state` is built FROM the row — author and
+   family from `claimed_model`/`result`, `tried[]` from the reviewers and rounds
+   the result recorded, `attempt` 0 — with `adopted_from`/`adopted_head`
+   recording the provenance. **The row's status is not changed**: it stays
+   `needs-review`, because the queue IS triage.
+2. **Review.** Up to `HIVE_DOCTOR_REVIEW_SUBMIT_MAX` (default 3) review jobs per
+   sweep go through the existing roster pairing: a cross-family reviewer from
+   `hive/core/reviewer-roster.json`, never the author's family, skipping routes
+   at their concurrency cap or failing the health check. Retry backoff and
+   `max_attempts` come from the existing `review_state`.
+3. **Record.** Only a structured verdict counts (see
+   `interpret_review_outcome`). Prose, empty, truncated and 503 output is never
+   an approval, and an approve counts only for the exact head sha it reviewed.
+   The structured verdict, with `reviewers[].model` named, is recorded on the
+   row (`review_state.approved`) for the operator-merge pass.
+4. **Never merge or cancel.** The doctor records the verdict; it does not merge,
+   cancel or change status.
+
+The adoption phase and the review phase are ONE pass over one listing, so
+`HIVE_DOCTOR_REVIEW_SUBMIT_MAX` is a cap on the SWEEP, not on each phase: the
+review phase's budget is the cap minus what adoption already submitted, and it
+never drops below zero. A dry run previews up to the same cap (and no further)
+through that one shared floor, so the log lists exactly the reviews a real
+sweep would submit.
+
+### A partial block is repaired, never skipped
+
+A row can carry a `result.review_state` block that the sweep cannot advance:
+one missing `author`, `attempt` or `max_attempts`, or carrying the wrong shape
+(`attempt: "zero"`, `tried: "qwen"`) — a partial write, a hand edit, or a bus
+dialect that stringified the JSON. Such a block is NOT "the queue already owns
+this row": `usable_review_state` refuses it and the adoption pass REPAIRS it
+from the row (review 2026-10-31, high). The repair keeps whatever the block
+still holds that is trustworthy — the author it named, the attempts spent, a
+pending `next_attempt_at`, a `parked_reason` and a live `review_job_id` — so a
+repair neither re-forges a known author nor lets a row spend its retry budget
+twice, and records the defect in `repaired_from` / `adopted_from`. A block with
+a live review is still never a second review, and a COMPLETE block is never
+re-adopted.
+
+### No duplicate review jobs
+
+A row is never submitted twice. Before any route picking,
+`process_awaiting_review_row` reads the row's live review: `review_job_id` from
+`review_state`, and for an adopted row the earlier worker's own
+`result.auto_review_job_id` or any non-terminal `review:` child. A live child
+means the row is `awaited`, not submitted. `adopt_legacy_review_row` also
+refuses to adopt a row with a review child still running.
+
+### Lane B is never the doctor's
+
+Rows in project `riskyeats`, on the `test/` `refactor/` `fix/` `docs/` `perf/`
+`ops/` `feat/` branch families, or whose job id is in a lane-B owner-wait chain
+(`01a18ab8-0a4f…`, `01a18a8d-9ffa…`) are not adopted, not submitted for and not
+touched: their verdict is the owner's (`lane_b_row`).
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS` | `1` (ON) | Adopt and review legacy needs-review rows |
+| `HIVE_DOCTOR_REVIEW_SUBMIT_MAX` | `3` | Review jobs one sweep may submit (never below 0) |
+| `HIVE_DOCTOR_ADOPT_DRY_RUN` | `0` | Log what it would submit; submit and write nothing |
+
+Every one of these is parsed defensively at import (`doctor._env_int`): an unset
+or unparsable value uses the default with a logged warning instead of taking the
+doctor down at import, and a value below the floor is clamped (a negative cap
+means "submit nothing", exit 0, never a crash loop). `HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS`
+and `HIVE_DOCTOR_ADOPT_DRY_RUN` are read at import from the process env only.
+
 ## Tests
 
 * `test_review_queue_20261031.py` — family table, roster, pairing matrix, the
@@ -297,6 +382,14 @@ operator. If the behaviour must be reverted:
   with a fake usage source and cooldown marker, the concurrency cap, bulk-vs-
   hard-lane ordering, the kind `codex` job spec, no-token-access, and the
   structured verdict contract (prose-only is never an approval).
+* `test_doctor_adopt_legacy_reviews_20261031.py` — adoption of each legacy
+  shape, no adoption while a review is in flight or an approve covers the head,
+  cross-family pairing (an alibaba author never gets a qwen reviewer), the
+  per-sweep cap, lane-B exclusion, fake-clock backoff, and idempotency across
+  sweeps (including a row already holding `review_job_id`).
+* `test_doctor_review_queue_hardening_20261031.py` — the two findings of the
+  structured review: a partial or malformed `review_state` block is repaired
+  (adopted, not skipped) and every import-time env int is parsed defensively.
 * `test_review_queue_fixes_20261031.py` — the defects found in review: name
   resolution (case, aliases, role ids, newer MiniMax), parking with no author,
   cross-family and head-bound approvals, retry/exhaust progression, per-route
