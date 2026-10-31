@@ -32,6 +32,7 @@ from hive.review_queue import (
     FAMILY_TABLE_PATH,
     ROSTER_PATH,
     awaiting_review_reason,
+    backoff_seconds,
     family_of,
     load_roster,
     load_family_table,
@@ -179,6 +180,21 @@ def test_no_same_family_pair_is_ever_returned(author):
     assert all(r["family"] != author_family for r in picked)
 
 
+def test_every_author_family_against_the_whole_roster_is_cross_family_only():
+    """The full matrix: for EVERY family the roster knows, and every model in it,
+    no returned reviewer shares the author's family (or a co-author's)."""
+    roster = load_roster()
+    families = sorted({entry["family"] for entry in roster})
+    assert len(families) >= 7
+    for family in families:
+        for author in [e["model_id"] for e in roster if e["family"] == family]:
+            picked = pick_reviewers(author, roster, health=_healthy, load=lambda route: 0, repo="graeae-hive")
+            assert picked, author
+            assert {r["family"] for r in picked}.isdisjoint({family}), author
+            # And nothing outside the roster can sneak in.
+            assert {r["id"] for r in picked} <= {e["id"] for e in roster}
+
+
 def test_co_author_families_are_excluded_too():
     picked = pick_reviewers(
         "qwen38", co_authors=["gemma4-31b"], health=_healthy, load=lambda route: 0, repo="graeae-hive"
@@ -321,10 +337,10 @@ def test_sweep_consumes_review_child_verdicts(bus):
     from hive.workers import doctor
 
     rows, calls, messages, monkeypatch = bus
-    rows["source"]["result"]["review_state"] = state(
-        "qwen38", [{"model_id": "gemma4-31b", "failure": "review_busy"}], attempt=1, now=0
-    )
-    rows["source"]["result"]["auto_review_job_id"] = "review-child"
+    rows["source"]["result"]["review_state"] = {
+        **state("qwen38", [{"model_id": "gemma4-31b", "failure": "review_busy"}], attempt=1, now=0),
+        "review_job_id": "review-child",
+    }
     children = {
         "review-child": {
             "id": "review-child",
@@ -360,7 +376,10 @@ def test_request_changes_goes_back_to_the_author(bus):
     from hive.workers import doctor
 
     rows, calls, messages, monkeypatch = bus
-    rows["source"]["result"]["review_state"] = state("qwen38", [{"model_id": "gemma4-31b", "failure": "review_busy"}], attempt=1, now=0)
+    rows["source"]["result"]["review_state"] = {
+        **state("qwen38", [{"model_id": "gemma4-31b", "failure": "review_busy"}], attempt=1, now=0),
+        "review_job_id": "review-child",
+    }
     child = {
         "id": "review-child",
         "kind": "review:fix-20261031",
