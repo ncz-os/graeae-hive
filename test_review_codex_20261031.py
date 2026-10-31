@@ -957,3 +957,36 @@ def test_a_repo_path_is_judged_by_the_lane():
     assert review_lane(repo="some-org/redaction-tools", paths=["hive/queue_logic.py"]) == "hard"
     # No repo, no paths, no kind: nothing sensitive about it.
     assert review_lane() == "bulk"
+
+
+def test_no_approved_repo_escalates_to_the_hard_lane_by_its_name():
+    """The repo is now part of the lane text, so no approved repo may trip it."""
+    from hive.review_queue import APPROVED_REPOS, review_lane
+
+    for repo in APPROVED_REPOS:
+        assert review_lane(repo=repo, paths=["hive/queue_logic.py"]) == "bulk", repo
+
+
+def test_a_marker_with_no_readable_expiry_never_reaches_the_writer(tmp_path):
+    """PINNING test: ``current`` always carries a numeric ``expires_at``.
+
+    ``write_codex_cooldown`` merges with ``float(current["expires_at"])``
+    without its own guard. That is safe because ``read_codex_cooldown`` already
+    returns None for a marker whose ``expires_at`` is missing or non-numeric
+    (or that has expired), so an unusable marker can never be merged in and
+    the merge cannot raise.
+    """
+    from hive.review_queue import codex_cooldown_path, read_codex_cooldown, write_codex_cooldown
+
+    for body in (
+        {"provider": "codex", "created_at": 900.0},
+        {"provider": "codex", "created_at": 900.0, "expires_at": None},
+        {"provider": "codex", "created_at": 900.0, "expires_at": "garbage"},
+        {"provider": "codex", "created_at": 900.0, "expires_at": 1000.0},  # already expired
+    ):
+        path = codex_cooldown_path(str(tmp_path))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        assert read_codex_cooldown(now=1500.0, state_dir=str(tmp_path)) is None, body
+        marker = write_codex_cooldown(now=1500.0, ttl_secs=60.0, state_dir=str(tmp_path))
+        assert marker["expires_at"] == 1560.0, body

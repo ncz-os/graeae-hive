@@ -739,6 +739,8 @@ def review_lane(*, repo: str | None = None, paths: list[str] | None = None, kind
     The REPO is part of what is being reviewed, not just a label: a change in
     a repo that itself names a security-sensitive area (``auth-service``,
     ``redaction-tools``) is hard-lane work even when the paths look ordinary.
+    The repo name is matched against the SAME patterns as a path, so no
+    approved repo (``APPROVED_REPOS``) escalates by accident.
     """
     parts = [str(kind or ""), str(repo or ""), *(str(p) for p in paths or [])]
     text = " ".join(part for part in parts if part.strip())
