@@ -237,6 +237,18 @@ def test_shrunk_phantom_approvals_stay_non_approval():
     assert rv.row_verdict({"review_evidence": {"verdict": "blocked"}}) == "blocked"
 
 
+def test_child_worker_approve_needs_a_named_model():
+    """Regression: a model-less worker approve is not a usable verdict."""
+    assert rv.child_verdict({"reviewer": {"verdict": "approve"}}) is None
+    assert rv.child_verdict({"reviewer": {"verdict": "APPROVE", "model": "auto"}}) is None
+    assert rv.child_verdict({"reviewer": {"verdict": "approve", "model": ""}}) is None
+    # Named-model approves and non-approve verdicts are untouched.
+    worker = rv.child_verdict({"reviewer": {"verdict": "approve", "model": "nemotron-3"}, "head_sha": "abc1234"})
+    assert worker == {"verdict": "approve", "head": "abc1234"}
+    assert rv.child_verdict({"reviewer": {"verdict": "request-changes"}}) is not None
+    assert rv.child_verdict({"verdict": {"verdict": "approve"}}) == {"verdict": "approve"}
+
+
 def test_503_and_error_shapes_are_never_approval():
     for result in (
         {"error": "request failed: 503 Service Unavailable"},

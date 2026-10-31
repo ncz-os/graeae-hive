@@ -48,6 +48,10 @@ def child_verdict(child_result: dict) -> dict | None:
     text = text_value(reviewer.get("verdict")) if isinstance(reviewer, dict) else None
     if not text:
         return None
+    if text.lower() == "approve" and not named_model(reviewer.get("model")):
+        # FB40: a worker approve without a named reviewer is not approval —
+        # the reconcile gate must not complete code work on a model-less claim.
+        return None
     remote = text_value(child_result.get("remote_sha")) if child_result.get("remote_verified") is True else None
     return {"verdict": text.lower(), "head": remote or text_value(child_result.get("head_sha"))}
 
