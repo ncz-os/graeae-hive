@@ -458,6 +458,39 @@ def test_module_is_stdlib_only_and_defines_what_it_uses():
         assert hasattr(doctor_rules, name)
 
 
+def test_the_doctor_module_defines_every_name_its_new_code_uses():
+    """A chunked reviewer keeps flagging names it cannot see.
+
+    These are the definitions the new call sites rely on; asserting they exist
+    (and are module-level) is cheaper than re-litigating each false positive,
+    and it FAILS loudly if one is ever actually removed."""
+    from hive.workers import doctor
+
+    for name in (
+        "doctor_rules",
+        "urllib",
+        "STATE",
+        "_MODEL_CALL_LEDGER",
+        "_chain",
+        "chain_from_env",
+        "build_residue_prompt",
+        "invoke_doctor_agent",
+        "_invoke_openweight",
+        "_ledger_urlopen",
+        "_note_doctor_model_call",
+        "_record_model_call",
+        "doctor_model_call_counter",
+        "_PHASE_BASE_URLS",
+        "DOCTOR_FALLBACK_BASE_URLS",
+        "DOCTOR_FALLBACK_MODELS",
+    ):
+        assert hasattr(doctor, name), f"doctor is missing {name}"
+    # The opener defaults to the stdlib one, and the phase base map is a dict
+    # the legacy chain reads by phase key (tests monkeypatch entries into it).
+    assert doctor.chain_from_env is doctor.doctor_models.chain_from_env
+    assert isinstance(doctor._PHASE_BASE_URLS, dict)
+
+
 def test_the_classified_result_shape_matches_the_legacy_action():
     cls = doctor_rules.classify_row(_row(result={"failure_reason": "the host was rebooted"}))
     action = doctor_rules.as_action(cls)
