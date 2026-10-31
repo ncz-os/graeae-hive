@@ -398,6 +398,35 @@ def test_cap_is_configurable(bus, monkeypatch):
 # ── the switch and the dry run ───────────────────────────────────────────────
 
 
+def test_switch_off_returns_one_report_shape(bus, monkeypatch):
+    """A disabled pass reports the SAME fields, all zero, with ``disabled``.
+
+    ``run_review_queue_sweep`` reads ``adopted``/``submitted``/``would_submit``/
+    ``_handled_rows`` off this summary unconditionally. A disabled pass that
+    dropped those keys would raise, or would report a missing key as a broken
+    sweep; instead it reports a complete, zeroed pass (review 2026-10-31).
+    """
+    from hive.workers import doctor
+
+    row = _legacy_row()
+    summary = doctor.submit_adopted_reviews(rows=[_legacy_row(jid="probe")], now=1000.0)
+    assert summary["submitted"] == 1
+    monkeypatch.setattr(doctor, "HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS", False)
+    bus.calls.clear()
+    off = doctor.submit_adopted_reviews(rows=[row], now=1000.0)
+    assert off["disabled"] is True
+    # Same keys, plus the ``disabled`` marker a live pass does not carry.
+    assert set(summary) | {"disabled"} == set(off), set(summary) ^ set(off)
+    assert all(off[k] == 0 for k in ("scanned", "adopted", "submitted", "would_submit", "previewed", "capped"))
+    assert off["_handled_rows"] == set()
+    assert bus.posts() == []
+
+    # And the whole sweep tolerates the disabled phase.
+    monkeypatch.setattr(doctor, "fetch_needs_review_jobs", lambda limit=1000: [row])
+    report = doctor.report_needs_review_sweep()["review_queue"]
+    assert report["submitted"] == 0 and report["adopted"] == 0
+
+
 def test_switch_off_submits_nothing(bus, monkeypatch):
     from hive.workers import doctor
 

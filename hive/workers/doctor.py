@@ -6033,7 +6033,13 @@ def submit_adopted_reviews(
         "dry_run": HIVE_DOCTOR_ADOPT_DRY_RUN,
     }
     if not HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS:
+        # A disabled pass keeps the SAME report shape, all zero: the sweep
+        # reads ``adopted``/``submitted``/``would_submit``/``_handled_rows``
+        # off this summary unconditionally, so dropping them (or leaving the
+        # caller to default a missing key) would make a switched-off phase
+        # indistinguishable from a broken one.
         summary["disabled"] = True
+        summary["_handled_rows"] = set()
         return summary
     if rows is None:
         rows = fetch_needs_review_jobs(limit=1000)
