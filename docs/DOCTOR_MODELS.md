@@ -71,11 +71,20 @@ Hosted quota rules:
   06:00–10:00 UTC, Mon–Fri. Bulk work skips the rung in those windows;
   operator-blocking work (`operator_blocking=True`) may spend the peak rate.
 
+The doctor's own in-flight calls per rung are counted by `ModelChain.lease`;
+a rung at its cap is skipped and the next rung is considered.
+
 A 429 / 503 / timeout / transport error is "busy": the rung cools down for 30s,
 doubling on each further failure (capped at 15 minutes). Other 4xx statuses are
 a config error: the rung cools down and the call stops (it would fail
 everywhere). A reply that is empty, prose-only for a structured phase, or
-truncated is a failure of that rung and the next rung is tried in the same call.
+truncated is a failure of that rung and the next rung is tried in the same
+call. "Structured" means the reply parses to an object with a non-empty
+`action_type` (`doctor.parse_doctor_response` alone accepts a bare truncated
+object, so the chain checks for the field).
+
+A busy rung's cached "busy" reading is re-probed on the next attempt, so a site
+that answers (with a transport error, say) is retried before a colder rung.
 
 ## Selection
 
