@@ -82,6 +82,11 @@ def _app(tmp_path):
     _deps._HIVE_REPO = None
     import agent_bus
 
+    # The schema is created by the repo's init(), exactly as the deployed bus
+    # does on start: without it the first request hits "no such table: agents".
+    import asyncio
+
+    asyncio.run(_deps.hive_repo().init())
     return agent_bus
 
 
@@ -121,6 +126,12 @@ def _awaiting_row(app_module):
     )
     assert resp.status_code in (200, 201), resp.text
     job_id = resp.json()["id"]
+    # A queued row cannot be PATCHed straight to needs-review: the worker claims
+    # it first, then reports the outcome (the real path).
+    worker = _register(app_module)
+    claimed = _request(app_module, "POST", f"/v1/jobs/next?agent_urn={worker}")
+    assert claimed.status_code == 200, claimed.text
+    _request(app_module, "PATCH", f"/v1/jobs/{job_id}", {"status": "running"})
     patched = _request(app_module, "PATCH", f"/v1/jobs/{job_id}", {"status": "needs-review", "result": _needs_review_row()["result"]})
     assert patched.status_code == 200, patched.text
     return job_id
