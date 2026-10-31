@@ -48,10 +48,10 @@ Deliberate design decisions (the tests pin these):
   ``test_audit_env_usage_20261031.py``).
 
 * **``hive/`` is scanned recursively, ``deploy/`` non-recursively**
-  (``deploy/hive_worker.py`` plus the two ``.env.example`` files carry no
-  Python reads; the systemd units and arm-orchestrator notes are not
-  Python). Both trees are optional: a tree that is absent contributes no
-  reads (a fixture may have only one of them).
+  (``deploy/hive_worker.py`` is the only Python file at deploy/ top level;
+  the systemd units and arm-orchestrator notes are not Python). Both trees
+  are optional: a tree that is absent contributes no reads (a fixture may
+  have only one of them).
 """
 
 from __future__ import annotations
@@ -64,24 +64,29 @@ from pathlib import Path
 
 #: The three literal-read forms. ``os.environ.get("NAME"``,
 #: ``os.getenv("NAME")`` and ``os.environ["NAME"]`` — with or without a
-#: default argument, single or double quoted.
+#: default argument, single or double quoted. A name must be at least two
+#: characters long: a one-character token such as an HTTP method literal
+#: is never an environment variable.
 READ_RE = re.compile(
-    r"os\.environ\.get\(\s*['\"]([A-Z][A-Z0-9_]+)['\"]"
-    r"|os\.getenv\(\s*['\"]([A-Z][A-Z0-9_]+)['\"]"
-    r"|os\.environ\[\s*['\"]([A-Z][A-Z0-9_]+)['\"]"
+    r"os\.environ\.get\(\s*['\"]([A-Z][A-Z0-9_]{1,})['\"]"
+    r"|os\.getenv\(\s*['\"]([A-Z][A-Z0-9_]{1,})['\"]"
+    r"|os\.environ\[\s*['\"]([A-Z][A-Z0-9_]{1,})['\"]"
 )
 
 #: An UPPER_SNAKE literal assigned to a name: ``FOO_ENV = "FOO_BAR"``,
 #: ``X = ("FOO_BAR",)`` etc. This is the fleet-inventory indirection: the
-#: name is declared once as a string constant and read through it.
+#: name is declared once as a string constant and read through it. The name
+#: must be at least two characters long (``method="POST"`` is not a
+#: constant) and must start the line before any assignment operator, so a
+#: keyword argument can never be mistaken for a constant.
 ASSIGN_RE = re.compile(
-    r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:\(?\s*)?|return\s+(?:\(?\s*)?)"
-    r"['\"]([A-Z][A-Z0-9_]+)['\"]"
+    r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=\s*(?:\(\s*)?['\"]([A-Z][A-Z0-9_]{1,})['\"]"
+    r"|^\s*return\s+(?:\(\s*)?['\"]([A-Z][A-Z0-9_]{1,})['\"]"
 )
 
 
 def scan_reads(py_file: Path) -> dict[str, list[tuple[str, int]]]:
-    """Map env name -> list of (relative-ish path, line number) literal reads.
+    """Map env name -> list of (path, line number) literal reads.
 
     A name reached through an assigned string constant in the same file is
     recorded at the constant's line (that is where the name is introduced).
@@ -93,7 +98,7 @@ def scan_reads(py_file: Path) -> dict[str, list[tuple[str, int]]]:
             name = next(g for g in m.groups() if g)
             reads.setdefault(name, []).append((str(py_file), lineno))
         for m in ASSIGN_RE.finditer(line):
-            name = m.group(1)
+            name = next(g for g in m.groups() if g)
             reads.setdefault(name, []).append((str(py_file), lineno))
     return reads
 
@@ -143,16 +148,12 @@ def audit(root: Path) -> list[str]:
         findings.append(f"undocumented: {name} read at {_rel(root, first[0])}:{first[1]}")
     for name in sorted(declared):
         if name not in reads:
-            findings.append(
-                f"unused: {name} declared in docs/environment-requirements.json but read nowhere in hive/ or deploy/"
-            )
+            findings.append(f"unused: {name} declared in docs/environment-requirements.json but read nowhere in hive/ or deploy/")
     return findings
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(
-        description="Audit env var reads in hive/ and deploy/ against docs/environment-requirements.json, both directions."
-    )
+    ap = argparse.ArgumentParser(description="Audit env var reads in hive/ and deploy/ against docs/environment-requirements.json, both directions.")
     ap.add_argument("--root", default=".", help="repo root to audit (default: current directory)")
     args = ap.parse_args(argv)
     findings = audit(Path(args.root))
