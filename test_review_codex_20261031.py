@@ -739,3 +739,71 @@ def test_pick_reviewers_orders_a_flagless_route_without_raising():
     )
     # The flagless route sorts on its defaults (priority 0) ahead of Codex (-5).
     assert [route["id"] for route in picked] == ["bare", "codex-worker"]
+
+
+# ── 12. a malformed roster flag is the default, not a crash ────────────────
+#
+# ``load_roster`` does not type-check ``flags``: they are operator data. A
+# typo (``"priority": "high"``) used to raise ValueError from ``int()`` inside
+# the sort, taking the whole sweep down instead of parking the row. A flag the
+# roster cannot express now means the default, which is what a MISSING flag
+# already meant.
+
+
+@pytest.mark.parametrize(
+    "value,expected", [(None, 0), ("high", 0), ([], 0), ({}, 0), (5, 5), (-3, -3), ("7", 7), (True, 1)]
+)
+def test_a_flag_that_is_not_a_number_is_the_default(value, expected):
+    from hive import review_queue as rq
+
+    assert rq._int_flag(value) == expected
+
+
+def test_a_malformed_priority_does_not_break_the_bulk_sort():
+    from hive import review_queue as rq
+
+    typo = {"id": "typo", "flags": {"priority": "high"}}
+    assert rq._bulk_key(typo) == (0, 3, "typo")
+
+
+def test_a_malformed_priority_does_not_break_the_hard_lane():
+    from hive import review_queue as rq
+
+    row = {"id": "hard", "flags": {"hard_lane_priority": 20, "priority": "high"}}
+    assert rq._bulk_key(row, rq.LANE_HARD) == (-20, 0, "hard")
+
+
+def test_a_malformed_priority_does_not_break_pick_reviewers():
+    """The pick must order a typo'd route, not raise out of the sweep."""
+    from hive import review_queue as rq
+
+    roster = [
+        {
+            "id": "typo",
+            "model_id": "qwen38",
+            "family": "alibaba",
+            "location": "local",
+            "concurrency": 1,
+            "flags": {"priority": "high"},
+        },
+        _roster_entry(),
+    ]
+    picked = rq.pick_reviewers(
+        "deepseek-flash",
+        roster=roster,
+        health=_healthy,
+        load=_idle,
+        repo="graeae-hive",
+        codex_worker_online=True,
+        codex_usage=lambda: {"remaining_pct": 90.0},
+    )
+    assert [route["id"] for route in picked] == ["typo", "codex-worker"]
+
+
+def test_a_valid_roster_entry_sorts_exactly_as_before():
+    """The hardening must not move a route that was already well-formed."""
+    from hive import review_queue as rq
+
+    entry = _roster_entry()
+    assert rq._bulk_key(entry) == (5, 3, "codex-worker")
+    assert rq._bulk_key(entry, rq.LANE_HARD) == (-20, 5, "codex-worker")

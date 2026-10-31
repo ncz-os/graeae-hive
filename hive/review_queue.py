@@ -732,6 +732,25 @@ def _reviewable(entry: dict, *, repo: str | None, author_routes: set[str]) -> bo
     return not (isinstance(tier, dict) and str(repo or "").strip() not in (tier.get("repos") or []))
 
 
+def _int_flag(value: Any) -> int:
+    """A roster flag as an int, 0 when it is absent or not a number.
+
+    ``load_roster`` does not type-check ``flags`` (they are operator data), so
+    a typo (``"priority": "high"``) would otherwise raise ValueError from
+    ``int()`` in the middle of a sort and take the whole sweep down. A flag the
+    roster cannot express is the default, which is what every missing flag
+    already means.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _bulk_key(entry: dict, lane: str = LANE_BULK) -> tuple:
     """Deterministic tie-break for a review LANE.
 
@@ -745,9 +764,9 @@ def _bulk_key(entry: dict, lane: str = LANE_BULK) -> tuple:
     # without the block sorts by its defaults instead of raising KeyError.
     flags = entry.get("flags") if isinstance(entry.get("flags"), dict) else {}
     if lane == LANE_HARD:
-        hard = int(flags.get("hard_lane_priority") or 0)
-        return (-hard, -int(flags.get("priority") or 0), entry["id"])
-    priority = int(flags.get("priority") or 0)
+        hard = _int_flag(flags.get("hard_lane_priority"))
+        return (-hard, -_int_flag(flags.get("priority")), entry["id"])
+    priority = _int_flag(flags.get("priority"))
     return (
         -priority,
         {"local": 0, "provider": 1, "eih": 2}.get(str(entry.get("location")), 3),
