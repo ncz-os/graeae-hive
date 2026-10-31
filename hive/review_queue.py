@@ -725,7 +725,9 @@ def _reviewable(entry: dict, *, repo: str | None, author_routes: set[str]) -> bo
         return False
     if entry["id"] in author_routes:
         return False
-    tier = entry["flags"].get("contributor_tier")
+    # Same reason as ``_bulk_key``: a hand-built route may carry no flags block.
+    flags = entry.get("flags") if isinstance(entry.get("flags"), dict) else {}
+    tier = flags.get("contributor_tier")
     # A contributor tier is allowed only on the operator-approved repos.
     return not (isinstance(tier, dict) and str(repo or "").strip() not in (tier.get("repos") or []))
 
@@ -738,10 +740,14 @@ def _bulk_key(entry: dict, lane: str = LANE_BULK) -> tuple:
     then local before provider before eih, then id. Hard: ``hard_lane_priority``
     first, so Codex leads the authoring review of hard-lane work.
     """
+    # ``load_roster`` normalises ``flags`` on every entry, but the pick is also
+    # reached with hand-built routes (test doubles, probe callers), so a route
+    # without the block sorts by its defaults instead of raising KeyError.
+    flags = entry.get("flags") if isinstance(entry.get("flags"), dict) else {}
     if lane == LANE_HARD:
-        hard = int(entry["flags"].get("hard_lane_priority") or 0)
-        return (-hard, -int(entry["flags"].get("priority") or 0), entry["id"])
-    priority = int(entry["flags"].get("priority") or 0)
+        hard = int(flags.get("hard_lane_priority") or 0)
+        return (-hard, -int(flags.get("priority") or 0), entry["id"])
+    priority = int(flags.get("priority") or 0)
     return (
         -priority,
         {"local": 0, "provider": 1, "eih": 2}.get(str(entry.get("location")), 3),

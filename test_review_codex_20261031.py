@@ -680,3 +680,62 @@ def test_a_bare_float_probe_is_unknown_not_a_crash():
     answer = codex_gate(worker_online=True, env={}, usage=lambda: 90.0)
     assert answer["allowed"] is False
     assert answer["reason"] == "codex_usage_unknown"
+
+
+# ── 11. the symbols the codex path needs, and a route without flags ─────────
+
+
+def test_the_codex_path_has_every_symbol_it_references():
+    """Pin the names the gate/pick/submit path resolves, so a rename fails here.
+
+    The reviewer of an earlier attempt reported these as missing imports; they
+    are definitions in the two modules that own them. This test is what keeps
+    that claim false: if any were removed, this fails before the sweep does.
+    """
+    from pathlib import Path
+
+    from hive import review_queue as rq
+    from hive.workers import doctor
+
+    assert rq.Path is Path
+    assert callable(rq.load_roster) and rq.load_roster()
+    assert rq.CODEX_WORKER_KIND == "codex"
+    assert rq.LANE_BULK == "bulk" and rq.LANE_HARD == "hard"
+    # The doctor owns the usage probe hook and reads the constants off the module.
+    assert hasattr(doctor, "CODEX_REVIEW_USAGE")
+    assert doctor.review_queue.CODEX_WORKER_KIND == rq.CODEX_WORKER_KIND
+    assert doctor.review_queue.LANE_BULK == rq.LANE_BULK
+
+
+def test_a_route_without_flags_sorts_by_defaults():
+    """``_bulk_key`` sees hand-built routes too: no flags is defaults, not KeyError."""
+    from hive import review_queue as rq
+
+    bare = {"id": "bare", "location": "local"}
+    assert rq._bulk_key(bare) == (0, 0, "bare")
+    assert rq._bulk_key(bare, rq.LANE_HARD) == (0, 0, "bare")
+    assert rq._bulk_key({"id": "n", "location": "local", "flags": None}) == (0, 0, "n")
+
+
+def test_pick_reviewers_orders_a_flagless_route_without_raising():
+    from hive import review_queue as rq
+
+    roster = [
+        # A hand-built route with NO flags block at all.
+        {"id": "bare", "model_id": "qwen38", "family": "alibaba", "location": "local", "concurrency": 1},
+        # The real codex row (its flags block carries the ladder the gate reads).
+        _roster_entry(),
+    ]
+    # A deepseek author is outside both families, so neither route is excluded
+    # by pairing and the assertion is about ORDER, not filtering.
+    picked = rq.pick_reviewers(
+        "deepseek-flash",
+        roster=roster,
+        health=_healthy,
+        load=_idle,
+        repo="graeae-hive",
+        codex_worker_online=True,
+        codex_usage=lambda: {"remaining_pct": 90.0},
+    )
+    # The flagless route sorts on its defaults (priority 0) ahead of Codex (-5).
+    assert [route["id"] for route in picked] == ["bare", "codex-worker"]
