@@ -71,7 +71,11 @@ def test_codex_is_a_roster_route_of_family_openai():
     assert entry["family"] == "openai"
     assert family_of(entry["model_id"]) == "openai"
     # NEVER an EIH route, never a provider API route: the confined local worker.
-    assert entry["location"] == "local"
+    # ``worker`` (not ``local``): the route is driven by a worker, so it has no
+    # slot endpoint to probe -- calling it ``local`` made the shared load probe
+    # read LOAD_UNKNOWN and silently retire the route from every pick.
+    assert entry["location"] == "worker"
+    assert "port" not in entry
     assert entry["kind"] == "codex"
     assert entry["worker"] == "hive-worker-codex.service"
     assert entry["host"] == "cerberus"
@@ -415,9 +419,7 @@ def test_a_codex_verdict_names_the_model_and_binds_the_head(bus):
         "kind": "review:fix-20261031",
         "status": "done",
         "parent_job_id": "source",
-        "result": {
-            "verdict": {"reviewers": [{"model": "gpt-6-luna", "verdict": "approve"}], "head_sha": "a" * 40}
-        },
+        "result": {"verdict": {"reviewers": [{"model": "gpt-6-luna", "verdict": "approve"}], "head_sha": "a" * 40}},
     }
 
     def http(method, path, body=None, **kwargs):
@@ -451,7 +453,7 @@ def test_prose_only_codex_output_is_never_an_approval(bus):
 
 def test_astra_is_never_auto_selected_or_pinned():
     assert codex_ladder(_roster_entry()) == ["gpt-6-luna", "gpt-6.1-terra", "gpt-6-sol"]
-    assert codex_review_available(_roster_entry(), usage={"remaining_pct": 90.0}) ["model"] == "gpt-6-luna"
+    assert codex_review_available(_roster_entry(), usage={"remaining_pct": 90.0})["model"] == "gpt-6-luna"
 
 
 def test_astra_requires_an_operator_authorization_recorded_in_the_job():
@@ -485,5 +487,109 @@ def test_nothing_in_the_codex_path_touches_an_oauth_token(tmp_path, monkeypatch)
 
 def test_roster_file_has_no_token_fields():
     text = ROSTER_PATH.read_text().lower()
-    for forbidden in ('token\":', "api_key", "access_token", "refresh_token"):
+    for forbidden in ('token":', "api_key", "access_token", "refresh_token"):
         assert forbidden not in text, forbidden
+
+
+# ── 7. the route is REACHABLE through the production seams ──────────────────
+#
+# Regression (found on review of the first Codex attempt, 2026-10-31): the
+# roster row said ``location: local`` with no ``port``, so the SHARED load probe
+# tried to read a slot endpoint that does not exist, got LOAD_UNKNOWN back, and
+# ``_available`` read that as "saturated". Every codex test injected a fake
+# ``load=_idle``, so the suite stayed green while the route could never be
+# picked in production. These tests use the real probe and the real pick.
+
+
+def _real_probe_roster():
+    """The roster WITHOUT an injected health/load override."""
+    return load_roster()
+
+
+def test_codex_is_not_a_slot_serving_local_route():
+    """A worker-driven route has no HTTP slot endpoint to probe."""
+    from hive import review_queue as rq
+
+    entry = _roster_entry()
+    assert entry["location"] == "worker", "codex is driven by a worker, not an HTTP server"
+    assert "port" not in entry, "there is no port: nothing in codex is reached over HTTP"
+    assert rq.is_codex_route(entry)
+
+
+def test_real_load_probe_reports_codex_as_idle_not_unknown():
+    """The production probe must not retire the route it cannot probe."""
+    from hive import review_queue as rq
+
+    entry = _roster_entry()
+    fetched = []
+
+    def urlopen(url, timeout=0):  # pragma: no cover - must never be called
+        fetched.append(url)
+        raise AssertionError(f"the codex route must not be probed: {url}")
+
+    assert rq.route_load_fn(urlopen=urlopen, clock=lambda: 1.0)(entry) == 0
+    assert fetched == [], "no slot/metrics request is made for the codex route"
+
+
+def test_codex_is_reachable_with_the_production_load_probe():
+    """End to end: the REAL probe + the roster's real flags pick Codex."""
+    from hive import review_queue as rq
+
+    picked = pick_reviewers(
+        "qwen38",
+        roster=_real_probe_roster(),
+        health=_healthy,
+        load=rq.route_load_fn(urlopen=lambda *a, **k: None, clock=lambda: 1.0),
+        repo="graeae-hive",
+        codex_worker_online=True,
+        codex_usage=lambda: {"remaining_pct": 90.0},
+    )
+    assert CODEX_ROUTE_ID in [route["id"] for route in picked]
+
+
+def test_codex_is_not_mistaken_for_an_eih_route():
+    """Only a genuine EIH route sorts into the EIH tier."""
+    from hive.workers import doctor
+
+    entry = _roster_entry()
+    key = doctor._sort_routes_by_family_load.__doc__  # exists: the sort seam
+    assert key is not None
+    ordered = doctor._sort_routes_by_family_load([entry, _roster_entry("eih-nemotron")], lambda _r: 0)
+    assert [route["id"] for route in ordered][-1] == "eih-nemotron"
+
+
+# ── 8. the gate must not confuse "unknown" with "offline" ───────────────────
+
+
+def test_an_unreadable_worker_list_fails_closed_as_unknown():
+    """The bus being down is not proof that the worker is offline."""
+    answer = codex_gate(worker_online=None, env={}, usage=lambda: {"remaining_pct": 90.0})
+    assert answer["allowed"] is False
+    assert answer["reason"] == "codex_worker_unknown"
+
+
+def test_an_offline_worker_still_reports_offline():
+    answer = codex_gate(worker_online=False, env={}, usage=lambda: {"remaining_pct": 90.0})
+    assert answer["allowed"] is False
+    assert answer["reason"] == "codex_worker_offline"
+
+
+def test_pick_reviewers_does_not_read_unknown_worker_state_as_online():
+    """No caller may omit the worker view and get Codex anyway."""
+    picked = pick_reviewers(
+        "qwen38",
+        health=_healthy,
+        load=_idle,
+        repo="graeae-hive",
+        codex_usage=lambda: {"remaining_pct": 90.0},
+    )
+    assert CODEX_ROUTE_ID not in [route["id"] for route in picked]
+
+
+def test_the_doctor_passes_an_unknown_worker_view_as_none(monkeypatch):
+    """``_online_worker_kinds() -> None`` must reach the gate as None."""
+    from hive.workers import doctor
+
+    monkeypatch.setattr(doctor, "_online_worker_kinds", lambda: None)
+    assert doctor._codex_worker_online() is None
+    assert doctor.review_queue_codex_gate()["reason"] == "codex_worker_unknown"

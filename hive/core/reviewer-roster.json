@@ -181,7 +181,7 @@
       "roles": [],
       "model_id": "gpt-6-luna",
       "family": "openai",
-      "location": "local",
+      "location": "worker",
       "kind": "codex",
       "worker": "hive-worker-codex.service",
       "host": "cerberus",

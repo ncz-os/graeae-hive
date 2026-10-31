@@ -5016,10 +5016,14 @@ REVIEW_QUEUE_ROUTE_LOAD = None
 CODEX_REVIEW_USAGE = None
 
 
-def _codex_worker_online() -> bool:
-    """Whether a ``codex``-kind worker is online right now (unknown: offline)."""
+def _codex_worker_online() -> bool | None:
+    """Whether a ``codex``-kind worker is online (``None``: the bus cannot say)."""
     kinds = _online_worker_kinds()
-    return bool(kinds and review_queue.CODEX_WORKER_KIND in kinds)
+    if kinds is None:
+        # Bus unreachable: not "offline", just unknown. The gate fails closed
+        # either way, but the reason it reports must be the true one.
+        return None
+    return review_queue.CODEX_WORKER_KIND in kinds
 
 
 def review_queue_codex_gate() -> dict:

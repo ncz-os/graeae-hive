@@ -367,6 +367,13 @@ class _Probe:
         self.cache: dict[str, tuple[float, Any]] = {}
 
     def __call__(self, route: dict) -> Any:
+        if is_codex_route(route):
+            # A worker-driven route serves NO slot endpoint: its load is the
+            # number of codex review jobs the worker is running, which the
+            # caller adds from the in-flight count (the worker's own claim gate
+            # enforces the concurrency cap of 1). Probing it would return
+            # LOAD_UNKNOWN and silently retire the route from every pick.
+            return 0
         if str(route.get("location")) != "local":
             # Provider routes expose no slot endpoint; there is nothing cheap
             # to read and the concurrency cap is enforced at dispatch time.
@@ -625,7 +632,7 @@ def write_codex_cooldown(
 def codex_gate(
     *,
     entry: dict | None = None,
-    worker_online: bool,
+    worker_online: bool | None,
     env: dict | None = None,
     usage: Any = None,
     now: float | None = None,
@@ -633,12 +640,14 @@ def codex_gate(
 ) -> dict:
     """Whether an automatic Codex review may be dispatched, and why not.
 
-    ``worker_online`` is the doctor's live view of the codex kind (and a worker
-    the gate cannot see is offline: fail closed). ``usage`` is the injected plan
+    ``worker_online`` is the doctor's live view of the codex kind: ``None``
+    means the bus could not say (fail closed as ``codex_worker_unknown``),
+    ``False`` means it said the worker is not online. ``usage`` is the injected plan
     usage source returning ``{"remaining_pct": float}`` (or None when it cannot
     be read -- an unknown share fails closed). Returns
     ``{"allowed": bool, "reason": str, "model": str|None}`` with a reason from
-    ``codex_disabled``, ``codex_worker_offline``, ``codex_usage_unknown``,
+    ``codex_disabled``, ``codex_worker_unknown``, ``codex_worker_offline``,
+    ``codex_usage_unknown``,
     ``codex_quota_low``, ``codex_cooldown`` or ``""`` (allowed).
     """
     entry = entry if entry is not None else next((e for e in load_roster() if is_codex_route(e)), None)
@@ -652,6 +661,11 @@ def codex_gate(
 
     if not _truthy(env.get(CODEX_ENABLED_ENV, "1")):
         return answer(False, "codex_disabled")
+    if worker_online is None:
+        # The doctor cannot see the worker list at all (bus down / probe
+        # failed). That is not the same fact as "the codex worker is offline",
+        # and it must never be read as permission: fail closed, but say which.
+        return answer(False, "codex_worker_unknown")
     if not worker_online:
         return answer(False, "codex_worker_offline")
     if read_codex_cooldown(now=now, state_dir=state_dir) is not None:
@@ -748,7 +762,7 @@ def pick_reviewers(
     cross-family pick (``hard`` puts Codex first, ``bulk`` last).
 
     The Codex route is only an option when its GATE passes: the config switch,
-    an online codex worker (``codex_worker_online``; an unset value means the
+    an online codex worker (``codex_worker_online``; ``None``/unset means the
     gate cannot vouch for a worker -- fail closed), the injected plan usage
     (``codex_usage``, a callable or a ``{"remaining_pct"}`` dict), no live
     cooldown marker and the route's own concurrency cap.
@@ -782,7 +796,7 @@ def pick_reviewers(
             if codex_ok is None:
                 codex_ok = codex_gate(
                     entry=entry,
-                    worker_online=bool(codex_worker_online),
+                    worker_online=codex_worker_online,
                     env=codex_env,
                     usage=codex_usage,
                     now=codex_now,
@@ -911,7 +925,9 @@ def review_state(job: dict) -> dict | None:
     return state
 
 
-def awaiting_review_status(loop_teardown: str | None, *, exit_code: int, ready: bool, cancelled: bool) -> tuple[str, str | None]:
+def awaiting_review_status(
+    loop_teardown: str | None, *, exit_code: int, ready: bool, cancelled: bool
+) -> tuple[str, str | None]:
     """Disposition for a loop that authored work but got no reviewer.
 
     ``reviewer_unavailable`` (a busy endpoint, a timeout, a 503) is the reviewer
@@ -938,9 +954,7 @@ def awaiting_review_status(loop_teardown: str | None, *, exit_code: int, ready: 
 def awaiting_review_reason(job: dict) -> str:
     """The human-readable reason a row is waiting, for the triage listing."""
     state = review_state(job) or {}
-    tried = ", ".join(
-        f"{t.get('model_id')}({t.get('failure') or 'unavailable'})" for t in state.get("tried") or []
-    )
+    tried = ", ".join(f"{t.get('model_id')}({t.get('failure') or 'unavailable'})" for t in state.get("tried") or [])
     base = "reviewer unavailable" if tried else "no cross-family reviewer attempted"
     family = state.get("author_family") or "unknown"
     text = f"{base}: author family {family}"
