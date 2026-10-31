@@ -66,7 +66,8 @@ def canonical_reviewer(evidence: Any, launched: Any = None) -> dict:
     """The reviewer record: from the verdict, else the launched route, else empty."""
     names = evidence_reviewers(evidence)
     if names:
-        entries = evidence.get("reviewers") or []
+        entries = evidence.get("reviewers") if isinstance(evidence, dict) else None
+        entries = entries or []
         first = next((e for e in entries if _label(e) == names[0]), {})
         verdict = str(first.get("verdict") or "").strip().lower() or None
         return {
@@ -87,6 +88,8 @@ def canonical_reviewer(evidence: Any, launched: Any = None) -> dict:
 
 
 def _delivery_entries(result: dict) -> list[dict]:
+    if not isinstance(result, dict):
+        return []
     reviews = result.get("hive_reviews")
     return [
         r

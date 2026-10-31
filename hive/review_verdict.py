@@ -33,9 +33,14 @@ def child_verdict(child_result: dict) -> dict | None:
     dict with a string ``verdict`` (returned unchanged). The real worker result
     has ``result.verdict`` null and the verdict at ``result.reviewer.verdict``
     (``hive/review_record.py``), next to the shas of the commit the review job
-    left the branch at: ``remote_sha`` when ``remote_verified`` is true (what
+    left the branch at: ``    remote_sha`` when ``remote_verified`` is true (what
     the remote really holds), else ``head_sha``. Anything else is unusable.
+
+    Never raises: a non-dict root (prose, a truncated write, a bare list)
+    is unusable, not an error.
     """
+    if not isinstance(child_result, dict):
+        return None
     verdict = child_result.get("verdict")
     if isinstance(verdict, dict) and text_value(verdict.get("verdict")):
         return verdict
@@ -45,6 +50,21 @@ def child_verdict(child_result: dict) -> dict | None:
         return None
     remote = text_value(child_result.get("remote_sha")) if child_result.get("remote_verified") is True else None
     return {"verdict": text.lower(), "head": remote or text_value(child_result.get("head_sha"))}
+
+
+_PLACEHOLDER_MODELS = frozenset({"", "auto", "unknown", "reviewer", "none", "null"})
+
+
+def named_model(value) -> str:
+    """A reviewer model name, or "" when the value is blank or a placeholder.
+
+    Mirrors ``hive.review_record._named`` (kept local so this module stays
+    dependency-free): bare/placeholder names never identify a reviewer.
+    """
+    text = text_value(value)
+    if not text or text.lower() in _PLACEHOLDER_MODELS or text.startswith("("):
+        return ""
+    return text
 
 
 def normalize_verdict(value) -> str:
@@ -69,7 +89,9 @@ def same_sha(left, right) -> bool:
 
 def delivered_head(job: dict, result: dict) -> str | None:
     """The head the row delivered: ``result.head_sha``, else the row's own."""
-    return text_value(result.get("head_sha")) or text_value(job.get("head_sha"))
+    res_head = text_value(result.get("head_sha")) if isinstance(result, dict) else None
+    job_head = text_value(job.get("head_sha")) if isinstance(job, dict) else None
+    return res_head or job_head
 
 
 def reviewed_heads(result: dict) -> list[str]:
@@ -81,7 +103,11 @@ def reviewed_heads(result: dict) -> list[str]:
     ``head_sha`` / ``reviewed_head``. ``delivered_head`` and ``approved_unmerged_tip``
     are not read: the first is the row's own head and the second is a tip the review
     job pushed, neither is "the commit that was reviewed".
+
+    Never raises: a non-dict root carries no reviewed heads.
     """
+    if not isinstance(result, dict):
+        return []
     heads: list[str] = []
 
     def add(value) -> None:
@@ -105,7 +131,12 @@ def reviewed_heads(result: dict) -> list[str]:
 
 
 def row_verdict(result: dict) -> str:
-    """The reviewer's verdict on the row, normalised ('' when none is recorded)."""
+    """The reviewer's verdict on the row, normalised ('' when none is recorded).
+
+    Never raises: a non-dict root records no verdict.
+    """
+    if not isinstance(result, dict):
+        return ""
     reviewer = result.get("reviewer")
     if isinstance(reviewer, dict):
         text = normalize_verdict(reviewer.get("verdict"))
@@ -130,7 +161,13 @@ def evidence_summary(job: dict, result: dict) -> str:
     ``<failure_reason>, review=<verdict>@<reviewed sha7 or ?> head=<delivered sha7>,
     final_round=reviewer_unavailable``. The review part is printed whenever the row
     has review evidence of any kind, so a line that says ``evidence=none`` is true.
+
+    Never raises: non-dict inputs summarise as ``"none"``.
     """
+    if not isinstance(job, dict):
+        job = {}
+    if not isinstance(result, dict):
+        result = {}
     parts: list[str] = []
     reason = text_value(job.get("failure_reason")) or text_value(result.get("failure_reason"))
     if reason:
