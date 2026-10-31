@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from hive import review_queue  # noqa: E402
-from hive.workers import loop_outcome  # noqa: E402
+from hive.workers import doctor_rules, loop_outcome  # noqa: E402
 
 ACTIVE_JOB_STATUSES = ("claimed", "running")
 ATTENTION_STATUSES = ("failed", "needs-review")
@@ -179,12 +179,25 @@ def build_status(rows: dict, *, older_than_hours: float = 24.0, now: float | Non
         for a in agents
         if str(a.get("status") or "") == "offline" and str(a.get("urn") or "") in claiming_urns
     ]
+    # The doctor's model-call counter (operator 2026-10-31): carried on the
+    # snapshot so the weekend triage line shows how much the doctor leaned on
+    # a model this hour, and how often it found its free slot taken.
+    doctor = rows.get("doctor") if isinstance(rows.get("doctor"), dict) else {}
+    model_calls = doctor.get("model_calls") if isinstance(doctor.get("model_calls"), dict) else {}
     return {
         "queue": {"by_status": by_status, "by_kind": by_kind, "total": len(jobs)},
         "agents": {"by_kind": agents_by_kind, "by_status": agents_by_status, "total": len(agents)},
         "active": sorted(active, key=lambda r: r["id"]),
         "attention": sorted(attention, key=lambda r: r["id"]),
         "flags": {"stale": sorted(stale, key=lambda r: r["id"]), "offline_claiming": offline_claiming},
+        "doctor": {
+            "model_calls": {
+                "calls_last_hour": int(model_calls.get("calls_last_hour") or 0),
+                "slot_taken_last_hour": int(model_calls.get("slot_taken_last_hour") or 0),
+                "alert": bool(model_calls.get("alert")),
+                "alert_reason": model_calls.get("alert_reason"),
+            }
+        },
     }
 
 
@@ -220,6 +233,8 @@ def render_text(snapshot: dict) -> str:
         if row.get("review_state"):
             line += f" review={row['review_state']} reason={row['review_reason']}"
         lines.append(line)
+    model_calls = (snapshot.get("doctor") or {}).get("model_calls") or {}
+    lines.append(doctor_rules.format_counter_line(model_calls))
     lines.append("flags:")
     if not snapshot["flags"]["stale"] and not snapshot["flags"]["offline_claiming"]:
         lines.append("  (none)")

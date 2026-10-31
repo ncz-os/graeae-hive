@@ -62,6 +62,14 @@ A local rung whose host the fleet inventory does not know gets an empty
 cached for 5 seconds per chain. A probe that cannot be read is **not** proof of
 capacity: the rung is skipped (fail closed).
 
+An **empty** `slots` list is UNKNOWN, not busy: llama-server reports every slot
+it is configured with, so a body with no slots measures nothing (a server
+between a restart and its allocation, say), and `all()` over an empty list is
+vacuously true. `_llama_busy` reads it as `0/0 busy` (free) and the doctor's
+slot-taken observer records no event for it — only a non-empty list whose
+slots are all `is_processing` is the "free slot found taken" evidence the
+restoration alert counts.
+
 Hosted quota rules:
 
 * `quota_guard = "minimax"` — a Token Plan 429 `usage limit reached (2056)` (or
