@@ -469,7 +469,7 @@ def test_invoke_openweight_gets_model_only_as_keyword(doctor, monkeypatch):
     would be a TypeError at call time."""
     seen = []
 
-    def fake_invoke(prompt, model_alias, *, base_url=None, model=None):
+    def fake_invoke(prompt, model_alias, *, base_url=None, model=None, structured=False):
         seen.append({"alias": model_alias, "base": base_url, "model": model})
         return True, '{"action_type":"no_action"}'
 

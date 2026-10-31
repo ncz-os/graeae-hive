@@ -48,6 +48,7 @@ Env:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -73,7 +74,7 @@ from hive.core import fleet_inventory
 # container still runs this module standalone.
 from hive.review_queue import pick_reviewers
 from hive.workers import doctor_decline_paths as decline_paths
-from hive.workers import doctor_gates, doctor_models, doctor_v2, loop_outcome, remediation, retention
+from hive.workers import doctor_gates, doctor_models, doctor_rules, doctor_v2, loop_outcome, remediation, retention
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "")
@@ -802,7 +803,40 @@ def register() -> str:
 REREGISTER_CODES = (404, 409)
 
 
+def _emit_light_model_alert() -> dict:
+    """Broadcast ``doctor.light_model_needed`` from the heartbeat, ONCE.
+
+    The ledger decides when a crossing happened (``CallLedger._alerted_reason``
+    de-duplicates per hour, and a quiet hour re-arms it); the heartbeat is the
+    one place that can broadcast without a model call issuing a second request.
+    """
+    try:
+        summary = _model_call_ledger().counter()
+    except Exception as exc:  # noqa: BLE001 -- telemetry never fails a heartbeat
+        log.warning("doctor model-call counter unavailable: %s", exc)
+        return {}
+    if summary.get("alert"):
+        log.warning(
+            "doctor %s reason=%s calls=%s slot_taken=%s",
+            doctor_rules.ALERT_TOPIC,
+            summary.get("alert_reason"),
+            summary.get("calls_last_hour"),
+            summary.get("slot_taken_last_hour"),
+        )
+        broadcast_doctor_message(
+            doctor_rules.ALERT_TOPIC,
+            {
+                "host": AGENT_HOST,
+                "reason": summary.get("alert_reason"),
+                "calls_last_hour": summary.get("calls_last_hour"),
+                "slot_taken_last_hour": summary.get("slot_taken_last_hour"),
+            },
+        )
+    return summary
+
+
 def heartbeat():
+    _emit_light_model_alert()
     code, _ = _http("POST", "/v1/agents/heartbeat", {"urn": _urn, "status": "online"})
     if code in REREGISTER_CODES:
         # Without this a ghost doctor (URN reaped after a stall, or bus restored)
@@ -951,61 +985,97 @@ and exact operator approvals; they are not model-selectable actions.
 """
 DOCTOR_SYSTEM += "\nDiagnostic hosts: " + "|".join(doctor_gates.restart_target_names())
 
+#: The residue prompt's system text: short, and it names ONLY the classes.
+#: The doctor asks a model for one enum value and a short reason, nothing else
+#: (operator 2026-10-31) -- so the schema, the grammar and the prompt agree.
+RESIDUE_SYSTEM = (
+    "You classify ONE failed Hive job row. Answer with one JSON object and nothing else: "
+    '{"action_type": <one of no_action | release_to_queue | escalate>, "confidence": <0..1>, '
+    '"reason": <at most 140 characters>}. '
+    "release_to_queue = the failure is transient and rerunning the SAME work is safe. "
+    "no_action = the row needs nothing from the doctor. "
+    "escalate = everything else, including anything you cannot quote from the evidence. "
+    "Do not call tools; purges, restarts and code fixes are never yours to choose."
+)
 
-def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry: dict, failure_count_hint: int) -> str:
-    msg = [
-        "TRIAGE REQUEST",
-        f"triage_job_id: {job.get('id', '')}",
-        f"triage_kind: {job.get('kind', '')}",
-        f"base_kind: {base_kind}",
-        f"failure_count_hint: {failure_count_hint}",
-        "",
-        "TRIAGE DESCRIPTION:",
-        (job.get("description") or "")[:6000],
-        "",
-        f"RECENT FAILED JOBS OF base_kind={base_kind!r} ({len(failed)} shown):",
-    ]
-    for fj in failed[:8]:
-        result_preview = ""
-        if fj.get("result"):
-            try:
-                rd = json.loads(fj["result"]) if isinstance(fj["result"], str) else fj["result"]
-                txt = " | ".join(
-                    str(rd.get(key) or "")[-4096:]
-                    for key in ("failure_reason", "error", "tail", "stderr", "stdout")
-                    if rd.get(key)
-                )
-                exit_code = rd.get("exit_code")
-                result_preview = (
-                    f"exit={exit_code} retry_count={fj.get('retry_count', rd.get('retry_count', 0))} | {txt[-16384:]}"
-                )
-            except Exception:
-                result_preview = str(fj["result"])[:400]
-        msg.append(
-            f"  - id={fj.get('id', '')[:12]} kind={fj.get('kind', '')} "
-            f"claimed_by={fj.get('claimed_by', '')} "
-            f"provider={fj.get('claimed_provider', '')} "
-            f"model={fj.get('claimed_model', '')}"
-        )
-        if result_preview:
-            msg.append(f"    result: {result_preview}")
-        msg.append(
-            f"    host={fj.get('host') or fj.get('claimed_host') or ''} head_branch={fj.get('head_branch') or ''}"
-        )
-    msg.extend(
+
+def build_residue_prompt(row: dict, cls: doctor_rules.RowClass | None = None) -> str:
+    """The SHORT prompt for the only model-classifiable part of triage.
+
+    The old prompt asked for evidence quotes, retry scopes and release kinds; it
+    now asks for one enum value and a short reason, and carries a bounded slice
+    of the evidence instead of a transcript."""
+    result = row.get("result")
+    if not isinstance(result, str):
+        result = json.dumps(result or {})
+    return "\n".join(
         [
-            "EVIDENCE RULE: A release_to_queue decision MUST include evidence_quote exactly as supplied below.",
-            "An invented or absent quote is invalid and will be escalated.",
-            "",
-            "AGENT REGISTRY SUMMARY:",
-            f"  by_kind: {json.dumps(registry.get('by_kind', {}))}",
-            f"  by_host: {json.dumps(registry.get('by_host', {}))}",
-            f"  by_status: {json.dumps(registry.get('by_status', {}))}",
-            "",
-            "Respond with the JSON action object only.",
+            "TRIAGE RESIDUE",
+            f"job_id: {str(row.get('id') or '')[:12]}",
+            f"kind: {row.get('kind') or ''}",
+            f"failure_reason: {str(row.get('failure_reason') or '')[:500]}",
+            f"result (truncated): {result[:2000]}",
+            f"rule_out: {cls.rule_id if cls else 'none'}; decision classes: {' | '.join(doctor_rules.CLASSES)}",
         ]
     )
-    return "\n".join(msg)
+
+
+def _classify_triage_state(row: dict, base_kind: str = "") -> dict:
+    """The deterministic classification of one triage row (operator 2026-10-31).
+
+    Called from ``process_triage_job`` at the ONE point a model used to be
+    dialled. ``doctor_rules.classify_row`` answers from the row's shape; the
+    only residue it cannot name (``ambiguous``) is asked of a model with a
+    CONSTRAINED reply, and a model that cannot produce one is escalated rather
+    than obeyed. Either way the return value is one of ``CLASSES``."""
+    cls = doctor_rules.classify_row(row)
+    if cls is not None and not cls.ambiguous:
+        log.info("doctor row=%s classified rule=%s action=%s", str(row.get("id", ""))[:12], cls.rule_id, cls.action)
+        return doctor_rules.as_action(cls)
+    if cls is None:
+        # A never-act class is owned by another caller; do not invent a
+        # second decision for it.
+        return doctor_rules.as_action(None)
+
+    # The residue: evidence no rule names. ONE constrained call, and the next
+    # rung when the reply does not parse (the chain and the legacy loop both
+    # retry); a final non-answer escalates, it never releases.
+    prompt = build_residue_prompt(row, cls)
+    started = time.monotonic()
+    ok, text = invoke_doctor_agent(prompt, phase="triage")
+    latency_ms = (time.monotonic() - started) * 1000.0
+    if not ok:
+        _note_doctor_model_call("triage", "unavailable", latency_ms)
+        return {
+            "action_type": "escalate",
+            "confidence": 1.0,
+            "reason": "residue model unavailable; escalated",
+            "rule_id": "residue:model_unavailable",
+            "needs_review": True,
+            "model_attempted": True,
+            "raw": text,
+        }
+    raw_reply = parse_doctor_response(text) or {}
+    parsed_ok, decision = doctor_rules.parse_constrained(json.dumps(raw_reply))
+    _note_doctor_model_call("triage", "ok" if parsed_ok else "unusable", latency_ms)
+    if not parsed_ok:
+        return {
+            "action_type": "escalate",
+            "confidence": 1.0,
+            "reason": f"residue model reply rejected ({decision.get('error')}); escalated",
+            "rule_id": "residue:rejected",
+            "needs_review": True,
+            "model_attempted": True,
+            "raw": text,
+        }
+    # Keep the model's own evidence quote: the residual validator below checks
+    # it verbatim against the row, and the schema deliberately drops it.
+    quote = raw_reply.get("evidence_quote") or raw_reply.get("quote")
+    if quote:
+        decision["evidence_quote"] = str(quote)
+    decision["rule_id"] = f"residue:model:{decision['action_type']}"
+    decision["needs_review"] = decision["action_type"] == "escalate"
+    return decision
 
 
 DOCTOR_GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1").strip()
@@ -1087,13 +1157,21 @@ def _invoke_openweight(
     *,
     base_url: str | None = None,
     model: str | None = None,
+    urlopen=None,
+    structured: bool = False,
 ) -> tuple[bool, str]:
     """Run a non-codex phase via an OpenAI-compatible chat endpoint.
 
     Defaults to the LOCAL brain (CERBERUS, DOCTOR_OPENWEIGHT_MODEL) — pass
     ``base_url``/``model`` for a specific phase. Anthropic + Together remain
     FORBIDDEN per CLAUDE.md. Local endpoints accept a placeholder auth, so a
-    missing key is only fatal when a base is explicitly remote."""
+    missing key is only fatal when a base is explicitly remote.
+
+    ``structured=True`` constrains the reply (operator 2026-10-31): the request
+    carries ``response_format`` (honoured by every OpenAI-compatible rung) AND
+    ``json_schema``/``grammar`` (what llama-server and vLLM compile into a
+    grammar), so a small or overloaded model cannot answer outside the
+    enumerated classes."""
     base = (base_url or DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
     model_id = model or DOCTOR_OPENWEIGHT_MODEL
     if not base:
@@ -1116,6 +1194,8 @@ def _invoke_openweight(
         "temperature": 0.0,
         "stream": False,
     }
+    if structured:
+        body.update(doctor_rules.structured_request_fields())
     url = f"{base}/chat/completions"
     data = json.dumps(body).encode()
     headers = {"content-type": "application/json"}
@@ -1125,8 +1205,9 @@ def _invoke_openweight(
         log.warning("no open-weight API key; calling %s unauthenticated (ok for local)", base)
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     log.info("invoking model=%s at %s (alias=%s, prompt_chars=%d)", model_id, base, model_alias, len(prompt))
+    opener = urlopen or urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=DOCTOR_OPENWEIGHT_TIMEOUT) as r:
+        with opener(req, timeout=DOCTOR_OPENWEIGHT_TIMEOUT) as r:
             resp = json.loads(r.read())
         text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
         if text and text.strip():
@@ -1148,6 +1229,25 @@ _codex_alias_warned = False
 def _is_codex_alias(model_alias: str) -> bool:
     alias = (model_alias or "").strip().lower()
     return alias in _CODEX_ALIASES or alias.startswith("gpt-")
+
+
+def _chain():
+    """The slot-aware chain for this call, or ``None`` for the legacy path.
+
+    A thin seam so tests (and a future caller) can inject a chain without
+    patching the module that defines it: ``chain_from_env`` reads
+    DOCTOR_MODEL_CHAIN and returns None when unset, which is the default."""
+    chain = doctor_models.chain_from_env(
+        # Count the doctor's own calls per rung; a rung at its cap is skipped,
+        # not dialled (the "free slot found taken" evidence the alert reads).
+        urlopen=_ledger_urlopen(),
+        clock=_model_chain_clock,
+    )
+    return chain
+
+
+#: Re-exported so a caller/test can name the chain factory from this module.
+chain_from_env = doctor_models.chain_from_env
 
 
 def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
@@ -1173,19 +1273,37 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     # single-base-per-phase chain below runs exactly as before.
     # `is not None` is load-bearing: tests patch chain_from_env with a falsy
     # sentinel to assert the legacy path consults no chain at all.
-    model_chain = doctor_models.chain_from_env()
+    model_chain = _chain()
     if model_chain is not None:
-        outcome = model_chain.call(
-            phase,
-            system=DOCTOR_SYSTEM,
-            prompt=prompt,
-            structured=phase != "fix",
-            timeout=DOCTOR_OPENWEIGHT_TIMEOUT,
-        )
-        if outcome.ok:
-            log.info("doctor phase=%s answered by chain rung=%s attempts=%s", phase, outcome.rung, outcome.attempts)
-            return True, outcome.text
-        return False, f"model chain failed for phase {phase}; tried {outcome.attempts}: {outcome.text}"
+        # A structured reply that does not parse is a failure of THAT rung, and
+        # the next rung must be tried (operator 2026-10-31: "reject and retry on
+        # the next rung when it does not parse"). The chain already walks its
+        # rungs inside one call; this loop covers a chain that returns a
+        # rejection, and it is bounded so a broken chain cannot spin.
+        max_rounds = int(getattr(doctor_models, "DEFAULT_MAX_ATTEMPTS", 5))
+        tried: list[str] = []
+        last = ""
+        for _round in range(max(1, int(max_rounds))):
+            outcome = model_chain.call(
+                phase,
+                system=DOCTOR_SYSTEM,
+                prompt=prompt,
+                structured=phase != "fix",
+                timeout=DOCTOR_OPENWEIGHT_TIMEOUT,
+            )
+            tried.extend(outcome.attempts)
+            if outcome.ok:
+                log.info(
+                    "doctor phase=%s answered by chain rung=%s attempts=%s",
+                    phase,
+                    outcome.rung,
+                    outcome.attempts,
+                )
+                return True, outcome.text
+            last = outcome.text
+            if not str(outcome.text).startswith("unusable reply"):
+                break
+        return False, f"model chain failed for phase {phase}; tried {tried}: {last}"
 
     model_alias = _PHASE_MODELS.get(phase, DOCTOR_TRIAGE_MODEL)
     if _is_codex_alias(model_alias):
@@ -1211,8 +1329,25 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     for idx, (base, model) in enumerate(chain):
         # Pass the model ONLY as the keyword: _invoke_openweight's second
         # positional parameter is the alias label, not the model id.
-        ok, text = _invoke_openweight(prompt, model_alias, base_url=base, model=model)
-        if ok and text.strip():
+        # Constrained output (operator 2026-10-31): a triage/review reply must
+        # parse into the enumerated classes, so every rung inherits the schema.
+        structured = phase != "fix"
+        started = time.monotonic()
+        ok, text = _invoke_openweight(prompt, model_alias, base_url=base, model=model, structured=structured)
+        latency_ms = (time.monotonic() - started) * 1000.0
+        # A reply that arrived but does not parse into the classes is a failure
+        # of THIS rung; the next rung is tried in the same call.
+        parsed_ok = True
+        if ok and text.strip() and structured:
+            parsed_ok = _reply_satisfies_schema(text)
+        _record_model_call(
+            rung=model or model_alias or base,
+            phase=phase,
+            latency_ms=latency_ms,
+            outcome=("ok" if ok and parsed_ok else "unusable" if ok else _classify_attempt_failure(text)),
+            skipped_because=None if ok else str(text)[:200],
+        )
+        if ok and text.strip() and parsed_ok:
             if idx == 0:
                 log.info("doctor phase=%s answered by %s model=%s", phase, base, model)
             else:
@@ -1289,6 +1424,145 @@ def parse_doctor_response(text: str) -> dict | None:
         except Exception:
             continue
     return best
+
+
+def _reply_satisfies_schema(text: str) -> bool:
+    """Is this legacy reply usable, or must the next rung be tried?
+
+    The legacy chain predates the constraint and its bytes/behaviour must not
+    change when ``DOCTOR_MODEL_CHAIN`` is unset: prose is still returned to the
+    caller, exactly as before. Only a MALFORMED framed reply -- an action
+    object that was started and did not close or did not parse -- is a failure
+    of this rung, so a truncated/garbled answer rolls to the next rung instead
+    of being handed to the residue validator as if it were a diagnosis.
+
+    The chain path is the strict one: it passes ``structured=True`` and judges
+    replies with ``doctor_models._acceptable`` against ``doctor_rules.CLASSES``.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if "{" not in stripped and "`" not in stripped:
+        return True  # plain prose: legacy-legal, and the caller escalates on it
+    return parse_doctor_response(stripped) is not None
+
+
+def _model_chain_clock() -> float:
+    """The chain's clock, patched by tests; the ledger stamps with it too."""
+    return time.time()
+
+
+def _ledger_urlopen():
+    """Wrap urlopen so every probe that finds a rung BUSY is evidence.
+
+    The chain probes a rung before choosing it; a second probe on a rung whose
+    cached reading (a few seconds old) said "busy" is the doctor finding the
+    free slot TAKEN (the chain's re-probe). Recording that here is the only
+    place it is observable without a slot-level contract.
+    """
+    real = urllib.request.urlopen
+
+    def opener(request, timeout=0):
+        busy = False
+        try:
+            with real(request, timeout=timeout) as response:
+                body = response.read(1 << 20)
+        except Exception:
+            # A probe that cannot be read is not proof of capacity; it is not
+            # evidence of a taken slot either.
+            raise
+        try:
+            text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+            if "/slots" in getattr(request, "full_url", ""):
+                data = json.loads(text)
+                slots = data.get("slots") if isinstance(data, dict) else data
+                busy = isinstance(slots, list) and all(
+                    isinstance(slot, dict) and slot.get("is_processing") for slot in slots
+                )
+        except (ValueError, AttributeError):
+            busy = False
+        if busy:
+            _record_model_call(
+                rung="slot-probe",
+                phase="probe",
+                latency_ms=0.0,
+                outcome="busy",
+                skipped_because="free slot found taken",
+                slot_taken=True,
+            )
+
+        class _Replay(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        return _Replay(body)
+
+    return opener
+
+
+def _model_call_ledger() -> doctor_rules.CallLedger:
+    """The process-wide ledger (one JSONL file, like the safety state)."""
+    global _MODEL_CALL_LEDGER
+    if _MODEL_CALL_LEDGER is None:
+        _MODEL_CALL_LEDGER = doctor_rules.CallLedger(clock=_model_chain_clock)
+    return _MODEL_CALL_LEDGER
+
+
+_MODEL_CALL_LEDGER: doctor_rules.CallLedger | None = None
+
+
+def _record_model_call(**entry) -> dict:
+    """One ledger line per rung; returns the counter (and the ONCE-alert flag).
+
+    The alert is NOT broadcast from here: a model call must never issue a
+    second network request (an outage is exactly when it fires). The caller --
+    the doctor heartbeat, where a broadcast is expected -- reads
+    ``alert`` and emits ``doctor.light_model_needed``.
+
+    ``doctor.light_model_needed`` is emitted when more than 30 doctor model
+    calls happen in an hour, or the doctor's free slot is found taken more than
+    3 times in an hour (operator rule 2026-10-31) -- that is the evidence the
+    restoration rule reads before a dedicated light model is put back."""
+    try:
+        summary = _model_call_ledger().record(**entry)
+    except Exception as exc:  # noqa: BLE001 -- telemetry never fails a triage
+        log.warning("doctor model-call ledger unavailable: %s", exc)
+        return {}
+    if summary.get("alert"):
+        log.warning(
+            "doctor %s reason=%s calls=%s slot_taken=%s",
+            doctor_rules.ALERT_TOPIC,
+            summary.get("alert_reason"),
+            summary.get("calls_last_hour"),
+            summary.get("slot_taken_last_hour"),
+        )
+    return summary
+
+
+def _note_doctor_model_call(phase: str, outcome: str, latency_ms: float = 0.0, rung: str = "") -> dict:
+    """Thin, patchable seam for call sites outside ``invoke_doctor_agent``."""
+    return _record_model_call(rung=rung, phase=phase, latency_ms=latency_ms, outcome=outcome)
+
+
+def doctor_model_call_counter() -> dict:
+    """The counter the doctor status and the weekend triage line expose."""
+    try:
+        return _model_call_ledger().counter()
+    except Exception:  # noqa: BLE001 -- a status read never raises
+        return doctor_rules.model_call_counter([], now=time.time())
+
+
+def doctor_agent_status() -> dict:
+    """The extra health payload the doctor status carries (heartbeat metadata)."""
+    return {
+        "model_calls": doctor_model_call_counter(),
+        "doctor_state_loaded": bool(STATE.loaded_ok),
+    }
 
 
 # ───────────────────────── Playbook actions ─────────────────────────
@@ -3573,7 +3847,6 @@ def process_triage_job(job: dict) -> dict:
     )
 
     failed = fetch_failed_jobs_for_kind(base_kind, limit=10)
-    registry = fetch_agent_registry_summary()
 
     # ── Deterministic decline paths (2026-10-27) ──
     # The decline vocabulary is decided by table, not by prompt: every reason
@@ -3730,35 +4003,61 @@ def process_triage_job(job: dict) -> dict:
             "result": unknown_action.get("result"),
         }
 
-    prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
-
-    # Diagnose = triage phase (cheap open-weight by default). The doctor emits a
-    # JSON action; any code FIX is dispatched to open-weight workers, and
-    # adversarial REVIEW of that fix runs on codex (DOCTOR_REVIEW_MODEL).
-    ok, text = invoke_doctor_agent(prompt, phase="triage")
-    if not ok:
+    # ── The residue: everything above answered from the row. What is left is
+    # ambiguous, and that is the ONLY reason a model is dialled (operator
+    # 2026-10-31). ``_classify_triage_state`` asks one CONSTRAINED question --
+    # one enum value and a short reason -- and rejects/retries down the chain
+    # when the reply does not parse; when no rung parses, the row escalates.
+    # Deployment-dependent worker_error (no_repo_mapping) is NOT a row the
+    # table may answer for: whether it is unschedulable depends on the catalog,
+    # which only this process can read. A genuinely absent repo escalates with
+    # no model call; a catalog-present one falls through to the ordinary path.
+    _unsched = _is_unschedulable(failed or [job])
+    if _unsched:
         return {
-            "exit_code": 2,
-            "stdout": "doctor agent failed",
-            "stderr": text[:2000],
-            "action_type": "escalate",
-            "reason": "doctor LLM call failed",
+            "exit_code": 0,
+            "stdout": f"action=escalate; reason=unschedulable ({_unsched}); no model call",
+            "action": {
+                "action_type": "escalate",
+                "confidence": 1.0,
+                "reason": f"unschedulable ({_unsched}): the submitter must create the branch or map the repo",
+            },
+            "base_kind": base_kind,
+            "needs_review": True,
+            "doctor_model_calls": doctor_model_call_counter(),
         }
 
-    action = parse_doctor_response(text)
-    if not action:
+    residue_row = _classify_triage_state(failed[0] if failed else job)
+    # ``parse_constrained`` bounds a model reply to the decision schema, which
+    # deliberately drops extras -- including ``evidence_quote``. Carry the raw
+    # quote through so the residual validator below can still verify it against
+    # the row's own evidence (the quote gate is not weakened by the schema).
+    action = {**residue_row, **(residue_row.get("model_action") or {})}
+
+    if residue_row.get("action_type") == "escalate" and residue_row.get("model_attempted"):
         return {
             "exit_code": 3,
-            "stdout": "could not parse doctor response",
-            "raw": text[-2000:],
+            "stdout": "could not parse doctor response on any rung",
+            "raw": str(residue_row.get("raw") or "")[-2000:],
             "action_type": "escalate",
+            "base_kind": base_kind,
+            "needs_review": True,
+            "action": {"action_type": "escalate", "reason": residue_row.get("reason") or ""},
+            "doctor_model_calls": doctor_model_call_counter(),
         }
 
     # Residual release decisions must cite the original evidence and obey the
-    # same durable per-signature retry ceiling as deterministic rules.
+    # same durable per-signature retry ceiling as deterministic rules. A TABLE
+    # decision is not residual: it names its own rule, so it needs no evidence
+    # quote -- the quote gate exists for free-form model diagnoses.
     residual_evidence = doctor_v2.collect_evidence(failed[0] if failed else job)
     used_retries = len(_signature_resubmits(base_kind, residual_evidence.signature))
-    if "evidence_quote" in action or "quote" in action or action.get("action_type") == "release_to_queue":
+    from_table = bool(
+        residue_row.get("rule_id", "").startswith(("retryable_", "residue:no_action", "loop:", "empty_result"))
+    )
+    if not from_table and (
+        "evidence_quote" in action or "quote" in action or action.get("action_type") == "release_to_queue"
+    ):
         residual = doctor_v2.validate_llm_decision(
             action,
             residual_evidence,
@@ -3822,6 +4121,9 @@ def process_triage_job(job: dict) -> dict:
             if v2
             else None
         ),
+        # The doctor call counter rides on the result so the weekend triage
+        # line and the status can read it without a second source of truth.
+        "doctor_model_calls": doctor_model_call_counter(),
     }
 
 
