@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from fastapi import HTTPException
@@ -232,6 +234,79 @@ class RequeueArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail["override"], "dead-letter")
         self.assertEqual(detail["reason"], "operator: reopen after fixing head branch")
         self.assertEqual((detail["max_retries"], detail["retry_count"]), (2, 1))
+
+
+    async def test_repeated_requeues_append_two_history_entries(self):
+        await self._job("job-repeat", result={"exit_code": 1}, retry_count=1, max_retries=2)
+        async with self.repo.connection() as tx:
+            changed = await self.repo.archive_and_requeue_job(
+                tx, job_id="job-repeat", actor=ACTOR, reason="first", archived_at=10.0
+            )
+            await tx.commit()
+        self.assertEqual(changed, 1)
+        async with self.repo.connection() as tx:
+            await tx.execute(
+                "UPDATE jobs SET status='failed', result=?, retry_count=1 WHERE id=?",
+                (json.dumps({"exit_code": 2}), "job-repeat"),
+            )
+            await tx.commit()
+        async with self.repo.connection() as tx:
+            changed = await self.repo.archive_and_requeue_job(
+                tx, job_id="job-repeat", actor=ACTOR, reason="second", archived_at=20.0
+            )
+            await tx.commit()
+        self.assertEqual(changed, 1)
+
+        history = await self._history("job-repeat")
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["payload"], {"exit_code": 2})
+        self.assertEqual(history[0]["reason"], "second")
+        self.assertEqual(history[1]["payload"], {"exit_code": 1})
+        self.assertEqual(history[1]["reason"], "first")
+
+    async def test_history_write_failure_leaves_current_result_untouched(self):
+        payload = {"exit_code": 1}
+        await self._job("job-rollback", result=payload)
+        async with self.repo.connection() as tx:
+            await tx.execute(
+                "INSERT INTO job_result_history "
+                "(id, job_id, attempt, prior_status, archived_at, actor_urn, reason, action, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("fb51-collision", "job-rollback", 2, "failed", 1.0, ACTOR, "seeded", "requeue", "{}"),
+            )
+            await tx.commit()
+        fixed = SimpleNamespace(hex="fb51-collision")
+        with mock.patch("hive.persistence.sqlite.uuid.uuid4", return_value=fixed):
+            with self.assertRaises(sqlite3.IntegrityError):
+                async with self.repo.connection() as tx:
+                    await self.repo.archive_and_requeue_job(
+                        tx, job_id="job-rollback", actor=ACTOR, reason="rollback", archived_at=2.0
+                    )
+                    await tx.commit()
+
+        row = await self._row("job-rollback")
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["result"], payload)
+        history = await self._history("job-rollback")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["reason"], "seeded")
+
+    async def test_concurrent_requeue_writes_no_duplicate_history(self):
+        payload = {"exit_code": 1}
+        await self._job("job-race-endpoint", result=payload)
+        original = self.repo.patch_job_status
+
+        async def interleave(tx, job_id, **kwargs):
+            await tx.execute("UPDATE jobs SET status='done' WHERE id=?", (job_id,))
+            return await original(tx, job_id, **kwargs)
+
+        with mock.patch.object(self.repo, "patch_job_status", side_effect=interleave):
+            result = await self._requeue("job-race-endpoint")
+        self.assertEqual(result["skipped_conflict"], ["job-race-endpoint"])
+        row = await self._row("job-race-endpoint")
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["result"], payload)
+        self.assertEqual(await self._history("job-race-endpoint"), [])
 
 
 if __name__ == "__main__":
