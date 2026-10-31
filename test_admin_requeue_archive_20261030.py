@@ -20,6 +20,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from fastapi import HTTPException
+
 os.environ.setdefault("HIVE_BACKEND", "sqlite")
 
 import agent_bus
@@ -172,6 +174,64 @@ class RequeueArchiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["retry_count"], 0, "retry_count resets to 0")
         for column in ("claim_lease_expires_at", "claimed_at", "ended_at"):
             self.assertIsNone(row[column], column)
+
+
+    async def _audit(self, job_id):
+        async with self.repo.connection() as tx:
+            async with tx.execute(
+                "SELECT actor_urn, old_status, new_status, patch FROM job_audit_log WHERE job_id=?",
+                (job_id,),
+            ) as cur:
+                return [tuple(row) for row in await cur.fetchall()]
+
+    async def _reclassify(self, *job_ids, **request):
+        with mock.patch.object(admin_router, "hive_repo", lambda: self.repo):
+            return await admin_router.admin_reclassify_jobs(
+                agent_bus.ReclassifyRequest(job_ids=list(job_ids), **request), actor=ACTOR
+            )
+
+    async def test_dead_letter_reclassify_without_override_is_refused_whole(self):
+        await self._job("job-dlq", status="dead-letter", result={"exit_code": 1, "hive_reviews": REVIEWS})
+        with self.assertRaises(HTTPException) as refused:
+            await self._reclassify("job-dlq", status="queued")
+        self.assertEqual(refused.exception.status_code, 422)
+
+        row = await self._row("job-dlq")
+        self.assertEqual(row["status"], "dead-letter")
+        self.assertEqual(row["result"], {"exit_code": 1, "hive_reviews": REVIEWS})
+        self.assertEqual(await self._history("job-dlq"), [])
+        self.assertEqual(await self._audit("job-dlq"), [])
+
+    async def test_dead_letter_reclassify_with_override_archives_and_audits(self):
+        payload = {"exit_code": 1, "hive_reviews": REVIEWS}
+        await self._job("job-dlq-override", status="dead-letter", result=payload, retry_count=1, max_retries=2)
+        result = await self._reclassify(
+            "job-dlq-override",
+            status="queued",
+            override_max_retries=True,
+            override_reason="operator: reopen after fixing head branch",
+        )
+        self.assertEqual(result["ok"], ["job-dlq-override"])
+
+        row = await self._row("job-dlq-override")
+        self.assertEqual(row["status"], "queued")
+        self.assertIsNone(row["result"])
+        self.assertEqual(row["retry_count"], 0)
+
+        (entry,) = await self._history("job-dlq-override")
+        self.assertEqual(entry["action"], "reclassify")
+        self.assertEqual(entry["prior_status"], "dead-letter")
+        self.assertEqual(entry["actor"], ACTOR)
+        self.assertEqual(entry["reason"], "operator: reopen after fixing head branch")
+        self.assertEqual(entry["payload"]["hive_reviews"], REVIEWS)
+
+        (audit,) = await self._audit("job-dlq-override")
+        actor, old_status, new_status, patch = audit
+        self.assertEqual((actor, old_status, new_status), (ACTOR, "dead-letter", "queued"))
+        detail = json.loads(patch)
+        self.assertEqual(detail["override"], "dead-letter")
+        self.assertEqual(detail["reason"], "operator: reopen after fixing head branch")
+        self.assertEqual((detail["max_retries"], detail["retry_count"]), (2, 1))
 
 
 if __name__ == "__main__":

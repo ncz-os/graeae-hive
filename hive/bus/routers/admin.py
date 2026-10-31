@@ -6,6 +6,7 @@ Individual DELETE /v1/jobs/{id} is not provided.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Any
@@ -57,13 +58,20 @@ def _override_ok(req: Any) -> bool:
 
 
 async def _budget_row(tx, job_id: str):
-    """(status, max_retries, retry_count) for job_id, or None."""
-    async with tx.execute("SELECT status, max_retries, retry_count FROM jobs WHERE id=?", (job_id,)) as cur:
+    """(status, max_retries, retry_count, claimed_by) for job_id, or None."""
+    async with tx.execute(
+        "SELECT status, max_retries, retry_count, claimed_by FROM jobs WHERE id=?", (job_id,)
+    ) as cur:
         row = await cur.fetchone()
     if not row:
         return None
     row = tuple(row)
-    return (row[0], row[1] if len(row) > 1 else None, row[2] if len(row) > 2 else None)
+    return (
+        row[0],
+        row[1] if len(row) > 1 else None,
+        row[2] if len(row) > 2 else None,
+        row[3] if len(row) > 3 else None,
+    )
 
 
 async def _emit_overrides(overrides: list[dict], actor: str, reason: str) -> None:
@@ -269,6 +277,9 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
     to surface ambiguous dead-letter jobs for a human."""
     if req.status not in RECLASSIFY_ALLOWED_TARGETS:
         raise HTTPException(422, f"status must be one of {sorted(RECLASSIFY_ALLOWED_TARGETS)}")
+    # FB51: reopening dead-letter as queued is an explicit override, not a
+    # silent transition. The guard is checked per row before any write, so a
+    # refused batch leaves every row untouched.
     actor = _actor_name(actor)
     results: dict = {"ok": [], "not_found": [], "skipped_done": [], "skipped_retry_budget": [], "skipped_conflict": []}
     overrides: list[dict] = []
@@ -282,6 +293,13 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
             if row[0] == "done":
                 results["skipped_done"].append(job_id)
                 continue
+            dead_letter_override = row[0] == "dead-letter" and req.status == "queued"
+            if dead_letter_override and not _override_ok(req):
+                raise HTTPException(
+                    422,
+                    "dead-letter -> queued requires override_max_retries=true "
+                    "with a non-empty override_reason",
+                )
             if req.status == "queued" and _retry_budget_exhausted(row[1], row[2]):
                 # reclassify -> queued is a requeue: same retry-budget rule.
                 if not _override_ok(req):
@@ -312,17 +330,40 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
                     }
                 )
             if req.status == "queued":
-                # full requeue semantics (reset claim + retry/backoff)
-                sets = {
-                    "status": "queued",
-                    "claimed_by": None,
-                    "claimed_at": None,
-                    "retry_count": 0,
-                    "retry_backoff_until": None,
-                }
+                # Full requeue semantics through the same repository operation
+                # that archives the cleared result (FB51).
+                changed = await hive_repo().archive_and_requeue_job(
+                    tx,
+                    job_id=job_id,
+                    actor=actor,
+                    reason=(req.override_reason or req.reason) if dead_letter_override else req.reason,
+                    archived_at=time.time(),
+                    expected_status=row[0],
+                    action="reclassify",
+                )
+                if changed == 1 and dead_letter_override:
+                    await hive_repo().insert_job_audit(
+                        tx,
+                        job_id=job_id,
+                        ts=time.time(),
+                        actor_urn=actor,
+                        old_status=row[0],
+                        new_status="queued",
+                        old_claimed_by=row[3],
+                        new_claimed_by=None,
+                        patch_json=json.dumps(
+                            {
+                                "action": "reclassify",
+                                "override": "dead-letter",
+                                "reason": req.override_reason,
+                                "max_retries": row[1],
+                                "retry_count": row[2],
+                            }
+                        ),
+                    )
             else:
                 sets = {"status": req.status, "claimed_by": None, "claimed_at": None}
-            changed = await hive_repo().patch_job_status(tx, job_id, sets=sets, expected_status=row[0])
+                changed = await hive_repo().patch_job_status(tx, job_id, sets=sets, expected_status=row[0])
             if changed != 1:
                 results["skipped_conflict"].append(job_id)
                 continue
