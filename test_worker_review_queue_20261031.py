@@ -127,3 +127,34 @@ def test_resume_delay_doubles_and_is_bounded(worker):
     assert worker.review_resume_delay(0) == backoff_seconds(0)
     assert worker.review_resume_delay(1) == 2 * backoff_seconds(0)
     assert worker.review_resume_delay(99) == review_queue.MAX_BACKOFF_SEC
+
+
+def test_no_stray_splice_scaffolding_with_unresolved_names():
+    """No ``.rq_*.py`` splice fragment may survive in the repo root.
+
+    The worker seams were developed as root-level ``.rq_*`` fragments that a
+    splice step pasted into ``deploy/hive_worker.py``. ``99d56c4`` removed
+    ``.rq_insert.py`` and ``.rq_section.py`` but left
+    ``.rq_worker_section.py`` behind: a dead, unpackaged copy of the worker
+    seams that uses ``review_queue`` without importing it (ruff F821) and that
+    had drifted from the live code (it classified the CERBERUS-busy ``no review
+    chunks`` signature as ``review_empty`` instead of ``review_busy``). A file
+    nothing imports cannot regress a run, but an unimported duplicate of live
+    logic is a trap for the next reader, so its absence is asserted here.
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent
+    strays = sorted(p.name for p in root.glob(".rq_*.py"))
+    assert strays == [], f"stray review-queue splice scaffolding: {strays}"
+
+
+def test_live_worker_classifies_busy_before_empty(worker):
+    """The CERBERUS-busy signature is a retryable BUSY route, not an empty review.
+
+    ``no review chunks`` means the loop never got a slot at all (the 8-slot
+    gpt-oss-20b endpoint), so it must classify ``review_busy``: the row stays
+    awaiting_review and retries rather than being parked as an empty review.
+    """
+    kind = worker.reviewer_failure_kind({"error": "all healthy endpoints failed: no review chunks"}, head_sha="a" * 40)
+    assert kind == "review_busy"
