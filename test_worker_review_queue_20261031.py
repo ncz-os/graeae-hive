@@ -158,3 +158,91 @@ def test_live_worker_classifies_busy_before_empty(worker):
     """
     kind = worker.reviewer_failure_kind({"error": "all healthy endpoints failed: no review chunks"}, head_sha="a" * 40)
     assert kind == "review_busy"
+
+
+# ── the finalizer actually writes the queue entry (review fix 2026-10-31) ────
+# The seams above were defined but never called by the delivery path, so no
+# row ever reached the queue. ``apply_awaiting_review`` is the one call the
+# finalizer makes after the review gate.
+
+_DELIVERED = {
+    "commits": ["a" * 40],
+    "files_changed": ["hive/x.py"],
+    "tracked_worktree_clean": True,
+    "remote_verified": True,
+    "remote_sha": "a" * 40,
+    "head_sha": "a" * 40,
+}
+
+
+def _loop_result(final_verdict, error="no review chunks were generated"):
+    return {"teardown": {"final_verdict": final_verdict, "error": error}}
+
+
+def test_reviewer_outage_on_a_delivered_branch_enters_the_review_queue(worker):
+    from hive.review_queue import review_state
+
+    result = {"loop_result": _loop_result("reviewer_unavailable")}
+    status, reason = worker.apply_awaiting_review(
+        "needs-review",
+        "loop_unresolved_work_rescued",
+        result,
+        evidence=_DELIVERED,
+        cancelled=False,
+        run_models={"author": "qwen38"},
+        reviewer="gpt-oss-20b",
+        now=100.0,
+    )
+    assert (status, reason) == ("needs-review", "reviewer_unavailable")
+    state = review_state({"result": result})
+    assert state["author"] == "qwen38" and state["author_family"] == "alibaba"
+    assert state["attempt"] == 0 and state["last_failure"] == "review_busy"
+    assert state["tried"][0]["model_id"] == "gpt-oss-20b"
+    assert state["tried"][0]["failure"] == "review_busy"
+
+
+def test_reviewer_outage_that_failed_the_loop_still_enters_the_queue(worker):
+    result = {"loop_result": _loop_result("reviewer-unavailable")}
+    status, reason = worker.apply_awaiting_review(
+        "failed", "loop_unresolved", result, evidence=_DELIVERED, cancelled=False, run_models={"author": "qwen38"}
+    )
+    assert (status, reason) == ("needs-review", "reviewer_unavailable")
+    assert result["review_state"]["state"] == "awaiting_review"
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "loop", "evidence", "cancelled"),
+    [
+        # nothing delivered: there is no branch to review
+        ("failed", "loop_unresolved", _loop_result("reviewer_unavailable"), {}, False),
+        # another actor cancelled the job
+        ("failed", "loop_unresolved", _loop_result("reviewer_unavailable"), _DELIVERED, True),
+        # the AUTHOR failed, not the reviewer
+        ("failed", "loop_unresolved", _loop_result("author_failed"), _DELIVERED, False),
+        # harder failures always win over the review queue
+        ("failed", "delivery_integrity_check_failed", _loop_result("reviewer_unavailable"), _DELIVERED, False),
+        ("failed", "ai_attribution_trailer", _loop_result("reviewer_unavailable"), _DELIVERED, False),
+        ("failed", "protection_violation", _loop_result("reviewer_unavailable"), _DELIVERED, False),
+        ("failed", "budget_exceeded", _loop_result("reviewer_unavailable"), _DELIVERED, False),
+        # a successful delivery is not queued
+        ("done", None, _loop_result("reviewer_unavailable"), _DELIVERED, False),
+    ],
+)
+def test_review_queue_entry_only_for_a_delivered_reviewer_outage(worker, status, reason, loop, evidence, cancelled):
+    result = {"loop_result": loop}
+    out = worker.apply_awaiting_review(
+        status, reason, result, evidence=evidence, cancelled=cancelled, run_models={"author": "qwen38"}
+    )
+    assert out == (status, reason)
+    assert "review_state" not in result
+
+
+def test_the_finalizer_calls_the_review_queue_seam():
+    """The delivery path must call the seam, after the gate and the spend cap."""
+    root = __import__("pathlib").Path(__file__).resolve().parent
+    source = (root / "deploy" / "hive_worker.py").read_text()
+    gate = source.index("status, failure_reason = zeroclaw_review_gate(")
+    call = source.index("status, failure_reason = apply_awaiting_review(")
+    budget = source.index("result.update(budget_fields)", gate)
+    patch = source.index("patch_job(job_id, status, result)", call)
+    assert gate < budget < call < patch

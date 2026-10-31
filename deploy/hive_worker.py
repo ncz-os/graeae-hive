@@ -6872,6 +6872,18 @@ def _run_job_inner(job: dict) -> None:
         status = "failed"
         failure_reason = BUDGET_EXCEEDED_FAILURE
         result.update(budget_fields)
+    if WORKER_KIND != "codex" and codex_delivery_result is None:
+        # REVIEW QUEUE (2026-10-31): a delivered branch whose reviewer could
+        # not answer waits for a cross-family review instead of failing.
+        status, failure_reason = apply_awaiting_review(
+            status,
+            failure_reason,
+            result,
+            evidence=evidence,
+            cancelled=cancelled,
+            run_models=run_models,
+            reviewer=launched_reviewer_route(None),
+        )
     if failure_reason:
         result["failure_reason"] = failure_reason
         if failure_reason == "ai_attribution_trailer":
@@ -7084,6 +7096,47 @@ def awaiting_review_disposition(
 def review_resume_delay(attempt: int) -> float:
     """Delay before review attempt ``attempt+1`` (15 min doubling, capped at 2 h)."""
     return review_queue.backoff_seconds(attempt)
+
+
+#: Dispositions the review queue may take over: the loop's own unresolved
+#: outcome. Integrity, attribution, protection and spend-cap failures always win.
+_REVIEW_QUEUE_TAKES_OVER = frozenset({"loop_unresolved", "loop_unresolved_work_rescued"})
+
+
+def apply_awaiting_review(
+    status: str,
+    failure_reason: str | None,
+    result: dict,
+    *,
+    evidence: dict,
+    cancelled: bool,
+    run_models: dict | None,
+    reviewer: str | None = None,
+    now: float | None = None,
+) -> tuple[str, str | None]:
+    """Put a delivered branch whose REVIEWER could not answer into the queue.
+
+    Only the loop's own unresolved outcome is taken over, only when the loop
+    ended ``reviewer_unavailable``, only for a verified delivery (there must be
+    a branch to review) and never for a cancelled job. The row becomes
+    ``needs-review`` / ``reviewer_unavailable`` with
+    ``result.review_state`` naming the author, its family and the reviewer
+    that failed; the doctor's needs-review sweep takes it from there. Anything
+    else returns the disposition unchanged.
+    """
+    if cancelled or failure_reason not in _REVIEW_QUEUE_TAKES_OVER:
+        return status, failure_reason
+    loop = result.get("loop_result") if isinstance(result.get("loop_result"), dict) else {}
+    teardown = loop.get("teardown") if isinstance(loop.get("teardown"), dict) else {}
+    final = str(teardown.get("final_verdict") or "").strip().lower().replace("-", "_")
+    if final != "reviewer_unavailable" or not completion_ready(evidence or {}):
+        return status, failure_reason
+    new_status, new_reason = awaiting_review_disposition(final, exit_code=1, ready=True, cancelled=False)
+    author = str((run_models or {}).get("author") or "") if isinstance(run_models, dict) else ""
+    kind = reviewer_failure_kind(teardown, author_model=author) or "review_busy"
+    tried = [{"model_id": str(reviewer), "failure": kind}] if str(reviewer or "").strip() else []
+    result["review_state"] = awaiting_review_state(author, tried, last_failure=kind, now=now)
+    return new_status, new_reason
 
 def main() -> None:
     if WORKER_KIND not in ("zeroclaw", "codex"):
