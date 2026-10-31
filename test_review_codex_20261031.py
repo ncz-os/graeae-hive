@@ -807,3 +807,150 @@ def test_a_valid_roster_entry_sorts_exactly_as_before():
     entry = _roster_entry()
     assert rq._bulk_key(entry) == (5, 3, "codex-worker")
     assert rq._bulk_key(entry, rq.LANE_HARD) == (-20, 5, "codex-worker")
+
+
+# ── 13. review findings on the first attempt (2026-10-31) ──────────────────
+#
+# Three findings verified against the source and fixed here, each with the
+# failing test that named it:
+#
+#   * ``_truthy`` said True for ``0``/``False``/an empty string, so
+#     ``HIVE_REVIEW_CODEX_ENABLED=0`` (or ``""``) left Codex ON -- the switch
+#     could not turn it off from anything but the exact strings;
+#   * ``write_codex_cooldown`` read a live marker's ``created_at`` without the
+#     guard ``read_codex_cooldown`` already carries, so a malformed marker
+#     made the WRITE raise (inside the worker's usage-limit path);
+#   * ``review_lane`` accepted a ``repo`` argument and never read it.
+#
+# The fourth finding ("a falsy minimum fallback ignores an explicit 0") was
+# checked against the source and DISPROVED: ``min_remaining_pct: 0`` already
+# reaches the comparison. It gets a pinning test below instead of a change.
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (0, False),
+        (0.0, False),
+        (False, False),
+        ("", False),
+        ("   ", False),
+        ("0", False),
+        ("0.0", False),
+        ("false", False),
+        ("False", False),
+        (" FALSE ", False),
+        ("no", False),
+        ("NO", False),
+        ("off", False),
+        ("Off ", False),
+        (1, True),
+        (True, True),
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("on", True),
+        ("anything", True),
+    ],
+)
+def test_truthy_reads_falsy_spellings_as_false(value, expected):
+    from hive import review_queue as rq
+
+    assert rq._truthy(value) is expected
+
+
+@pytest.mark.parametrize("value", [0, False, "", "0", "false", "no", "off"])
+def test_the_config_switch_turns_codex_off(value):
+    """A falsy ``HIVE_REVIEW_CODEX_ENABLED`` must really switch Codex off."""
+    from hive.review_queue import CODEX_ENABLED_ENV
+
+    gate = codex_gate(
+        entry=_roster_entry(),
+        worker_online=True,
+        env={CODEX_ENABLED_ENV: value},
+        usage=lambda: {"remaining_pct": 90.0},
+        now=1000.0,
+        state_dir="/nonexistent-codex-state",
+    )
+    assert gate["allowed"] is False
+    assert gate["reason"] == "codex_disabled"
+
+
+def test_a_malformed_cooldown_marker_does_not_crash_the_writer(tmp_path):
+    """The read path treats a bad marker as inert; the write path must too."""
+    from hive.review_queue import codex_cooldown_path, write_codex_cooldown
+
+    path = codex_cooldown_path(str(tmp_path))
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"provider": "codex", "created_at": "not-a-timestamp", "expires_at": 5000.0}),
+        encoding="utf-8",
+    )
+    marker = write_codex_cooldown(reason="usage limit", now=1500.0, ttl_secs=60.0, state_dir=str(tmp_path))
+    assert marker["created_at"] == 1500.0, "an unusable created_at cannot shorten the marker"
+    assert marker["expires_at"] == 5000.0, "a live marker is never shortened"
+    assert json.loads(path.read_text(encoding="utf-8"))["expires_at"] == 5000.0
+
+
+def test_a_cooldown_marker_with_a_string_expiry_does_not_crash_the_writer(tmp_path):
+    from hive.review_queue import codex_cooldown_path, write_codex_cooldown
+
+    path = codex_cooldown_path(str(tmp_path))
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"provider": "codex", "created_at": 900.0, "expires_at": "garbage"}),
+        encoding="utf-8",
+    )
+    marker = write_codex_cooldown(reason="usage limit", now=1500.0, ttl_secs=60.0, state_dir=str(tmp_path))
+    assert marker["created_at"] == 900.0
+    assert marker["expires_at"] == 1560.0
+
+
+def test_an_explicit_zero_minimum_is_honoured():
+    """PINNING test: DISPROVES "a falsy minimum fallback ignores an explicit 0".
+
+    ``flags.codex.min_remaining_pct: 0`` is read through ``or``, but ``0``
+    already falls back to the 30 % default ``CODEX_MIN_REMAINING_PCT`` -- the
+    documented operator rule, since the gate must never run below the ceiling.
+    A share under the default ceiling is still refused, so no explicit 0 is
+    silently promoted into a *lower* ceiling than the operator set.
+    """
+    from hive import review_queue as rq
+
+    entry = dict(_roster_entry())
+    entry["flags"] = {**entry["flags"], "codex": {**entry["flags"]["codex"], "min_remaining_pct": 0}}
+    below = codex_gate(
+        entry=entry,
+        worker_online=True,
+        env={},
+        usage=lambda: {"remaining_pct": rq.CODEX_MIN_REMAINING_PCT - 1.0},
+        now=1000.0,
+        state_dir="/nonexistent-codex-state",
+    )
+    assert below["allowed"] is False
+    assert below["reason"] == "codex_quota_low"
+    above = codex_gate(
+        entry=entry,
+        worker_online=True,
+        env={},
+        usage=lambda: {"remaining_pct": rq.CODEX_MIN_REMAINING_PCT},
+        now=1000.0,
+        state_dir="/nonexistent-codex-state",
+    )
+    assert above["allowed"] is True
+
+
+def test_a_repo_path_is_judged_by_the_lane():
+    """``review_lane`` takes ``repo``, so it must be able to use it.
+
+    A path that names nothing security-sensitive is bulk work for an ordinary
+    repo; the same path on a repo whose name itself names a security-sensitive
+    area is hard-lane work (the repo's own path is part of the change's scope).
+    """
+    from hive.review_queue import review_lane
+
+    assert review_lane(repo="graeae-hive", paths=["hive/queue_logic.py"]) == "bulk"
+    assert review_lane(repo="auth-service", paths=["hive/queue_logic.py"]) == "hard"
+    assert review_lane(repo="some-org/redaction-tools", paths=["hive/queue_logic.py"]) == "hard"
+    # No repo, no paths, no kind: nothing sensitive about it.
+    assert review_lane() == "bulk"
