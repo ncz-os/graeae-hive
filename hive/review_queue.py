@@ -647,7 +647,9 @@ def review_state(job: dict) -> dict | None:
     return state
 
 
-def awaiting_review_status(loop_teardown: str | None, *, exit_code: int, ready: bool, cancelled: bool) -> tuple[str, str | None]:
+def awaiting_review_status(
+    loop_teardown: str | None, *, exit_code: int, ready: bool, cancelled: bool
+) -> tuple[str, str | None]:
     """Disposition for a loop that authored work but got no reviewer.
 
     ``reviewer_unavailable`` (a busy endpoint, a timeout, a 503) is the reviewer
@@ -674,8 +676,11 @@ def awaiting_review_status(loop_teardown: str | None, *, exit_code: int, ready: 
 def awaiting_review_reason(job: dict) -> str:
     """The human-readable reason a row is waiting, for the triage listing."""
     state = review_state(job) or {}
+    # A block written by a bus dialect or a partial repair may hold a non-list
+    # ``tried``: the listing renders the row instead of failing (2026-10-31).
+    rounds = state.get("tried") if isinstance(state.get("tried"), list) else []
     tried = ", ".join(
-        f"{t.get('model_id')}({t.get('failure') or 'unavailable'})" for t in state.get("tried") or []
+        f"{t.get('model_id')}({t.get('failure') or 'unavailable'})" for t in rounds if isinstance(t, dict)
     )
     base = "reviewer unavailable" if tried else "no cross-family reviewer attempted"
     family = state.get("author_family") or "unknown"
@@ -703,16 +708,19 @@ def triage_reason(job: dict) -> str | None:
 
 
 def attempts_remain(state: dict | None) -> bool:
+    """Attempts left: an unreadable ``attempt`` counts as 0 (never raises)."""
     if not state:
         return False
-    return int(state.get("attempt") or 0) < int(state.get("max_attempts") or MAX_REVIEW_ATTEMPTS)
+    attempt = state.get("attempt") if _is_int(state.get("attempt")) else 0
+    limit = state.get("max_attempts") if _is_int(state.get("max_attempts")) else MAX_REVIEW_ATTEMPTS
+    return attempt < limit
 
 
 def in_backoff(state: dict | None, now: float | None = None) -> bool:
     if not state:
         return False
     next_at = state.get("next_attempt_at")
-    if not isinstance(next_at, (int, float)) or not next_at:
+    if not isinstance(next_at, (int, float)) or isinstance(next_at, bool) or not next_at:
         return False
     return float(next_at) > (time.time() if now is None else float(now))
 
@@ -730,3 +738,315 @@ def is_resolved(state: dict | None) -> bool:
 def finite_load(value: Any) -> bool:
     """A usable load reading (not unknown, not NaN)."""
     return value is not LOAD_UNKNOWN and isinstance(value, (int, float)) and not math.isnan(value)
+
+
+# ---------------------------------------------------------------------------
+# Adopting legacy rows (operator 2026-10-31).
+# ---------------------------------------------------------------------------
+# The queue can only advance a row that carries ``result.review_state``, and
+# only the new worker line writes that block. The deployed workers still run the
+# older ``deploy/hive-canonical`` line, so their needs-review rows were invisible
+# to the sweep: production logged ``review_queue scanned=0 submitted=0`` while
+# thirteen rows sat unapproved. A legacy row is ADOPTED -- its review_state is
+# built FROM the row, in pure data, status untouched.
+
+#: Why a legacy row was adopted: the shape its ``result`` records.
+ADOPTION_NO_REVIEWER = "no_reviewer"
+ADOPTION_DID_NOT_APPROVE = "review_did_not_approve"
+ADOPTION_SUPERSEDED_HEAD = "review_superseded_head"
+#: The review_state fields a consumer reads. A block missing any is a partial
+#: write, so such a row is adopted again instead of skipped forever.
+ADOPTION_REQUIRED_FIELDS = ("author", "attempt", "max_attempts")
+
+
+def _result_dict(value: Any) -> dict:
+    """``result`` as a dict, tolerating the bus dialect that stores JSON text."""
+    if isinstance(value, (str, bytes)):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def verdict_word(value: Any) -> str:
+    """Lower-case verdict with ``-`` read as ``_`` (``request-changes`` == ``request_changes``)."""
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _reviewer_name(entry: dict) -> str:
+    return str(entry.get("model") or entry.get("model_id") or entry.get("reviewer_model") or "").strip()
+
+
+def _evidence_dicts(result: dict) -> list[dict]:
+    """Every dict on a row that may record a review round (reading order)."""
+    out: list[dict] = []
+
+    def add(value):
+        if isinstance(value, dict):
+            out.append(value)
+
+    add(result.get("review_evidence"))
+    add(result.get("reviewer"))
+    for key in ("hive_reviews", "review_rounds", "reviews"):
+        for entry in result.get(key) or []:
+            add(entry)
+    loop = result.get("loop_result")
+    if isinstance(loop, dict):
+        for entry in loop.get("verdicts") or []:
+            add(entry)
+        add(loop.get("teardown"))
+    for entry in result.get("result_history") or []:
+        add(entry)
+    return out
+
+
+def _structured_approve_for_head(result: dict, head: str) -> bool:
+    """A structured ``reviewers[]`` approve naming EXACTLY ``head``."""
+    for evidence in [result, *_evidence_dicts(result)]:
+        entries = evidence.get("reviewers")
+        if not isinstance(entries, list) or not entries:
+            continue
+        words = [verdict_word(entry.get("verdict")) for entry in entries if isinstance(entry, dict)]
+        if "approve" not in words or any(w in ("request_changes", "blocked") for w in words):
+            continue
+        reviewed = ""
+        for key in ("head_sha", "head", "reviewed_head"):
+            if isinstance(evidence.get(key), str) and evidence[key].strip():
+                reviewed = evidence[key].strip()
+                break
+        if head and reviewed and same_head(reviewed, head):
+            return True
+    return False
+
+
+def legacy_review_failure(result: dict) -> str | None:
+    """The structured failure kind a legacy row's ``result`` records, or None."""
+    texts = []
+    for evidence in _evidence_dicts(result):
+        for key in ("failure", "failure_reason", "verdict", "error", "final_verdict", "reason"):
+            if isinstance(evidence.get(key), str):
+                texts.append(evidence[key].lower())
+    for key in ("failure_reason", "error", "verdict", "error_message"):
+        if isinstance(result.get(key), str):
+            texts.append(result[key].lower())
+    haystack = " ".join(texts)
+    for needle, kind in (
+        ("no review chunks", "review_busy"),
+        ("reviewer_unavailable", "reviewer_unavailable"),
+        ("reviewer unavailable", "reviewer_unavailable"),
+        ("review_busy", "review_busy"),
+        ("review_timeout", "review_timeout"),
+        ("timeout", "review_timeout"),
+        ("timed out", "review_timeout"),
+        ("prose", "review_prose_only"),
+        ("truncat", "review_truncated"),
+        ("empty", "review_empty"),
+        ("503", "review_http_503"),
+    ):
+        if needle in haystack:
+            return kind
+    return None
+
+
+def legacy_review_tried(result: dict) -> list[dict]:
+    """``tried[]`` for an adopted row, from the reviewer/rounds its result records.
+
+    Only NAMES are read from the row (the reviewer a round named); the failure
+    kind is classified here, so a row can never inject its own outcome.
+    """
+    failure = legacy_review_failure(result)
+    tried: list[dict] = []
+    seen: set[str] = set()
+    for evidence in _evidence_dicts(result):
+        model = _reviewer_name(evidence)
+        if not model or model.lower() in seen:
+            continue
+        seen.add(model.lower())
+        tried.append({"model_id": model, "failure": failure or "review_reported"})
+    return tried
+
+
+def legacy_author_model(job: dict, result: dict | None = None) -> str:
+    """The author model a legacy row names: ``claimed_model`` then ``result`` fields.
+
+    ``claimed_model`` is the AUTHOR route of the job (hive/review_record.py); the
+    result's ``models.author`` / ``author_model`` are the older line's fallbacks.
+    No author recorded answers "" -- the caller PARKS, it never guesses.
+    """
+    result = result if isinstance(result, dict) else {}
+    models = result.get("models") if isinstance(result.get("models"), dict) else {}
+    for candidate in (
+        job.get("claimed_model"),
+        models.get("author"),
+        result.get("author_model"),
+        result.get("author"),
+    ):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def legacy_effective_head(job: dict, result: dict | None = None) -> str:
+    """The head a legacy row delivered: ``result.head_sha``, the row, the last commit."""
+    result = result if isinstance(result, dict) else {}
+    for value in (result.get("head_sha"), job.get("head_sha") if isinstance(job, dict) else None):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for entry in reversed(result.get("commits") if isinstance(result.get("commits"), list) else []):
+        sha = entry.get("sha") if isinstance(entry, dict) else entry
+        if isinstance(sha, str) and sha.strip():
+            return sha.strip()
+    return ""
+
+
+def _is_int(value: Any) -> bool:
+    """A real integer (bools are not counts); ``"3"`` is a string, not a count."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def state_problem(state: dict | None) -> str:
+    """Why a review_state block cannot be advanced as written; "" when it can.
+
+    The fields the advance reads must be PRESENT and of the right shape:
+    ``author`` a string, ``attempt``/``max_attempts`` integers (a block the
+    worker wrote always has them; a partial write, a hand edit or a bus dialect
+    that stringified the JSON does not). Naming the defect lets the caller both
+    refuse the block and record what it repaired (review 2026-10-31).
+    """
+    if not isinstance(state, dict):
+        return "no_state"
+    missing = [field for field in ADOPTION_REQUIRED_FIELDS if field not in state]
+    if missing:
+        return "missing:" + ",".join(missing)
+    malformed = [field for field in ("attempt", "max_attempts") if not _is_int(state.get(field))]
+    if malformed:
+        return "malformed:" + ",".join(malformed)
+    if not isinstance(state.get("author"), str):
+        return "malformed:author"
+    if not isinstance(state.get("tried", []), list):
+        return "malformed:tried"
+    return ""
+
+
+def usable_review_state(job: dict) -> dict | None:
+    """The row's review_state ONLY when it is complete enough to advance.
+
+    ``review_state()`` answers "is this row in the queue"; this answers "can a
+    sweep act on it". A block missing a field the advance reads (author,
+    attempt, max_attempts), or carrying one of the wrong shape, is a partial
+    write: None here, and ``needs_adoption`` then REPAIRS it -- it is never a
+    reason to skip the row forever (review 2026-10-31).
+    """
+    state = review_state(job)
+    if state_problem(state):
+        return None
+    return state
+
+
+def needs_adoption(job: dict) -> tuple[bool, str]:
+    """Whether a needs-review row should be adopted, and the shape it records.
+
+    Not adopted: no pushed head branch; the queue owns a COMPLETE row; a review
+    is in flight; an approve already covers the delivered head (a LATER head is
+    a different review and is adopted again). Otherwise the row is legacy, and
+    the reason names its shape -- ``review_state_partial`` for a block the queue
+    wrote but cannot advance (it is repaired, not skipped; review 2026-10-31,
+    high) -- or the recorded failure kind (``reviewer_unavailable``,
+    ``review_prose_only``, a 503 ...), ``review_superseded_head`` (evidence for
+    an older head), ``review_did_not_approve`` or ``no_reviewer``.
+    """
+    if not isinstance(job, dict) or not str(job.get("head_branch") or "").strip():
+        return False, ""
+    result = _result_dict(job.get("result"))
+    state = review_state(job)
+    if state is not None and state.get("review_job_id"):
+        return False, ""  # a review is in flight: never a second one
+    if state is not None and state.get("approved"):
+        return False, ""  # already approved
+    head = legacy_effective_head(job, result)
+    if _structured_approve_for_head(result, head):
+        return False, ""
+    # A legacy row (no block at all) and a PARTIAL block take the same path:
+    # the block is rebuilt from the row. Only a complete block means "owned".
+    if state is not None and not state_problem(state):
+        return False, ""
+    failure = legacy_review_failure(result)
+    if failure:
+        return True, failure
+    has_review = bool(
+        result.get("review_evidence")
+        or result.get("reviewer")
+        or result.get("hive_reviews")
+        or result.get("review_rounds")
+        or (isinstance(result.get("loop_result"), dict) and result["loop_result"].get("verdicts"))
+    )
+    if not has_review:
+        return True, ADOPTION_NO_REVIEWER
+    heads = []
+    for evidence in _evidence_dicts(result):
+        for key in ("head_sha", "head", "reviewed_head"):
+            if isinstance(evidence.get(key), str) and evidence[key].strip():
+                heads.append(evidence[key].strip())
+    if heads and head and not any(same_head(h, head) for h in heads):
+        return True, ADOPTION_SUPERSEDED_HEAD
+    return True, ADOPTION_DID_NOT_APPROVE
+
+
+def adoption_review_state(job: dict, *, now: float | None = None) -> dict | None:
+    """The ``review_state`` an adopted legacy row gets, or None (not adoptable).
+
+    Built FROM the row: author/family from ``claimed_model``/``result``,
+    ``tried[]`` from the reviewer its result recorded, attempt 0 (a legacy row
+    spent no queue attempts). ``adopted_from``/``adopted_head`` record the
+    provenance of the block, so a later reader can tell an adopted row from one
+    the worker tagged.
+
+    A PARTIAL block on the row is repaired rather than skipped (review
+    2026-10-31, high). Whatever of it is still trustworthy is kept -- the author
+    it named, the attempts it spent, a pending backoff and a parked_reason -- so
+    a repair neither re-forges a known author nor spends the retry budget twice;
+    the defect is recorded in ``adopted_from``/``repaired_from``.
+    """
+    adopt, reason = needs_adoption(job)
+    if not adopt:
+        return None
+    result = _result_dict(job.get("result"))
+    partial = review_state(job)
+    problem = state_problem(partial) if partial is not None else ""
+    if partial is not None and not problem:
+        return None  # complete: nothing to repair
+    author = ""
+    attempt = 0
+    if partial is not None:
+        if isinstance(partial.get("author"), str) and partial["author"].strip():
+            author = partial["author"].strip()
+        if _is_int(partial.get("attempt")):
+            attempt = partial["attempt"]
+    author = author or legacy_author_model(job, result)
+    tried = legacy_review_tried(result)
+    if partial is not None and isinstance(partial.get("tried"), list):
+        kept = [entry for entry in partial["tried"] if isinstance(entry, dict) and entry.get("model_id")]
+        if kept and not tried:
+            tried = kept
+    state = make_review_state(
+        author,
+        tried,
+        attempt=attempt,
+        last_failure=(partial or {}).get("last_failure") or reason or None,
+        now=now,
+    )
+    if partial is not None:
+        next_at = partial.get("next_attempt_at")
+        if isinstance(next_at, (int, float)) and not isinstance(next_at, bool):
+            state["next_attempt_at"] = next_at
+        if isinstance(partial.get("parked_reason"), str) and partial["parked_reason"]:
+            state["parked_reason"] = partial["parked_reason"]
+        if isinstance(partial.get("review_job_id"), str) and partial["review_job_id"]:
+            state["review_job_id"] = partial["review_job_id"]
+        state["repaired_from"] = problem
+        state["adopted_from"] = f"partial-review-state:{problem}"
+    else:
+        state["adopted_from"] = f"legacy-needs-review:{reason or 'unknown'}"
+    state["adopted_head"] = legacy_effective_head(job, result)
+    return state
