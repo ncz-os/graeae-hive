@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -25,6 +26,32 @@ log = logging.getLogger(__name__)
 RELEASE_DEP_STATUSES = ("failed", "failed_completion", "dead-letter", "cancelled")
 #: The purge path (row deleted outright) cannot report the dep's status.
 RELEASE_DEP_PURGED = "purged"
+
+#: Columns an admin requeue resets. ONE definition, used by
+#: :meth:`SqliteHiveRepository.archive_and_requeue_job`, so the endpoint never
+#: spells out the reset list (FB51).
+REQUEUE_RESET_SETS: dict[str, Any] = {
+    "status": "queued",
+    "claimed_by": None,
+    "claimed_at": None,
+    "ended_at": None,
+    "result": None,
+    "claimed_runtime": None,
+    "claimed_model": None,
+    "claimed_provider": None,
+    "claimed_cost_tier": None,
+    "claimed_host_caps": None,
+    "claim_lease_expires_at": None,
+    "tokens_in": None,
+    "tokens_out": None,
+    "estimated_cost_usd": None,
+    "result_mnemos_id": None,
+    "retry_count": 0,
+    "retry_backoff_until": None,
+}
+
+#: Result payloads that carry no evidence, so archiving them would add noise.
+_EMPTY_RESULT_SPELLINGS = {"", "{}", "[]", "null"}
 
 
 @dataclass(frozen=True)
@@ -150,6 +177,23 @@ CREATE TABLE IF NOT EXISTS job_audit_log (
   patch TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_job_audit_job_ts ON job_audit_log(job_id, ts);
+
+-- Append-only archive of the result payload a job carried when an admin
+-- requeue/reclassify cleared it (FB51). A table rather than a JSON list on the
+-- jobs row: the row stays small on the hot queue path, the history is never
+-- rewritten, and every backend can append by key without parsing CLOB JSON.
+CREATE TABLE IF NOT EXISTS job_result_history (
+  id TEXT PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL,
+  prior_status TEXT,
+  archived_at REAL NOT NULL,
+  actor_urn TEXT,
+  reason TEXT,
+  action TEXT,
+  payload TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_job_result_history_job ON job_result_history(job_id, archived_at);
 
 CREATE TABLE IF NOT EXISTS messages (
   id TEXT PRIMARY KEY,
@@ -494,6 +538,13 @@ class SqliteHiveRepository(HiveMindRepository):
                 "actor_urn TEXT, old_status TEXT, new_status TEXT, old_claimed_by TEXT, "
                 "new_claimed_by TEXT, patch TEXT NOT NULL)",
                 "CREATE INDEX IF NOT EXISTS idx_job_audit_job_ts ON job_audit_log(job_id, ts)",
+                # FB51: converge a live DB that predates the result archive.
+                "CREATE TABLE IF NOT EXISTS job_result_history ("
+                "id TEXT PRIMARY KEY, job_id TEXT NOT NULL, attempt INTEGER NOT NULL, "
+                "prior_status TEXT, archived_at REAL NOT NULL, actor_urn TEXT, reason TEXT, "
+                "action TEXT, payload TEXT NOT NULL)",
+                "CREATE INDEX IF NOT EXISTS idx_job_result_history_job "
+                "ON job_result_history(job_id, archived_at)",
             )
             for stmt in live_indexes:
                 await db.execute(stmt)
@@ -1632,6 +1683,96 @@ class SqliteHiveRepository(HiveMindRepository):
                 fields.get("patch_json"),
             ),
         )
+
+    async def list_job_result_history(self, tx: Transaction, *, job_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """The archived result payloads for one job, newest first (read-only)."""
+        rows: list[dict[str, Any]] = []
+        async with tx.execute(
+            "SELECT id, job_id, attempt, prior_status, archived_at, actor_urn, reason, action, payload "
+            "FROM job_result_history WHERE job_id=? ORDER BY archived_at DESC, attempt DESC LIMIT ?",
+            (job_id, max(1, int(limit))),
+        ) as cur:
+            async for r in cur:
+                payload = r[8]
+                try:
+                    payload = json.loads(payload) if payload else None
+                except (TypeError, ValueError):
+                    payload = r[8]
+                rows.append(
+                    {
+                        "id": r[0],
+                        "job_id": r[1],
+                        "attempt": r[2],
+                        "prior_status": r[3],
+                        "archived_at": r[4],
+                        "actor": r[5],
+                        "reason": r[6],
+                        "action": r[7],
+                        "payload": payload,
+                    }
+                )
+        return rows
+
+    async def archive_and_requeue_job(
+        self,
+        tx: Transaction,
+        *,
+        job_id: str,
+        actor: str,
+        reason: str | None,
+        archived_at: float,
+        expected_status: str | None = None,
+        action: str = "requeue",
+    ) -> int:
+        """Archive the job's result payload, then requeue the row. One transaction.
+
+        FB51: the previous endpoint wrote ``result=NULL`` through
+        ``patch_job_status``, which destroyed the ``hive_reviews`` evidence a
+        reviewer had recorded. This operation is the single place that clears a
+        result, so the evidence always lands in ``job_result_history`` first.
+
+        Returns the requeued rowcount (0 = no such job, or the status changed
+        under us). A result that carries nothing (None/blank/``{}``/``[]``) adds
+        no history entry, and a lost compare-and-set removes the entry this call
+        had just written, so a losing concurrent requeue leaves no duplicate.
+        """
+        db = tx
+        async with db.execute("SELECT status, result, retry_count FROM jobs WHERE id=?", (job_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return 0
+        prior_status = row[0]
+        prior_result = row[1]
+        prior_attempt = int(row[2] or 0)
+        if expected_status is not None and prior_status != expected_status:
+            return 0
+        archive_id = None
+        if prior_result is not None and str(prior_result).strip().lower() not in _EMPTY_RESULT_SPELLINGS:
+            archive_id = uuid.uuid4().hex
+            await db.execute(
+                "INSERT INTO job_result_history "
+                "(id, job_id, attempt, prior_status, archived_at, actor_urn, reason, action, payload) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    archive_id,
+                    job_id,
+                    prior_attempt + 1,
+                    prior_status,
+                    float(archived_at),
+                    actor,
+                    reason,
+                    action,
+                    prior_result if isinstance(prior_result, str) else json.dumps(prior_result, default=str),
+                ),
+            )
+        changed = await self.patch_job_status(
+            tx, job_id, sets=dict(REQUEUE_RESET_SETS), expected_status=prior_status
+        )
+        if changed != 1 and archive_id is not None:
+            # Lost the compare-and-set: the row is someone else's now, so this
+            # call must not leave a history entry behind.
+            await db.execute("DELETE FROM job_result_history WHERE id=?", (archive_id,))
+        return changed
 
     async def job_claim_context(self, tx: Transaction, job_id: str) -> tuple[Any, ...] | None:
         """The by-id claim pre-read (status/kind/caps/kinds/hosts/tier/prefs/deps)."""

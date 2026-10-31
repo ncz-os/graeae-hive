@@ -149,6 +149,7 @@ _TABLE_MAP = {
     "scheduled_jobs": "hive_scheduled_jobs",
     "worker_kind_stats": "hive_worker_kind_stats",
     "job_audit_log": "hive_job_audit_log",
+    "job_result_history": "hive_job_result_history",
 }
 
 
@@ -522,6 +523,7 @@ class OracleHiveRepository(SqliteHiveRepository):
 
     async def _apply_migrations(self, raw: Any) -> None:
         await self._ensure_capacity_tables(raw)
+        await self._ensure_result_history_table(raw)
         columns = await self._job_columns(raw)
         if not columns:
             raise RuntimeError(
@@ -627,6 +629,29 @@ class OracleHiveRepository(SqliteHiveRepository):
                 raw,
                 "CREATE TABLE capacity_usage (dedup_key VARCHAR2(200) PRIMARY KEY, service VARCHAR2(64), "
                 "tokens NUMBER DEFAULT 0, cost_usd NUMBER DEFAULT 0, ts NUMBER)",
+            )
+
+    async def _ensure_result_history_table(self, raw: Any) -> None:
+        """Create the FB51 result archive if absent (additive DDL).
+
+        Same idiom as the capacity tables: the shared SQL mentions
+        ``job_result_history`` and the adapter rewrites it to
+        ``hive_job_result_history``, so this table must exist under that name.
+        """
+        existing = {
+            str(r[0]).upper()
+            for r in await _raw_execute(
+                raw,
+                "SELECT table_name FROM user_tables WHERE table_name = 'HIVE_JOB_RESULT_HISTORY'",
+            )
+        }
+        if "HIVE_JOB_RESULT_HISTORY" not in existing:
+            await _raw_execute(
+                raw,
+                "CREATE TABLE hive_job_result_history ("
+                "id VARCHAR2(64) PRIMARY KEY, job_id VARCHAR2(64) NOT NULL, attempt NUMBER NOT NULL, "
+                "prior_status VARCHAR2(32), archived_at NUMBER NOT NULL, actor_urn VARCHAR2(512), "
+                "reason VARCHAR2(2000), action VARCHAR2(32), payload CLOB NOT NULL)",
             )
 
     async def _verify_schema(self, raw: Any) -> None:

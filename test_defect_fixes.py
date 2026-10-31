@@ -830,9 +830,21 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
 
                 return _c()
 
-            async def patch_job_status(self, tx, job_id, *, sets, expected_status=None):
-                captured["job_id"] = job_id
-                captured["sets"] = sets
+            async def archive_and_requeue_job(
+                self, tx, *, job_id, actor, reason, archived_at, expected_status=None, action="requeue"
+            ):
+                # FB51: the endpoint delegates the clear-and-requeue to ONE
+                # repository operation, so this seam pins what it is told.
+                captured.setdefault("calls", []).append(
+                    {
+                        "job_id": job_id,
+                        "actor": actor,
+                        "reason": reason,
+                        "archived_at": archived_at,
+                        "expected_status": expected_status,
+                        "action": action,
+                    }
+                )
                 return 1
 
         with mock.patch.object(hive_admin_router, "hive_repo", lambda: _Repo()):
@@ -840,23 +852,15 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
                 agent_bus.RequeueRequest(job_ids=["job-1"]),
             )
         self.assertEqual(result["ok"], ["job-1"])
-        sets = captured["sets"]
-        # stale execution + result fields are cleared (None -> SQL NULL)
-        for col in (
-            "ended_at",
-            "result",
-            "claimed_runtime",
-            "claimed_host_caps",
-            "claim_lease_expires_at",
-            "tokens_in",
-            "tokens_out",
-            "estimated_cost_usd",
-            "result_mnemos_id",
-        ):
-            self.assertIn(col, sets)
-            self.assertIsNone(sets[col])
-        self.assertEqual(sets["status"], "queued")
-        self.assertEqual(sets["retry_count"], 0)
+        (call,) = captured["calls"]
+        self.assertEqual(call["job_id"], "job-1")
+        self.assertEqual(call["expected_status"], "failed")
+        self.assertEqual(call["action"], "requeue")
+        self.assertEqual(call["reason"], "manual-requeue")
+        self.assertGreater(call["archived_at"], 0)
+        # The reset list itself lives in the repository now; the real rows are
+        # asserted against sqlite in test_admin_requeue_resets_real_default_sqlite_row
+        # and in test_admin_requeue_archive_20261030.
 
     async def test_admin_requeue_resets_real_default_sqlite_row(self):
         with tempfile.TemporaryDirectory() as td:

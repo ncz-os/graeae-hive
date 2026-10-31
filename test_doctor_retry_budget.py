@@ -15,6 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from fastapi import HTTPException
 
 import agent_bus
 from hive.bus.routers import admin as hive_admin_router
@@ -389,11 +390,16 @@ def test_bus_reclassify_to_queued_obeys_the_same_rule():
             await repo.init(agent_bus.SCHEMA)
             await _seed(repo, [("zero", "dead-letter", 0, 0), ("left", "dead-letter", 2, 0)])
             with mock.patch.object(hive_admin_router, "hive_repo", lambda: repo):
-                res = await hive_admin_router.admin_reclassify_jobs(
-                    agent_bus.ReclassifyRequest(job_ids=["zero", "left"], status="queued"),
-                    actor="urn:x",
-                )
-                assert res["ok"] == ["left"] and res["skipped_retry_budget"] == ["zero"]
+                # FB51: dead-letter needs the explicit dead-letter override even
+                # when budget remains, so the unguarded batch is refused whole.
+                with pytest.raises(HTTPException) as refused:
+                    await hive_admin_router.admin_reclassify_jobs(
+                        agent_bus.ReclassifyRequest(job_ids=["zero", "left"], status="queued"),
+                        actor="urn:x",
+                    )
+                assert refused.value.status_code == 422
+                assert (await _status(repo, "zero"))[0] == "dead-letter"
+                assert (await _status(repo, "left"))[0] == "dead-letter"
                 # needs-review is not a requeue: always allowed.
                 res2 = await hive_admin_router.admin_reclassify_jobs(
                     agent_bus.ReclassifyRequest(job_ids=["zero"], status="needs-review"),

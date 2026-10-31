@@ -15,15 +15,11 @@ step the invariants below are checked from ONE bulk list read:
 * review evidence is never lost;
 * dead-letter is terminal.
 
-Two behaviours violate those last two properties at this base and are pinned as
-``xfail(strict=True)`` regressions with finding ids, so the randomized machine
-passes only while no *unknown* violation exists:
-
-* ``FB36-FINDING-1`` -- ``POST /v1/admin/jobs/requeue`` sets ``result`` to NULL,
-  so a review recorded on the row is lost;
-* ``FB36-FINDING-2`` -- ``POST /v1/admin/jobs/reclassify`` moves a dead-letter
-  row to ``queued`` (an intentional administrative override in
-  ``hive/bus/routers/admin.py``, which contradicts the requested invariant).
+FB51 resolved the two findings FB36 had pinned: ``POST /v1/admin/jobs/requeue``
+archives the cleared result (including ``hive_reviews``) in
+``job_result_history`` before clearing it, and ``dead-letter -> queued``
+reclassify requires an explicit override. The randomized machine still passes
+only while no *unknown* violation exists.
 """
 
 import asyncio
@@ -273,9 +269,12 @@ class LifecycleMachine(RuleBasedStateMachine):
     def reclassify(self, i, status):
         jid = self.select(i)
         if jid:
-            code, data = self.request(
-                "POST", "/v1/admin/jobs/reclassify", {"job_ids": [jid], "status": status}, self.submitter
-            )
+            body = {"job_ids": [jid], "status": status}
+            if status == "queued" and self.row(jid)["status"] == "dead-letter":
+                # FB51: dead-letter only reopens with an explicit override.
+                body["override_max_retries"] = True
+                body["override_reason"] = "stateful dead-letter reopen"
+            code, data = self.request("POST", "/v1/admin/jobs/reclassify", body, self.submitter)
             assert code == 200, data
             self.last_action = "reclassify"
 
@@ -348,8 +347,10 @@ class LifecycleMachine(RuleBasedStateMachine):
             old_reviews = (before.get("result") or {}).get("hive_reviews")
             new_reviews = (row.get("result") or {}).get("hive_reviews")
             if old_reviews and new_reviews != old_reviews:
-                assert self.last_action == "requeue", (
-                    f"{jid}: review evidence lost after {self.last_action!r} ({FINDING_REQUEUE_REVIEW})"
+                # FB51 archives the evidence before clearing the current result;
+                # the archive itself is pinned by the dedicated history test.
+                assert self.last_action in ("requeue", "reclassify"), (
+                    f"{jid}: review evidence cleared after {self.last_action!r} ({FINDING_REQUEUE_REVIEW})"
                 )
 
             self.previous[jid] = row
@@ -367,12 +368,11 @@ def test_documented_transitions_match_the_map():
             assert (src, dst) in DOC_ACCEPTED, f"map allows {src!r} -> {dst!r} but the doc omits it"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"{FINDING_REQUEUE_REVIEW}: admin requeue nulls result and loses hive_reviews",
-)
 def test_requeue_preserves_review_evidence():
-    """Sequence: submit -> claim -> progress (records a review) -> admin requeue."""
+    """Sequence: submit -> claim -> progress (records a review) -> admin requeue.
+
+    FB51 archives the review evidence, then clears the current result.
+    """
     machine = LifecycleMachine()
     try:
         machine.submit()
@@ -382,17 +382,19 @@ def test_requeue_preserves_review_evidence():
         machine.requeue(0)
         row = machine.row(machine.ids[0])
         assert row["status"] == "queued"
-        assert (row["result"] or {}).get("hive_reviews") == before
+        assert (row["result"] or {}).get("hive_reviews") is None
+        code, history = machine.request(
+            "GET", f"/v1/admin/jobs/{machine.ids[0]}/history", actor=machine.submitter
+        )
+        assert code == 200, history
+        assert history["count"] >= 1, history
+        assert history["history"][0]["payload"]["hive_reviews"] == before
     finally:
         machine.teardown()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=f"{FINDING_DEAD_LETTER}: admin reclassify moves a dead-letter row back to queued",
-)
 def test_dead_letter_reclassification_is_terminal():
-    """Three real decline releases reach dead-letter; reclassify reopens it."""
+    """Three real decline releases reach dead-letter; only an explicit override reopens it."""
     machine = LifecycleMachine()
     try:
         machine.submit()
@@ -403,11 +405,36 @@ def test_dead_letter_reclassification_is_terminal():
             machine.release(0, "invalid_head_branch")
             machine.advance_clock(600)
         assert machine.row(jid)["status"] == "dead-letter"
+        before = machine.row(jid)["result"]
         code, result = machine.request(
             "POST", "/v1/admin/jobs/reclassify", {"job_ids": [jid], "status": "queued"}, machine.submitter
         )
-        assert code == 200, result
+        assert code == 422, result
         assert machine.row(jid)["status"] == "dead-letter"
+        code, result = machine.request(
+            "POST",
+            "/v1/admin/jobs/reclassify",
+            {
+                "job_ids": [jid],
+                "status": "queued",
+                "override_max_retries": True,
+                "override_reason": "operator: dead-letter reopen after fixing head branch",
+            },
+            machine.submitter,
+        )
+        assert code == 200, result
+        row = machine.row(jid)
+        assert row["status"] == "queued"
+        assert row["retry_count"] == 0
+        code, history = machine.request("GET", f"/v1/admin/jobs/{jid}/history", actor=machine.submitter)
+        assert code == 200, history
+        if before:
+            assert history["count"] >= 1, history
+            entry = history["history"][0]
+            assert (entry["prior_status"], entry["action"]) == ("dead-letter", "reclassify")
+            assert entry["payload"] == before
+        else:
+            assert history["count"] == 0, history
     finally:
         machine.teardown()
 

@@ -134,6 +134,27 @@ Status codes: 200, 401, 403, 422 (raised explicitly in code: 401, 403, 422)
 
 Example: `curl http://<bus-host>:5005/v1/admin/jobs/requeue`
 
+## `GET /v1/admin/jobs/{job_id}/history`
+
+Handler: `admin_job_result_history`. Admin Job Result History — Read-only view of the result payloads an admin requeue archived (FB51). Before this existed there was no way to see the ``hive_reviews`` evidence a force-requeue had destroyed; now every cleared paylo
+
+Auth: X-Hive-Actor (admin operation; must name a registered, active agent)
+
+Parameters:
+
+| name | in | required | type |
+| --- | --- | --- | --- |
+| `X-Hive-Actor` | header | False | string | null |
+| `X-Hive-Token` | header | False | string | null |
+| `job_id` | path | True | string |
+| `limit` | query | False | integer (default 50) |
+
+Body: none.
+
+Status codes: 200, 401, 403, 422 (raised explicitly in code: 401, 403, 422)
+
+Example: `curl http://<bus-host>:5005/v1/admin/jobs/{job_id}/history`
+
 ## `GET /v1/agents`
 
 Handler: `list_agents`. List Agents

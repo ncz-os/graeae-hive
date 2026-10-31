@@ -10,6 +10,11 @@ worker and doctor address settings, `HIVE_AGENT_STALE_SECONDS`, and
 the control-host variables.
 
 ## Bus
+- Admin requeue archives the cleared `result` (review evidence included)
+  in the append-only `job_result_history` table before resetting the row
+  (read back at `GET /v1/admin/jobs/{job_id}/history`); reopening
+  `dead-letter` as `queued` now requires an explicit override and writes
+  an audit row.
 - Agent deregistration endpoint with an optional stale-agent reaper
   rule (`HIVE_AGENT_STALE_SECONDS`).
 - The `freebuff` agent kind registers, heartbeats and may submit like
