@@ -593,3 +593,30 @@ def test_the_doctor_passes_an_unknown_worker_view_as_none(monkeypatch):
     monkeypatch.setattr(doctor, "_online_worker_kinds", lambda: None)
     assert doctor._codex_worker_online() is None
     assert doctor.review_queue_codex_gate()["reason"] == "codex_worker_unknown"
+
+
+# ── 9. the job names the model it will actually run ─────────────────────────
+
+
+def test_the_codex_job_names_the_model_that_runs(bus):
+    """``preferred_models`` must name the route's model, not an arbitrary one.
+
+    The codex worker fails loudly (``codex_model_mismatch``) when a job names a
+    ``gpt-*`` model the host does not serve, so the submitted spec and the
+    picked route have to agree: the job asks for the model the roster would run,
+    and that model is on the ladder (never the authorization-only rung).
+    """
+    from hive.workers import doctor
+
+    rows, calls, _, monkeypatch = bus
+    _codex_only(doctor, monkeypatch)
+    monkeypatch.setattr(doctor, "CODEX_REVIEW_USAGE", lambda: {"remaining_pct": 80.0})
+    assert doctor.run_review_queue_sweep(rows=list(rows.values()))["submitted"] == 1
+    spec = _submits(calls)[0]
+    names = spec["preferred_models"]
+    assert names == [codex_review_available()["model"]]
+    assert names[0] in codex_ladder()
+    assert names[0] != _roster_entry()["flags"]["codex"]["authorization_model"]
+    # A normal Hive job: the same read-only review kind, restricted to codex.
+    assert spec["kind"].startswith("review:")
+    assert spec["eligible_kinds"] == ["codex"]
