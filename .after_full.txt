@@ -1,0 +1,1959 @@
+...................................................FFFF................. [  5%]
+........................................................................ [ 10%]
+........................................................................ [ 15%]
+........................................................................ [ 21%]
+........................................................................ [ 26%]
+........................................................................ [ 31%]
+........................................................................ [ 36%]
+........................................................................ [ 42%]
+........................................................................ [ 47%]
+.......................................... [ 50%]
+..................................................... [ 54%]
+..........................................FFFF.............. [ 58%]
+....................................................................EEEEEE............ [ 65%]
+........................................................................ [ 70%]
+...................................................................... [ 75%]
+..............FFF......FFFFF.........FFFFFFFF........................... [ 80%]
+........................................................................ [ 85%]
+s..................FF..F................................................ [ 91%]
+..................EssssEssssEssssEssssEssssEssssEssssEssssEssssEssssEsss [ 96%]
+sEssssxssssE..E.................................                         [100%]
+==================================== ERRORS ====================================
+_ ERROR at setup of BusRouterRemoved.test_app_facade_no_longer_reexports_cap_helpers _
+
+cls = <class 'test_knemon_router_removed.BusRouterRemoved'>
+
+    @classmethod
+    def setUpClass(cls):
+>       import hive.bus.app as bus_app
+
+test_knemon_router_removed.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+_ ERROR at setup of BusRouterRemoved.test_app_startup_does_not_import_the_router_module _
+
+cls = <class 'test_knemon_router_removed.BusRouterRemoved'>
+
+    @classmethod
+    def setUpClass(cls):
+>       import hive.bus.app as bus_app
+
+test_knemon_router_removed.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+____ ERROR at setup of BusRouterRemoved.test_models_has_no_knemon_machinery ____
+
+cls = <class 'test_knemon_router_removed.BusRouterRemoved'>
+
+    @classmethod
+    def setUpClass(cls):
+>       import hive.bus.app as bus_app
+
+test_knemon_router_removed.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+_ ERROR at setup of BusRouterRemoved.test_no_registered_route_serves_a_removed_path _
+
+cls = <class 'test_knemon_router_removed.BusRouterRemoved'>
+
+    @classmethod
+    def setUpClass(cls):
+>       import hive.bus.app as bus_app
+
+test_knemon_router_removed.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+_____ ERROR at setup of BusRouterRemoved.test_openapi_has_no_knemon_paths ______
+
+cls = <class 'test_knemon_router_removed.BusRouterRemoved'>
+
+    @classmethod
+    def setUpClass(cls):
+>       import hive.bus.app as bus_app
+
+test_knemon_router_removed.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+___ ERROR at setup of BusRouterRemoved.test_repository_has_no_spend_summary ____
+
+cls = <class 'test_knemon_router_removed.BusRouterRemoved'>
+
+    @classmethod
+    def setUpClass(cls):
+>       import hive.bus.app as bus_app
+
+test_knemon_router_removed.py:35: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+_ ERROR at setup of test_init_is_idempotent_and_connection_yields_a_transaction[sqlite] _
+
+request = <SubRequest 'backend' for <Function test_init_is_idempotent_and_connection_yields_a_transaction[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e2e0dd0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+__ ERROR at setup of test_agent_register_heartbeat_and_metadata_patch[sqlite] __
+
+request = <SubRequest 'backend' for <Function test_agent_register_heartbeat_and_metadata_patch[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e2e29d0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_ ERROR at setup of test_submit_claim_patch_cycle_and_compare_and_set[sqlite] __
+
+request = <SubRequest 'backend' for <Function test_submit_claim_patch_cycle_and_compare_and_set[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e212dd0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+____ ERROR at setup of test_claim_refuses_an_unsatisfied_dependency[sqlite] ____
+
+request = <SubRequest 'backend' for <Function test_claim_refuses_an_unsatisfied_dependency[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e212ba0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_________ ERROR at setup of test_dedup_index_and_lookup_agree[sqlite] __________
+
+request = <SubRequest 'backend' for <Function test_dedup_index_and_lookup_agree[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e11de50>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+__ ERROR at setup of test_events_are_append_only_and_cursor_readable[sqlite] ___
+
+request = <SubRequest 'backend' for <Function test_events_are_append_only_and_cursor_readable[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e141fd0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+___________ ERROR at setup of test_messages_post_and_filter[sqlite] ____________
+
+request = <SubRequest 'backend' for <Function test_messages_post_and_filter[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e1599d0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_______ ERROR at setup of test_result_cache_store_lookup_and_hit[sqlite] _______
+
+request = <SubRequest 'backend' for <Function test_result_cache_store_lookup_and_hit[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e6b9190>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_________ ERROR at setup of test_worker_kind_stats_accumulate[sqlite] __________
+
+request = <SubRequest 'backend' for <Function test_worker_kind_stats_accumulate[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e6bb650>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_________ ERROR at setup of test_schedule_create_due_and_fire[sqlite] __________
+
+request = <SubRequest 'backend' for <Function test_schedule_create_due_and_fire[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e635310>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_ ERROR at setup of test_capacity_state_is_a_keyed_set_and_folds_are_idempotent[sqlite] _
+
+request = <SubRequest 'backend' for <Function test_capacity_state_is_a_keyed_set_and_folds_are_idempotent[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x7856356d37d0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_ ERROR at setup of test_reaper_selects_and_orphan_requeue_releases_the_row[sqlite] _
+
+request = <SubRequest 'backend' for <Function test_reaper_selects_and_orphan_requeue_releases_the_row[sqlite]>>
+
+    @pytest.fixture(params=BACKENDS)
+    def backend(request):
+        """A live repository for one backend, or a clean skip without its DSN."""
+        name = request.param
+        dsn_env = BACKEND_DSN_ENV[name]
+        if dsn_env and not any(os.environ.get(var) for var in dsn_env):
+            pytest.skip(f"{name}: no DSN configured ({' / '.join(dsn_env)})")
+>       repo, tmp = _make_repo(name)
+                    ^^^^^^^^^^^^^^^^
+
+tests/persistence_contract/conftest.py:60: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/persistence_contract/conftest.py:46: in _make_repo
+    _run(repo.init())
+tests/persistence_contract/conftest.py:39: in _run
+    return asyncio.run(coro)
+           ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e6ef3b0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_____________ ERROR at setup of test_the_workload_really_emits_sql _____________
+
+    @pytest.fixture(scope="module")
+    def captured_sql():
+        import asyncio
+        import tempfile
+        import uuid
+        from pathlib import Path
+    
+        from hive.persistence.factory import get_hive_repository
+    
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = get_hive_repository(backend="sqlite", db_path=str(Path(tmp) / "capture.db"))
+>           asyncio.run(repo.init())
+
+tests/persistence_contract/test_persistence_contract_dialect.py:53: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e23ab10>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+______ ERROR at setup of test_no_statement_needs_a_sqlite_only_construct _______
+
+    @pytest.fixture(scope="module")
+    def captured_sql():
+        import asyncio
+        import tempfile
+        import uuid
+        from pathlib import Path
+    
+        from hive.persistence.factory import get_hive_repository
+    
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = get_hive_repository(backend="sqlite", db_path=str(Path(tmp) / "capture.db"))
+>           asyncio.run(repo.init())
+
+tests/persistence_contract/test_persistence_contract_dialect.py:53: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e23ab10>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+=================================== FAILURES ===================================
+__ CapacityLedgerPersistenceTests.test_conflicting_keys_in_one_tx_apply_once ___
+
+self = <test_capacity_ledger.CapacityLedgerPersistenceTests testMethod=test_conflicting_keys_in_one_tx_apply_once>
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hive-cap-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_capacity_ledger.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785635dc2210>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+___ CapacityLedgerPersistenceTests.test_fold_usage_distinct_keys_accumulate ____
+
+self = <test_capacity_ledger.CapacityLedgerPersistenceTests testMethod=test_fold_usage_distinct_keys_accumulate>
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hive-cap-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_capacity_ledger.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785635dc0190>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_________ CapacityLedgerPersistenceTests.test_fold_usage_is_idempotent _________
+
+self = <test_capacity_ledger.CapacityLedgerPersistenceTests testMethod=test_fold_usage_is_idempotent>
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hive-cap-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_capacity_ledger.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x7856351b3e10>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_________ CapacityLedgerPersistenceTests.test_set_upsert_is_idempotent _________
+
+self = <test_capacity_ledger.CapacityLedgerPersistenceTests testMethod=test_set_upsert_is_idempotent>
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hive-cap-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_capacity_ledger.py:18: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785635064640>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_______________________ test_generation_is_deterministic _______________________
+
+    def test_generation_is_deterministic():
+>       assert generate() == generate()
+               ^^^^^^^^^^
+
+test_gen_api_reference_20261029.py:15: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+scripts/gen_api_reference.py:248: in generate
+    app = _load_app()
+          ^^^^^^^^^^^
+scripts/gen_api_reference.py:32: in _load_app
+    import agent_bus
+agent_bus.py:8: in <module>
+    from hive.bus.app import *  # noqa: F401,F403
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+____________________ test_every_route_in_app_appears_in_doc ____________________
+
+    def test_every_route_in_app_appears_in_doc():
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+>       import agent_bus
+
+test_gen_api_reference_20261029.py:20: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+agent_bus.py:8: in <module>
+    from hive.bus.app import *  # noqa: F401,F403
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+__________________________ test_check_fires_on_drift ___________________________
+
+tmp_path = PosixPath('/tmp/pytest-of-jasonperlow/pytest-42/test_check_fires_on_drift0')
+
+    def test_check_fires_on_drift(tmp_path):
+        out = tmp_path / "API_REFERENCE.md"
+>       assert main(["--out", str(out)]) == 0
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+test_gen_api_reference_20261029.py:36: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+scripts/gen_api_reference.py:377: in main
+    text = generate()
+           ^^^^^^^^^^
+scripts/gen_api_reference.py:248: in generate
+    app = _load_app()
+          ^^^^^^^^^^^
+scripts/gen_api_reference.py:32: in _load_app
+    import agent_bus
+agent_bus.py:8: in <module>
+    from hive.bus.app import *  # noqa: F401,F403
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+______________________ test_no_addresses_or_tokens_in_doc ______________________
+
+    def test_no_addresses_or_tokens_in_doc():
+>       text = generate()
+               ^^^^^^^^^^
+
+test_gen_api_reference_20261029.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+scripts/gen_api_reference.py:248: in generate
+    app = _load_app()
+          ^^^^^^^^^^^
+scripts/gen_api_reference.py:32: in _load_app
+    import agent_bus
+agent_bus.py:8: in <module>
+    from hive.bus.app import *  # noqa: F401,F403
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+______________ RealBusTests.test_depends_on_must_exist_on_the_bus ______________
+
+self = <test_offload_queue_20261030.RealBusTests testMethod=test_depends_on_must_exist_on_the_bus>
+
+    async def asyncSetUp(self):
+>       import httpx
+E       ModuleNotFoundError: No module named 'httpx'
+
+test_offload_queue_20261030.py:865: ModuleNotFoundError
+_ RealBusTests.test_release_touches_only_the_kind_and_reports_the_missing_priority_patch _
+
+self = <test_offload_queue_20261030.RealBusTests testMethod=test_release_touches_only_the_kind_and_reports_the_missing_priority_patch>
+
+    async def asyncSetUp(self):
+>       import httpx
+E       ModuleNotFoundError: No module named 'httpx'
+
+test_offload_queue_20261030.py:865: ModuleNotFoundError
+__ RealBusTests.test_submit_is_idempotent_and_the_job_has_the_contract_fields __
+
+self = <test_offload_queue_20261030.RealBusTests testMethod=test_submit_is_idempotent_and_the_job_has_the_contract_fields>
+
+    async def asyncSetUp(self):
+>       import httpx
+E       ModuleNotFoundError: No module named 'httpx'
+
+test_offload_queue_20261030.py:865: ModuleNotFoundError
+_ DependencyTransactionAuditTests.test_claim_missing_dep_event_rolls_back_when_other_dep_blocks _
+
+self = <test_persistence_queue_audit_20261027.DependencyTransactionAuditTests testMethod=test_claim_missing_dep_event_rolls_back_when_other_dep_blocks>
+
+    async def asyncSetUp(self):
+        import tempfile
+        from pathlib import Path
+    
+        from hive.persistence.sqlite import SqliteHiveRepository
+    
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = SqliteHiveRepository(str(Path(self.directory.name) / "audit.db"))
+>       await self.repo.init()
+
+test_persistence_queue_audit_20261027.py:111: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785635a23d50>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_ DependencyTransactionAuditTests.test_release_events_do_not_commit_terminal_transition_on_failure _
+
+self = <test_persistence_queue_audit_20261027.DependencyTransactionAuditTests testMethod=test_release_events_do_not_commit_terminal_transition_on_failure>
+
+    async def asyncSetUp(self):
+        import tempfile
+        from pathlib import Path
+    
+        from hive.persistence.sqlite import SqliteHiveRepository
+    
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = SqliteHiveRepository(str(Path(self.directory.name) / "audit.db"))
+>       await self.repo.init()
+
+test_persistence_queue_audit_20261027.py:111: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785635070d50>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+______________ test_orphan_requeue_compare_and_set_observed_claim ______________
+
+tmp_path = PosixPath('/tmp/pytest-of-jasonperlow/pytest-42/test_orphan_requeue_compare_an0')
+
+    def test_orphan_requeue_compare_and_set_observed_claim(tmp_path):
+>       asyncio.run(_orphan_requeue_compare_and_set_observed_claim(tmp_path))
+
+test_priority_a_reaper.py:10: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+test_priority_a_reaper.py:15: in _orphan_requeue_compare_and_set_observed_claim
+    await repo.init()
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785634dae5d0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_______ test_stale_cancellation_rechecks_claim_and_releases_dependencies _______
+
+tmp_path = PosixPath('/tmp/pytest-of-jasonperlow/pytest-42/test_stale_cancellation_rechec0')
+
+    def test_stale_cancellation_rechecks_claim_and_releases_dependencies(tmp_path):
+>       asyncio.run(_stale_cancellation(tmp_path))
+
+test_priority_a_reaper.py:32: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+test_priority_a_reaper.py:36: in _stale_cancellation
+    from hive.bus.app import _cancel_stale_jobs
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+_______ test_stale_cancellation_rolls_back_when_dependency_update_fails ________
+
+tmp_path = PosixPath('/tmp/pytest-of-jasonperlow/pytest-42/test_stale_cancellation_rolls_0')
+
+    def test_stale_cancellation_rolls_back_when_dependency_update_fails(tmp_path):
+>       asyncio.run(_stale_cancellation_release_failure(tmp_path))
+
+test_priority_a_reaper.py:56: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+test_priority_a_reaper.py:60: in _stale_cancellation_release_failure
+    from hive.bus.app import _cancel_stale_jobs
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+    """
+    GRAEAE Hive Mind — fleet-wide MCP-compatible agent coordination + triage queue.
+    
+    Brand: GRAEAE Hive Mind (extension of GRAEAE consensus engine — sister to mnemos memory)
+    Identity: urn:agent:<kind>:<host>:<session_uuid>   (kinds: claude, opencode, codex, zeroclaw, openclaw, hermes, human, ic-engine, mnemos, ...)
+    Backend: SQLite WAL (Phase 1) — PG migration documented for Phase 2 when >50 agents OR LISTEN/NOTIFY needed
+    Pub/sub: SSE (Phase 1) — NATS migration Phase 2 when >20 concurrent OR >100 msg/s
+    Triage queue: /v1/jobs/next dequeues highest-priority eligible work; no central scheduler — agents self-claim.
+    """
+    
+    from __future__ import annotations
+    
+    import asyncio
+    import json
+    import os
+    import time
+    from contextlib import asynccontextmanager, suppress
+    
+>   from fastapi import FastAPI
+E   ModuleNotFoundError: No module named 'fastapi'
+
+hive/bus/app.py:19: ModuleNotFoundError
+_________ AgentLifecycleReaperTests.test_mark_agents_stale_and_offline _________
+
+self = <test_reaper_agents.AgentLifecycleReaperTests testMethod=test_mark_agents_stale_and_offline>
+
+    async def asyncSetUp(self):
+        # a fresh DB per test (no cross-test contamination)
+        self._dir = tempfile.mkdtemp(prefix="hive-reaper-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_agents.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78563515a7b0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+___ AgentLifecycleReaperTests.test_purge_protects_agents_with_inflight_claim ___
+
+self = <test_reaper_agents.AgentLifecycleReaperTests testMethod=test_purge_protects_agents_with_inflight_claim>
+
+    async def asyncSetUp(self):
+        # a fresh DB per test (no cross-test contamination)
+        self._dir = tempfile.mkdtemp(prefix="hive-reaper-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_agents.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785636008c90>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_ AgentLifecycleReaperTests.test_release_unstarted_jobs_only_offered_or_claimed _
+
+self = <test_reaper_agents.AgentLifecycleReaperTests testMethod=test_release_unstarted_jobs_only_offered_or_claimed>
+
+    async def asyncSetUp(self):
+        # a fresh DB per test (no cross-test contamination)
+        self._dir = tempfile.mkdtemp(prefix="hive-reaper-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_agents.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785636008830>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+____ AgentLifecycleReaperTests.test_retention_selects_only_terminal_and_old ____
+
+self = <test_reaper_agents.AgentLifecycleReaperTests testMethod=test_retention_selects_only_terminal_and_old>
+
+    async def asyncSetUp(self):
+        # a fresh DB per test (no cross-test contamination)
+        self._dir = tempfile.mkdtemp(prefix="hive-reaper-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_agents.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785635661710>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_______ AgentLifecycleReaperTests.test_stale_vs_dead_by_heartbeat_window _______
+
+self = <test_reaper_agents.AgentLifecycleReaperTests testMethod=test_stale_vs_dead_by_heartbeat_window>
+
+    async def asyncSetUp(self):
+        # a fresh DB per test (no cross-test contamination)
+        self._dir = tempfile.mkdtemp(prefix="hive-reaper-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_agents.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785634e15550>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+__________________ ReaperSweepsTests.test_purge_events_before __________________
+
+self = <test_reaper_sweeps.ReaperSweepsTests testMethod=test_purge_events_before>
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hive-sweep-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_sweeps.py:28: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x785634e14710>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+__________ ReaperSweepsTests.test_stale_queued_cancel_only_old_queued __________
+
+self = <test_reaper_sweeps.ReaperSweepsTests testMethod=test_stale_queued_cancel_only_old_queued>
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hive-sweep-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_sweeps.py:28: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78563417c890>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_____ ReaperSweepsTests.test_sweepable_test_junk_only_terminal_pattern_old _____
+
+self = <test_reaper_sweeps.ReaperSweepsTests testMethod=test_sweepable_test_junk_only_terminal_pattern_old>
+
+    async def asyncSetUp(self):
+        self._dir = tempfile.mkdtemp(prefix="hive-sweep-")
+        self.repo = SqliteHiveRepository(os.path.join(self._dir, "t.db"))
+>       await self.repo.init()
+
+test_reaper_sweeps.py:28: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78563417c5d0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+____ ResultHistoryDialectTests.test_history_table_name_survives_translation ____
+
+self = <test_result_history_dialect_20261030.ResultHistoryDialectTests testMethod=test_history_table_name_survives_translation>
+
+    def test_history_table_name_survives_translation(self):
+        """Oracle/Db2 prefix the archive table; the rewrite must apply here too."""
+        history_statements = [
+>           (sql, params) for sql, params in captured_statements() if "job_result_history" in sql.lower()
+                                             ^^^^^^^^^^^^^^^^^^^^^
+        ]
+
+test_result_history_dialect_20261030.py:201: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+test_result_history_dialect_20261030.py:161: in captured_statements
+    asyncio.run(body())
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+test_result_history_dialect_20261030.py:138: in body
+    await repo.init()
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e5dac10>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_ ResultHistoryDialectTests.test_no_emitted_statement_needs_a_sqlite_only_construct _
+
+self = <test_result_history_dialect_20261030.ResultHistoryDialectTests testMethod=test_no_emitted_statement_needs_a_sqlite_only_construct>
+
+    def test_no_emitted_statement_needs_a_sqlite_only_construct(self):
+        """Translate every captured statement; no sqlite-only constructs allowed."""
+        unexpected: list[str] = []
+        for backend in BACKENDS:
+>           for sql, params in captured_statements():
+                               ^^^^^^^^^^^^^^^^^^^^^
+
+test_result_history_dialect_20261030.py:191: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+test_result_history_dialect_20261030.py:161: in captured_statements
+    asyncio.run(body())
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+test_result_history_dialect_20261030.py:138: in body
+    await repo.init()
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e5d96d0>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+_______ ResultHistoryDialectTests.test_the_archive_path_really_emits_sql _______
+
+self = <test_result_history_dialect_20261030.ResultHistoryDialectTests testMethod=test_the_archive_path_really_emits_sql>
+
+    def test_the_archive_path_really_emits_sql(self):
+        """Guard the guard: a thin capture would make the checks vacuous."""
+>       statements = captured_statements()
+                     ^^^^^^^^^^^^^^^^^^^^^
+
+test_result_history_dialect_20261030.py:169: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+test_result_history_dialect_20261030.py:161: in captured_statements
+    asyncio.run(body())
+/usr/lib/python3.14/asyncio/runners.py:205: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/runners.py:128: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/asyncio/base_events.py:720: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+test_result_history_dialect_20261030.py:138: in body
+    await repo.init()
+hive/persistence/sqlite.py:350: in init
+    async with self.connection() as db:
+               ^^^^^^^^^^^^^^^^^
+/usr/lib/python3.14/contextlib.py:214: in __aenter__
+    return await anext(self.gen)
+           ^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <hive.persistence.sqlite.SqliteHiveRepository object at 0x78562e5f8440>
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[Transaction]:
+        db = await aiosqlite.connect(
+            self.db_path,
+            timeout=self.busy_timeout_ms / 1000,
+            check_same_thread=False,
+        )
+        try:
+>           await db.create_function("JSON_VALUE", 2, _json_value, deterministic=True)
+                  ^^^^^^^^^^^^^^^^^^
+E           AttributeError: 'Connection' object has no attribute 'create_function'
+
+hive/persistence/sqlite.py:571: AttributeError
+=========================== short test summary info ============================
+FAILED test_capacity_ledger.py::CapacityLedgerPersistenceTests::test_conflicting_keys_in_one_tx_apply_once
+FAILED test_capacity_ledger.py::CapacityLedgerPersistenceTests::test_fold_usage_distinct_keys_accumulate
+FAILED test_capacity_ledger.py::CapacityLedgerPersistenceTests::test_fold_usage_is_idempotent
+FAILED test_capacity_ledger.py::CapacityLedgerPersistenceTests::test_set_upsert_is_idempotent
+FAILED test_gen_api_reference_20261029.py::test_generation_is_deterministic
+FAILED test_gen_api_reference_20261029.py::test_every_route_in_app_appears_in_doc
+FAILED test_gen_api_reference_20261029.py::test_check_fires_on_drift - Module...
+FAILED test_gen_api_reference_20261029.py::test_no_addresses_or_tokens_in_doc
+FAILED test_offload_queue_20261030.py::RealBusTests::test_depends_on_must_exist_on_the_bus
+FAILED test_offload_queue_20261030.py::RealBusTests::test_release_touches_only_the_kind_and_reports_the_missing_priority_patch
+FAILED test_offload_queue_20261030.py::RealBusTests::test_submit_is_idempotent_and_the_job_has_the_contract_fields
+FAILED test_persistence_queue_audit_20261027.py::DependencyTransactionAuditTests::test_claim_missing_dep_event_rolls_back_when_other_dep_blocks
+FAILED test_persistence_queue_audit_20261027.py::DependencyTransactionAuditTests::test_release_events_do_not_commit_terminal_transition_on_failure
+FAILED test_priority_a_reaper.py::test_orphan_requeue_compare_and_set_observed_claim
+FAILED test_priority_a_reaper.py::test_stale_cancellation_rechecks_claim_and_releases_dependencies
+FAILED test_priority_a_reaper.py::test_stale_cancellation_rolls_back_when_dependency_update_fails
+FAILED test_reaper_agents.py::AgentLifecycleReaperTests::test_mark_agents_stale_and_offline
+FAILED test_reaper_agents.py::AgentLifecycleReaperTests::test_purge_protects_agents_with_inflight_claim
+FAILED test_reaper_agents.py::AgentLifecycleReaperTests::test_release_unstarted_jobs_only_offered_or_claimed
+FAILED test_reaper_agents.py::AgentLifecycleReaperTests::test_retention_selects_only_terminal_and_old
+FAILED test_reaper_agents.py::AgentLifecycleReaperTests::test_stale_vs_dead_by_heartbeat_window
+FAILED test_reaper_sweeps.py::ReaperSweepsTests::test_purge_events_before - A...
+FAILED test_reaper_sweeps.py::ReaperSweepsTests::test_stale_queued_cancel_only_old_queued
+FAILED test_reaper_sweeps.py::ReaperSweepsTests::test_sweepable_test_junk_only_terminal_pattern_old
+FAILED test_result_history_dialect_20261030.py::ResultHistoryDialectTests::test_history_table_name_survives_translation
+FAILED test_result_history_dialect_20261030.py::ResultHistoryDialectTests::test_no_emitted_statement_needs_a_sqlite_only_construct
+FAILED test_result_history_dialect_20261030.py::ResultHistoryDialectTests::test_the_archive_path_really_emits_sql
+ERROR test_knemon_router_removed.py::BusRouterRemoved::test_app_facade_no_longer_reexports_cap_helpers
+ERROR test_knemon_router_removed.py::BusRouterRemoved::test_app_startup_does_not_import_the_router_module
+ERROR test_knemon_router_removed.py::BusRouterRemoved::test_models_has_no_knemon_machinery
+ERROR test_knemon_router_removed.py::BusRouterRemoved::test_no_registered_route_serves_a_removed_path
+ERROR test_knemon_router_removed.py::BusRouterRemoved::test_openapi_has_no_knemon_paths
+ERROR test_knemon_router_removed.py::BusRouterRemoved::test_repository_has_no_spend_summary
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_init_is_idempotent_and_connection_yields_a_transaction[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_agent_register_heartbeat_and_metadata_patch[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_submit_claim_patch_cycle_and_compare_and_set[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_claim_refuses_an_unsatisfied_dependency[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_dedup_index_and_lookup_agree[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_events_are_append_only_and_cursor_readable[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_messages_post_and_filter[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_result_cache_store_lookup_and_hit[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_worker_kind_stats_accumulate[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_schedule_create_due_and_fire[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_capacity_state_is_a_keyed_set_and_folds_are_idempotent[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_behaviour.py::test_reaper_selects_and_orphan_requeue_releases_the_row[sqlite]
+ERROR tests/persistence_contract/test_persistence_contract_dialect.py::test_the_workload_really_emits_sql
+ERROR tests/persistence_contract/test_persistence_contract_dialect.py::test_no_statement_needs_a_sqlite_only_construct
