@@ -27,9 +27,9 @@ from __future__ import annotations
 import fnmatch
 import json
 import threading
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Mapping
 
 HERE = Path(__file__).resolve().parent
 FAMILIES_PATH = HERE / "model_families.json"
@@ -96,7 +96,7 @@ class Roster:
     def __getitem__(self, index):
         return self.routes[index]
 
-    def get(self, route_id: str) -> "Route | None":
+    def get(self, route_id: str) -> Route | None:
         return route_by_id(route_id, self.routes)
 
 
@@ -202,16 +202,14 @@ def families_pair(left: str, right: str) -> bool:
     # An unknown AUTHOR family can never prove a cross-family pairing (we
     # cannot know it differs from any reviewer), so it is refused. An unknown
     # REVIEWER family is its own family and fine to rely on for a known author.
-    if a.startswith("unknown:"):
-        return False
-    return True
+    return not a.startswith("unknown:")
 
 
 def is_reviewer(route: Route) -> bool:
     return not route.never_reviewer
 
 
-def reviewer_routes(roster: "Roster | Mapping[str, Route] | Iterable[Route]") -> list[Route]:
+def reviewer_routes(roster: Roster | Mapping[str, Route] | Iterable[Route]) -> list[Route]:
     """Routes that may review at all (MiMo and anything else flagged out)."""
     return [r for r in as_routes(roster) if is_reviewer(r)]
 
@@ -224,7 +222,7 @@ def route_allowed_for_repo(route: Route, repo: str | None) -> bool:
     return bool(slug) and slug in route.approved_repos
 
 
-def as_routes(roster: "Roster | Mapping[str, Route] | Iterable[Route] | None") -> list[Route]:
+def as_routes(roster: Roster | Mapping[str, Route] | Iterable[Route] | None) -> list[Route]:
     """Accept a Roster, a ``{id: Route}`` mapping, a list of routes, or None."""
     if roster is None:
         return []
@@ -232,7 +230,7 @@ def as_routes(roster: "Roster | Mapping[str, Route] | Iterable[Route] | None") -
     return [r for r in values if isinstance(r, Route)]
 
 
-def route_capacity(route: Route, roster: "Roster | Mapping[str, Route] | Iterable[Route] | None" = None) -> int:
+def route_capacity(route: Route, roster: Roster | Mapping[str, Route] | Iterable[Route] | None = None) -> int:
     """Review calls one route can hold at once.
 
     Routes that front the same endpoint (the CERBERUS reviewer and narrator
@@ -254,7 +252,7 @@ def _healthy(route: Route, health: Mapping[str, str] | None) -> bool:
     return str(value).strip().lower() in HEALTHY
 
 
-def _saturated(route: Route, load: Mapping[str, int] | None, roster: "Roster | Iterable[Route]") -> bool:
+def _saturated(route: Route, load: Mapping[str, int] | None, roster: Roster | Iterable[Route]) -> bool:
     if not load:
         return False
     capacity = route_capacity(route, roster)
@@ -332,9 +330,7 @@ def pick_reviewers(
     return out
 
 
-def route_by_id(
-    route_id: str, roster: "Roster | Mapping[str, Route] | Iterable[Route] | None" = None
-) -> Route | None:
+def route_by_id(route_id: str, roster: Roster | Mapping[str, Route] | Iterable[Route] | None = None) -> Route | None:
     for route in as_routes(roster) if roster is not None else load_roster():
         if route.id == route_id:
             return route

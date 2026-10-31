@@ -28,7 +28,6 @@ injected mappings.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 
 import pytest
@@ -98,9 +97,7 @@ def test_every_roster_model_has_exactly_one_family():
     # And the roster agrees with the table for every enumerated exact model.
     for model in (r.model for r in roster):
         assert model in table["families"] or any(
-            model.lower().startswith(p.rstrip("*").lower())
-            for p in table["families"]
-            if p.endswith("*")
+            model.lower().startswith(p.rstrip("*").lower()) for p in table["families"] if p.endswith("*")
         ), f"{model} has no family rule"
 
 
@@ -117,9 +114,7 @@ def test_family_table_is_free_of_duplicate_patterns():
         # Only ENUMERATED model ids that the wildcard covers are a duplicate.
         # Wildcards sharing a prefix ("mimo*" and "mimo-v2*") are fine as long
         # as they agree on the family. Look the literals up case-insensitively.
-        clashes = [
-            k for k in table_by_lower if k != pattern.lower() and k.startswith(stem) and "*" not in k
-        ]
+        clashes = [k for k in table_by_lower if k != pattern.lower() and k.startswith(stem) and "*" not in k]
         # "mimo*" naturally covers "mimo-v2.6-flash"; what must not happen is
         # two DIFFERENT wildcard stems covering the same explicit model.
         if clashes:
@@ -220,7 +215,9 @@ def test_eih_nemotron_is_allowed_but_marked_slow_and_lowest_priority():
 
 # ── (3) pick_reviewers ──────────────────────────────────────────────────────
 
-AUTHOR_FAMILIES = sorted({r.family for r in rr.reviewer_routes(rr.load_roster())} | {"alibaba", "anthropic", "unknown:zzz"})
+AUTHOR_FAMILIES = sorted(
+    {r.family for r in rr.reviewer_routes(rr.load_roster())} | {"alibaba", "anthropic", "unknown:zzz"}
+)
 
 
 @pytest.mark.parametrize("author_family", AUTHOR_FAMILIES)
@@ -282,13 +279,13 @@ def test_pick_reviewers_honours_co_author_families():
 
 def test_pick_reviewers_honours_approved_repo_flags():
     roster = rr.load_roster()
-    picked = rr.pick_reviewers("qwen38", roster=roster, health={}, load={}, repo="some-other-repo", include_expensive=True)
+    picked = rr.pick_reviewers(
+        "qwen38", roster=roster, health={}, load={}, repo="some-other-repo", include_expensive=True
+    )
     assert "meta" not in {r.family for r in picked}
     assert "stepfun" not in {r.family for r in picked}
     # Approved repo + include_expensive may surface them.
-    wide = rr.pick_reviewers(
-        "qwen38", roster=roster, health={}, load={}, repo="graeae-hive", include_expensive=True
-    )
+    wide = rr.pick_reviewers("qwen38", roster=roster, health={}, load={}, repo="graeae-hive", include_expensive=True)
     assert "meta" in {r.family for r in wide}
 
 

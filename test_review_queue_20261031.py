@@ -31,8 +31,8 @@ from pathlib import Path
 
 import pytest
 
-from hive.workers import reviewer_roster as rr
 from hive.workers import review_queue as rq
+from hive.workers import reviewer_roster as rr
 
 ROOT = Path(__file__).resolve().parent
 
@@ -129,9 +129,7 @@ def test_approved_delivery_is_never_downgraded():
         "head_sha": "d" * 40,
     }
     assert (
-        rq.awaiting_review_record(
-            status="done", failure_reason=None, result=result, has_commits=True, pushed=True
-        )
+        rq.awaiting_review_record(status="done", failure_reason=None, result=result, has_commits=True, pushed=True)
         is None
     )
 
@@ -232,7 +230,7 @@ def test_route_concurrency_cap_is_enforced():
     assert not shared.acquire(narrator, roster)
     # Alone (no roster to consult) a route only knows its own limit.
     solo = rq.RouteInflight()
-    for _ in range(gemma_cap := rr.route_capacity(route, roster)):
+    for _ in range(rr.route_capacity(route, roster)):
         assert solo.acquire(route)
 
 
@@ -355,7 +353,6 @@ def test_backoff_defers_rows_that_are_not_due():
 
 
 def test_a_failed_attempt_schedules_the_next_try_with_backoff():
-    roster = rr.load_roster()
     row = _row("retry")
     entry = rq.mark_attempt_failed(row, "busy", now=1000.0, base=30.0, cap=900.0, jitter=0.0)
     assert entry["attempts"] == 1
@@ -564,7 +561,5 @@ def test_doctor_never_escalates_a_queued_row_as_stuck():
     doctor = _doctor()
     row = _row("escalate")
     row.update({"kind": "code", "updated_at": 0.0})
-    sent = doctor.escalate_stuck_needs_review(
-        [row], evidence_fn=lambda job: {"head_branch": "hv/x"}, now=10**7
-    )
+    sent = doctor.escalate_stuck_needs_review([row], evidence_fn=lambda job: {"head_branch": "hv/x"}, now=10**7)
     assert sent == []

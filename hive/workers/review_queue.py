@@ -38,7 +38,8 @@ import re
 import threading
 import time
 import urllib.request
-from typing import Any, Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 from hive.workers import reviewer_roster as rr
 
@@ -77,13 +78,14 @@ def _named_reviewer(value: Any) -> bool:
 def _evidence_has_named_reviewer(result: Mapping) -> bool:
     """True when the row already carries a review from a NAMED model."""
     evidence = result.get("review_evidence")
-    if isinstance(evidence, Mapping) and evidence.get("reviewers"):
-        if any(isinstance(e, Mapping) and _named_reviewer(e.get("model")) for e in evidence["reviewers"]):
-            return True
-    reviewer = result.get("reviewer")
-    if isinstance(reviewer, Mapping) and _named_reviewer(reviewer.get("model")):
+    if (
+        isinstance(evidence, Mapping)
+        and evidence.get("reviewers")
+        and any(isinstance(e, Mapping) and _named_reviewer(e.get("model")) for e in evidence["reviewers"])
+    ):
         return True
-    return False
+    reviewer = result.get("reviewer")
+    return isinstance(reviewer, Mapping) and _named_reviewer(reviewer.get("model"))
 
 
 class AwaitingReview:
@@ -130,7 +132,9 @@ def awaiting_review_record(
         "author_family": rr.family_of(author_model) if author_model else None,
         "attempts": 0,
         "next_attempt_at": float(now or 0.0),
-        "last_error": "reviewer_unavailable" if failure_reason in (None, "", "reviewer_unavailable") else str(failure_reason),
+        "last_error": "reviewer_unavailable"
+        if failure_reason in (None, "", "reviewer_unavailable")
+        else str(failure_reason),
     }
     queued = dict(result)
     queued[FIELD] = entry
@@ -173,7 +177,11 @@ def parse_structured_verdict(payload: Any) -> tuple[dict | None, str | None]:
     if not str(data.get("verdict") or "").strip():
         return None, "non_json"
     reviewers = data.get("reviewers")
-    named = [r for r in (reviewers if isinstance(reviewers, list) else []) if isinstance(r, Mapping) and _named_reviewer(r.get("model"))]
+    named = [
+        r
+        for r in (reviewers if isinstance(reviewers, list) else [])
+        if isinstance(r, Mapping) and _named_reviewer(r.get("model"))
+    ]
     if not named:
         return None, "no_named_reviewer"
     return data, None
@@ -245,7 +253,9 @@ class RouteInflight:
     def count(self, route: rr.Route) -> int:
         return self._counts.get(self._key(route), 0)
 
-    def acquire(self, route: rr.Route, roster: "rr.Roster | Mapping[str, rr.Route] | Iterable[rr.Route] | None" = None) -> bool:
+    def acquire(
+        self, route: rr.Route, roster: rr.Roster | Mapping[str, rr.Route] | Iterable[rr.Route] | None = None
+    ) -> bool:
         key = self._key(route)
         capacity = rr.route_capacity(route, roster)
         with self._lock:
@@ -366,7 +376,10 @@ class LoadProbe:
                 for slot in payload:
                     if not isinstance(slot, dict):
                         continue
-                    if slot.get("is_processing") is True or str(slot.get("state") or "").lower() in {"processing", "generating"}:
+                    if slot.get("is_processing") is True or str(slot.get("state") or "").lower() in {
+                        "processing",
+                        "generating",
+                    }:
                         busy += 1
                 return busy, "llama_slots"
         except Exception:  # noqa: BLE001 - fall through to metrics; unknown is not zero
@@ -442,9 +455,7 @@ def mark_attempt_failed(
         entry["state"] = STATE_EXHAUSTED
     else:
         entry["state"] = STATE_QUEUED
-        entry["next_attempt_at"] = float(now) + retry_delay(
-            attempts - 1, base=base, cap=cap, jitter=jitter, rand=rand
-        )
+        entry["next_attempt_at"] = float(now) + retry_delay(attempts - 1, base=base, cap=cap, jitter=jitter, rand=rand)
     result[FIELD] = entry
     return entry
 
