@@ -23,8 +23,6 @@ Everything is hermetic: no bus, no probes, no deployed resolver modules.
 
 import importlib
 import os
-import sys
-import warnings
 
 import pytest
 
@@ -62,7 +60,13 @@ PARTIAL_BLOCKS = {
     "attempt is a word": {"state": "awaiting_review", "author": "a", "attempt": "zero", "max_attempts": 3},
     "attempt is a list": {"state": "awaiting_review", "author": "a", "attempt": [1], "max_attempts": 3},
     "max_attempts is a word": {"state": "awaiting_review", "author": "a", "attempt": 0, "max_attempts": "three"},
-    "tried is not a list": {"state": "awaiting_review", "author": "a", "attempt": 0, "max_attempts": 3, "tried": "qwen"},
+    "tried is not a list": {
+        "state": "awaiting_review",
+        "author": "a",
+        "attempt": 0,
+        "max_attempts": 3,
+        "tried": "qwen",
+    },
     "empty block": {},
 }
 
@@ -84,7 +88,11 @@ def test_a_partial_or_malformed_review_state_is_still_adopted(label):
     for field in rq.ADOPTION_REQUIRED_FIELDS:
         assert field in repaired, f"{label}: repaired block missing {field}"
     assert repaired["attempt"] == 0 and repaired["max_attempts"] == rq.MAX_REVIEW_ATTEMPTS
-    assert repaired["author"] == "gpt-oss-20b", label
+    if isinstance(block.get("author"), str) and block["author"].strip():
+        # A partial block that names its author keeps it (never re-forged).
+        assert repaired["author"] == block["author"].strip(), label
+    else:
+        assert repaired["author"] == "gpt-oss-20b", label
     assert isinstance(repaired["tried"], list), label
     # The repaired block is complete, so the NEXT sweep sees a usable row.
     assert rq.usable_review_state({"result": {"review_state": repaired}}) is not None
@@ -147,19 +155,18 @@ def _fresh_doctor(monkeypatch, env):
         monkeypatch.setenv(key, value)
     from hive.workers import doctor
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        importlib.reload(doctor)
-    return doctor, [str(w.message) for w in caught]
+    importlib.reload(doctor)
+    return doctor
 
 
-def test_a_malformed_cap_env_var_does_not_crash_the_import():
+def test_a_malformed_cap_env_var_does_not_crash_the_import(caplog):
     """Regression (review 2026-10-31, high): ``int()`` on an env var at import."""
     monkeypatch = pytest.MonkeyPatch()
     try:
-        doctor, messages = _fresh_doctor(monkeypatch, {"HIVE_DOCTOR_REVIEW_SUBMIT_MAX": "three"})
+        with caplog.at_level("WARNING", logger="doctor"):
+            doctor = _fresh_doctor(monkeypatch, {"HIVE_DOCTOR_REVIEW_SUBMIT_MAX": "three"})
         assert doctor.HIVE_DOCTOR_REVIEW_SUBMIT_MAX == 3, "the default must be used"
-        assert any("HIVE_DOCTOR_REVIEW_SUBMIT_MAX" in m for m in messages), messages
+        assert any("HIVE_DOCTOR_REVIEW_SUBMIT_MAX" in rec.getMessage() for rec in caplog.records), caplog.text
     finally:
         monkeypatch.undo()
         importlib.reload(__import__("hive.workers.doctor", fromlist=["doctor"]))
@@ -168,9 +175,9 @@ def test_a_malformed_cap_env_var_does_not_crash_the_import():
 def test_a_negative_cap_is_clamped_to_zero():
     monkeypatch = pytest.MonkeyPatch()
     try:
-        doctor, _messages = _fresh_doctor(monkeypatch, {"HIVE_DOCTOR_REVIEW_SUBMIT_MAX": "-4"})
+        doctor = _fresh_doctor(monkeypatch, {"HIVE_DOCTOR_REVIEW_SUBMIT_MAX": "-4"})
         assert doctor.HIVE_DOCTOR_REVIEW_SUBMIT_MAX == 0
-        doctor, _messages = _fresh_doctor(monkeypatch, {"HIVE_DOCTOR_REVIEW_SUBMIT_MAX": "7"})
+        doctor = _fresh_doctor(monkeypatch, {"HIVE_DOCTOR_REVIEW_SUBMIT_MAX": "7"})
         assert doctor.HIVE_DOCTOR_REVIEW_SUBMIT_MAX == 7
     finally:
         monkeypatch.undo()
@@ -202,21 +209,20 @@ def test_every_import_time_env_int_in_the_doctor_is_guarded():
     assert re.search(r"def _env_int\(", source), "the defensive parser must exist"
 
 
-def test_the_defensive_env_parser_reads_each_shape():
+def test_the_defensive_env_parser_reads_each_shape(caplog):
     """``_env_int``: default, bounds, and a warning naming the variable."""
     from hive.workers import doctor
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        assert doctor._env_int("__HIVE_TEST_UNSET__", 5) == 5
+    os.environ.pop("__HIVE_TEST_INT__", None)
+    assert doctor._env_int("__HIVE_TEST_UNSET__", 5) == 5
+    with caplog.at_level("WARNING", logger="doctor"):
         os.environ["__HIVE_TEST_INT__"] = " 9 "
         try:
             assert doctor._env_int("__HIVE_TEST_INT__", 5) == 9
             os.environ["__HIVE_TEST_INT__"] = "nope"
             assert doctor._env_int("__HIVE_TEST_INT__", 5) == 5
-            assert any("__HIVE_TEST_INT__" in str(w.message) for w in caught)
+            assert any("__HIVE_TEST_INT__" in rec.getMessage() for rec in caplog.records), caplog.text
             os.environ["__HIVE_TEST_INT__"] = "-2"
             assert doctor._env_int("__HIVE_TEST_INT__", 5, minimum=0) == 0
         finally:
             del os.environ["__HIVE_TEST_INT__"]
-            sys.modules.pop("__nope__", None)

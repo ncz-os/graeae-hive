@@ -274,6 +274,21 @@ never drops below zero. A dry run previews up to the same cap (and no further)
 through that one shared floor, so the log lists exactly the reviews a real
 sweep would submit.
 
+### A partial block is repaired, never skipped
+
+A row can carry a `result.review_state` block that the sweep cannot advance:
+one missing `author`, `attempt` or `max_attempts`, or carrying the wrong shape
+(`attempt: "zero"`, `tried: "qwen"`) — a partial write, a hand edit, or a bus
+dialect that stringified the JSON. Such a block is NOT "the queue already owns
+this row": `usable_review_state` refuses it and the adoption pass REPAIRS it
+from the row (review 2026-10-31, high). The repair keeps whatever the block
+still holds that is trustworthy — the author it named, the attempts spent, a
+pending `next_attempt_at`, a `parked_reason` and a live `review_job_id` — so a
+repair neither re-forges a known author nor lets a row spend its retry budget
+twice, and records the defect in `repaired_from` / `adopted_from`. A block with
+a live review is still never a second review, and a COMPLETE block is never
+re-adopted.
+
 ### No duplicate review jobs
 
 A row is never submitted twice. Before any route picking,
@@ -295,8 +310,14 @@ touched: their verdict is the owner's (`lane_b_row`).
 | Variable | Default | Meaning |
 |---|---|---|
 | `HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS` | `1` (ON) | Adopt and review legacy needs-review rows |
-| `HIVE_DOCTOR_REVIEW_SUBMIT_MAX` | `3` | Review jobs one sweep may submit |
+| `HIVE_DOCTOR_REVIEW_SUBMIT_MAX` | `3` | Review jobs one sweep may submit (never below 0) |
 | `HIVE_DOCTOR_ADOPT_DRY_RUN` | `0` | Log what it would submit; submit and write nothing |
+
+Every one of these is parsed defensively at import (`doctor._env_int`): an unset
+or unparsable value uses the default with a logged warning instead of taking the
+doctor down at import, and a value below the floor is clamped (a negative cap
+means "submit nothing", exit 0, never a crash loop). `HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS`
+and `HIVE_DOCTOR_ADOPT_DRY_RUN` are read at import from the process env only.
 
 ## Tests
 
@@ -311,6 +332,9 @@ touched: their verdict is the owner's (`lane_b_row`).
   cross-family pairing (an alibaba author never gets a qwen reviewer), the
   per-sweep cap, lane-B exclusion, fake-clock backoff, and idempotency across
   sweeps (including a row already holding `review_job_id`).
+* `test_doctor_review_queue_hardening_20261031.py` — the two findings of the
+  structured review: a partial or malformed `review_state` block is repaired
+  (adopted, not skipped) and every import-time env int is parsed defensively.
 * `test_review_queue_fixes_20261031.py` — the defects found in review: name
   resolution (case, aliases, role ids, newer MiniMax), parking with no author,
   cross-family and head-bound approvals, retry/exhaust progression, per-route

@@ -94,22 +94,52 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    """``os.environ[name]`` as an int, defensively: default, bounds, one warning.
+
+    A bare ``int(os.environ.get(...))`` at module scope raises on a typo
+    (``HIVE_DOCTOR_REVIEW_SUBMIT_MAX=three``) and takes the WHOLE doctor down at
+    import, which is a crash loop, not a config error. An unset or unparsable
+    value falls back to the default with a logged warning; ``minimum``/
+    ``maximum`` clamp a real value (the warning names it when they do), and a
+    clamped ``minimum=0`` cap is how "never submit" is spelled (review
+    2026-10-31, high).
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning("doctor: %s=%r is not an integer; using the default %d", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        log.warning("doctor: %s=%r is below the minimum %d; using %d", name, raw, minimum, minimum)
+        return minimum
+    if maximum is not None and value > maximum:
+        log.warning("doctor: %s=%r is above the maximum %d; using %d", name, raw, maximum, maximum)
+        return maximum
+    return value
+
+
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
-ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "900"))
-MAX_SSH_PER_HOUR = int(os.environ.get("MAX_SSH_PER_HOUR", "3"))
+ZEROCLAW_TIMEOUT = _env_int("ZEROCLAW_TIMEOUT", 900)
+MAX_SSH_PER_HOUR = _env_int("MAX_SSH_PER_HOUR", 3, minimum=0)
 # The window the SSH rate cap is measured over. Named so the durable rate limiter
 # and the in-memory deque cannot drift onto different windows.
 SSH_RATE_WINDOW_SEC = float(os.environ.get("SSH_RATE_WINDOW_SEC", "3600"))
-MIN_HOST_COOLDOWN = int(os.environ.get("MIN_HOST_COOLDOWN", "1800"))
+MIN_HOST_COOLDOWN = _env_int("MIN_HOST_COOLDOWN", 1800)
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 # Loop-detection: per-job-id (re)fail counter. If the same job_id keeps
 # coming back to the doctor (because we released it and some broken worker
 # re-failed it), we escalate instead of releasing it again.
 _seen_job_attempts: dict[str, list[float]] = {}
 LOOP_WINDOW_SEC = float(os.environ.get("LOOP_WINDOW_SEC", "1800"))  # 30 min
-LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
+LOOP_ESCALATE_THRESHOLD = _env_int("LOOP_ESCALATE_THRESHOLD", 3, minimum=0)
 
 # ── Per-phase model selection (2026-06-02) ──
 # The doctor runs in phases; each phase picks its model independently.
@@ -142,7 +172,7 @@ _PHASE_MODELS = {
 DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get("DOCTOR_OPENWEIGHT_BASE_URL", "").rstrip("/")
 DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "gpt-oss-20b")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
-DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
+DOCTOR_OPENWEIGHT_TIMEOUT = _env_int("DOCTOR_OPENWEIGHT_TIMEOUT", 120, minimum=1)
 # Per-phase bases. Triage and review default to CERBERUS (DOCTOR_OPENWEIGHT_BASE_URL);
 # the fix phase defaults to TYDEUS, where qwen38 is served — a phase model id
 # is sent to its phase base, so the two must agree. Override any phase to a
@@ -267,12 +297,12 @@ RETENTION_DEAD_TTL_SEC = float(os.environ.get("RETENTION_DEAD_TTL_SEC", "3600"))
 RETENTION_TRIAGE_TTL_SEC = float(
     os.environ.get("RETENTION_TRIAGE_TTL_SEC", "600")
 )  # triage work orders older than 10 min
-RETENTION_MAX_DEAD = int(os.environ.get("RETENTION_MAX_DEAD", "10"))  # hard cap on dead (failed+dead-letter+cancelled)
+RETENTION_MAX_DEAD = _env_int("RETENTION_MAX_DEAD", 10, minimum=0)  # hard cap on dead (failed+dead-letter+cancelled)
 RETENTION_SWEEP_INTERVAL = float(os.environ.get("RETENTION_SWEEP_INTERVAL", "600"))  # seconds between retention sweeps
 
 # Self-triage scanner config
 SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))  # seconds between failed-cluster scans
-CLUSTER_THRESHOLD = int(os.environ.get("CLUSTER_THRESHOLD", "1"))  # min failures of same base_kind to trigger a triage
+CLUSTER_THRESHOLD = _env_int("CLUSTER_THRESHOLD", 1, minimum=0)  # min failures of same base_kind to trigger a triage
 CLUSTER_WINDOW_SEC = float(os.environ.get("CLUSTER_WINDOW_SEC", "21600"))  # only look at failures in last 6h
 # To avoid re-triaging the same cluster repeatedly, we remember kinds we've already
 # auto-triaged within this rolling window:
@@ -286,7 +316,7 @@ TRIAGE_SEEN_TTL_SEC = float(os.environ.get("TRIAGE_SEEN_TTL_SEC", str(30 * 86400
 # with no automatic remediation.
 DLQ_SCAN_INTERVAL = float(os.environ.get("DLQ_SCAN_INTERVAL", str(SCAN_INTERVAL)))
 DLQ_APPLY = os.environ.get("DLQ_APPLY", "0") == "1"
-DLQ_MAX_PER_CYCLE = int(os.environ.get("DLQ_MAX_PER_CYCLE", "20"))
+DLQ_MAX_PER_CYCLE = _env_int("DLQ_MAX_PER_CYCLE", 20, minimum=0)
 # The WORK one dead-letter cycle may do, counted in ATTEMPTS rather than in actions.
 # `DLQ_MAX_PER_CYCLE` is a budget for progress: a refusal for want of an approval
 # does not spend it, because a job the doctor was not allowed to act on is still a
@@ -295,7 +325,7 @@ DLQ_MAX_PER_CYCLE = int(os.environ.get("DLQ_MAX_PER_CYCLE", "20"))
 # which is one pass over the whole dead-letter queue per cycle for a queue that
 # cannot drain. This bounds the pass. It is at least `DLQ_MAX_PER_CYCLE`, so the
 # action budget still binds first whenever the doctor is actually making progress.
-DLQ_MAX_ATTEMPTS_PER_CYCLE = max(DLQ_MAX_PER_CYCLE, int(os.environ.get("DLQ_MAX_ATTEMPTS_PER_CYCLE", "50")))
+DLQ_MAX_ATTEMPTS_PER_CYCLE = max(DLQ_MAX_PER_CYCLE, _env_int("DLQ_MAX_ATTEMPTS_PER_CYCLE", 50, minimum=0))
 # Once a dead-letter job has a logged decision, don't re-decide it every cycle.
 _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
@@ -359,7 +389,7 @@ SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
 # row and re-dispatch the same work once on the remaining hosts, excluding the
 # offending one. The cap and the markers are durable (STATE), so a restart
 # never re-purges or re-dispatches the same original job id.
-VIOLATION_MAX_RETRIES = int(os.environ.get("VIOLATION_MAX_RETRIES", "2"))
+VIOLATION_MAX_RETRIES = _env_int("VIOLATION_MAX_RETRIES", 2, minimum=0)
 PROTECTION_RETRY_TTL_SEC = 30 * 86400.0
 PROTECTION_ERROR_RE = re.compile(r"driver modified another session's checkout:\s*(\S+)")
 
@@ -371,7 +401,7 @@ PROTECTION_ERROR_RE = re.compile(r"driver modified another session's checkout:\s
 # big backlog cannot flood the queue. A row that HAS a review verdict is left
 # for a human/orchestrator, and a needs-review row is never auto-purged:
 # if it carries commits, those are delivered work.
-REVIEW_FOLLOWUP_MAX_PER_SWEEP = int(os.environ.get("REVIEW_FOLLOWUP_MAX_PER_SWEEP", "3"))
+REVIEW_FOLLOWUP_MAX_PER_SWEEP = _env_int("REVIEW_FOLLOWUP_MAX_PER_SWEEP", 3, minimum=0)
 REVIEW_FOLLOWUP_TTL_SEC = 30 * 86400.0
 REVIEW_FOLLOWUP_KIND_PREFIX = "review:"
 REVIEW_FOLLOWUP_ELIGIBLE_KINDS = []  # ANY reviewer family; scheduler owns capability matching
@@ -453,7 +483,7 @@ DLQ_TRANSIENT_RE = re.compile(
 # auto-dispatches a codex fix without burning an LLM call.
 # Rate-limit: max 3 fixes per host per hour to avoid loops.
 _token_fix_attempts: dict[str, list[float]] = {}
-MAX_TOKEN_FIX_PER_HOST = int(os.environ.get("MAX_TOKEN_FIX_PER_HOST", "3"))
+MAX_TOKEN_FIX_PER_HOST = _env_int("MAX_TOKEN_FIX_PER_HOST", 3, minimum=0)
 TOKEN_FIX_WINDOW_SEC = float(os.environ.get("TOKEN_FIX_WINDOW_SEC", "3600"))  # 1 hour
 # SECURITY (review C2/H3): no baked-in default. The prior literal
 # ('fleet-lan-token-2026-05-26') was a committed shared LAN secret embedded into
@@ -1009,8 +1039,8 @@ def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry:
 
 
 DOCTOR_GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1").strip()
-DOCTOR_GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "42617"))
-DOCTOR_GATEWAY_TIMEOUT = int(os.environ.get("DOCTOR_GATEWAY_TIMEOUT", "180"))
+DOCTOR_GATEWAY_PORT = _env_int("GATEWAY_PORT", 42617, minimum=1, maximum=65535)
+DOCTOR_GATEWAY_TIMEOUT = _env_int("DOCTOR_GATEWAY_TIMEOUT", 180, minimum=1)
 
 
 def _invoke_gateway(prompt: str) -> tuple[bool, str]:
@@ -5048,7 +5078,7 @@ HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS = os.environ.get("HIVE_DOCTOR_ADOPT_LEGACY_REVI
     "no",
     "off",
 )
-HIVE_DOCTOR_REVIEW_SUBMIT_MAX = max(0, int(os.environ.get("HIVE_DOCTOR_REVIEW_SUBMIT_MAX", "3")))
+HIVE_DOCTOR_REVIEW_SUBMIT_MAX = _env_int("HIVE_DOCTOR_REVIEW_SUBMIT_MAX", 3, minimum=0)
 HIVE_DOCTOR_ADOPT_DRY_RUN = os.environ.get("HIVE_DOCTOR_ADOPT_DRY_RUN", "0").strip().lower() in (
     "1",
     "true",
