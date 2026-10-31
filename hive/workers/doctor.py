@@ -4890,6 +4890,32 @@ def review_followup_protected(job: dict) -> bool:
     return dlq_protected(job) or decline_paths.review_is_never_act(job)
 
 
+# ── lane B / RiskyEats: never the doctor's rows to review (2026-10-31) ──────
+# The operator's lane-B work (RiskyEats, and the test/ refactor/ fix/ docs/
+# perf/ ops/ feat/ branch families) has its own owner, as do two owner-wait
+# chains whose jobs the operator is holding. The review queue must not adopt,
+# submit for, or touch them: their verdict is the owner's.
+LANE_B_JOB_ID_PREFIXES = ("01a18ab8-0a4f", "01a18a8d-9ffa")
+LANE_B_BRANCH_PREFIXES = ("test/", "refactor/", "fix/", "docs/", "perf/", "ops/", "feat/")
+LANE_B_PROJECTS = frozenset({"riskyeats"})
+
+
+def lane_b_row(job: dict) -> bool:
+    """Whether this row belongs to lane B / RiskyEats or a lane-B owner-wait chain."""
+    if not isinstance(job, dict):
+        return False
+    jid = str(job.get("id") or "").strip().lower()
+    if jid.startswith(LANE_B_JOB_ID_PREFIXES):
+        return True
+    if str(job.get("project") or "").strip().lower() in LANE_B_PROJECTS:
+        return True
+    repo = str(job.get("repo") or "").strip().lower()
+    if repo.rsplit("/", 1)[-1] in LANE_B_PROJECTS:
+        return True
+    head = str(job.get("head_branch") or "").strip().lower()
+    return head.startswith(LANE_B_BRANCH_PREFIXES)
+
+
 def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     """Shared immediate/reconciliation path; never mutate protected lanes."""
     jid = str(job.get("id") or "")
@@ -5007,6 +5033,28 @@ REVIEW_QUEUE_ROUTE_HEALTH: dict = {}
 # Override for the per-route load reader (a callable returning one); None uses
 # the cached 30 s llama-server ``/slots`` / vLLM metrics probe over the roster.
 REVIEW_QUEUE_ROUTE_LOAD = None
+
+# ── adopting legacy rows (operator 2026-10-31) ──────────────────────────────
+# The deployed worker line does not write ``result.review_state``, so every one
+# of its needs-review rows was invisible to the queue above (production logged
+# ``scanned=0 submitted=0`` while thirteen rows sat unapproved). With this
+# switch ON (the default, operator 2026-10-31) the sweep ADOPTS such a row --
+# builds its review_state from the row, status untouched -- and reviews it like
+# any other queue row. ``HIVE_DOCTOR_ADOPT_DRY_RUN`` only logs what it would
+# submit; the per-sweep cap bounds how many review jobs one pass sends.
+HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS = os.environ.get("HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+HIVE_DOCTOR_REVIEW_SUBMIT_MAX = max(0, int(os.environ.get("HIVE_DOCTOR_REVIEW_SUBMIT_MAX", "3")))
+HIVE_DOCTOR_ADOPT_DRY_RUN = os.environ.get("HIVE_DOCTOR_ADOPT_DRY_RUN", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def _review_route_health():
@@ -5179,8 +5227,124 @@ def merge_handoff(job: dict) -> str:
 
 
 def _review_queue_rows(rows: list[dict]) -> list[dict]:
-    """The awaiting_review rows of a needs-review listing (they ARE the queue)."""
-    return [row for row in rows if review_queue.review_state(row) is not None]
+    """The rows the queue owns, oldest-owed first (adopted rows go last).
+
+    A row with a complete review_state is advanced exactly as before. A LEGACY
+    row (one the older worker line left without review_state) is admitted too:
+    it is owed a review, and the operator's point is that the queue must do the
+    reviewing (2026-10-31). Adopted rows are ordered LAST so a backlog of rows
+    the queue already owns drains first, and so a single legacy backlog cannot
+    starve them.
+    """
+
+    def _owed(row: dict) -> tuple:
+        state = review_queue.usable_review_state(row)
+        if state is not None:
+            return (0, state.get("next_attempt_at") or 0)
+        if _adoptable_row(row):
+            return (1, row.get("ended_at") or row.get("started_at") or row.get("last_update_at") or 0)
+        return (2, 0)
+
+    ordered = [row for row in rows if review_queue.review_state(row) is not None or _adoptable_row(row)]
+    return sorted(ordered, key=_owed)
+
+
+def _adoptable_row(job: dict) -> bool:
+    """True when this sweep must ACT on the row: adopt it, or advance it.
+
+    A row still carrying a complete ``review_state`` is already the queue's
+    (adopted by an earlier sweep, or written by the newer worker line): it is
+    not adopted again, but its in-flight review, backoff, approve and retry
+    bookkeeping still have to be advanced, so it stays in the pass.
+    """
+    if _adoption_for(job) is not None:
+        return True
+    return _review_state_row(job) is not None
+
+
+def _review_state_row(job: dict) -> dict | None:
+    """The complete review_state of a needs-review row this sweep may advance."""
+    if not HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS:
+        return None
+    if str(job.get("status") or "") != "needs-review":
+        return None
+    if str(job.get("kind") or "").startswith("triage:"):
+        return None
+    if lane_b_row(job):
+        return None
+    return review_queue.usable_review_state(job)
+
+
+def _adoption_for(job: dict) -> dict | None:
+    """The review_state a legacy row would be adopted with, or None.
+
+    Lane B / RiskyEats rows and the lane-B owner-wait chains are never adopted
+    (operator 2026-10-31): another owner is already waiting on them.
+    """
+    if not HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS:
+        return None
+    if str(job.get("status") or "") != "needs-review":
+        return None
+    if str(job.get("kind") or "").startswith("triage:"):
+        return None
+    if lane_b_row(job):
+        return None
+    return review_queue.adoption_review_state(job)
+
+
+def _in_flight_review_job_id(job: dict, result: dict) -> str:
+    """The row's live review child id, or "" -- the guard before route picking.
+
+    Two sources, both recorded on the row rather than in review_state: the
+    worker's own ``result.auto_review_job_id`` and any ``review:`` child the
+    bus still lists as non-terminal. A row whose review is already running is
+    never submitted again (operator 2026-10-31: no duplicate review jobs).
+    """
+    recorded = str(result.get("auto_review_job_id") or "").strip()
+    if recorded:
+        return recorded
+    try:
+        children = _needs_review_child_review_jobs(job)
+    except RuntimeError:
+        # An unreadable listing is not "no review": the caller falls through to
+        # its own in-flight handling, which reports the error.
+        return ""
+    for child in children:
+        if str(child.get("status") or "") not in _REVIEW_CHILD_TERMINAL:
+            return str(child.get("id") or "").strip()
+    return ""
+
+
+def _review_is_in_flight(job: dict) -> bool:
+    """Whether a review child for this row is still running (never re-adopt)."""
+    try:
+        children = _needs_review_child_review_jobs(job)
+    except RuntimeError:
+        # Cannot prove the row is unclaimed: treat it as in flight so a sweep
+        # never submits a second review on an unreadable listing.
+        return True
+    return any(str(c.get("status") or "") not in _REVIEW_CHILD_TERMINAL for c in children)
+
+
+def adopt_legacy_review_row(job: dict, *, now: float | None = None) -> bool:
+    """Give a legacy needs-review row the review_state the queue advances.
+
+    The row's STATUS is not touched (still needs-review: the queue IS triage);
+    only ``result.review_state`` is added, built from what the row already
+    records. Returns True when the row now carries a state it did not before.
+    """
+    if review_queue.usable_review_state(job) is not None:
+        return False
+    if _review_is_in_flight(job):
+        # A review child is already running: the row is not legacy, it is busy.
+        return False
+    state = _adoption_for(job)
+    if state is None:
+        return False
+    result = _row_result_dict(job)
+    result["review_state"] = state
+    job["result"] = result
+    return True
 
 
 def _review_child_outcome(child: dict, *, head_sha: str = "", author_families: set | None = None) -> dict | None:
@@ -5199,6 +5363,11 @@ def _review_child_outcome(child: dict, *, head_sha: str = "", author_families: s
     for key in ("review_evidence", "verdict"):
         if proof.get(key):
             sources.append(proof[key])
+    if proof.get("reviewers"):
+        # A review job whose verdict IS its result (reviewers[].model plus the
+        # reviewed head), with no prose beside it. Without this the finished
+        # review read as empty and the row was retried instead of resolved.
+        sources.append(proof)
     tail = proof.get("tail")
     if isinstance(tail, str) and tail.strip():
         sources.append(tail)
@@ -5360,7 +5529,13 @@ def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: 
 
 
 def process_awaiting_review_row(
-    job: dict, *, now: float | None = None, health=None, load=None, roster: list[dict] | None = None
+    job: dict,
+    *,
+    now: float | None = None,
+    health=None,
+    load=None,
+    roster: list[dict] | None = None,
+    allow_submit: bool = True,
 ) -> tuple[str, dict | None, dict | None]:
     """Advance ONE awaiting_review row. Returns (outcome, new_state, verdict).
 
@@ -5370,6 +5545,12 @@ def process_awaiting_review_row(
     ``exhausted`` (attempt budget spent: the row waits for an owner),
     ``approved``, ``request_changes`` and ``review_failed``.
 
+    A LEGACY needs-review row (no complete review_state) is adopted first: the
+    state is built from the row and recorded on it, status untouched. So the
+    queue reviews what the older worker line left behind, not just what the new
+    line tags (operator 2026-10-31). ``allow_submit=False`` spends no attempt:
+    the row waits for the next sweep (the per-sweep submit cap).
+
     The row never leaves needs-review: there is no separate review status.
     """
     now = time.time() if now is None else float(now)
@@ -5378,7 +5559,10 @@ def process_awaiting_review_row(
         return "skipped_status", None, None
     if str(job.get("kind") or "").startswith("triage:"):
         return "skipped_triage", None, None
-    state = review_queue.review_state(job)
+    state = review_queue.usable_review_state(job)
+    if state is None:
+        adopt_legacy_review_row(job, now=now)
+        state = review_queue.usable_review_state(job)
     if state is None:
         return "skipped_status", None, None
     if review_queue.is_resolved(state):
@@ -5389,6 +5573,12 @@ def process_awaiting_review_row(
     head = _review_head(job, result)
     # A submitted review in flight: read its outcome, never submit a second one.
     in_flight = str(state.get("review_job_id") or "")
+    if not in_flight:
+        # An ADOPTED row can also carry the earlier worker's own review child
+        # (``result.auto_review_job_id`` / a live review: child) with no
+        # ``review_job_id`` in its state. Submitting again here would hand the
+        # same job to two reviewers, so the live child is adopted as in-flight.
+        in_flight = _in_flight_review_job_id(job, result)
     if in_flight:
         try:
             children = [c for c in _needs_review_child_review_jobs(job) if str(c.get("id")) == in_flight]
@@ -5465,12 +5655,10 @@ def process_awaiting_review_row(
             failure = outcome.get("failure") or "review_no_reviewers"
             tried = list(state.get("tried") or [])
             catalog = roster or review_queue.load_roster()
-            failing = (
-                outcome.get("reviewers")
-                or [str(entry.get("model_id") or "") for entry in state.get("tried") or [] if entry.get("model_id")][
-                    -1:
-                ]
-            )
+            # The reviewer that failed, from this attempt only: ``tried`` is
+            # grown below, so re-reading it here would record the same failure
+            # twice (and inflate the backoff step).
+            failing = list(outcome.get("reviewers") or [])
             for model in failing:
                 entry = next((r for r in catalog if _same_model(r.get("model_id"), model)), None)
                 tried.append(_tried_entry(entry or {"model_id": model}, failure, now))
@@ -5500,7 +5688,7 @@ def process_awaiting_review_row(
     health = health or _review_route_health()
     load = load or review_queue_load_reader()
     co_authors = [str(m) for m in co_authors if str(m or "").strip()]
-    picked = _pick_routes(author, job, roster, health, load, co_authors)
+    picked = _ordered_routes(_pick_routes(author, job, roster, health, load, co_authors), state)
     if not picked and _pick_routes(author, job, roster, health, lambda _route: 0, co_authors):
         # A cross-family reviewer EXISTS but every one is at its concurrency
         # cap (in-flight reviews included). That is not a park and costs no
@@ -5537,6 +5725,13 @@ def process_awaiting_review_row(
             },
         )
         return "parked", new_state, None
+    if not allow_submit:
+        # The per-sweep submit cap is spent. Nothing is written: the row is
+        # unchanged and the next sweep picks it up (no attempt is spent).
+        return "capped", state, None
+    if HIVE_DOCTOR_ADOPT_DRY_RUN:
+        _record_dry_run_submission(job, {**state, "author": author}, picked, now=now)
+        return "previewed", {**state, "author": author}, None
     try:
         review_id, spec = _review_queue_submit(job, {**state, "author": author}, picked, now=now)
     except RuntimeError as exc:
@@ -5573,6 +5768,37 @@ def process_awaiting_review_row(
     return "submitted", new_state, None
 
 
+def _ordered_routes(routes: list[dict], state: dict) -> list[dict]:
+    """Put the cross-family routes the row's own ``tried[]`` names at the back.
+
+    The roster pairing is unchanged (``pick_reviewers`` already excluded the
+    author's family and every saturated or unhealthy route). What this adds is
+    least-tried-first, so a row that already spent attempts on the CERBERUS
+    endpoint tries TYDEUS qwen38, MiniMax M3, Muse, DeepSeek or the EIH route
+    before going back to the one that just failed.
+    """
+    tried = {
+        str(entry.get("model_id") or "").strip().lower()
+        for entry in state.get("tried") or []
+        if isinstance(entry, dict)
+    }
+    if not tried:
+        return list(routes)
+    return sorted(routes, key=lambda route: str(route.get("model_id") or "").strip().lower() in tried)
+
+
+def _record_dry_run_submission(job: dict, state: dict, picked: list[dict], *, now: float) -> None:
+    """Log what a real sweep would submit, writing nothing (``HIVE_DOCTOR_ADOPT_DRY_RUN``)."""
+    log.info(
+        "DRY_RUN: would submit review for %s at %s: reviewers=%s author=%s (%s)",
+        str(job.get("id") or "")[:12],
+        (_review_head(job, _row_result_dict(job)) or "unrecorded")[:12],
+        ",".join(str(route.get("model_id") or "") for route in picked[:2]),
+        state.get("author") or "unknown",
+        state.get("author_family") or "unknown",
+    )
+
+
 def _sort_routes_by_family_load(routes: list[dict], load) -> list[dict]:
     """Least-loaded first WITHIN a priority tier; a lower tier is always later.
 
@@ -5601,6 +5827,12 @@ def _sort_routes_by_family_load(routes: list[dict], load) -> list[dict]:
 def _schedule_retry(
     job: dict, state: dict, tried: list[dict], failure: str, *, now: float, review_job_id: str
 ) -> tuple[str, dict, None]:
+    """Record a failed review attempt and schedule the next one.
+
+    ``attempt`` is the SUBMISSION budget (it is spent when a review is sent, in
+    the submit path, not here), so a failure records the failure and the
+    backoff without spending a second attempt.
+    """
     attempt = int(state.get("attempt") or 0)
     if attempt >= int(state.get("max_attempts") or review_queue.MAX_REVIEW_ATTEMPTS):
         return _park_exhausted(job, {**state, "tried": tried, "last_failure": failure, "review_job_id": None}, now)
@@ -5664,17 +5896,24 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
     Rows come from the SAME needs-review listing the triage report reads --
     there is no separate queue. Outcomes are counted per row so one bad row
     cannot stop the sweep; a listing failure is raised, never read as empty.
+
+    Phase 0 ADOPTS the legacy rows in the listing (the older worker line never
+    wrote ``result.review_state``, so without this the queue scanned 0 of them
+    in production), then ONE pass advances every row the queue owns -- adopted
+    and tagged alike -- under the per-sweep submit cap.
     """
     now = time.time() if now is None else float(now)
     if rows is None:
         rows = fetch_needs_review_jobs(limit=1000)
-    rows = sorted(
-        _review_queue_rows(rows),
-        key=lambda j: (review_queue.review_state(j) or {}).get("next_attempt_at") or 0,
-    )
+    adoption = submit_adopted_reviews(rows=rows, now=now, **{k: v for k, v in kwargs.items() if k != "load"})
+    handled = adoption.pop("_handled_rows", None)
+    rows = _review_queue_rows(rows)
     summary = {
         "scanned": len(rows),
-        "submitted": 0,
+        "adopted": adoption.get("adopted", 0),
+        "submitted": adoption.get("submitted", 0),
+        "would_submit": adoption.get("would_submit", 0),
+        "dry_run": adoption.get("dry_run", False),
         "awaited": 0,
         "deferred": 0,
         "capacity": 0,
@@ -5684,7 +5923,10 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
         "request_changes": 0,
         "review_failed": 0,
         "resolved": 0,
+        "capped": 0,
     }
+    if adoption.get("errors"):
+        summary["errors"] = adoption["errors"]
     # Per-route concurrency cap across the whole pass: reviews already in
     # flight on the bus plus the ones this pass submits count against each
     # route's ``concurrency`` on top of the probed server load (a queued review
@@ -5703,11 +5945,20 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
             return value
         return value + in_flight.get(str(route.get("id")), 0)
 
+    # The per-sweep submit cap is shared with the adoption phase; the review
+    # jobs that phase already sent count against it.
+    budget = max(0, int(HIVE_DOCTOR_REVIEW_SUBMIT_MAX) - summary["submitted"])
+    if HIVE_DOCTOR_ADOPT_DRY_RUN:
+        budget = 0
     for job in rows:
+        if handled and id(job) in handled:
+            continue  # phase 0 advanced (or capped) this legacy row already
         before = review_queue.review_state(job) or {}
         held = str(before.get("review_route") or "") if before.get("review_job_id") else ""
         try:
-            outcome, new_state, _ = process_awaiting_review_row(job, now=now, load=load, **kwargs)
+            outcome, new_state, _ = process_awaiting_review_row(
+                job, now=now, load=load, allow_submit=budget > 0, **kwargs
+            )
         except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
             summary["errors"] = summary.get("errors", 0) + 1
             log.error("review queue failed job=%s: %s", str(job.get("id"))[:12], exc)
@@ -5720,7 +5971,127 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
         if outcome == "submitted" and new_state and new_state.get("review_route"):
             route_id = str(new_state["review_route"])
             in_flight[route_id] = in_flight.get(route_id, 0) + 1
+            budget -= 1
         summary[outcome] = summary.get(outcome, 0) + 1
+    return summary
+
+
+def submit_adopted_reviews(
+    *,
+    rows: list[dict] | None = None,
+    now: float | None = None,
+    roster: list[dict] | None = None,
+    health=None,
+    load=None,
+) -> dict:
+    """Adopt the legacy needs-review rows and review them (one capped pass).
+
+    This is the operator's point made real (2026-10-31): the triage queue is
+    supposed to be REVIEWING. Rows the older worker line left without
+    ``result.review_state`` are adopted and advanced exactly like queue rows --
+    cross-family reviewer from ``hive/core/reviewer-roster.json``, retry
+    backoff, owner-wait at the attempt cap -- with:
+
+    * the row's STATUS untouched (still needs-review: the queue IS triage);
+    * at most ``HIVE_DOCTOR_REVIEW_SUBMIT_MAX`` review jobs per pass;
+    * ``HIVE_DOCTOR_ADOPT_DRY_RUN`` logging what it would submit, writing
+      nothing;
+    * lane B / RiskyEats rows and the lane-B owner-wait chains never touched.
+
+    The doctor neither merges nor cancels anything here: a structured approve
+    is RECORDED on the row (``review_state.approved`` with the reviewers named)
+    for the operator-merge pass.
+    """
+    now = time.time() if now is None else float(now)
+    summary = {
+        "scanned": 0,
+        "adopted": 0,
+        "would_submit": 0,
+        "submitted": 0,
+        "awaited": 0,
+        "deferred": 0,
+        "capacity": 0,
+        "capped": 0,
+        "parked": 0,
+        "exhausted": 0,
+        "approved": 0,
+        "request_changes": 0,
+        "review_failed": 0,
+        "resolved": 0,
+        "skipped_status": 0,
+        "skipped_triage": 0,
+        "skipped_protected": 0,
+        "previewed": 0,
+        "dry_run": HIVE_DOCTOR_ADOPT_DRY_RUN,
+    }
+    if not HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS:
+        summary["disabled"] = True
+        return summary
+    if rows is None:
+        rows = fetch_needs_review_jobs(limit=1000)
+    # Every row this phase ADOPTS is claimed here, so the phase-1 pass over the
+    # same listing cannot touch it a second time (it is already in flight).
+    adoptable = {id(row) for row in rows if _adoptable_row(row)}
+    claimed: set[int] = set()
+    summary["_handled_rows"] = claimed
+    summary["scanned"] = len(adoptable)
+    # A dry run spends no real submit but previews up to the same cap; a real
+    # pass allows one submission only while budget is left (never negative).
+    budget = max(0, int(HIVE_DOCTOR_REVIEW_SUBMIT_MAX))
+    for row in list(rows):
+        jid = str(row.get("id") or "")
+        if id(row) not in adoptable:
+            continue
+        claimed.add(id(row))
+        try:
+            adopted = adopt_legacy_review_row(row, now=now)
+            if (
+                adopted
+                and not HIVE_DOCTOR_ADOPT_DRY_RUN
+                and not _patch_review_state(row, review_queue.usable_review_state(row) or {})
+            ):
+                summary["errors"] = summary.get("errors", 0) + 1
+                continue
+            if adopted:
+                summary["adopted"] += 1
+                state = review_queue.usable_review_state(row) or {}
+                log.info(
+                    "adopted legacy needs-review row %s (%s, author %s/%s)",
+                    jid[:12],
+                    state.get("adopted_from"),
+                    state.get("author") or "unknown",
+                    state.get("author_family") or "unknown",
+                )
+            outcome, _state, _verdict = process_awaiting_review_row(
+                row,
+                now=now,
+                health=health,
+                load=load,
+                roster=roster,
+                allow_submit=budget > 0,
+            )
+        except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
+            summary["errors"] = summary.get("errors", 0) + 1
+            log.error("legacy review adoption failed job=%s: %s", jid[:12], exc)
+            broadcast_doctor_message(
+                "doctor.sweep_error", {"sweep": "adopt-legacy-reviews", "job_id": jid, "error": str(exc)}
+            )
+            continue
+        if outcome == "previewed":
+            summary["would_submit"] += 1
+        if outcome in ("submitted", "previewed"):
+            budget -= 1
+        summary[outcome] = summary.get(outcome, 0) + 1
+    if summary["adopted"] and not HIVE_DOCTOR_ADOPT_DRY_RUN:
+        broadcast_doctor_message(
+            "doctor.review_adopted",
+            {
+                "host": AGENT_HOST,
+                "adopted": summary["adopted"],
+                "submitted": summary["submitted"],
+                "would_submit": summary["would_submit"],
+            },
+        )
     return summary
 
 
