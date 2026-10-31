@@ -267,6 +267,13 @@ report-only, so nothing ever reviewed those rows.
 4. **Never merge or cancel.** The doctor records the verdict; it does not merge,
    cancel or change status.
 
+The adoption phase and the review phase are ONE pass over one listing, so
+`HIVE_DOCTOR_REVIEW_SUBMIT_MAX` is a cap on the SWEEP, not on each phase: the
+review phase's budget is the cap minus what adoption already submitted, and it
+never drops below zero. A dry run previews up to the same cap (and no further)
+through that one shared floor, so the log lists exactly the reviews a real
+sweep would submit.
+
 ### No duplicate review jobs
 
 A row is never submitted twice. Before any route picking,

@@ -423,6 +423,35 @@ def test_dry_run_logs_what_it_would_submit_and_writes_nothing(bus, monkeypatch, 
     assert any("would submit" in rec.getMessage() for rec in caplog.records)
 
 
+def test_dry_run_previews_never_exceed_the_per_sweep_cap(bus, monkeypatch, caplog):
+    """A dry run previews at most the cap and writes nothing (review 2026-10-31).
+
+    "Logs what it would submit" must mean the SAME list a real sweep would
+    submit: a dry run that previews one row per scanner is a fiction that
+    misleads the operator reading the log. The share of the per-sweep budget is
+    held under ONE floor so the two phases can never spend the cap twice.
+    """
+    from hive.workers import doctor
+
+    monkeypatch.setattr(doctor, "HIVE_DOCTOR_ADOPT_DRY_RUN", True)
+    monkeypatch.setattr(doctor, "HIVE_DOCTOR_REVIEW_SUBMIT_MAX", 2)
+    rows = [_legacy_row(jid=f"legacy-{i}") for i in range(5)]
+    with caplog.at_level("INFO"):
+        summary = doctor.submit_adopted_reviews(rows=[row for row in rows], now=1000.0)
+    assert summary["adopted"] == 5
+    assert summary["would_submit"] == 2, summary
+    assert summary["previewed"] == 2 and summary["capped"] == 3
+    assert len([r for r in caplog.records if "would submit" in r.getMessage()]) == 2
+    assert bus.posts() == []
+    assert [p for p in bus.patches() if "result" in p] == []
+
+    # The whole sweep (adoption phase + review phase) still previews only 2.
+    monkeypatch.setattr(doctor, "fetch_needs_review_jobs", lambda limit=1000: [dict(r) for r in rows])
+    report = doctor.report_needs_review_sweep()["review_queue"]
+    assert report["would_submit"] == 2, report
+    assert bus.posts() == []
+
+
 # ── backoff on a fake clock ─────────────────────────────────────────────────
 
 
