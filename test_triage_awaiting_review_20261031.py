@@ -29,7 +29,7 @@ def _needs_review_row(rows=()):
         "result": {
             "head_sha": "a" * 40,
             "commits": ["a" * 40],
-            **make_review_state(
+            "review_state": make_review_state(
                 "qwen38",
                 [{"model_id": "gpt-oss-20b", "failure": "review_busy"}],
                 attempt=1,

@@ -253,7 +253,7 @@ def bus(monkeypatch, tmp_path):
         "result": {
             "head_sha": "a" * 40,
             "commits": ["a" * 40],
-            **make_review_state("qwen38", [], attempt=0, now=0),
+            "review_state": make_review_state("qwen38", [], attempt=0, now=0),
         },
     }
     monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda topic, body: messages.append((topic, body)))
@@ -296,7 +296,7 @@ def test_awaiting_review_with_budget_submits_one_review(bus):
     patched = [c[2] for c in calls if c[0] == "PATCH"]
     assert patched and patched[-1]["status"] == "needs-review"
     state = patched[-1]["result"]["review_state"]
-    assert state == "awaiting_review"
+    assert state["state"] == "awaiting_review"
     assert state["tried"][-1]["model_id"] == spec["preferred_models"][0]
 
 
@@ -305,7 +305,7 @@ def test_awaiting_review_never_self_reviews(bus):
     from hive.workers import doctor
 
     rows, calls, _, monkeypatch = bus
-    rows["source"]["result"] = {"head_sha": "a" * 40, "commits": ["a" * 40], **state("qwen38", [], attempt=0, now=0)}
+    rows["source"]["result"] = {"head_sha": "a" * 40, "commits": ["a" * 40], "review_state": state("qwen38", [], attempt=0, now=0)}
     # Only the author's family is healthy: nothing cross-family exists.
     monkeypatch.setattr(doctor, "REVIEW_QUEUE_ROUTE_HEALTH", {"qwen38": True})
     summary = doctor.run_review_queue_sweep(rows=list(rows.values()))

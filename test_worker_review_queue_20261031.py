@@ -18,7 +18,7 @@ import types
 
 import pytest
 
-from hive.review_queue import FAMILY_TABLE_PATH, ROSTER_PATH, family_of
+from hive.review_queue import FAMILY_TABLE_PATH, ROSTER_PATH, backoff_seconds, family_of
 
 
 @pytest.fixture

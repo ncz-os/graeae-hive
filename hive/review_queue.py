@@ -443,6 +443,47 @@ REVIEWER_FAILURE_KINDS = frozenset(
 )
 
 
+def has_structured_verdict(evidence: Any, *, head_sha: str | None = None) -> bool:
+    """True only when ``evidence`` carries a structured ``reviewers[].model`` verdict.
+
+    The worker's answer to "did the reviewer actually review?": prose, an empty
+    body, a truncated fragment, a 503 object or JSON without a reviewer list is
+    NEVER an approval (operator 2026-10-31). A verdict naming a DIFFERENT head
+    is a real review of the wrong commit -- also not a verdict for this head.
+    """
+    payload = evidence
+    if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+        payload = payload["result"]
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("http_status") == 503 or payload.get("status_code") == 503:
+        return False
+    entries = payload.get("reviewers")
+    if not isinstance(entries, list) or not entries:
+        return False
+    models = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return False
+        model = str(entry.get("model") or entry.get("model_id") or "").strip()
+        if not model:
+            return False
+        models.append(model)
+    reviewed = str(payload.get("head_sha") or "").strip()
+    if head_sha and reviewed and not same_head(reviewed, head_sha):
+        return False
+    return bool(models)
+
+
+def same_head(left: Any, right: Any) -> bool:
+    """Shas refer to the same commit (full or abbreviated, either direction)."""
+    a = str(left or "").strip().lower()
+    b = str(right or "").strip().lower()
+    if not a or not b:
+        return False
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
 def backoff_seconds(attempt: int) -> float:
     """Delay before review attempt ``attempt+1``: 15 min, 30 min, 1 h, ... <= 2 h."""
     step = max(0, int(attempt))
@@ -505,14 +546,18 @@ def awaiting_review_status(loop_teardown: str | None, *, exit_code: int, ready: 
 
     ``reviewer_unavailable`` (a busy endpoint, a timeout, a 503) is the reviewer
     queue's problem, not the job's work: the branch is delivered and the row is
-    ``needs-review``. Anything else keeps the plain mapping (an unresolved loop
-    with a verified delivery is a rescued needs-review row, else failed).
+    ``needs-review``. Anything else keeps the worker's own mapping
+    (``resolve_delivery_status``): a rescued branch is needs-review, a cancel or
+    an author failure stays failed.
     """
     if cancelled:
         return "failed", "loop_unresolved"
     teardown = str(loop_teardown or "").strip().lower()
     if teardown == "reviewer_unavailable":
         return "needs-review", "reviewer_unavailable"
+    if teardown == "author_failed":
+        # The AUTHOR failed: delivering a branch does not make the work done.
+        return "failed", "loop_unresolved"
     if exit_code == 0:
         return ("done", None) if ready else ("needs-review", "completion_evidence_missing")
     if ready:
@@ -565,6 +610,11 @@ def in_backoff(state: dict | None, now: float | None = None) -> bool:
 def is_parked(state: dict | None) -> bool:
     """Parked: no cross-family reviewer is available (never a self-review)."""
     return bool(state and state.get("parked_reason") == "no_cross_family_reviewer")
+
+
+def is_resolved(state: dict | None) -> bool:
+    """A review finished: approved, or changes handed back to the author."""
+    return bool(state and (state.get("approved") or state.get("request_changes")))
 
 
 def finite_load(value: Any) -> bool:
