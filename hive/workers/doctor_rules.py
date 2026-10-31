@@ -412,6 +412,7 @@ class CallLedger:
         One unparsable line (a truncated tail after a crash) drops THAT line
         only: losing the whole sidecar would hide the hour's slot-taken
         events, which is exactly the evidence the alert exists to read."""
+        lines: list[str] = []
         try:
             with open(self._slot_path, encoding="utf-8") as fh:
                 lines = fh.readlines()
