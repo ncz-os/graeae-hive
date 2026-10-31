@@ -74,6 +74,7 @@ from hive.workers import remediation, retention
 from hive.workers import doctor_gates, doctor_v2
 from hive.workers import doctor_decline_paths as decline_paths
 from hive.workers import loop_outcome
+from hive.workers import review_queue
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "")
@@ -3091,6 +3092,40 @@ def review_followup_row_has_verdict(job: dict) -> bool:
     return bool(str(res.get("auto_review_job_id") or "").strip())
 
 
+def awaiting_review_entry(job: dict) -> dict | None:
+    """The row's ``result.awaiting_review`` (review queue) entry, or None.
+
+    Operator rule 2026-10-31: a loop that finished authoring without a review
+    is QUEUED work, not failed. The queue writes its state into the row's own
+    result so the row keeps the ``needs-review`` status every guard already
+    protects; this helper is how the sweep tells "waiting for a reviewer" from
+    "waiting for a human".
+    """
+    return review_queue.entry_of(_job_result_dict(job))
+
+
+def is_awaiting_review(job: dict) -> bool:
+    """True while the review queue still owes this row a review."""
+    return review_queue.is_awaiting_review({"result": _job_result_dict(job)})
+
+
+def needs_review_queue_counts(jobs: list[dict], result_key: str = "needs_review_result") -> dict:
+    """Counts for the dashboard/report: queued, parked and unreviewed rows."""
+    counts = {"total": 0, "queued": 0, "submitted": 0, "parked": 0, "approved": 0, "exhausted": 0, "unreviewed": 0}
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        counts["total"] += 1
+        entry = awaiting_review_entry(job)
+        state = str((entry or {}).get("state") or "").lower()
+        if state in counts:
+            counts[state] += 1
+        else:
+            counts["unreviewed"] += 1
+    counts[result_key] = dict(counts)
+    return counts
+
+
 def _needs_review_child_review_jobs(job: dict) -> list[dict]:
     """Child jobs of this row whose kind starts with review: — a review that was
     already dispatched for it."""
@@ -4584,6 +4619,17 @@ def review_followup_blocker(job: dict) -> str | None:
     """
     if str(job.get("kind") or "").startswith("triage:"):
         return "a triage report: it needs a human, not a code review"
+    queue_entry = awaiting_review_entry(job)
+    if queue_entry is not None:
+        state = str(queue_entry.get("state") or "").lower()
+        if state == review_queue.STATE_PARKED:
+            return (
+                "awaiting review in the review queue (parked: "
+                f"{queue_entry.get('last_error') or 'no_cross_family_reviewer'})"
+            )
+        if state == review_queue.STATE_EXHAUSTED:
+            return "awaiting review in the review queue (retries exhausted)"
+        return "awaiting review in the review queue (queued for the next cross-family reviewer)"
     result = _job_result_dict(job)
     if result.get("verdict"):
         return "the row already carries a verdict"
@@ -4633,6 +4679,13 @@ def escalate_stuck_needs_review(jobs: list[dict], *, evidence_fn, now: float | N
             continue
         if str(job.get("kind") or "").startswith("triage:"):
             continue  # a triage report is meant to wait for a human; one message each would be noise
+        if is_awaiting_review(job):
+            # Operator rule 2026-10-31: an awaiting-review row is QUEUED work for
+            # the review queue (it retries with backoff), not a row a human must
+            # chase. Only the queue's own terminal states can be stuck.
+            entry = awaiting_review_entry(job) or {}
+            if str(entry.get("state") or "").lower() in review_queue.ACTIVE_STATES:
+                continue
         touched = _row_touched_at(job)
         if touched is None or now - touched <= NEEDS_REVIEW_ESCALATE_SECONDS:
             continue
