@@ -660,7 +660,7 @@ def test_route_load_returns_none_off_the_load_path():
     assert route_load_fn(urlopen=lambda *a, **k: None, clock=lambda: 1.0)(provider) == 0
 
 
-# ── 6b. dashboard counts (regression: the queue half must be counted) ────────
+# ── 6b. dashboard counts and the follow-up blocker ──────────────────────────
 
 
 def test_doctor_counts_awaiting_review_rows_as_queued_work():
@@ -683,7 +683,7 @@ def test_doctor_counts_awaiting_review_rows_as_queued_work():
     assert counts["parked"] == 1
     assert counts["unreviewed"] == 1
     assert counts["awaiting_review"] == 2
-    # An exhausted row is waiting for an OWNER, not hidden inside "queued".
+    # An exhausted row waits for an OWNER: counted apart, never hidden in "queued".
     tired = {
         "id": "q3",
         "status": "needs-review",
@@ -707,4 +707,4 @@ def test_doctor_followup_blocker_names_the_queue():
     blocker = doctor.review_followup_blocker(row)
     assert blocker is not None
     # It names the queue, and specifically NOT "no review was submitted".
-    assert "queue" in blocker
+    assert "review queue" in blocker
