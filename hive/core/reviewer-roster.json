@@ -12,6 +12,13 @@
     "marked 'slow' -- measured 39 s for a one-word reply -- and sorts last).",
     "flags.contributor_tier lists the operator-approved repos for the StepFun",
     "and Meta contributor tiers. MiMo is never a reviewer and is NOT listed.",
+    "The codex route is the confined LOCAL Hive Codex worker (kind codex,",
+    "workspace-write limited to the job workspace, CERBERUS",
+    "hive-worker-codex.service) -- never EIH, never a cloud API. Its model",
+    "ladder and the operator-authorization-only model live in flags.codex;",
+    "PYTHIA holds the master OAuth token and nothing here reads or refreshes",
+    "it. Family openai, like gpt-oss: an openai author is never reviewed by",
+    "Codex, and Codex-authored work always gets a non-openai review.",
     "Local routes carry host + port only: the address comes from the fleet",
     "inventory (HIVE_FLEET_INVENTORY), never from this file."
   ],
@@ -166,6 +173,38 @@
           ]
         },
         "provider": true
+      }
+    },
+    {
+      "id": "codex-worker",
+      "provider_id": "codex",
+      "roles": [],
+      "model_id": "gpt-6-luna",
+      "family": "openai",
+      "location": "local",
+      "kind": "codex",
+      "worker": "hive-worker-codex.service",
+      "host": "cerberus",
+      "server": "codex-cli",
+      "concurrency": 1,
+      "cost_class": "B",
+      "flags": {
+        "priority": -5,
+        "hard_lane_priority": 20,
+        "provider": true,
+        "codex": {
+          "worker_kind": "codex",
+          "sandbox": "workspace-write",
+          "service": "hive-worker-codex.service",
+          "auth_token_holder": "pythia",
+          "ladder": [
+            "gpt-6-luna",
+            "gpt-6.1-terra",
+            "gpt-6-sol"
+          ],
+          "authorization_model": "gpt-6-astra",
+          "min_remaining_pct": 30
+        }
       }
     },
     {

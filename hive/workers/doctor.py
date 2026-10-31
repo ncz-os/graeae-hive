@@ -5007,6 +5007,37 @@ REVIEW_QUEUE_ROUTE_HEALTH: dict = {}
 # Override for the per-route load reader (a callable returning one); None uses
 # the cached 30 s llama-server ``/slots`` / vLLM metrics probe over the roster.
 REVIEW_QUEUE_ROUTE_LOAD = None
+# Codex (operator 2026-10-31): the plan-usage probe the roster's quota guard
+# reads. None means "no readable share", which the gate treats as fail-closed
+# (``codex_usage_unknown``); a host with a probe overrides it with a callable
+# returning ``{"remaining_pct": float}``. The doctor NEVER logs in, refreshes or
+# reads the OAuth token for this: PYTHIA holds the master token and the confined
+# codex worker spends it.
+CODEX_REVIEW_USAGE = None
+
+
+def _codex_worker_online() -> bool:
+    """Whether a ``codex``-kind worker is online right now (unknown: offline)."""
+    kinds = _online_worker_kinds()
+    return bool(kinds and review_queue.CODEX_WORKER_KIND in kinds)
+
+
+def review_queue_codex_gate() -> dict:
+    """The doctor's Codex gate: config switch + online worker + usage guard."""
+    return review_queue.codex_gate(
+        worker_online=_codex_worker_online(),
+        usage=CODEX_REVIEW_USAGE,
+    )
+
+
+def _review_lane(job: dict, result: dict, roster: list[dict]) -> str:
+    """The row's review lane: hard for architecture/security-sensitive work."""
+    paths = result.get("files_changed") if isinstance(result.get("files_changed"), list) else []
+    return review_queue.review_lane(
+        repo=job.get("repo"),
+        paths=[str(p) for p in paths if str(p).strip()],
+        kind=str(job.get("kind") or ""),
+    )
 
 
 def _review_route_health():
@@ -5277,8 +5308,23 @@ def _resume_state(state: dict) -> dict:
     return out
 
 
-def _pick_routes(author: str, job: dict | None, roster: list[dict], health, load, co_authors: list[str]) -> list[dict]:
-    """The cross-family pick, saturated routes last, never a blocked family."""
+def _pick_routes(
+    author: str,
+    job: dict | None,
+    roster: list[dict],
+    health,
+    load,
+    co_authors: list[str],
+    *,
+    lane: str = review_queue.LANE_BULK,
+) -> list[dict]:
+    """The cross-family pick, saturated routes last, never a blocked family.
+
+    Every Codex pick is behind the roster gate (``review_queue_codex_gate``:
+    config switch, online codex worker, plan usage, cooldown marker), so no
+    cron or hook can start a Codex review without it; an UNSET
+    ``CODEX_REVIEW_USAGE`` probe makes the gate refuse (fail closed).
+    """
     job = job or {}
     cohort = _excluded_families(author, *co_authors)
     picked = pick_reviewers(
@@ -5289,6 +5335,9 @@ def _pick_routes(author: str, job: dict | None, roster: list[dict], health, load
         co_authors=[m for m in co_authors if str(m or "").strip()],
         repo=job.get("repo"),
         author_routes=[str(job.get("claimed_agent") or "")] if job.get("claimed_agent") else None,
+        lane=lane,
+        codex_worker_online=_codex_worker_online(),
+        codex_usage=CODEX_REVIEW_USAGE,
     )
     return [route for route in _sort_routes_by_family_load(picked, load) if route["family"] not in cohort]
 
@@ -5328,6 +5377,7 @@ def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: 
         f"and a 'reason' field. Prose is not a verdict. Reviewed job id: {jid}. No commits expected."
     )
     attempt = int(state.get("attempt") or 0)
+    codex = review_queue.is_codex_route(reviewers[0]) if reviewers else False
     spec = {
         "kind": review_kind,
         "description": desc,
@@ -5342,6 +5392,16 @@ def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: 
         "parent_job_id": jid,
         "idempotency_key": f"review-queue:{jid}:{attempt}:{head_sha[:12] or 'nohead'}",
     }
+    if codex:
+        # A Codex review is a normal Hive job (the same read-only ``review:``
+        # kind every reviewer gets, so the read-only completion gate and the
+        # child listing keep working) that ONLY the confined local codex
+        # worker may claim (workspace-write, one at a time): never zoder, EIH
+        # or any cloud route.
+        spec["eligible_kinds"] = [review_queue.CODEX_WORKER_KIND]
+        spec["max_concurrency"] = 1
+        spec["review_route"] = reviewers[0]["id"]
+        spec["review_lane"] = "codex"
     code, resp = submit_job_spec(spec)
     new_id = (resp or {}).get("id") if isinstance(resp, dict) else None
     if code in (200, 201) and new_id:
@@ -5500,8 +5560,9 @@ def process_awaiting_review_row(
     health = health or _review_route_health()
     load = load or review_queue_load_reader()
     co_authors = [str(m) for m in co_authors if str(m or "").strip()]
-    picked = _pick_routes(author, job, roster, health, load, co_authors)
-    if not picked and _pick_routes(author, job, roster, health, lambda _route: 0, co_authors):
+    lane = _review_lane(job, result, roster)
+    picked = _pick_routes(author, job, roster, health, load, co_authors, lane=lane)
+    if not picked and _pick_routes(author, job, roster, health, lambda _route: 0, co_authors, lane=lane):
         # A cross-family reviewer EXISTS but every one is at its concurrency
         # cap (in-flight reviews included). That is not a park and costs no
         # attempt: the row waits unchanged for the next sweep.
