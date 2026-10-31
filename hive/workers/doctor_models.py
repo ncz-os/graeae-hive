@@ -472,6 +472,8 @@ class ModelChain:
     @contextmanager
     def lease(self, rung: ChainRung):
         """Count one call of the doctor's own against ``rung``."""
+        # Counter (not dict): a first increment on an unseen rung must not
+        # raise KeyError. Stated here so the invariant is local to the use.
         self._in_flight[rung.id] += 1
         try:
             yield rung

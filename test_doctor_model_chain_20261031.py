@@ -825,3 +825,44 @@ def test_module_level_imports_resolve_for_the_helpers_under_test():
     # locals that only exist inside one test.
     for name in ("_acceptable", "_http_kind", "_llama_busy", "_vllm_busy", "chain_from_env"):
         assert callable(getattr(doctor_models, name)), name
+
+
+# ── the invariants the chain's own helpers depend on ───────────────────────
+
+
+def test_lease_does_not_require_the_rung_to_be_seen_first():
+    """A first `lease()` on an unseen rung must not raise (Counter semantics)."""
+    from collections import Counter
+
+    from hive.workers import doctor_models
+
+    rung = doctor_models.ChainRung.from_dict(_rung(id="fresh", model="gpt-oss-20b", base_url=CERBERUS))
+    chain = doctor_models.ModelChain(rungs=[rung], urlopen=lambda *a, **k: None, clock=Clock())
+    assert isinstance(chain._in_flight, Counter)
+    assert chain.in_flight("fresh") == 0
+    with chain.lease(rung):
+        assert chain.in_flight("fresh") == 1
+    assert chain.in_flight("fresh") == 0
+
+
+def test_module_imports_the_stdlib_names_its_helpers_use():
+    """Every stdlib name the module's helpers call is imported at module scope."""
+    import re
+
+    from hive.workers import doctor_models
+
+    with open("hive/workers/doctor_models.py", encoding="utf-8") as fh:
+        source = fh.read()
+    # A module-scope import statement (^ at column 0), not a function-local
+    # one; `import urllib.error` binds the root name `urllib`.
+    imported = set()
+    for line in source.splitlines():
+        m = re.match(r"(?:from|import)\s+(\S+)", line)
+        if m:
+            imported.add(m.group(1).split(".")[0])
+    for name in ("collections", "urllib", "json", "tomllib", "urllib"):
+        assert name in imported, f"{name} must be imported at module scope"
+    # And the names really resolve on the module.
+    assert doctor_models.Counter is not None
+    assert doctor_models.urllib.request.Request is not None
+    assert doctor_models.urllib.error.HTTPError is not None
