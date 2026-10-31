@@ -675,7 +675,18 @@ def codex_gate(
     except Exception:  # noqa: BLE001 -- a broken probe is an unknown share
         reading = None
     remaining = reading.get("remaining_pct") if isinstance(reading, dict) else None
-    if not finite_load(remaining) or math.isnan(float(remaining)):
+    # A quota share is a FINITE number or nothing: ``inf`` would otherwise pass
+    # the >= minimum test and open the gate on a reading that means "no data".
+    # ``finite_load`` alone is not enough here because it accepts an infinite
+    # float, and it is shared with the load reader where that is a separate
+    # question. A numeric string ("45") is accepted rather than treated as an
+    # unreadable share; anything else is unknown and fails closed.
+    if isinstance(remaining, str) and remaining.strip():
+        try:
+            remaining = float(remaining)
+        except ValueError:
+            remaining = None
+    if not isinstance(remaining, (int, float)) or isinstance(remaining, bool) or not math.isfinite(remaining):
         return answer(False, "codex_usage_unknown")
     if float(remaining) < minimum:
         return answer(False, "codex_quota_low")

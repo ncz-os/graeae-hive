@@ -620,3 +620,63 @@ def test_the_codex_job_names_the_model_that_runs(bus):
     # A normal Hive job: the same read-only review kind, restricted to codex.
     assert spec["kind"].startswith("review:")
     assert spec["eligible_kinds"] == ["codex"]
+
+
+# ── 10. the quota guard never raises and never fails open ───────────────────
+
+
+@pytest.mark.parametrize("value", [None, "abc", "", [], {}, object(), float("nan")])
+def test_an_unreadable_share_is_unknown_not_a_crash(value):
+    """A garbage usage probe must refuse, not raise (the gate runs in the sweep)."""
+    answer = codex_gate(worker_online=True, env={}, usage=lambda: {"remaining_pct": value})
+    assert answer["allowed"] is False
+    assert answer["reason"] == "codex_usage_unknown"
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), "inf"])
+def test_an_infinite_share_is_never_an_approval(value):
+    """``inf >= 30`` is True: an infinite share must not open the gate."""
+    answer = codex_gate(worker_online=True, env={}, usage=lambda: {"remaining_pct": value})
+    assert answer["allowed"] is False
+    assert answer["reason"] == "codex_usage_unknown"
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_a_boolean_share_is_not_a_percentage(value):
+    """``True`` is an int in Python; it is not a reading of the plan share."""
+    answer = codex_gate(worker_online=True, env={}, usage=lambda: {"remaining_pct": value})
+    assert answer["allowed"] is False
+    assert answer["reason"] == "codex_usage_unknown"
+
+
+@pytest.mark.parametrize("value", ["45", " 45 ", "45.5"])
+def test_a_numeric_string_share_is_read_as_its_number(value):
+    """A probe that reports its share as text is read, not discarded."""
+    answer = codex_gate(worker_online=True, env={}, usage=lambda: {"remaining_pct": value})
+    assert answer["allowed"] is True, answer
+    assert answer["reason"] == ""
+
+
+def test_a_share_exactly_at_the_ceiling_is_allowed():
+    """30 % remaining is the boundary: ``< 30`` refuses, 30 does not."""
+    answer = codex_gate(worker_online=True, env={}, usage=lambda: {"remaining_pct": 30.0})
+    assert answer["allowed"] is True
+    just_under = codex_gate(worker_online=True, env={}, usage=lambda: {"remaining_pct": 29.999})
+    assert just_under["allowed"] is False
+    assert just_under["reason"] == "codex_quota_low"
+
+
+def test_a_usage_probe_that_raises_is_unknown_not_a_crash():
+    def boom():
+        raise RuntimeError("usage endpoint down")
+
+    answer = codex_gate(worker_online=True, env={}, usage=boom)
+    assert answer["allowed"] is False
+    assert answer["reason"] == "codex_usage_unknown"
+
+
+def test_a_bare_float_probe_is_unknown_not_a_crash():
+    """The probe contract is a dict; a bare float is unreadable, not a crash."""
+    answer = codex_gate(worker_online=True, env={}, usage=lambda: 90.0)
+    assert answer["allowed"] is False
+    assert answer["reason"] == "codex_usage_unknown"
