@@ -1055,8 +1055,10 @@ def _classify_triage_state(row: dict, base_kind: str = "") -> dict:
             "model_attempted": True,
             "raw": text,
         }
-    raw_reply = parse_doctor_response(text) or {}
-    parsed_ok, decision = doctor_rules.parse_constrained(json.dumps(raw_reply))
+    # ``parse_constrained`` takes the REPLY TEXT (it is the same parser the
+    # schema tests exercise), so the constraint is judged on what the model
+    # actually sent -- not on a re-serialisation of it.
+    parsed_ok, decision = doctor_rules.parse_constrained(text)
     _note_doctor_model_call("triage", "ok" if parsed_ok else "unusable", latency_ms)
     if not parsed_ok:
         return {
@@ -1070,6 +1072,7 @@ def _classify_triage_state(row: dict, base_kind: str = "") -> dict:
         }
     # Keep the model's own evidence quote: the residual validator below checks
     # it verbatim against the row, and the schema deliberately drops it.
+    raw_reply = parse_doctor_response(text) or {}
     quote = raw_reply.get("evidence_quote") or raw_reply.get("quote")
     if quote:
         decision["evidence_quote"] = str(quote)
