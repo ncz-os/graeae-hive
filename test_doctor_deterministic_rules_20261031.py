@@ -31,7 +31,9 @@ from __future__ import annotations
 import io
 import json
 import logging
+import pathlib
 import re
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -165,6 +167,22 @@ def _reply(text):
     return json.dumps({"choices": [{"message": {"content": text}}]}).encode()
 
 
+class _Reply(io.BytesIO):
+    """A chat reply: a real urlopen-style context manager with a status.
+
+    A subclass, not an instance patched with ``__enter__``/``__exit__``: the
+    dunder lookup for ``with`` goes to the TYPE, and assigning onto an
+    ``io.BytesIO`` instance is not something the runtime promises."""
+
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+
 class FakeServer:
     """A recording OpenAI-compatible endpoint."""
 
@@ -175,10 +193,7 @@ class FakeServer:
     def __call__(self, request, timeout=0):
         self.requests.append({"url": request.full_url, "body": json.loads(request.data.decode())})
         body = self.bodies.pop(0)
-        resp = io.BytesIO(_reply(body))
-        resp.__enter__ = lambda: resp  # noqa: SLF001 -- context manager shape
-        resp.__exit__ = lambda *_a: None
-        return resp
+        return _Reply(_reply(body))
 
 
 def test_a_model_call_carries_the_grammar_and_the_json_schema():
@@ -571,3 +586,267 @@ def test_the_residue_prompt_asks_only_for_the_enum(monkeypatch):
     for action in doctor_rules.CLASSES:
         assert action in prompt
     assert "diagnostic hosts" not in prompt.lower()
+
+
+# ── review round: the findings that were verified REAL ────────────────────
+
+
+def _empty_ledger_alert(monkeypatch, alert):
+    """Make the heartbeat's counter report ``alert`` without a ledger file."""
+    from hive.workers import doctor
+
+    monkeypatch.setattr(doctor, "_model_call_ledger", lambda: _AlertingLedger(alert))
+
+
+class _AlertingLedger:
+    def __init__(self, alert):
+        self._alert = alert
+
+    def counter(self, now=None):
+        return self._alert
+
+
+def test_an_alert_broadcast_that_raises_never_breaks_the_heartbeat(monkeypatch):
+    """HIGH, verified: the counter read was isolated but the BROADCAST was not.
+
+    A bus outage (or a serializer that chokes on the payload) raised out of
+    ``_emit_light_model_alert`` and skipped the heartbeat POST, so the doctor
+    silently stopped heartbeating exactly when it needed the bus. Alert
+    telemetry must never be able to fail the heartbeat."""
+    from hive.workers import doctor
+
+    _empty_ledger_alert(
+        monkeypatch, {"alert": True, "alert_reason": "calls_per_hour", "calls_last_hour": 31, "slot_taken_last_hour": 0}
+    )
+    broadcast = []
+
+    def broken_broadcast(topic, payload):
+        broadcast.append(topic)
+        raise RuntimeError("bus down")
+
+    heartbeats = []
+
+    def fake_http(method, path, body=None, timeout=15.0):
+        heartbeats.append(path)
+        return 200, {}
+
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", broken_broadcast)
+    monkeypatch.setattr(doctor, "_http", fake_http)
+    doctor.heartbeat()  # must not raise
+    assert broadcast == [doctor_rules.ALERT_TOPIC]
+    assert heartbeats == ["/v1/agents/heartbeat"], "the heartbeat must still be sent"
+
+    # A PAYLOAD that cannot be serialised is the same class of failure.
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", doctor.broadcast_doctor_message)
+    heartbeats.clear()
+
+    def unserialisable(_topic, _payload):
+        raise TypeError("not JSON serialisable")
+
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", unserialisable)
+    doctor.heartbeat()
+    assert heartbeats == ["/v1/agents/heartbeat"]
+
+
+def test_the_alert_is_still_emitted_once_the_broadcast_works(monkeypatch):
+    """The positive control: isolation must not disable the alert."""
+    from hive.workers import doctor
+
+    _empty_ledger_alert(
+        monkeypatch,
+        {"alert": True, "alert_reason": "free_slot_taken", "calls_last_hour": 3, "slot_taken_last_hour": 4},
+    )
+    broadcast = []
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda topic, payload: broadcast.append((topic, payload)))
+    monkeypatch.setattr(doctor, "_http", lambda *_a, **_k: (200, {}))
+    doctor.heartbeat()
+    assert [topic for topic, _ in broadcast] == [doctor_rules.ALERT_TOPIC]
+    assert broadcast[0][1]["reason"] == "free_slot_taken"
+
+
+_NOT_PASSED = object()
+
+
+class _SigRecording:
+    """A transport double that records how it was called, like urllib does."""
+
+    def __init__(self, body=b'{"slots": [{"is_processing": false}]}'):
+        self.body = body
+        self.calls = []
+
+    def __call__(self, request, timeout=_NOT_PASSED):
+        self.calls.append({"request": request, "timeout": timeout})
+        resp = io.BytesIO(self.body)
+        resp.status = 200
+        resp.__enter__ = lambda: resp  # noqa: SLF001 -- a plain double, not a C-type instance
+        resp.__exit__ = lambda *_a: None
+        return resp
+
+
+class _StatusResponse(io.BytesIO):
+    """A response object that also reports an HTTP status, like http.client."""
+
+    def __init__(self, body, status=200):
+        super().__init__(body)
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return None
+
+
+def test_the_ledger_opener_forwards_its_arguments_and_keeps_the_default_timeout(monkeypatch):
+    """HIGH, verified: the wrapper took ``(request, timeout=0)``.
+
+    The real chain always passes a timeout, so the changed DEFAULT only bit a
+    caller that left it out -- ``urlopen(request)`` would have become a 0 s
+    timeout, i.e. an immediate failure. And dropping ``*args`` turned any
+    positional call into a TypeError. Both change what the transport does."""
+    from hive.workers import doctor
+
+    transport = _SigRecording()
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", transport)
+    recorder = []
+    monkeypatch.setattr(doctor, "_record_model_call", lambda **entry: recorder.append(entry) or {})
+
+    opener = doctor._ledger_urlopen()
+    request = urllib.request.Request("http://host:8080/slots")
+
+    with opener(request) as resp:
+        assert resp.read()
+    # A forwarded call that leaves the timeout out leaves it out -- the
+    # wrapper must not substitute one of its own (the base defaulted to 0 s,
+    # i.e. an immediate timeout).
+    assert transport.calls[0]["timeout"] is _NOT_PASSED
+
+    opener(request, 2.0)
+    assert transport.calls[1]["timeout"] == 2.0
+
+    # A positional extra argument reaches the transport, not the wrapper.
+    extra = object()
+
+    def positional(called_with, timeout=0, *args, **kwargs):
+        transport.calls.append({"request": called_with, "timeout": timeout, "args": args})
+        return _StatusResponse(b"[]")
+
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", positional)
+    opener = doctor._ledger_urlopen()
+    opener(request, 3.0, extra)
+    assert transport.calls[-1]["args"] == (extra,)
+
+
+def test_the_ledger_opener_replays_what_the_transport_returned(monkeypatch):
+    """MEDIUM, verified: the replay dropped the status and any other header.
+
+    A real response reports ``status`` (the chain reads it nowhere today, but a
+    future reader would see 200 for every probe whatever the server said). The
+    replay must carry the status forward."""
+    from hive.workers import doctor
+
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", lambda *_a, **_k: _StatusResponse(b"{}", status=207))
+    opener = doctor._ledger_urlopen()
+    with opener(urllib.request.Request("http://host:8080/slots")) as resp:
+        assert resp.status == 207
+        assert resp.read() == b"{}"
+    # The replay is a context manager whose exit is a no-op (BytesIO close).
+    assert resp.__exit__(None, None, None) is None
+
+
+def _probe_with(monkeypatch, body: bytes) -> list:
+    """Run the real ledger opener over one ``/slots`` body; return what it logged."""
+    from hive.workers import doctor
+
+    class _Response(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", lambda *_a, **_k: _Response(body))
+    recorded = []
+    monkeypatch.setattr(doctor, "_record_model_call", lambda **entry: recorded.append(entry) or {})
+    with doctor._ledger_urlopen()(urllib.request.Request("http://host:8080/slots")) as resp:
+        resp.read()
+    return recorded
+
+
+def test_an_empty_slots_list_is_unknown_not_busy(monkeypatch):
+    """HIGH, verified: ``all() over []`` is True, so an EMPTY list was "busy".
+
+    llama-server reports every slot it is configured with, so a ``/slots`` body
+    with no slots is not a measurement of a full server: the server may have
+    restarted between config and probe, or be answering before it allocated
+    slots. ``all()`` (and its inverse) over nothing is vacuously true, which
+    turned "nothing to read" into "every slot is taken" and counted a
+    slot-taken event toward the restoration alert. Empty is UNKNOWN: no
+    evidence either way, so the probe records nothing.
+
+    The chain agrees -- ``_llama_busy`` reads an empty list as 0 busy, not as
+    a full server -- and the two must not disagree."""
+    from hive.workers import doctor_models
+
+    assert _probe_with(monkeypatch, b"[]") == []
+    assert _probe_with(monkeypatch, b'{"slots": []}') == []
+    # Positive controls: a real busy reading and a real free reading.
+    assert [entry["slot_taken"] for entry in _probe_with(monkeypatch, b'[{"is_processing": true}]')] == [True]
+    assert _probe_with(monkeypatch, b'[{"is_processing": false}]') == []
+
+    # The chain's own reading of the same bodies.
+    assert doctor_models._llama_busy("[]") == (0.0, "0/0 busy")
+    assert doctor_models._llama_busy('[{"is_processing": true}, {"is_processing": true}]')[0] == 2.0
+    assert doctor_models._llama_busy('[{"is_processing": false}]')[0] == 0.0
+
+
+def test_one_bad_line_in_the_slot_sidecar_only_drops_that_line(tmp_path):
+    """MEDIUM, verified: a ``[float(line) for line in fh]`` loses the WHOLE file.
+
+    One truncated tail line (a crash mid-write) or a stray blank-made-junk
+    line raised out of the comprehension's ``float`` and the ``except``
+    returned ``[]`` -- every slot-taken event in the hour vanished, which is
+    exactly the evidence the restoration rule reads. The parser must skip the
+    bad line and keep the rest."""
+    path = tmp_path / "calls.jsonl"
+    ledger = doctor_rules.CallLedger(str(path), clock=lambda: 8000.0)
+    for _ in range(doctor_rules.ALERT_SLOT_TAKEN_PER_HOUR + 1):
+        ledger.record(rung="c", phase="triage", latency_ms=1, outcome="ok", slot_taken=True)
+    sidecar = pathlib.Path(f"{path}.slot-taken")
+    lines = sidecar.read_text().splitlines()
+    sidecar.write_text("\n".join([lines[0], "not-a-timestamp", *lines[1:], "8000.0"]) + "\n")
+
+    counter = doctor_rules.CallLedger(str(path), clock=lambda: 8000.0).counter()
+    assert counter["slot_taken_last_hour"] == doctor_rules.ALERT_SLOT_TAKEN_PER_HOUR + 2
+    assert counter["alert"] is True and counter["alert_reason"] == "free_slot_taken"
+    assert counter["calls_last_hour"] == doctor_rules.ALERT_SLOT_TAKEN_PER_HOUR + 1
+
+    # A sidecar that is entirely junk is still empty, not an error.
+    sidecar.write_text("junk\n\n ")
+    assert doctor_rules.CallLedger(str(path), clock=lambda: 8000.0).counter()["slot_taken_last_hour"] == 0
+
+
+def test_the_fake_servers_return_a_real_context_manager():
+    """HIGH (test helper), verified as fragile rather than as a live failure.
+
+    ``FakeServer`` patched ``__enter__``/``__exit__`` onto an ``io.BytesIO``
+    INSTANCE. That works on this CPython (3.14) but it is not a contract: a
+    C-type instance is not guaranteed to accept an attribute assignment and
+    the double-underline methods are looked up on the TYPE, not the instance,
+    so a runtime that refuses the assignment crashes the helper instead of
+    testing the code. The reply is now a tiny subclass, like the other fakes
+    in the suite, and this test pins the shape."""
+    server = FakeServer(['{"action_type": "no_action"}'])
+    resp = server(urllib.request.Request("http://h/v1/chat/completions", data=b"{}", method="POST"))
+    assert isinstance(resp, io.IOBase), "the reply must be a real IO object"
+    # The dunder methods are looked up on the TYPE, so they work on every
+    # runtime -- not only where assigning them onto an instance happens to
+    # succeed (an io.BytesIO instance is not guaranteed to accept that).
+    assert type(resp) is not io.BytesIO, "the reply should be a subclass, not a patched BytesIO"
+    assert "__enter__" in type(resp).__dict__ and "__exit__" in type(resp).__dict__
+    with resp as ctx:
+        assert ctx is resp
+        assert ctx.status == 200
+        assert ctx.read()

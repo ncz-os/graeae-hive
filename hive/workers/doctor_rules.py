@@ -407,12 +407,22 @@ class CallLedger:
             pass
 
     def _slot_taken_entries(self, now: float) -> list[dict[str, Any]]:
-        """The sidecar's timestamps inside the window, as counter entries."""
+        """The sidecar's timestamps inside the window, as counter entries.
+
+        One unparsable line (a truncated tail after a crash) drops THAT line
+        only: losing the whole sidecar would hide the hour's slot-taken
+        events, which is exactly the evidence the alert exists to read."""
         try:
             with open(self._slot_path, encoding="utf-8") as fh:
-                stamps = [float(line) for line in fh if line.strip()]
-        except (OSError, ValueError):
+                lines = fh.readlines()
+        except OSError:
             return []
+        stamps: list[float] = []
+        for line in lines:
+            try:
+                stamps.append(float(line))
+            except (TypeError, ValueError):
+                continue
         return [{"at": at, "outcome": "slot_taken", "slot_taken": True} for at in stamps if now - at < WINDOW_SECS]
 
     def _append(self, entry: dict[str, Any]) -> None:

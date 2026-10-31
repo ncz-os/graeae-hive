@@ -823,20 +823,29 @@ def _emit_light_model_alert() -> dict:
             summary.get("calls_last_hour"),
             summary.get("slot_taken_last_hour"),
         )
-        broadcast_doctor_message(
-            doctor_rules.ALERT_TOPIC,
-            {
-                "host": AGENT_HOST,
-                "reason": summary.get("alert_reason"),
-                "calls_last_hour": summary.get("calls_last_hour"),
-                "slot_taken_last_hour": summary.get("slot_taken_last_hour"),
-            },
-        )
+        try:
+            broadcast_doctor_message(
+                doctor_rules.ALERT_TOPIC,
+                {
+                    "host": AGENT_HOST,
+                    "reason": summary.get("alert_reason"),
+                    "calls_last_hour": summary.get("calls_last_hour"),
+                    "slot_taken_last_hour": summary.get("slot_taken_last_hour"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry never fails a heartbeat
+            log.warning("doctor %s broadcast failed: %s", doctor_rules.ALERT_TOPIC, exc)
     return summary
 
 
 def heartbeat():
-    _emit_light_model_alert()
+    # Alert telemetry is best effort: a bus outage is exactly when an alert
+    # fires, and it must never cost the doctor its heartbeat. `_emit_...`
+    # already isolates what it can; this is the belt for the rest.
+    try:
+        _emit_light_model_alert()
+    except Exception as exc:  # noqa: BLE001 -- never let telemetry fail a heartbeat
+        log.warning("doctor alert broadcast failed (heartbeat continues): %s", exc)
     code, _ = _http("POST", "/v1/agents/heartbeat", {"urn": _urn, "status": "online"})
     if code in REREGISTER_CODES:
         # Without this a ghost doctor (URN reaped after a stall, or bus restored)
@@ -1465,11 +1474,16 @@ def _ledger_urlopen():
     """
     real = urllib.request.urlopen
 
-    def opener(request, timeout=0):
+    # The wrapper must be transparent: it forwards every positional argument
+    # and keeps urlopen's own timeout default, so a caller that leaves the
+    # timeout out does not silently get a 0 s one (and a positional argument
+    # does not become a TypeError).
+    def opener(request, *args, **kwargs):
         busy = False
         try:
-            with real(request, timeout=timeout) as response:
+            with real(request, *args, **kwargs) as response:
                 body = response.read(1 << 20)
+                status = getattr(response, "status", _REPLAY_OK_STATUS)
         except Exception:
             # A probe that cannot be read is not proof of capacity; it is not
             # evidence of a taken slot either.
@@ -1479,9 +1493,7 @@ def _ledger_urlopen():
             if "/slots" in getattr(request, "full_url", ""):
                 data = json.loads(text)
                 slots = data.get("slots") if isinstance(data, dict) else data
-                busy = isinstance(slots, list) and all(
-                    isinstance(slot, dict) and slot.get("is_processing") for slot in slots
-                )
+                busy = _slots_report_full(slots)
         except (ValueError, AttributeError):
             busy = False
         if busy:
@@ -1495,17 +1507,32 @@ def _ledger_urlopen():
             )
 
         class _Replay(io.BytesIO):
-            status = 200
+            pass
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return None
-
-        return _Replay(body)
+        replay = _Replay(body)
+        replay.status = status
+        return replay
 
     return opener
+
+
+def _slots_report_full(slots: Any) -> bool:
+    """Is this llama-server ``/slots`` body every-slot-busy?
+
+    An EMPTY list is UNKNOWN, not busy: llama-server reports every configured
+    slot, so a body with no slots measures nothing (the server may be between
+    a restart and its allocation) -- and ``all()`` over nothing is vacuously
+    true, which turned "nothing to read" into "the free slot was taken". Only
+    a non-empty list of processing slots is evidence. The chain's
+    ``_llama_busy`` reads the same body the same way (0 busy, hence free).
+    """
+    if not isinstance(slots, list) or not slots:
+        return False
+    return all(isinstance(slot, dict) and slot.get("is_processing") for slot in slots)
+
+
+#: What a replayed response reports when the real one carried no status.
+_REPLAY_OK_STATUS = 200
 
 
 def _model_call_ledger() -> doctor_rules.CallLedger:
