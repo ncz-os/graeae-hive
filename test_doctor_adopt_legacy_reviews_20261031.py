@@ -627,3 +627,42 @@ def test_roster_still_provides_every_family_the_brief_names():
     """TYDEUS qwen38 / Muse / M3 / DeepSeek / CERBERUS, per the roster flags."""
     families = {route["family"] for route in load_roster()}
     assert {"alibaba", "meta", "minimax", "deepseek", "openai", "google"} <= families
+
+
+def test_ordered_routes_put_tried_routes_last_and_keep_the_roster_order():
+    """Least-tried-first must never reshuffle the untried routes among themselves."""
+    from hive.workers import doctor
+
+    routes = [{"model_id": m} for m in ("a", "b", "c", "d")]
+    assert [r["model_id"] for r in doctor._ordered_routes(routes, {})] == ["a", "b", "c", "d"]
+    assert [r["model_id"] for r in doctor._ordered_routes(routes, {"tried": [{"model_id": "B"}]})] == [
+        "a",
+        "c",
+        "d",
+        "b",
+    ]
+    assert [
+        r["model_id"] for r in doctor._ordered_routes(routes, {"tried": [{"model_id": "a"}, {"model_id": "c"}]})
+    ] == [
+        "b",
+        "d",
+        "a",
+        "c",
+    ]
+
+
+def test_a_non_terminal_autoreview_child_blocks_a_second_submission(bus):
+    """A recorded child that is still running means the row is already reviewed."""
+    from hive.workers import doctor
+
+    row = _legacy_row()
+    row["result"]["auto_review_job_id"] = "review-live"
+    bus.children["review-live"] = {
+        "id": "review-live",
+        "kind": "review:fix:thing-20261031",
+        "status": "running",
+        "parent_job_id": row["id"],
+    }
+    summary = doctor.submit_adopted_reviews(rows=[row], now=1000.0)
+    assert summary["submitted"] == 0
+    assert bus.posts() == [], "a running review child is never reviewed a second time"

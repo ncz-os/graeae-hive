@@ -5784,7 +5784,15 @@ def _ordered_routes(routes: list[dict], state: dict) -> list[dict]:
     }
     if not tried:
         return list(routes)
-    return sorted(routes, key=lambda route: str(route.get("model_id") or "").strip().lower() in tried)
+    # Tried routes last, and the roster order kept explicitly among the rest
+    # (no reliance on sort stability).
+    return [
+        route
+        for _, route in sorted(
+            enumerate(routes),
+            key=lambda item: (str(item[1].get("model_id") or "").strip().lower() in tried, item[0]),
+        )
+    ]
 
 
 def _record_dry_run_submission(job: dict, state: dict, picked: list[dict], *, now: float) -> None:
