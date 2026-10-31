@@ -790,20 +790,31 @@ def test_test_module_uses_no_name_that_only_exists_inside_another_function():
     with open(path, encoding="utf-8") as fh:
         tree = ast.parse(fh.read())
     unresolved = []
-    for fn in [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]:
+    # Only TOP-LEVEL functions are entry points. A nested def is checked as
+    # part of its enclosing function, which is where its closure lives.
+    top = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    for fn in top:
         local = set(module_names)
         for arg in fn.args.args + fn.args.kwonlyargs + fn.args.posonlyargs:
             local.add(arg.arg)
         for extra in (fn.args.vararg, fn.args.kwarg):
             if extra is not None:
                 local.add(extra.arg)
+        # A nested def closes over the enclosing function's scope (a closure
+        # variable is bound, not undefined), so names bound ANYWHERE in `fn`
+        # are visible to its inner functions.
         for node in ast.walk(fn):
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
                 local.add(node.id)
             elif isinstance(node, (ast.Import, ast.ImportFrom)):
                 local.update((a.asname or a.name).split(".")[0] for a in node.names)
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not fn:
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 local.add(node.name)
+                for arg in node.args.args + node.args.kwonlyargs + node.args.posonlyargs:
+                    local.add(arg.arg)
+                for extra in (node.args.vararg, node.args.kwarg):
+                    if extra is not None:
+                        local.add(extra.arg)
         for node in ast.walk(fn):
             if (
                 isinstance(node, ast.Name)
@@ -866,3 +877,37 @@ def test_module_imports_the_stdlib_names_its_helpers_use():
     assert doctor_models.Counter is not None
     assert doctor_models.urllib.request.Request is not None
     assert doctor_models.urllib.error.HTTPError is not None
+
+
+def test_unset_chain_env_reaches_the_legacy_code_path_end_to_end(fake, monkeypatch):
+    """chain_from_env() -> None must FALL THROUGH into the legacy chain.
+
+    A review claimed the legacy branch is "bypassed" when DOCTOR_MODEL_CHAIN
+    is unset. This drives the real (unpatched) decision with the env var
+    genuinely absent and asserts the legacy rung is the thing that answers."""
+    from hive.workers import doctor, doctor_models
+
+    monkeypatch.delenv("DOCTOR_MODEL_CHAIN", raising=False)
+    assert doctor_models.chain_from_env() is None, "unset must mean no chain"
+
+    # Spy on the legacy call so we can see WHICH path ran.
+    legacy_calls = []
+    real = doctor._invoke_openweight
+
+    def spy(prompt, *a, **kw):
+        legacy_calls.append((a, kw))
+        return real(prompt, *a, **kw)
+
+    monkeypatch.setattr(doctor, "_invoke_openweight", spy)
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", fake)
+    monkeypatch.setattr(doctor, "_openweight_api_key", lambda: "")
+    monkeypatch.setattr(doctor, "_phase_model", lambda phase: "gpt-oss-20b")
+    monkeypatch.setitem(doctor._PHASE_BASE_URLS, "triage", CERBERUS)
+    fake.chat[CERBERUS] = "legacy answered"
+
+    ok, text = doctor.invoke_doctor_agent("p", phase="triage")
+    assert (ok, text) == (True, "legacy answered")
+    assert legacy_calls, "the legacy chain was bypassed: _invoke_openweight never ran"
+    # One legacy rung, no capacity probe, no chain rung accounting.
+    assert fake.chat_calls == [CERBERUS + "/chat/completions"]
+    assert fake.probe_calls == 0
