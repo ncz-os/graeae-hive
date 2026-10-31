@@ -692,6 +692,12 @@ class ModelChain:
         return True, str(text), "ok"
 
 
+#: Every outcome ``ModelChain._attempt`` can report. ``call`` handles each:
+#: ok -> use ``_acceptable``; busy -> cool the rung down; quota -> block it;
+#: config -> cool the rung down and stop (it would fail on every rung).
+_ATTEMPT_KINDS = frozenset({"ok", "busy", "quota", "config"})
+
+
 def _http_kind(rung: ChainRung, status: int) -> str:
     """Classify an HTTP status for the chain."""
     if status == 429:

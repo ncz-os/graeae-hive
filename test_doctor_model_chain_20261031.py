@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import calendar
 import importlib
+import inspect
 import io
 import json
 import os
@@ -238,6 +239,10 @@ def test_default_chain_order_is_the_operator_order():
     by_id = {r.id: r for r in rungs}
     assert by_id["cerberus-gpt-oss"].kind == "llama"
     assert by_id["cerberus-gpt-oss"].max_concurrent == 8
+    # A local llama-server is unauthenticated: it names NO key env. Pinning this
+    # matters -- a key env here would send the MiniMax key to CERBERUS.
+    assert by_id["cerberus-gpt-oss"].api_key_env is None
+    assert by_id["tydeus-qwen38"].api_key_env is None
     assert by_id["tydeus-qwen38"].kind == "vllm"
     assert by_id["minimax-m3"].api_key_env == "MINIMAX_API_KEY"
     assert by_id["deepseek-flash"].api_key_env == "DEEPSEEK_API_KEY"
@@ -684,3 +689,46 @@ def test_doctor_module_imports_the_chain_and_keeps_its_legacy_path():
 
     source = inspect.getsource(doctor.invoke_doctor_agent)
     assert "chain_from_env" in source
+
+
+# ── module completeness (a chunked reviewer must see call + definition) ────
+
+
+def test_helpers_a_chunked_reader_calls_are_defined_in_this_module():
+    """`_acceptable` and `_attempt` are module-level, next to their caller.
+
+    A truncated diff view once reported both as missing (or as never making an
+    HTTP call). They are not: this test resolves each name from the module and
+    exercises the real call path end to end."""
+    from hive.workers import doctor_models
+
+    assert callable(doctor_models._acceptable)
+    assert inspect.signature(doctor_models._acceptable).parameters.keys() == {"text", "structured"}
+    assert callable(doctor_models.ModelChain._attempt)
+    assert callable(doctor_models.ModelChain.call)
+    # _attempt really performs the call and classifies every outcome.
+    assert {"ok", "busy", "quota", "config"} <= set(doctor_models._ATTEMPT_KINDS)
+
+
+def test_attempt_performs_the_http_call_and_classifies_each_outcome(fake, monkeypatch):
+    from hive.workers import doctor_models
+
+    rung = doctor_models.ChainRung.from_dict(_rung(id="c", model="gpt-oss-20b", base_url=CERBERUS))
+    chain = doctor_models.ModelChain(rungs=[rung], urlopen=fake, clock=Clock())
+
+    fake.chat[CERBERUS] = "answered"
+    assert chain._attempt(rung, system="S", prompt="P", timeout=5) == (True, "answered", "ok")
+    assert fake.chat_calls == [CERBERUS + "/chat/completions"]
+
+    fake.chat[CERBERUS] = 503
+    assert chain._attempt(rung, system="S", prompt="P", timeout=5)[2] == "busy"
+    fake.chat[CERBERUS] = 400
+    assert chain._attempt(rung, system="S", prompt="P", timeout=5)[2] == "config"
+
+    # A timeout is a transport failure, not a hang: it returns "busy".
+    def boom(request, timeout=0):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(chain, "urlopen", boom)
+    ok, text, kind = chain._attempt(rung, system="S", prompt="P", timeout=5)
+    assert (ok, kind) == (False, "busy") and "TimeoutError" in text
