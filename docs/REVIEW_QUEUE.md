@@ -175,8 +175,16 @@ head sha). Prose-only or empty output is never an approval.
 3. drops unhealthy routes (`health(route) -> bool`);
 4. drops saturated routes (`load(route) >= concurrency`);
 5. applies the contributor-tier repo rule;
-6. sorts with a deterministic tie-break — cost class, then family load, then
-   route id — so a repeated call returns the same order.
+6. sorts with a deterministic tie-break, so a repeated call returns the same
+   order. The key depends on the row's LANE (see §2, "The Codex route"):
+   * `bulk` — roster `flags.priority`, then `local` < `provider` < `eih`, then
+     route id. Codex carries `priority: -5`, so for bulk review it sorts behind
+     the local, DeepSeek and MiniMax M3 reviewers.
+   * `hard` — `hard_lane_priority`, then `flags.priority`, then route id.
+     Codex carries `hard_lane_priority: 20`, so it leads the authoring review
+     of hard-lane (security/auth/redaction/budget/architecture) work.
+   The lane never relaxes pairing: family exclusion happens before the order
+   matters, so a hard-lane Codex pick still cannot review an openai author.
 
 **An empty list is a verdict.** With no cross-family reviewer available the row
 is **parked** (`parked_reason: no_cross_family_reviewer`): never self-reviewed,
