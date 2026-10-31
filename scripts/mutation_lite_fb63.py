@@ -487,6 +487,8 @@ def run_one(mutant: dict, with_killers: bool = False) -> str:
             return f"HARNESS-FAIL: {mutant['old']!r} occurs {text.count(mutant['old'])}x"
         target.write_text(text.replace(mutant["old"], mutant["new"]))
         tests = [*mutant["tests"], *KILLERS] if with_killers else mutant["tests"]
+        # Minimal env on purpose: mutant runs must not inherit seat HIVE_*/HOME
+        # configuration; the repo is self-contained for these targeted files.
         proc = subprocess.run(
             [PY, *BASE_ARGS, *tests],
             cwd=tmp / "repo",
