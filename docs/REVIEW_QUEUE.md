@@ -176,13 +176,18 @@ head sha). Prose-only or empty output is never an approval.
 4. drops saturated routes (`load(route) >= concurrency`);
 5. applies the contributor-tier repo rule;
 6. sorts with a deterministic tie-break, so a repeated call returns the same
-   order. The key depends on the row's LANE (see §2, "The Codex route"):
-   * `bulk` — roster `flags.priority`, then `local` < `provider` < `eih`, then
-     route id. Codex carries `priority: -5`, so for bulk review it sorts behind
-     the local, DeepSeek and MiniMax M3 reviewers.
-   * `hard` — `hard_lane_priority`, then `flags.priority`, then route id.
-     Codex carries `hard_lane_priority: 20`, so it leads the authoring review
-     of hard-lane (security/auth/redaction/budget/architecture) work.
+   order. Every key component below is compared ASCENDING (lowest first), and
+   priority values are negated in the key, so a HIGHER `priority` value is
+   picked EARLIER. The key depends on the row's LANE (see §2, "The Codex
+   route"):
+   * `bulk` — roster `flags.priority` descending, then `local` < `provider` <
+     `eih`, then route id. Codex carries `priority: -5`, the lowest of any
+     non-slow route, so for bulk review it sorts behind every local, DeepSeek
+     and MiniMax M3 reviewer.
+   * `hard` — `hard_lane_priority` descending, then `flags.priority`
+     descending, then route id. Codex carries `hard_lane_priority: 20`, the
+     highest in the roster, so it leads the authoring review of hard-lane
+     (security/auth/redaction/budget/architecture) work.
    The lane never relaxes pairing: family exclusion happens before the order
    matters, so a hard-lane Codex pick still cannot review an openai author.
 
