@@ -92,7 +92,7 @@ class DeterminismTests(unittest.TestCase):
             op.write_text(json.dumps(OVERLAY))
             # Concatenation, not % formatting: a % in a temp path must not break it.
             helper = (
-                "import json,sys; sys.path.insert(0, " + json.dumps(str(ROOT)) + "; "
+                "import json,sys; sys.path.insert(0, " + json.dumps(str(ROOT)) + "); "
                 "from hive.registry import build_registry; "
                 "reg = build_registry(overlay_path=" + json.dumps(str(op)) + ", "
                 "skip=('gitlab','github','argonas','buildkite','r2')); "
