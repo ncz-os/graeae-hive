@@ -517,8 +517,25 @@ def _available(entry: dict, health, load) -> bool:
 # ---------------------------------------------------------------------------
 
 
+#: Spellings that mean OFF, whatever their case or surrounding whitespace.
+_FALSY_WORDS = frozenset({"", "0", "0.0", "false", "no", "off"})
+
+
 def _truthy(value: Any) -> bool:
-    return str(value or "").strip().lower() not in ("0", "false", "no", "off")
+    """Whether a switch is on: anything but an explicit falsy spelling.
+
+    ``0``, ``False``, an empty string and ``0/false/no/off`` (any case, either
+    side of whitespace) are OFF; anything else -- including an unset value the
+    caller already defaulted -- is ON. ``str(value or "")`` used to erase
+    ``0``/``False``/``""`` *before* the membership test, so all three read as
+    the empty string and came back True: ``HIVE_REVIEW_CODEX_ENABLED=0`` could
+    not turn Codex off except through the exact words.
+    """
+    if value is None or value is True or value is False:
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() not in _FALSY_WORDS
 
 
 def _codex_flags(entry: dict | None) -> dict:
@@ -620,7 +637,16 @@ def write_codex_cooldown(
     }
     current = read_codex_cooldown(now=now_epoch, state_dir=state_dir)
     if current is not None:
-        marker["created_at"] = min(float(current.get("created_at") or now_epoch), now_epoch)
+        # ``read_codex_cooldown`` guarantees a live ``expires_at`` is a number,
+        # but NOT that the marker's ``created_at`` is one (an older or hand-
+        # written marker may carry a string, and a malformed created_at must
+        # never take down the worker's usage-limit path). An unusable
+        # created_at cannot shorten the marker: keep the one being written.
+        try:
+            prior_created = float(current.get("created_at"))
+        except (TypeError, ValueError):
+            prior_created = now_epoch
+        marker["created_at"] = min(prior_created, now_epoch)
         marker["expires_at"] = max(float(current["expires_at"]), marker["expires_at"])
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -709,8 +735,13 @@ def review_lane(*, repo: str | None = None, paths: list[str] | None = None, kind
     The hard lane is where Codex is the FIRST reviewer (authoring review of
     architecture or a security/auth/redaction/budget change); everything else
     is bulk review, where local and DeepSeek/M3 reviewers come first.
+
+    The REPO is part of what is being reviewed, not just a label: a change in
+    a repo that itself names a security-sensitive area (``auth-service``,
+    ``redaction-tools``) is hard-lane work even when the paths look ordinary.
     """
-    text = " ".join([str(kind or ""), *(str(p) for p in paths or [])])
+    parts = [str(kind or ""), str(repo or ""), *(str(p) for p in paths or [])]
+    text = " ".join(part for part in parts if part.strip())
     for pattern in _HARD_PATH_RES:
         if pattern.search(text):
             return LANE_HARD

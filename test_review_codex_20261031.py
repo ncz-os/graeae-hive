@@ -893,6 +893,7 @@ def test_a_malformed_cooldown_marker_does_not_crash_the_writer(tmp_path):
 
 
 def test_a_cooldown_marker_with_a_string_expiry_does_not_crash_the_writer(tmp_path):
+    """A marker with an unusable ``expires_at`` is inert, not a crash either."""
     from hive.review_queue import codex_cooldown_path, write_codex_cooldown
 
     path = codex_cooldown_path(str(tmp_path))
@@ -902,7 +903,9 @@ def test_a_cooldown_marker_with_a_string_expiry_does_not_crash_the_writer(tmp_pa
         encoding="utf-8",
     )
     marker = write_codex_cooldown(reason="usage limit", now=1500.0, ttl_secs=60.0, state_dir=str(tmp_path))
-    assert marker["created_at"] == 900.0
+    # ``read_codex_cooldown`` cannot read the old expiry, so the old marker is
+    # dead and cannot constrain the new one.
+    assert marker["created_at"] == 1500.0
     assert marker["expires_at"] == 1560.0
 
 
