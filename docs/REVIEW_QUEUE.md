@@ -119,6 +119,51 @@ Rules encoded in the flags:
   `hive/core/fleet_inventory.py`); with no inventory entry the route's load is
   unknown and it is not picked.
 
+### The Codex route (operator, 2026-10-31)
+
+Codex is a reviewer route (`codex-worker`, family **openai**, same family as
+`gpt-oss*`) served **only** by the confined local Hive Codex worker:
+
+| Field | Value |
+| --- | --- |
+| kind | `codex` (`workspace-write`, limited to the job workspace) |
+| service | CERBERUS `hive-worker-codex.service` |
+| location | `local` — **never** EIH, never Azure/AWS/GCP/OCI, never the retired `:4100` gateway |
+| token | PYTHIA holds the master OAuth token; nothing in Hive logs in, refreshes or reads it |
+| concurrency | 1 |
+| ladder | `gpt-6-luna` → `gpt-6.1-terra` → `gpt-6-sol` |
+| authorization model | `gpt-6-astra` — only on an explicit operator authorization recorded in the job, never auto-selected, never pinned |
+
+**Gating.** Every automatic Codex dispatch — including any started from a cron
+or a hook — goes through `review_queue.codex_gate()`; there is no path that
+picks the route around it. The gate refuses, in order, when:
+
+1. `HIVE_REVIEW_CODEX_ENABLED` is `0`/`false`/`no`/`off` (`codex_disabled`).
+   Unset means on **only** while the worker is online;
+2. the codex worker kind is not online (`codex_worker_offline`) — an offline
+   worker would otherwise strand the review;
+3. a live cooldown marker exists at
+   `<state_dir>/cooldowns/codex.json` (`codex_cooldown`); the worker writes one
+   when Codex reports a usage limit, it expires after `CODEX_COOLDOWN_SECS`
+   (6 h) and an expired or corrupt marker is inert;
+4. the plan usage share cannot be read (`codex_usage_unknown`) — a host with no
+   usage probe fails **closed**;
+5. the remaining share is under 30 % (`codex_quota_low`, `min_remaining_pct`).
+
+**Priority.** Codex sorts **last** for bulk review (`priority: -5`, below local,
+DeepSeek and MiniMax M3) and **first** for the hard lane
+(`hard_lane_priority: 20`). The lane is `hard` when the delivered change touches
+security, auth/authn/authz/oauth, redaction, budget or architecture paths (see
+`_HARD_PATH_RES`); everything else is `bulk`. The hard lane still never
+self-reviews: an openai author or co-author is dropped before the order
+matters, so Codex-authored code always gets a **non-openai** review.
+
+**The review job.** A Codex review is a normal Hive job of kind `codex`
+(`eligible_kinds: ["codex"]`, `max_concurrency: 1`) with the same structured
+JSON verdict contract as every other reviewer (`approve`/`request_changes` and
+`reason`, `reviewers[]` naming the model e.g. `gpt-6-luna`, and the reviewed
+head sha). Prose-only or empty output is never an approval.
+
 ## 3. Pairing
 
 `hive.review_queue.pick_reviewers(author_model, roster, health, load)`:
@@ -130,8 +175,21 @@ Rules encoded in the flags:
 3. drops unhealthy routes (`health(route) -> bool`);
 4. drops saturated routes (`load(route) >= concurrency`);
 5. applies the contributor-tier repo rule;
-6. sorts with a deterministic tie-break — cost class, then family load, then
-   route id — so a repeated call returns the same order.
+6. sorts with a deterministic tie-break, so a repeated call returns the same
+   order. Every key component below is compared ASCENDING (lowest first), and
+   priority values are negated in the key, so a HIGHER `priority` value is
+   picked EARLIER. The key depends on the row's LANE (see §2, "The Codex
+   route"):
+   * `bulk` — roster `flags.priority` descending, then `local` < `provider` <
+     `eih`, then route id. Codex carries `priority: -5`, the lowest of any
+     non-slow route, so for bulk review it sorts behind every local, DeepSeek
+     and MiniMax M3 reviewer.
+   * `hard` — `hard_lane_priority` descending, then `flags.priority`
+     descending, then route id. Codex carries `hard_lane_priority: 20`, the
+     highest in the roster, so it leads the authoring review of hard-lane
+     (security/auth/redaction/budget/architecture) work.
+   The lane never relaxes pairing: family exclusion happens before the order
+   matters, so a hard-lane Codex pick still cannot review an openai author.
 
 **An empty list is a verdict.** With no cross-family reviewer available the row
 is **parked** (`parked_reason: no_cross_family_reviewer`): never self-reviewed,
@@ -208,6 +266,10 @@ cap.
 | `APPROVED_REPOS` | `hive/review_queue.py` | contributor-tier repos |
 | `REVIEW_QUEUE_ROUTE_HEALTH` | `hive/workers/doctor.py` | per-route health overrides (unlisted = healthy) |
 | `REVIEW_QUEUE_ROUTE_LOAD` | `hive/workers/doctor.py` | override for the load reader |
+| `HIVE_REVIEW_CODEX_ENABLED` | `hive/review_queue.py` | Codex route switch (unset = on while the worker is online; `0`/`false`/`no`/`off` = off) |
+| `CODEX_REVIEW_USAGE` | `hive/workers/doctor.py` | Codex plan-usage probe; unset fails the gate closed |
+| `CODEX_MIN_REMAINING_PCT` | `hive/review_queue.py` | Codex quota guard: skip under 30 % remaining |
+| `CODEX_COOLDOWN_SECS` | `hive/review_queue.py` | Codex usage-limit cooldown marker lifetime (6 h) |
 | `HIVE_ZODER_REVIEWER_ALT` | `deploy/hive_worker.py` | quiet-window backup reviewer (EIH Nemotron) |
 | `HIVE_ZODER_REVIEWER_QUIET_WINDOWS` | `deploy/hive_worker.py` | publish-burst windows routed to the backup |
 | `reviewer-roster.json` | `hive/core/` | concurrency, cost class, flags per route |
@@ -327,6 +389,12 @@ and `HIVE_DOCTOR_ADOPT_DRY_RUN` are read at import from the process env only.
   filter, summary counts.
 * `test_worker_review_queue_20261031.py` — the worker seams: cross-family pick,
   failure classification, disposition, resume delay.
+* `test_review_codex_20261031.py` — the Codex route: roster row and family
+  entry, the ladder and the authorization-only model, an openai author never
+  gets Codex (either direction, `gpt-oss` included), the gate's five refusals
+  with a fake usage source and cooldown marker, the concurrency cap, bulk-vs-
+  hard-lane ordering, the kind `codex` job spec, no-token-access, and the
+  structured verdict contract (prose-only is never an approval).
 * `test_doctor_adopt_legacy_reviews_20261031.py` — adoption of each legacy
   shape, no adoption while a review is in flight or an approve covers the head,
   cross-family pairing (an alibaba author never gets a qwen reviewer), the

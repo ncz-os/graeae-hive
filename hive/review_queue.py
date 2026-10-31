@@ -43,6 +43,7 @@ import fnmatch
 import functools
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -67,6 +68,25 @@ LOAD_CACHE_SEC = 30.0
 
 #: Repos the StepFun and Meta contributor tiers may review (operator list).
 APPROVED_REPOS = ("graeae-hive", "fleet-ops", "tokenomics", "ncz-screensavers", "zoder")
+
+#: Codex (operator 2026-10-31): a reviewer ROUTE served by the confined local
+#: Hive Codex worker. Its roster row carries the ladder and the sandbox; the
+#: gate below (worker online + config switch + plan usage + cooldown marker)
+#: decides whether a sweep may use it at all. Nothing here logs in, refreshes
+#: or reads the OAuth token: PYTHIA holds the master token, full stop.
+CODEX_ROUTE_ID = "codex-worker"
+CODEX_WORKER_KIND = "codex"
+#: ``HIVE_REVIEW_CODEX_ENABLED``: unset means ON, but only while the codex
+#: worker is online (and the usage/quota guard passes); 0/false/no/off is off.
+CODEX_ENABLED_ENV = "HIVE_REVIEW_CODEX_ENABLED"
+#: The plan-usage guard: skip Codex when less than this share remains.
+CODEX_MIN_REMAINING_PCT = 30.0
+#: Cooldown marker the worker writes when Codex reports a usage limit.
+CODEX_COOLDOWN_PROVIDER = "codex"
+CODEX_COOLDOWN_SECS = 6 * 3600.0
+#: Review lanes: bulk (default) and hard (architecture or security-sensitive).
+LANE_BULK = "bulk"
+LANE_HARD = "hard"
 
 #: Returned by a load probe when the route's load cannot be read (unknown).
 LOAD_UNKNOWN = object()
@@ -347,6 +367,13 @@ class _Probe:
         self.cache: dict[str, tuple[float, Any]] = {}
 
     def __call__(self, route: dict) -> Any:
+        if is_codex_route(route):
+            # A worker-driven route serves NO slot endpoint: its load is the
+            # number of codex review jobs the worker is running, which the
+            # caller adds from the in-flight count (the worker's own claim gate
+            # enforces the concurrency cap of 1). Probing it would return
+            # LOAD_UNKNOWN and silently retire the route from every pick.
+            return 0
         if str(route.get("location")) != "local":
             # Provider routes expose no slot endpoint; there is nothing cheap
             # to read and the concurrency cap is enforced at dispatch time.
@@ -464,6 +491,265 @@ def _available(entry: dict, health, load) -> bool:
     return float(current) < limit
 
 
+# ---------------------------------------------------------------------------
+# Codex (operator 2026-10-31: "codex needs to be part of our review system").
+#
+# Codex is a reviewer route like any other -- family openai -- served ONLY by
+# the confined local Hive Codex worker (kind codex, workspace-write limited to
+# the job workspace, CERBERUS ``hive-worker-codex.service``). It is never an
+# EIH route, never an Azure/AWS/GCP/OCI route and never the retired :4100
+# gateway. PYTHIA holds the master OAuth token; nothing in this module logs
+# in, refreshes or reads it -- the worker that owns the token runs the job.
+#
+# The gate every automatic dispatch goes through:
+#
+#   1. the config switch ``HIVE_REVIEW_CODEX_ENABLED`` (unset = on, but only
+#      while the worker is online; 0/false/no/off = off);
+#   2. the codex worker must be ONLINE (a review job of kind codex is only
+#      claimable by it -- an offline worker would strand the review);
+#   3. the quota guard: the plan usage must be readable and at least 30 % of
+#      the share must remain, and no cooldown marker may be live (the worker
+#      writes one when Codex reports a usage limit);
+#   4. the concurrency cap of 1 the roster row carries.
+#
+# Priority: BELOW local and DeepSeek/M3 reviewers for bulk review, ABOVE
+# everything for the hard lane (architecture or security-sensitive changes).
+# ---------------------------------------------------------------------------
+
+
+#: Spellings that mean OFF, whatever their case or surrounding whitespace.
+_FALSY_WORDS = frozenset({"", "0", "0.0", "false", "no", "off"})
+
+
+def _truthy(value: Any) -> bool:
+    """Whether a switch is on: anything but an explicit falsy spelling.
+
+    ``0``, ``False``, an empty string and ``0/false/no/off`` (any case, either
+    side of whitespace) are OFF; anything else -- including an unset value the
+    caller already defaulted -- is ON. ``str(value or "")`` used to erase
+    ``0``/``False``/``""`` *before* the membership test, so all three read as
+    the empty string and came back True: ``HIVE_REVIEW_CODEX_ENABLED=0`` could
+    not turn Codex off except through the exact words.
+    """
+    if value is None or value is True or value is False:
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() not in _FALSY_WORDS
+
+
+def _codex_flags(entry: dict | None) -> dict:
+    """The ``flags.codex`` block of a roster entry ({} when absent)."""
+    if not isinstance(entry, dict):
+        return {}
+    flags = entry.get("flags")
+    block = flags.get("codex") if isinstance(flags, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def is_codex_route(entry: dict | None) -> bool:
+    """True for the Codex reviewer route: the KIND is codex and it is local."""
+    if not isinstance(entry, dict):
+        return False
+    return str(entry.get("kind") or "").lower() == CODEX_WORKER_KIND or entry.get("id") == CODEX_ROUTE_ID
+
+
+def codex_ladder(entry: dict | None = None) -> list[str]:
+    """The automatic model ladder: gpt-6-luna, then gpt-6.1-terra, then gpt-6-sol.
+
+    ``gpt-6-astra`` is NOT on it: it is reachable only through an explicit
+    operator authorization recorded in the job (``codex_job_allowed``).
+    """
+    entry = entry if entry is not None else next((e for e in load_roster() if is_codex_route(e)), None)
+    ladder = [str(m).strip() for m in (_codex_flags(entry).get("ladder") or []) if str(m).strip()]
+    return ladder or ["gpt-6-luna", "gpt-6.1-terra", "gpt-6-sol"]
+
+
+def codex_job_allowed(entry: dict | None, model: str, *, job: dict | None = None) -> bool:
+    """Whether a codex review job may run ``model`` for ``job``.
+
+    A ladder model is always allowed; the authorization model (gpt-6-astra) is
+    allowed ONLY when the job itself records the operator's authorization
+    (``codex_model_authorization`` naming it). Anything else is refused.
+    """
+    wanted = str(model or "").strip().lower()
+    if not wanted:
+        return False
+    if wanted in {m.lower() for m in codex_ladder(entry)}:
+        return True
+    authorized = str(_codex_flags(entry).get("authorization_model") or "").strip().lower()
+    if not authorized or wanted != authorized:
+        return False
+    recorded = str((job or {}).get("codex_model_authorization") or "").strip().lower()
+    return recorded == authorized
+
+
+def codex_review_available(entry: dict | None = None, *, usage: Any = None) -> dict:
+    """The Codex model a READY route would run: ``{"model", "ladder"}``.
+
+    Never returns the authorization-only model: an automatic pick is always the
+    first ladder rung (``gpt-6-luna``).
+    """
+    ladder = codex_ladder(entry)
+    return {"model": ladder[0], "ladder": ladder}
+
+
+def codex_cooldown_path(state_dir: str | None = None) -> Path:
+    """Where the Codex usage-limit marker lives (worker state dir, or XDG)."""
+    root = str(state_dir or "").strip()
+    if not root:
+        root = os.environ.get("HIVE_WORKER_STATE_DIR", "").strip() or os.path.join(
+            os.environ.get("XDG_STATE_HOME", "").strip() or os.path.expanduser("~/.local/state"), "hive-worker"
+        )
+    return Path(os.path.expanduser(root)) / "cooldowns" / f"{CODEX_COOLDOWN_PROVIDER}.json"
+
+
+def read_codex_cooldown(*, now: float | None = None, state_dir: str | None = None) -> dict | None:
+    """The LIVE Codex cooldown marker, else None (expired/corrupt markers are inert)."""
+    path = codex_cooldown_path(state_dir)
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+        expires_at = float(marker["expires_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if float(time.time() if now is None else now) >= expires_at:
+        return None
+    return marker
+
+
+def write_codex_cooldown(
+    *,
+    reason: str = "",
+    model: str = "",
+    ttl_secs: float = CODEX_COOLDOWN_SECS,
+    now: float | None = None,
+    state_dir: str | None = None,
+) -> dict:
+    """Write the Codex usage-limit marker the gate honours (never shortened)."""
+    path = codex_cooldown_path(state_dir)
+    now_epoch = float(time.time() if now is None else now)
+    marker = {
+        "provider": CODEX_COOLDOWN_PROVIDER,
+        "model": str(model or ""),
+        "created_at": now_epoch,
+        "expires_at": now_epoch + float(ttl_secs),
+        "reason": str(reason or "")[:500],
+    }
+    current = read_codex_cooldown(now=now_epoch, state_dir=state_dir)
+    if current is not None:
+        # ``read_codex_cooldown`` guarantees a live ``expires_at`` is a number,
+        # but NOT that the marker's ``created_at`` is one (an older or hand-
+        # written marker may carry a string, and a malformed created_at must
+        # never take down the worker's usage-limit path). An unusable
+        # created_at cannot shorten the marker: keep the one being written.
+        try:
+            prior_created = float(current.get("created_at"))
+        except (TypeError, ValueError):
+            prior_created = now_epoch
+        marker["created_at"] = min(prior_created, now_epoch)
+        marker["expires_at"] = max(float(current["expires_at"]), marker["expires_at"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(marker), encoding="utf-8")
+    os.replace(tmp, path)
+    return marker
+
+
+def codex_gate(
+    *,
+    entry: dict | None = None,
+    worker_online: bool | None,
+    env: dict | None = None,
+    usage: Any = None,
+    now: float | None = None,
+    state_dir: str | None = None,
+) -> dict:
+    """Whether an automatic Codex review may be dispatched, and why not.
+
+    ``worker_online`` is the doctor's live view of the codex kind: ``None``
+    means the bus could not say (fail closed as ``codex_worker_unknown``),
+    ``False`` means it said the worker is not online. ``usage`` is the injected plan
+    usage source returning ``{"remaining_pct": float}`` (or None when it cannot
+    be read -- an unknown share fails closed). Returns
+    ``{"allowed": bool, "reason": str, "model": str|None}`` with a reason from
+    ``codex_disabled``, ``codex_worker_unknown``, ``codex_worker_offline``,
+    ``codex_usage_unknown``,
+    ``codex_quota_low``, ``codex_cooldown`` or ``""`` (allowed).
+    """
+    entry = entry if entry is not None else next((e for e in load_roster() if is_codex_route(e)), None)
+    env = os.environ if env is None else env
+    flags = _codex_flags(entry)
+    minimum = float(flags.get("min_remaining_pct") or CODEX_MIN_REMAINING_PCT)
+    model = codex_review_available(entry)["model"]
+
+    def answer(allowed: bool, reason: str) -> dict:
+        return {"allowed": allowed, "reason": reason, "model": model if allowed else None}
+
+    if not _truthy(env.get(CODEX_ENABLED_ENV, "1")):
+        return answer(False, "codex_disabled")
+    if worker_online is None:
+        # The doctor cannot see the worker list at all (bus down / probe
+        # failed). That is not the same fact as "the codex worker is offline",
+        # and it must never be read as permission: fail closed, but say which.
+        return answer(False, "codex_worker_unknown")
+    if not worker_online:
+        return answer(False, "codex_worker_offline")
+    if read_codex_cooldown(now=now, state_dir=state_dir) is not None:
+        return answer(False, "codex_cooldown")
+    try:
+        reading = usage() if callable(usage) else usage
+    except Exception:  # noqa: BLE001 -- a broken probe is an unknown share
+        reading = None
+    remaining = reading.get("remaining_pct") if isinstance(reading, dict) else None
+    # A quota share is a FINITE number or nothing: ``inf`` would otherwise pass
+    # the >= minimum test and open the gate on a reading that means "no data".
+    # ``finite_load`` alone is not enough here because it accepts an infinite
+    # float, and it is shared with the load reader where that is a separate
+    # question. A numeric string ("45") is accepted rather than treated as an
+    # unreadable share; anything else is unknown and fails closed.
+    if isinstance(remaining, str) and remaining.strip():
+        try:
+            remaining = float(remaining)
+        except ValueError:
+            remaining = None
+    if not isinstance(remaining, (int, float)) or isinstance(remaining, bool) or not math.isfinite(remaining):
+        return answer(False, "codex_usage_unknown")
+    if float(remaining) < minimum:
+        return answer(False, "codex_quota_low")
+    return answer(True, "")
+
+
+#: Path components (case-insensitive) that make a change SECURITY-SENSITIVE:
+#: security, auth, redaction and budget code (operator 2026-10-31).
+_HARD_PATH_RES = (
+    re.compile(r"(^|[/_.-])(security|secrets?|auth|authn|authz|oauth)($|[/_.-])", re.IGNORECASE),
+    re.compile(r"(^|[/_.-])redact", re.IGNORECASE),
+    re.compile(r"(^|[/_.-])budget", re.IGNORECASE),
+    re.compile(r"(^|[/_.-])architect", re.IGNORECASE),
+)
+
+
+def review_lane(*, repo: str | None = None, paths: list[str] | None = None, kind: str | None = None) -> str:
+    """``hard`` for architecture or security-sensitive work, else ``bulk``.
+
+    The hard lane is where Codex is the FIRST reviewer (authoring review of
+    architecture or a security/auth/redaction/budget change); everything else
+    is bulk review, where local and DeepSeek/M3 reviewers come first.
+
+    The REPO is part of what is being reviewed, not just a label: a change in
+    a repo that itself names a security-sensitive area (``auth-service``,
+    ``redaction-tools``) is hard-lane work even when the paths look ordinary.
+    The repo name is matched against the SAME patterns as a path, so no
+    approved repo (``APPROVED_REPOS``) escalates by accident.
+    """
+    parts = [str(kind or ""), str(repo or ""), *(str(p) for p in paths or [])]
+    text = " ".join(part for part in parts if part.strip())
+    for pattern in _HARD_PATH_RES:
+        if pattern.search(text):
+            return LANE_HARD
+    return LANE_BULK
+
+
 def _reviewable(entry: dict, *, repo: str | None, author_routes: set[str]) -> bool:
     family = str(entry.get("family") or "")
     if family in FORBIDDEN_FAMILIES or family in NEVER_REVIEW_FAMILIES:
@@ -472,14 +758,48 @@ def _reviewable(entry: dict, *, repo: str | None, author_routes: set[str]) -> bo
         return False
     if entry["id"] in author_routes:
         return False
-    tier = entry["flags"].get("contributor_tier")
+    # Same reason as ``_bulk_key``: a hand-built route may carry no flags block.
+    flags = entry.get("flags") if isinstance(entry.get("flags"), dict) else {}
+    tier = flags.get("contributor_tier")
     # A contributor tier is allowed only on the operator-approved repos.
     return not (isinstance(tier, dict) and str(repo or "").strip() not in (tier.get("repos") or []))
 
 
-def _bulk_key(entry: dict) -> tuple:
-    """Deterministic tie-break: priority (slow routes last), local first, id."""
-    priority = int(entry["flags"].get("priority") or 0)
+def _int_flag(value: Any) -> int:
+    """A roster flag as an int, 0 when it is absent or not a number.
+
+    ``load_roster`` does not type-check ``flags`` (they are operator data), so
+    a typo (``"priority": "high"``) would otherwise raise ValueError from
+    ``int()`` in the middle of a sort and take the whole sweep down. A flag the
+    roster cannot express is the default, which is what every missing flag
+    already means.
+    """
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _bulk_key(entry: dict, lane: str = LANE_BULK) -> tuple:
+    """Deterministic tie-break for a review LANE.
+
+    Bulk: roster priority first (slow routes last, and Codex, which is lower
+    priority than local and DeepSeek/M3 for bulk review, sorts behind them),
+    then local before provider before eih, then id. Hard: ``hard_lane_priority``
+    first, so Codex leads the authoring review of hard-lane work.
+    """
+    # ``load_roster`` normalises ``flags`` on every entry, but the pick is also
+    # reached with hand-built routes (test doubles, probe callers), so a route
+    # without the block sorts by its defaults instead of raising KeyError.
+    flags = entry.get("flags") if isinstance(entry.get("flags"), dict) else {}
+    if lane == LANE_HARD:
+        hard = _int_flag(flags.get("hard_lane_priority"))
+        return (-hard, -_int_flag(flags.get("priority")), entry["id"])
+    priority = _int_flag(flags.get("priority"))
     return (
         -priority,
         {"local": 0, "provider": 1, "eih": 2}.get(str(entry.get("location")), 3),
@@ -496,15 +816,29 @@ def pick_reviewers(
     co_authors: list[str] | None = None,
     repo: str | None = None,
     author_routes: list[str] | None = None,
+    lane: str = LANE_BULK,
+    codex_worker_online: bool | None = None,
+    codex_usage: Any = None,
+    codex_env: dict | None = None,
+    codex_now: float | None = None,
 ) -> list[dict]:
     """Ordered reviewer routes whose family differs from the author's.
 
     ``author_model`` is the model id, role id or agent alias the author ran as;
     ``co_authors`` are further author models known for the job (all of them are
     excluded by family). ``health(route) -> bool`` and ``load(route) -> int``
-    are injected; unhealthy or saturated routes are skipped. An empty result
-    means there is NO cross-family reviewer: the caller PARKS the row -- it must
-    never fall back to the author's own family or to a self-review.
+    are injected; unhealthy or saturated routes are skipped. ``lane`` orders the
+    cross-family pick (``hard`` puts Codex first, ``bulk`` last).
+
+    The Codex route is only an option when its GATE passes: the config switch,
+    an online codex worker (``codex_worker_online``; ``None``/unset means the
+    gate cannot vouch for a worker -- fail closed), the injected plan usage
+    (``codex_usage``, a callable or a ``{"remaining_pct"}`` dict), no live
+    cooldown marker and the route's own concurrency cap.
+
+    An empty result means there is NO cross-family reviewer: the caller PARKS
+    the row -- it must never fall back to the author's own family or to a
+    self-review.
     """
     if not str(author_model or "").strip():
         # No author means no family to exclude: there is no cross-family
@@ -519,16 +853,29 @@ def pick_reviewers(
     blocked = {family_of(m) for m in authors}
     healthy = health or (lambda _route: True)
     loads = load or (lambda _route: 0)
+    codex_ok = None
     picked = []
     for entry in routes:
         if entry.get("family") in blocked:
             continue
         if not _reviewable(entry, repo=repo, author_routes=author_routes):
             continue
+        if is_codex_route(entry):
+            # Every automatic Codex dispatch is behind the roster gate.
+            if codex_ok is None:
+                codex_ok = codex_gate(
+                    entry=entry,
+                    worker_online=codex_worker_online,
+                    env=codex_env,
+                    usage=codex_usage,
+                    now=codex_now,
+                )
+            if not codex_ok["allowed"]:
+                continue
         if not _available(entry, healthy, loads):
             continue
         picked.append(entry)
-    picked.sort(key=_bulk_key)
+    picked.sort(key=lambda route: _bulk_key(route, lane))
     return picked
 
 
