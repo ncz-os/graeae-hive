@@ -758,3 +758,35 @@ def test_signature_accepts_the_new_keyword_and_a_default_call(bus):
     )
     assert outcome == "capped", outcome  # the per-sweep cap spent, no attempt spent
     assert len(bus.posts()) == 1
+
+
+def test_review_queue_helpers_are_resolvable_from_the_module_itself():
+    """Regression (review 2026-10-31): the adoption path must not NameError.
+
+    The reviewer read the diff fragment and reported ``same_head`` as
+    "undefined or not imported in this module". It is defined in
+    ``hive/review_queue.py`` and the helpers that call it -- the ones the
+    adoption path runs on every legacy row -- are executed here so a genuine
+    missing definition cannot hide behind a passing import.
+    """
+    assert rq.same_head.__module__ == "hive.review_queue"
+    assert rq.same_head(HEAD[:12], HEAD) and not rq.same_head(OLD_HEAD, HEAD)
+
+    result = {
+        "head_sha": HEAD,
+        "commits": [HEAD],
+        "reviewer": "gemma4-31b",
+        "review_evidence": {"model": "gemma4-31b", "head_sha": OLD_HEAD, "verdict": "request_changes"},
+    }
+    # Request-changes at an OLDER head: a failure kind, and the reviewer the
+    # round named, in tried[] -- exactly the calls that would NameError.
+    assert rq.legacy_review_failure(result) in (None, "review_reported")
+    assert rq.legacy_review_tried(result) == [
+        {"model_id": "gemma4-31b", "failure": rq.legacy_review_failure(result) or "review_reported"}
+    ]
+    assert rq.legacy_effective_head({"head_sha": HEAD}, result) == HEAD
+
+    # And the doctor's own helper the reviewer named is in the same module.
+    from hive.workers import doctor
+
+    assert doctor._needs_review_child_review_jobs.__module__ == "hive.workers.doctor"
