@@ -4993,7 +4993,7 @@ def interpret_review_outcome(raw: Any, *, head_sha: str | None = None) -> dict:
         reviewers.append(model)
         verdicts.append(verdict)
     unreviewed = all(not review_queue.family_of(m) for m in reviewers)
-    reviewing = [v for m, v in zip(reviewers, verdicts) if review_queue.family_of(m)]
+    reviewing = [v for m, v in zip(reviewers, verdicts, strict=True) if review_queue.family_of(m)]
     reviewed_head = str(payload.get("head_sha") or "").strip()
     if "approve" in reviewing:
         if not head_sha or review_verdict.same_sha(reviewed_head, head_sha):

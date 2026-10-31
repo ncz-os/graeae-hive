@@ -378,9 +378,8 @@ def _reviewable(entry: dict, *, repo: str | None, author_routes: set[str]) -> bo
     if entry["id"] in author_routes:
         return False
     tier = entry["flags"].get("contributor_tier")
-    if isinstance(tier, dict) and str(repo or "").strip() not in (tier.get("repos") or []):
-        return False
-    return True
+    # A contributor tier is allowed only on the operator-approved repos.
+    return not (isinstance(tier, dict) and str(repo or "").strip() not in (tier.get("repos") or []))
 
 
 def _bulk_key(entry: dict) -> tuple:

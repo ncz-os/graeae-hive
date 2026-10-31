@@ -28,6 +28,7 @@ import json
 import time
 
 import pytest
+
 from hive.review_queue import (
     APPROVED_REPOS,
     FAMILY_TABLE_PATH,
@@ -35,8 +36,8 @@ from hive.review_queue import (
     awaiting_review_reason,
     backoff_seconds,
     family_of,
-    load_roster,
     load_family_table,
+    load_roster,
     make_review_state,
     pick_reviewers,
     review_state,
@@ -420,7 +421,7 @@ def test_reviewer_failure_schedules_exponential_backoff(bus):
 
     monkeypatch.setattr(doctor, "pick_reviewers", no_reviewer)
     rows["source"]["result"]["review_state"] = state("qwen38", [], attempt=0, now=0)
-    first = doctor.run_review_queue_sweep(rows=list(rows.values()))
+    doctor.run_review_queue_sweep(rows=list(rows.values()))
     nxt = [c[2] for c in calls if c[0] == "PATCH"][-1]["result"]["review_state"]["next_attempt_at"]
     calls.clear()
     rows["source"]["result"]["review_state"] = state(
@@ -444,7 +445,8 @@ def test_reviewer_failure_schedules_exponential_backoff(bus):
 
 
 def test_attempts_exhausted_stays_needs_review_with_owner_wait_reason(bus):
-    from hive.review_queue import MAX_REVIEW_ATTEMPTS, make_review_state as state
+    from hive.review_queue import MAX_REVIEW_ATTEMPTS
+    from hive.review_queue import make_review_state as state
     from hive.workers import doctor
 
     rows, calls, _, monkeypatch = bus

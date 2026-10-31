@@ -15,6 +15,7 @@ of the status script.
 import time
 
 import pytest
+
 from hive.review_queue import make_review_state
 
 
@@ -80,11 +81,11 @@ def _app(tmp_path):
     from hive.bus import deps as _deps
 
     _deps._HIVE_REPO = None
-    import agent_bus
-
     # The schema is created by the repo's init(), exactly as the deployed bus
     # does on start: without it the first request hits "no such table: agents".
     import asyncio
+
+    import agent_bus
 
     asyncio.run(_deps.hive_repo().init())
     return agent_bus
