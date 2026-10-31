@@ -307,7 +307,11 @@ def test_awaiting_review_never_self_reviews(bus):
     rows, calls, _, monkeypatch = bus
     rows["source"]["result"] = {"head_sha": "a" * 40, "commits": ["a" * 40], "review_state": state("qwen38", [], attempt=0, now=0)}
     # Only the author's family is healthy: nothing cross-family exists.
-    monkeypatch.setattr(doctor, "REVIEW_QUEUE_ROUTE_HEALTH", {"qwen38": True})
+    monkeypatch.setattr(
+        doctor,
+        "REVIEW_QUEUE_ROUTE_HEALTH",
+        {route["id"]: route["family"] == "alibaba" for route in load_roster()},
+    )
     summary = doctor.run_review_queue_sweep(rows=list(rows.values()))
     assert summary["submitted"] == 0
     assert summary["parked"] == 1
@@ -368,7 +372,8 @@ def test_sweep_consumes_review_child_verdicts(bus):
     merged = patched[-1]["result"]["review_state"]["approved"]
     assert merged["reviewers"] == ["gemma4-31b"]
     # Handed to the merge path, on the same row.
-    assert doctor.merge_handoff({"status": "needs-review", "result": rows["source"]["result"]}) == "ready_to_merge"
+    handoff = {**rows["source"], "result": patched[-1]["result"]}
+    assert doctor.merge_handoff(handoff) == "ready_to_merge"
 
 
 def test_request_changes_goes_back_to_the_author(bus):

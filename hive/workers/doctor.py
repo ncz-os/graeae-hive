@@ -62,9 +62,10 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import deque
+from typing import Any
 
 # Fleet addresses come from operator config (HIVE_FLEET_INVENTORY), never source.
-from hive import review_queue, review_verdict
+from hive import review_queue, review_record, review_verdict
 from hive.core import fleet_inventory
 from hive.workers import remediation, retention
 
@@ -4999,9 +5000,11 @@ def interpret_review_outcome(raw: Any, *, head_sha: str | None = None) -> dict:
             kind = "approve"
         else:
             raise ValueError("review_head_mismatch")
-    elif "request-changes" in reviewing:
+    # ``normalize_verdict`` returns ``request_changes`` (``-`` read as ``_``),
+    # so the comparison is against the normalized spelling, not the prose one.
+    elif "request_changes" in reviewing:
         kind = "request_changes"
-    elif review_verdict.normalize_verdict(payload.get("verdict")) == "request-changes":
+    elif review_verdict.normalize_verdict(payload.get("verdict")) == "request_changes":
         kind = "request_changes"
     elif reviewing and all(v == "blocked" for v in reviewing):
         kind = "reviewer_failure"
