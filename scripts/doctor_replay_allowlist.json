@@ -1,0 +1,86 @@
+[
+  {
+    "id": "reviewer-outage-retry",
+    "reason": "F1: loop-native row carries no top-level failure_reason, so v2 sees empty evidence (R5) and escalates work v1 requeues. Operator to decide: teach v2 loop_result.teardown or keep escalating reviewer outages.",
+    "v1_action": "requeue",
+    "v2_action": "escalate",
+    "v2_rule": "R5"
+  },
+  {
+    "id": "reviewer-down-hold",
+    "reason": "F7: v1 holds (reviewer down, retry later); v2 has no wait state and R5-escalates on empty evidence. Operator to decide whether v2 needs a hold equivalent.",
+    "v1_action": "hold",
+    "v2_action": "escalate",
+    "v2_rule": "R5"
+  },
+  {
+    "id": "author-failed",
+    "reason": "F1: author-failure row has no failure_reason, so v2 falls through to R10 (bs_audit) and escalates what v1 requeues.",
+    "v1_action": "requeue",
+    "v2_action": "escalate",
+    "v2_rule": "R10"
+  },
+  {
+    "id": "loop-timeout",
+    "reason": "F1: timeout row has no failure_reason, so v2 falls through to R10 (bs_audit) and escalates what v1 requeues.",
+    "v1_action": "requeue",
+    "v2_action": "escalate",
+    "v2_rule": "R10"
+  },
+  {
+    "id": "loop-crash",
+    "reason": "F1: crash row has no failure_reason, so v2 falls through to R10 (bs_audit) and escalates what v1 requeues.",
+    "v1_action": "requeue",
+    "v2_action": "escalate",
+    "v2_rule": "R10"
+  },
+  {
+    "id": "approved-unmerged",
+    "reason": "F4: v1 skips (approved work waits for a merge, no action); v2 R10 escalates to a human. Operator to confirm a merge wait should page someone.",
+    "v1_action": "skip",
+    "v2_action": "escalate",
+    "v2_rule": "R10"
+  },
+  {
+    "id": "sigterm-143",
+    "reason": "F1: 143/kill row has no failure_reason, so v2 falls through to R10 (bs_audit) and escalates what v1 requeues.",
+    "v1_action": "requeue",
+    "v2_action": "escalate",
+    "v2_rule": "R10"
+  },
+  {
+    "id": "clone-failed",
+    "reason": "F3: policy divergence, not an evidence gap. V1 retries clone failures as transient; v2 R1 escalates immediately as a bad brief. Operator to pick one policy.",
+    "v1_action": "requeue",
+    "v2_action": "escalate",
+    "v2_rule": "R1"
+  },
+  {
+    "id": "unknown-shape",
+    "reason": "F5: v1 keeps today's behaviour (default) on an unclassifiable row; v2 R10 escalates. Operator to confirm unknown rows should page someone.",
+    "v1_action": "default",
+    "v2_action": "escalate",
+    "v2_rule": "R10"
+  },
+  {
+    "id": "provider-503",
+    "reason": "F1: transient 503 row has no failure_reason, so v2 falls through to R10 (bs_audit) and escalates what v1 requeues. Compare transport-502-with-reason, where a populated failure_reason lets R2 agree with v1.",
+    "v1_action": "requeue",
+    "v2_action": "escalate",
+    "v2_rule": "R10"
+  },
+  {
+    "id": "loop-unresolved-test-failures",
+    "reason": "F6: v1 keeps today's behaviour (default) on loop_unresolved with failing tests; v2 R7 escalates with test names. Operator to confirm the R7 routing owns this shape.",
+    "v1_action": "default",
+    "v2_action": "escalate",
+    "v2_rule": "R7"
+  },
+  {
+    "id": "reviewer-outage-with-reason",
+    "reason": "F2: even with failure_reason populated, no v2 rule covers reviewer outages, so v2 defers to the residual LLM while v1 requeues. Operator to decide: add a reviewer-outage rule or bless the LLM fallback.",
+    "v1_action": "requeue",
+    "v2_action": "llm",
+    "v2_rule": "-"
+  }
+]

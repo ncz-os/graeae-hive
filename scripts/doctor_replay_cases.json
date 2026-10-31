@@ -1,0 +1,455 @@
+{
+ "cases": [
+  {
+   "events": [],
+   "id": "reviewer-outage-retry",
+   "job": {
+    "id": "job-reviewer-outage-retry",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "commits": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     ],
+     "loop_result": {
+      "iterations": [
+       {
+        "check_passed": true,
+        "diff_lines": 12,
+        "files_changed": [
+         "hive/x.py"
+        ]
+       }
+      ],
+      "teardown": {
+       "reason": "reviewer_unavailable"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "reviewer-outage-budget-spent",
+   "job": {
+    "id": "job-reviewer-outage-spent",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "commits": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     ],
+     "loop_result": {
+      "iterations": [
+       {
+        "check_passed": true,
+        "diff_lines": 12,
+        "files_changed": [
+         "hive/x.py"
+        ]
+       }
+      ],
+      "teardown": {
+       "reason": "reviewer_unavailable"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   },
+   "requeues_so_far": 2
+  },
+  {
+   "events": [],
+   "id": "reviewer-down-hold",
+   "job": {
+    "id": "job-reviewer-down-hold",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "commits": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     ],
+     "loop_result": {
+      "iterations": [
+       {
+        "check_passed": true,
+        "diff_lines": 12,
+        "files_changed": [
+         "hive/x.py"
+        ]
+       }
+      ],
+      "teardown": {
+       "reason": "reviewer_unavailable"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   },
+   "reviewer_healthy": false
+  },
+  {
+   "events": [],
+   "id": "author-failed",
+   "job": {
+    "id": "job-author-failed",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "author container exited 1",
+     "loop_result": {
+      "teardown": {
+       "reason": "author_failed"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "loop-timeout",
+   "job": {
+    "id": "job-loop-timeout",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "loop timed out after 3600s",
+     "loop_result": {
+      "teardown": {
+       "reason": "timeout"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "loop-crash",
+   "job": {
+    "id": "job-loop-crash",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "Traceback (most recent call last): ... RuntimeError: worker died",
+     "loop_result": {
+      "teardown": {
+       "reason": "crash"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "request-changes-exhausted",
+   "job": {
+    "id": "job-request-changes-exhausted",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "loop_result": {
+      "teardown": {
+       "detail": "reviewer requested changes 3 times with no approval",
+       "reason": "exhausted"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "nothing-to-commit",
+   "job": {
+    "id": "job-nothing-to-commit",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "loop_result": {
+      "teardown": {
+       "reason": "nothing_to_commit"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "approved-unmerged",
+   "job": {
+    "id": "job-approved-unmerged",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "loop_result": {
+      "teardown": {
+       "reason": "approved"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "sigterm-143",
+   "job": {
+    "id": "job-sigterm-143",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "process exited with code 143",
+     "exit_code": 143
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "sigkill-local-commits",
+   "job": {
+    "id": "job-sigkill-local-commits",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "process killed (SIGKILL)",
+     "exit_code": 137,
+     "finalizer": {
+      "committed": true,
+      "pushed": false,
+      "status": "committed_local_stopped"
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "clone-failed",
+   "job": {
+    "id": "job-clone-failed",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "git fetch origin: Remote branch origin/feature-x not found",
+     "failure_reason": "clone_failed: remote branch unavailable"
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "empty-diff-marker",
+   "job": {
+    "id": "job-empty-diff-marker",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "loop_result": {
+      "teardown": {
+       "note": "no review chunks were generated",
+       "reason": "reviewer_unavailable"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "empty-iterations",
+   "job": {
+    "id": "job-empty-iterations",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "loop_result": {
+      "iterations": [
+       {
+        "check_passed": false,
+        "diff_lines": 0,
+        "files_changed": []
+       },
+       {
+        "check_passed": false,
+        "diff_lines": 0,
+        "files_changed": []
+       }
+      ],
+      "teardown": {
+       "reason": "reviewer_unavailable"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "unknown-shape",
+   "job": {
+    "id": "job-unknown-shape",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {},
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [
+    {
+     "error": "reviewer timed out twice",
+     "phase": "review_response",
+     "summary": "no verdict returned"
+    }
+   ],
+   "id": "review-stuck-needs-review",
+   "job": {
+    "claimed_by": "urn:agent:zeroclaw:worker:1",
+    "id": "job-review-stuck",
+    "kind": "fix:replay",
+    "last_update_at": 1799990000.0,
+    "max_retries": 2,
+    "result": {
+     "hive_reviews": [
+      {
+       "model": "reviewer-a",
+       "verdict": "request_changes"
+      },
+      {
+       "model": "reviewer-a",
+       "verdict": "request_changes"
+      }
+     ],
+     "tail": "waiting on reviewer-a: third round of request_changes with no new findings"
+    },
+    "retry_count": 1,
+    "status": "needs-review"
+   }
+  },
+  {
+   "events": [],
+   "id": "provider-503",
+   "job": {
+    "id": "job-provider-503",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "request failed: 503 Service Unavailable from model endpoint",
+     "loop_result": {
+      "teardown": {
+       "reason": "crash"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "host-oom",
+   "job": {
+    "id": "job-host-oom",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "container OOM-killed during test run",
+     "loop_result": {
+      "teardown": {
+       "reason": "crash"
+      }
+     }
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "events": [],
+   "id": "loop-unresolved-test-failures",
+   "job": {
+    "id": "job-loop-unresolved-tests",
+    "kind": "fix:replay",
+    "max_retries": 2,
+    "result": {
+     "error": "pytest failed: test_matrix.py::test_rows failed",
+     "failure_reason": "loop_unresolved: author loop gave up"
+    },
+    "retry_count": 0,
+    "status": "failed"
+   }
+  },
+  {
+   "id": "transport-502-with-reason",
+   "job": {
+    "id": "job-transport-502",
+    "kind": "fix:replay",
+    "status": "failed",
+    "retry_count": 0,
+    "max_retries": 2,
+    "result": {
+     "failure_reason": "502 Bad Gateway from model endpoint",
+     "error": "request failed: 502",
+     "loop_result": {
+      "teardown": {
+       "reason": "crash"
+      }
+     }
+    }
+   },
+   "events": []
+  },
+  {
+   "id": "reviewer-outage-with-reason",
+   "job": {
+    "id": "job-reviewer-reason",
+    "kind": "fix:replay",
+    "status": "failed",
+    "retry_count": 0,
+    "max_retries": 2,
+    "result": {
+     "failure_reason": "reviewer_unavailable: no verdict in 600s",
+     "commits": [
+      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+     ],
+     "loop_result": {
+      "iterations": [
+       {
+        "check_passed": true,
+        "files_changed": [
+         "hive/x.py"
+        ],
+        "diff_lines": 12
+       }
+      ],
+      "teardown": {
+       "reason": "reviewer_unavailable"
+      }
+     }
+    }
+   },
+   "events": []
+  }
+ ]
+}
