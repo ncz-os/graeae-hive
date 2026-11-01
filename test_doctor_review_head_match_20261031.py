@@ -49,7 +49,8 @@ import subprocess
 
 import pytest
 
-from hive.workers import doctor, doctor_head_match as dhm
+from hive.workers import doctor
+from hive.workers import doctor_head_match as dhm
 
 ENV = {
     **os.environ,
@@ -176,9 +177,7 @@ def _review_spec(**over):
 
 
 def test_review_brief_sends_the_verdict_to_its_own_ref(worker):
-    brief = worker.review_brief_text(
-        head_branch="hv/bl-ct-dialect", job_id="review-job-01a19270", head_sha="db4d910"
-    )
+    brief = worker.review_brief_text(head_branch="hv/bl-ct-dialect", job_id="review-job-01a19270", head_sha="db4d910")
     assert "review/hv/bl-ct-dialect-review-job-01a19270" in brief
     assert "REVIEW_VERDICT_hv/bl-ct-dialect.json" in brief or "review-verdict-review-job-01a19270.json" in brief
     # It must forbid a commit on the author's branch.
@@ -450,7 +449,15 @@ class Classifier:
 def test_doctor_records_approved_mergeable_for_a_verdict_only_descendant(bus, monkeypatch):
     tip, reviewed = "a" * 40, "b" * 40
     classifier = Classifier(
-        {reviewed: dhm.HeadMatch(dhm.VERDICT_ONLY, reviewed, tip, files=list(VERDICT_FILES), reason=f"approved at {reviewed} (verdict-only descendant of {tip})")}
+        {
+            reviewed: dhm.HeadMatch(
+                dhm.VERDICT_ONLY,
+                reviewed,
+                tip,
+                files=list(VERDICT_FILES),
+                reason=f"approved at {reviewed} (verdict-only descendant of {tip})",
+            )
+        }
     )
     monkeypatch.setattr(doctor, "classify_review_head", classifier)
     row = _reviewing_row(head=tip)
@@ -475,7 +482,11 @@ def test_doctor_verdict_descendant_switch_off_keeps_head_exact(bus, monkeypatch)
     tip, reviewed = "a" * 40, "b" * 40
     classifier = Classifier({})
     monkeypatch.setattr(doctor, "classify_review_head", classifier)
+    # Drive the switch the way production reads it: the env var, not a module
+    # attribute (patch the module global too for the double-checked call site).
+    monkeypatch.setenv("HIVE_DOCTOR_VERDICT_DESCENDANT", "0")
     monkeypatch.setattr(doctor, "HIVE_DOCTOR_VERDICT_DESCENDANT", False)
+    assert dhm.env_switch("HIVE_DOCTOR_VERDICT_DESCENDANT", default=True) is False
     row = _reviewing_row(head=tip)
     bus.children["review-1"] = {"id": "review-1", "kind": "review:fix", "status": "done", "parent_job_id": row["id"]}
     bus.finish("review-1", _approve(reviewed, files=list(VERDICT_FILES), commits=[reviewed]))
@@ -487,7 +498,11 @@ def test_doctor_verdict_descendant_switch_off_keeps_head_exact(bus, monkeypatch)
 def test_doctor_does_not_count_an_overreach_approval(bus, monkeypatch):
     tip, reviewed = "a" * 40, "c" * 40
     classifier = Classifier(
-        {reviewed: dhm.HeadMatch(dhm.OVERREACH, reviewed, tip, files=["migrations/0007.sql"], reason="review_overreach: ...")}
+        {
+            reviewed: dhm.HeadMatch(
+                dhm.OVERREACH, reviewed, tip, files=["migrations/0007.sql"], reason="review_overreach: ..."
+            )
+        }
     )
     monkeypatch.setattr(doctor, "classify_review_head", classifier)
     row = _reviewing_row(head=tip)
@@ -566,7 +581,9 @@ def test_doctor_escalates_mergeable_when_the_rescue_fast_forwards(bus, monkeypat
 
 def test_doctor_sweep_is_idempotent_and_capped(bus, monkeypatch):
     tip, reviewed = "a" * 40, "b" * 40
-    classifier = Classifier({reviewed: dhm.HeadMatch(dhm.VERDICT_ONLY, reviewed, tip, files=list(VERDICT_FILES), reason="ok")})
+    classifier = Classifier(
+        {reviewed: dhm.HeadMatch(dhm.VERDICT_ONLY, reviewed, tip, files=list(VERDICT_FILES), reason="ok")}
+    )
     monkeypatch.setattr(doctor, "classify_review_head", classifier)
     rows = []
     for index in range(3):
@@ -591,7 +608,9 @@ def test_doctor_sweep_is_idempotent_and_capped(bus, monkeypatch):
 
 def test_doctor_dry_run_reports_the_sha_and_writes_nothing(bus, monkeypatch):
     tip, reviewed = "a" * 40, "b" * 40
-    classifier = Classifier({reviewed: dhm.HeadMatch(dhm.VERDICT_ONLY, reviewed, tip, files=list(VERDICT_FILES), reason="ok")})
+    classifier = Classifier(
+        {reviewed: dhm.HeadMatch(dhm.VERDICT_ONLY, reviewed, tip, files=list(VERDICT_FILES), reason="ok")}
+    )
     monkeypatch.setattr(doctor, "classify_review_head", classifier)
     monkeypatch.setattr(doctor, "HIVE_DOCTOR_HEAD_MATCH_DRY_RUN", True)
     row = _reviewing_row(head=tip)
