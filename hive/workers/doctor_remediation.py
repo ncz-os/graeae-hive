@@ -1274,6 +1274,7 @@ def _review_job_outcome(
     escalate: Callable[[dict, str], None],
     job_lookup: Callable[[str], dict | None] | None,
     now: float,
+    dry_run: bool = False,
 ) -> Outcome:
     """A review job in triage: no field change, no status move, no hand-over.
 
@@ -1290,6 +1291,10 @@ def _review_job_outcome(
         f"review job {jid} ({job.get('kind')}) is in needs-review but its work row "
         f"{parent.get('id')} is already {parent.get('status')}; a review job is never itself reviewed"
     )
+    if dry_run:
+        # A dry-run sweep must not broadcast, nor spend the once-per-TTL marker
+        # the live sweep needs.
+        return Outcome(job_id=jid, status=NO_CHANGE, cause=cause.name, detail=cause.detail, reason="review_job_dry_run")
     escalate(job, why)
     state.set_value(escalation_key(jid), {"at": now}, ttl=ESCALATE_TTL_SEC)
     return Outcome(job_id=jid, status=ESCALATED, cause=cause.name, detail=cause.detail, reason="review_job_settled")
@@ -1350,7 +1355,9 @@ def remediate_one(
     if cause is None:
         return Outcome(job_id=jid, status=NO_CHANGE, reason="healthy_row")
     if cause.name == REVIEW_JOB:
-        return _review_job_outcome(job, cause, state=state, escalate=escalate, job_lookup=job_lookup, now=now)
+        return _review_job_outcome(
+            job, cause, state=state, escalate=escalate, job_lookup=job_lookup, now=now, dry_run=dry_run
+        )
     spent = attempts(state, jid)
     if spent >= MAX_AUTO_REMEDIATIONS:
         if not _marked_within(state, escalation_key(jid), ESCALATE_TTL_SEC, now):

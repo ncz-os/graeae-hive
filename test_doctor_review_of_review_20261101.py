@@ -203,6 +203,19 @@ def test_a_review_job_whose_work_row_is_settled_gets_one_escalation_note(state):
     assert not fake.touched()
 
 
+def test_a_dry_run_sends_no_escalation_note_and_records_no_marker(state):
+    """Muse r56grr: the review_job escalation ignored dry_run -- a dry-run sweep
+    broadcast a real note and wrote the once-per-TTL marker, so the live sweep
+    that followed stayed silent."""
+    work = row("work_root", status="done")
+    fake = Fake(jobs={work["id"]: work})
+    job = row("review_child")
+    dry = dr.remediate_one(job, state=state, now=NOW, job_lookup=fake.lookup, dry_run=True, **fake.kwargs())
+    assert dry.status == dr.NO_CHANGE and fake.escalated == [] and not fake.touched()
+    live = dr.remediate_one(job, state=state, now=NOW + 60, job_lookup=fake.lookup, **fake.kwargs())
+    assert live.status == dr.ESCALATED and len(fake.escalated) == 1
+
+
 def test_an_unreadable_parent_lookup_is_no_note_and_no_action(state):
     def broken(_jid):
         raise RuntimeError("bus down")
