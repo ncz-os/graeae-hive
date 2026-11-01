@@ -41,6 +41,7 @@ Scope notes (deliberate, per the job's read-only restriction):
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import os
@@ -564,3 +565,27 @@ def test_blob_reads_the_blob_id_from_ls_tree(fixture_repo):
     assert _git(repo, "cat-file", "-t", blob).strip() == "blob"
     # A path that is not on that tip yields None instead of an IndexError.
     assert _blob(repo, fixture_repo["x"], "no-such-path.txt") is None
+
+
+def test_verdict_artifact_helpers_are_local_definitions():
+    """``review_verdict_ref`` / ``review_verdict_paths`` are module-level defs.
+
+    A non-author review (2026-11-01) reported a NameError because the
+    ``review_verdict`` import was "removed": the helpers are not imported at
+    all, they are defined in ``deploy/hive_worker.py`` itself and nothing in the
+    file reaches for a ``review_verdict`` module attribute. Pin the definitions
+    and the absence of module-qualified use, so the next chunked reviewer
+    cannot re-raise it.
+    """
+    ast_mod = ast.parse((REPO / "deploy" / "hive_worker.py").read_text())
+
+    defined = {node.name for node in ast_mod.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    assert {"review_verdict_ref", "review_verdict_paths"} <= defined
+
+    # No ``review_verdict.<attr>`` use anywhere in the file.
+    qualified = [
+        node
+        for node in ast.walk(ast_mod)
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "review_verdict"
+    ]
+    assert qualified == []
