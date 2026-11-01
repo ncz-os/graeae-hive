@@ -21,3 +21,8 @@ agents.db*
 # runtime artifacts (capacity shadow ledger) - not source
 admission_shadow.jsonl
 *.jsonl
+
+# local zoder review dumps (scratch output; never source, and a stale dump
+# must never be mistaken for the tree under review)
+.review*.json
+.review*.err

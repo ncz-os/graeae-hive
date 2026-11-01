@@ -135,6 +135,30 @@ class HiveMindRepository(ABC):
     ) -> int: ...
 
     @abstractmethod
+    async def patch_job_result_cas(
+        self,
+        tx: Transaction,
+        job_id: str,
+        *,
+        sets: Mapping[str, Any],
+        expected_status: str,
+        expected_result: str | None,
+    ) -> int:
+        """UPDATE one job row only if BOTH its status and its result payload are unchanged.
+
+        ``expected_result`` is the raw ``result`` value the caller read; ``None``
+        matches a NULL result (null-safe equality, never ``= NULL``). Returns
+        the rowcount: 0 means the status or the payload changed under the caller
+        (a conflict), so a concurrent writer's result is never overwritten.
+
+        The null-safe compare is dialect-specific (sqlite ``IS ?``, postgres
+        ``IS NOT DISTINCT FROM``, mysql ``<=>``; Oracle/Db2 store ``result`` as
+        a CLOB that SQL cannot compare at all), so it lives here, not in the
+        router.
+        """
+        ...
+
+    @abstractmethod
     async def archive_and_requeue_job(
         self,
         tx: Transaction,
@@ -156,9 +180,7 @@ class HiveMindRepository(ABC):
         ...
 
     @abstractmethod
-    async def list_job_result_history(
-        self, tx: Transaction, *, job_id: str, limit: int = 50
-    ) -> list[dict[str, Any]]:
+    async def list_job_result_history(self, tx: Transaction, *, job_id: str, limit: int = 50) -> list[dict[str, Any]]:
         """The archived result payloads for one job, newest first (read-only)."""
         ...
 

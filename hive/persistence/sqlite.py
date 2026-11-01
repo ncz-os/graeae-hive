@@ -335,6 +335,12 @@ class SqliteHiveRepository(HiveMindRepository):
     #: connection; Oracle/Db2 override this to add FOR UPDATE. Kept as a class
     #: attr so the dialect lives in the backend, never in the router.
     _retry_lock_clause = ""
+    #: Null-safe equality on ``jobs.result`` with one bound arg, for
+    #: ``patch_job_result_cas``. sqlite's ``IS ?`` is sqlite-only (Oracle
+    #: ORA-00908, 2026-11-01); each backend overrides it, and ``None`` means
+    #: ``result`` cannot be compared in SQL (a CLOB): the row is then read
+    #: under ``_retry_lock_clause`` and compared in Python.
+    _result_cas_sql: str | None = "result IS ?"
 
     def __init__(self, db_path: str, *, busy_timeout_ms: int = 5000) -> None:
         self.db_path = db_path
@@ -543,8 +549,7 @@ class SqliteHiveRepository(HiveMindRepository):
                 "id TEXT PRIMARY KEY, job_id TEXT NOT NULL, attempt INTEGER NOT NULL, "
                 "prior_status TEXT, archived_at REAL NOT NULL, actor_urn TEXT, reason TEXT, "
                 "action TEXT, payload TEXT NOT NULL)",
-                "CREATE INDEX IF NOT EXISTS idx_job_result_history_job "
-                "ON job_result_history(job_id, archived_at)",
+                "CREATE INDEX IF NOT EXISTS idx_job_result_history_job ON job_result_history(job_id, archived_at)",
             )
             for stmt in live_indexes:
                 await db.execute(stmt)
@@ -1030,6 +1035,49 @@ class SqliteHiveRepository(HiveMindRepository):
         cur = await tx.execute(f"UPDATE jobs SET {', '.join(assign_parts)} WHERE {where}", args)
         return cur.rowcount
 
+    async def patch_job_result_cas(
+        self,
+        tx: Transaction,
+        job_id: str,
+        *,
+        sets: Mapping[str, Any],
+        expected_status: str,
+        expected_result: str | None,
+    ) -> int:
+        """Compare-and-set on ``status`` AND ``result`` (see the ABC).
+
+        With ``_result_cas_sql`` the payload guard is one null-safe predicate
+        in the UPDATE. Without it (Oracle/Db2: ``result`` is a CLOB) the row is
+        read under ``_retry_lock_clause`` and compared here; the lock holds
+        until the caller's commit, so no writer can slip between the compare
+        and the write, and the UPDATE still carries the status guard.
+        """
+        if not sets:
+            return 0
+        if self._result_cas_sql is None:
+            async with tx.execute(
+                "SELECT result FROM jobs WHERE id=? AND status=?" + self._retry_lock_clause,
+                (job_id, expected_status),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None or row[0] != expected_result:
+                return 0
+            return await self.patch_job_status(tx, job_id, sets=sets, expected_status=expected_status)
+        assign_parts = []
+        args: list[Any] = []
+        for col, val in sets.items():
+            if isinstance(val, SqlExpr):
+                assign_parts.append(f"{col}={val.sql}")
+            else:
+                assign_parts.append(f"{col}=?")
+                args.append(val)
+        args.extend([job_id, expected_status, expected_result])
+        cur = await tx.execute(
+            f"UPDATE jobs SET {', '.join(assign_parts)} WHERE id=? AND status=? AND {self._result_cas_sql}",
+            args,
+        )
+        return cur.rowcount
+
     def _reason_prefix_sql(self, pattern: str) -> str:
         """The reason_prefix predicate, one WHERE fragment, one bound arg.
 
@@ -1471,9 +1519,7 @@ class SqliteHiveRepository(HiveMindRepository):
         # Comma-separated placeholders, one per id: "?,?,?" for three ids.
         placeholders = ",".join("?" for _ in ids)
         try:
-            async with db.execute(
-                f"SELECT id FROM jobs WHERE id IN ({placeholders})", tuple(ids)
-            ) as cur:
+            async with db.execute(f"SELECT id FROM jobs WHERE id IN ({placeholders})", tuple(ids)) as cur:
                 existing = {r[0] async for r in cur}
         except Exception as exc:  # noqa: BLE001 - fall back to fail-closed (no drop)
             log.warning("dependency drop for %s skipped: existence scan failed: %s", job_id, exc)
@@ -1765,9 +1811,7 @@ class SqliteHiveRepository(HiveMindRepository):
                     prior_result if isinstance(prior_result, str) else json.dumps(prior_result, default=str),
                 ),
             )
-        changed = await self.patch_job_status(
-            tx, job_id, sets=dict(REQUEUE_RESET_SETS), expected_status=prior_status
-        )
+        changed = await self.patch_job_status(tx, job_id, sets=dict(REQUEUE_RESET_SETS), expected_status=prior_status)
         if changed != 1 and archive_id is not None:
             # Lost the compare-and-set: the row is someone else's now, so this
             # call must not leave a history entry behind.

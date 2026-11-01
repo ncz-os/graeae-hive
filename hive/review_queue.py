@@ -1291,6 +1291,72 @@ def usable_review_state(job: dict) -> dict | None:
     return state
 
 
+# ---------------------------------------------------------------------------
+# Review chains: a review job is never itself reviewed (PYTHIA 2026-11-01).
+# ---------------------------------------------------------------------------
+
+#: The kind prefix every review job carries (doctor follow-up, review queue,
+#: Codex lane alike).
+REVIEW_KIND_PREFIX = "review:"
+#: The deepest a review child may sit below its work row, whatever the kinds
+#: along the way say: work row -> child (hop 1) -> its review (hop 2).
+MAX_REVIEW_CHAIN_HOPS = 2
+
+#: Why :func:`review_chain_refusal` refused a review child.
+REFUSE_REVIEW_OF_REVIEW = "review_of_review"
+REFUSE_CHAIN_TOO_DEEP = "review_chain_too_deep"
+REFUSE_CHAIN_UNREADABLE = "review_chain_unreadable"
+
+
+def is_review_kind(job: Any) -> bool:
+    """Whether ``job`` is itself a review job (its kind starts ``review:``).
+
+    Live incident 2026-11-01: a review job that ended needs-review was treated
+    as finished work waiting for review, and every review of it ended the same
+    way -- a ten-deep review-of-review chain, one new row per sweep."""
+    if not isinstance(job, dict):
+        return False
+    return str(job.get("kind") or "").strip().startswith(REVIEW_KIND_PREFIX)
+
+
+def review_chain_refusal(job: dict, get_job) -> str:
+    """Why a review child must NOT be created for ``job``, or ``""``.
+
+    * ``job`` is itself a review job: :data:`REFUSE_REVIEW_OF_REVIEW`;
+    * the new child would sit more than :data:`MAX_REVIEW_CHAIN_HOPS` hops below
+      the root of ``job``'s ``parent_job_id`` chain, whatever the kinds say:
+      :data:`REFUSE_CHAIN_TOO_DEEP` (a cycle counts as too deep);
+    * the chain cannot be read: :data:`REFUSE_CHAIN_UNREADABLE` (fail closed --
+      the row only waits for the next sweep).
+
+    ``get_job(job_id)`` returns the row, ``None`` when the bus no longer has it
+    (a purged ancestor ends the walk: that row is the root), and raises when
+    the bus cannot answer."""
+    if is_review_kind(job):
+        return REFUSE_REVIEW_OF_REVIEW
+    seen = {str(job.get("id") or "")}
+    depth = 0
+    parent = str(job.get("parent_job_id") or "").strip()
+    while parent:
+        if parent in seen:
+            return REFUSE_CHAIN_TOO_DEEP
+        seen.add(parent)
+        depth += 1
+        # The child would be ``depth + 1`` hops below the root.
+        if depth + 1 > MAX_REVIEW_CHAIN_HOPS:
+            return REFUSE_CHAIN_TOO_DEEP
+        try:
+            row = get_job(parent)
+        except Exception:  # noqa: BLE001 -- an unreadable chain is not a shallow one
+            return REFUSE_CHAIN_UNREADABLE
+        if row is None:
+            break
+        if not isinstance(row, dict):
+            return REFUSE_CHAIN_UNREADABLE
+        parent = str(row.get("parent_job_id") or "").strip()
+    return ""
+
+
 def needs_adoption(job: dict) -> tuple[bool, str]:
     """Whether a needs-review row should be adopted, and the shape it records.
 
@@ -1302,8 +1368,13 @@ def needs_adoption(job: dict) -> tuple[bool, str]:
     high) -- or the recorded failure kind (``reviewer_unavailable``,
     ``review_prose_only``, a 503 ...), ``review_superseded_head`` (evidence for
     an older head), ``review_did_not_approve`` or ``no_reviewer``.
+
+    A review job (kind ``review:``) is never adopted: it IS a review, and
+    adopting it queues a review of the review (PYTHIA 2026-11-01).
     """
     if not isinstance(job, dict) or not str(job.get("head_branch") or "").strip():
+        return False, ""
+    if is_review_kind(job):
         return False, ""
     result = _result_dict(job.get("result"))
     state = review_state(job)

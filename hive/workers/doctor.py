@@ -78,6 +78,7 @@ from hive.workers import (
     doctor_gates,
     doctor_head_match,
     doctor_models,
+    doctor_remediation,
     doctor_rules,
     doctor_v2,
     loop_outcome,
@@ -108,6 +109,14 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
+
+# The module logger must exist BEFORE the first ``_env_int`` call below. Those
+# calls run at import time and their warning branches read ``log``; a later
+# binding meant a malformed env var raised ``NameError: name 'log' is not
+# defined`` at import -- the exact crash loop ``_env_int`` exists to prevent
+# (review 2026-10-31, high). This is the ONLY binding: ``getLogger`` is
+# idempotent, so a second assignment further down was dead duplication.
+log = logging.getLogger("doctor")
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -532,8 +541,6 @@ def all_fleet_hosts() -> dict[str, dict]:
         for name, entry in fleet_inventory.load_inventory().items()
     }
 
-
-log = logging.getLogger("doctor")
 
 _running = True
 _urn: str = ""
@@ -3556,6 +3563,38 @@ def _needs_review_child_review_jobs(job: dict) -> list[dict]:
     return [j for j in resp["jobs"] if str(j.get("kind") or "").startswith(REVIEW_FOLLOWUP_KIND_PREFIX)]
 
 
+def _chain_job(jid: str) -> dict | None:
+    """One row for the review-chain walk: the row, None when the bus no longer
+    has it (404), and an exception when the bus cannot answer."""
+    from urllib.parse import quote
+
+    code, row = _http("GET", f"/v1/jobs/{quote(str(jid), safe='')}", timeout=10.0)
+    if code == 404:
+        return None
+    if code != 200 or not isinstance(row, dict):
+        raise RuntimeError(f"review chain lookup failed job={jid} http={code}")
+    return row
+
+
+def _review_child_refusal(job: dict) -> str:
+    """Why no review child may be created for ``job`` (``""`` when one may).
+
+    A review job is never itself reviewed and no review chain runs deeper than
+    ``review_queue.MAX_REVIEW_CHAIN_HOPS`` hops from its work row (PYTHIA
+    2026-11-01: a ten-deep review-of-review chain, one new row per sweep).
+    Every refusal is logged."""
+    reason = review_queue.review_chain_refusal(job, _chain_job)
+    if reason:
+        log.warning(
+            "refused review child for %s (kind %s, parent %s): %s",
+            str(job.get("id") or "")[:12],
+            job.get("kind"),
+            str(job.get("parent_job_id") or "")[:12] or "-",
+            reason,
+        )
+    return reason
+
+
 def _submit_review_followup(job: dict, *, rereview_reason: str = "") -> tuple[str, dict | None, str]:
     """Submit ONE review job for a needs-review row. Returns (job_id, spec, note).
 
@@ -3566,7 +3605,13 @@ def _submit_review_followup(job: dict, *, rereview_reason: str = "") -> tuple[st
     ``rereview_reason`` marks a re-review of a row whose existing evidence does not
     cover the delivered head: the idempotency key then carries the head, so the
     bus can never hand back the earlier review for it and there is at most one
-    re-review per (row, head)."""
+    re-review per (row, head).
+
+    Refused (nothing submitted) for a review-kind row or a chain past the depth
+    guard: see :func:`_review_child_refusal`."""
+    refused = _review_child_refusal(job)
+    if refused:
+        return "", None, f"refused review child: {refused}"
     jid = str(job.get("id") or "")
     res = _job_result_dict(job)
     kind = str(job.get("kind") or "").strip()
@@ -5279,6 +5324,103 @@ def run_review_followup_sweep() -> dict:
     return summary
 
 
+# ── Remediation sweep (the doctor FIXES rows, it does not only report) ──────
+
+
+def fetch_remediable_rows(limit: int = 300) -> list[dict]:
+    """The failed / needs-review / dead-letter rows the remediation sweep reads.
+
+    A failed listing is a HARD error, not an empty list: an unreadable bus must
+    never read as "nothing left to fix"."""
+    rows: list[dict] = []
+    for status in doctor_remediation.SCAN_STATUSES:
+        code, resp = _http("GET", f"/v1/jobs?status={status}&limit={int(limit)}", timeout=20.0)
+        if code != 200 or not isinstance(resp, dict) or not isinstance(resp.get("jobs"), list):
+            broadcast_doctor_message(
+                "doctor.sweep_error", {"sweep": "remediation", "status": status, "http_status": code}
+            )
+            raise RuntimeError(f"remediation listing incomplete status={status} http={code}")
+        rows.extend(j for j in resp["jobs"] if isinstance(j, dict))
+    return rows
+
+
+def _remediate_apply_fields(jid: str, changes: dict, reason: str) -> tuple[int, Any]:
+    """Write the changed fields onto the row (the audit trail rides along).
+
+    The route takes a field repair only as part of a status move
+    (``ReclassifyRequest.status`` is required), and merges it only when the row
+    stays out of the queue. ``needs-review`` is the doctor's own holding state:
+    the real status move that follows (requeue or hand-over) is a separate call.
+    """
+    body = {
+        "job_ids": [jid],
+        "status": "needs-review",
+        "fields": {name: change.get("after") for name, change in changes.items()},
+    }
+    return _http("POST", "/v1/admin/jobs/reclassify", {**body, "reason": f"doctor-remediate:{reason}"}, timeout=20.0)
+
+
+def _remediate_reclassify(jid: str, status: str, reason: str, override: bool, override_reason: str) -> tuple[int, Any]:
+    """Move the row through the EXISTING admin reclassify path."""
+    body: dict[str, Any] = {"job_ids": [jid], "status": status, "reason": f"doctor-remediate:{reason}"}
+    if override:
+        body["override_max_retries"] = True
+        body["override_reason"] = override_reason
+    return _http("POST", "/v1/admin/jobs/reclassify", body, timeout=20.0)
+
+
+def _remediate_escalate(job: dict, why: str) -> None:
+    """Escalate a row past the attempt cap (never a verdict, never a merge)."""
+    jid = str(job.get("id") or "")
+    broadcast_doctor_message("doctor.needs_review_stuck", {"host": AGENT_HOST, "job_ids": [jid], "reason": why})
+    log.warning("remediation escalated %s: %s", jid[:12], why)
+
+
+def run_remediation_sweep(*, dry_run: bool | None = None, now: float | None = None) -> dict:
+    """Classify and FIX the triage backlog: one thin call site for the module.
+
+    All the decision logic lives in :mod:`hive.workers.doctor_remediation` (so
+    the sibling review-adoption branch merges cleanly); this function only wires
+    the doctor's bus access and safety state to it. Disabled by
+    ``HIVE_DOCTOR_REMEDIATE=0``."""
+    if not doctor_remediation.REMEDIATE_ENABLED:
+        return {"enabled": False, "applied": 0, "reason": "HIVE_DOCTOR_REMEDIATE=0"}
+    # The durable store is checked BEFORE the bus is read: every guard in the
+    # module is durable, so without the store a sweep would re-fix the same row
+    # forever -- and a refused sweep must not have listed the board first.
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        raise RuntimeError("remediation refused: durable state unavailable")
+    rows = fetch_remediable_rows()
+    roster = review_queue.load_roster()
+    if not roster:
+        # The classifier would read an empty roster as "no route serves this
+        # model" and switch rows onto a route that does not exist. On a host
+        # where the roster file is missing that is every row, so an unreadable
+        # roster is a refused sweep, not an empty one (same rule as the store).
+        raise RuntimeError("remediation refused: reviewer roster unavailable")
+    summary = doctor_remediation.sweep(
+        rows,
+        state=STATE,
+        apply_fields=_remediate_apply_fields,
+        reclassify=_remediate_reclassify,
+        escalate=_remediate_escalate,
+        advance_review=lambda job: ensure_review_followup({**job, "status": "needs-review"}),
+        # The real reviewer roster and the doctor's own route-health view: a
+        # capped/down route is only visible through the probe, so leaving both
+        # unset would have the sweep classify rows against a roster nobody
+        # checked and switch them to a model that cannot serve them.
+        roster=roster,
+        health=_review_route_health(),
+        dry_run=doctor_remediation.DRY_RUN if dry_run is None else dry_run,
+        now=now,
+        # Only for the review_job escalation note: is the reviewed work row settled?
+        job_lookup=_chain_job,
+    )
+    summary["enabled"] = True
+    broadcast_doctor_message("doctor.remediation", {"host": AGENT_HOST, **summary})
+    return summary
+
+
 def review_followup_protected(job: dict) -> bool:
     """Owner protection and routing-only signals apply to all review mutations."""
     return dlq_protected(job) or decline_paths.review_is_never_act(job)
@@ -5318,6 +5460,9 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     # Triage rows are remediation reports, not branches for code review.
     if str(job.get("kind") or "").startswith("triage:"):
         return "skipped_triage"
+    # A review job is never itself reviewed (PYTHIA 2026-11-01).
+    if review_queue.is_review_kind(job):
+        return "skipped_review_job"
     if review_followup_protected(job):
         return "skipped_protected"
     if not STATE.loaded_ok or not STATE.persist_ok:
@@ -5383,6 +5528,8 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
             return "skipped_marker"
     if not allow_submit:
         return "deferred"
+    if _review_child_refusal(job):
+        return "skipped_review_chain"
     rereview_reason = gap or ""
     review_id, spec, note = _submit_review_followup(job, rereview_reason=rereview_reason)
     if not review_id:
@@ -5777,6 +5924,10 @@ def _review_state_row(job: dict) -> dict | None:
         return None
     if str(job.get("kind") or "").startswith("triage:"):
         return None
+    # A review job carrying a review_state (the remediation sweep wrote one on
+    # PYTHIA 2026-11-01) is still never advanced: that is the review-of-review.
+    if review_queue.is_review_kind(job):
+        return None
     if lane_b_row(job):
         return None
     return review_queue.usable_review_state(job)
@@ -5793,6 +5944,9 @@ def _adoption_for(job: dict) -> dict | None:
     if str(job.get("status") or "") != "needs-review":
         return None
     if str(job.get("kind") or "").startswith("triage:"):
+        return None
+    # A review job is never adopted: adopting it queues a review OF the review.
+    if review_queue.is_review_kind(job):
         return None
     if lane_b_row(job):
         return None
@@ -6073,7 +6227,13 @@ def _review_ref_slug(branch: str | None) -> str:
 
 
 def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: float) -> tuple[str, dict]:
-    """Submit ONE read-only review job naming the cross-family pick(s)."""
+    """Submit ONE read-only review job naming the cross-family pick(s).
+
+    Raises (nothing submitted) for a review-kind row or a chain past the depth
+    guard: see :func:`_review_child_refusal`."""
+    refused = _review_child_refusal(job)
+    if refused:
+        raise RuntimeError(f"refused review child: {refused}")
     jid = str(job.get("id") or "")
     res = _row_result_dict(job)
     kind = str(job.get("kind") or "").strip()
@@ -6665,6 +6825,10 @@ def process_awaiting_review_row(
         return "skipped_status", None, None
     if str(job.get("kind") or "").startswith("triage:"):
         return "skipped_triage", None, None
+    # A review job is never itself reviewed, whatever review_state it carries
+    # (PYTHIA 2026-11-01: the review-of-review chain).
+    if review_queue.is_review_kind(job):
+        return "skipped_review_job", None, None
     state = review_queue.usable_review_state(job)
     if state is None:
         adopt_legacy_review_row(job, now=now)
@@ -6871,6 +7035,10 @@ def process_awaiting_review_row(
         # The per-sweep submit cap is spent. Nothing is written: the row is
         # unchanged and the next sweep picks it up (no attempt is spent).
         return "capped", state, None
+    if _review_child_refusal(job):
+        # Past the review-chain depth guard (or the chain is unreadable): no
+        # review child, no attempt spent, nothing written.
+        return "skipped_review_chain", state, None
     if HIVE_DOCTOR_ADOPT_DRY_RUN:
         _record_dry_run_submission(job, {**state, "author": author}, picked, now=now)
         return "previewed", {**state, "author": author}, None
@@ -7357,6 +7525,102 @@ def _gate_review_queue_stuck(row: dict, job: dict, now: float | None) -> None:
     row["suggested_action"] = view["suggested_action"]
 
 
+def remediation_startup_line() -> str:
+    """The startup line for the remediation sweep: on/off, preview, cap.
+
+    Read through the module (never cached here) so one line answers the three
+    questions an operator has at start: is the doctor going to FIX rows, does
+    that only preview, and how many rows can one pass touch."""
+    state = "enabled" if doctor_remediation.REMEDIATE_ENABLED else "disabled"
+    return (
+        f"remediation {state} dry_run={doctor_remediation.DRY_RUN} "
+        f"max_per_sweep={doctor_remediation.MAX_REMEDIATIONS_PER_SWEEP} "
+        f"max_attempts_per_row={doctor_remediation.MAX_AUTO_REMEDIATIONS}"
+    )
+
+
+def doctor_loop_body(last: dict) -> None:
+    """One pass of the loop's periodic (interval-gated) work.
+
+    ``last`` is the loop's schedule (``last_hb``, ``last_scan``, ``last_dlq``,
+    ``last_needs_review``, ``last_retention``): each interval block stamps its
+    own key in place, so the cadence lives in the loop and not in this function.
+    Extracted from ``main`` (operator 2026-11-01) so the ORDER of the sweeps is
+    testable -- the remediation sweep had shipped without a call site and only a
+    test of this body could have caught it.
+    """
+    now = time.time()
+    if now - last["last_hb"] >= HEARTBEAT_INTERVAL:
+        heartbeat()
+        last["last_hb"] = now
+
+    # Periodic dead-letter-queue remediation (dry-run unless DLQ_APPLY=1).
+    if now - last["last_dlq"] >= DLQ_SCAN_INTERVAL:
+        last["last_dlq"] = now
+        try:
+            s = handle_dead_letter_queue()
+            log.info("dlq scan: %s (apply=%s)", s, DLQ_APPLY)
+        except Exception as e:
+            log.warning("dlq scan error: %s", e)
+
+    if now - last["last_needs_review"] >= NEEDS_REVIEW_SCAN_INTERVAL:
+        last["last_needs_review"] = now
+        try:
+            log.info("needs-review sweep: %s", run_needs_review_sweep())
+        except Exception as e:
+            log.warning("needs-review sweep error: %s", e)
+        # The wrapper path is not the only way a failure must be acted
+        # on: a failed row whose base_kind was already triaged inside the
+        # marker window would otherwise sit forever (operator: "triage
+        # queue has a loop_unresolved").
+        try:
+            log.info("orphan-failure sweep: %s", sweep_orphan_failures())
+        except Exception as e:
+            log.warning("orphan-failure sweep error: %s", e)
+        try:
+            log.info("unclaimable-queued sweep: %s", sweep_unclaimable_queued())
+        except Exception as e:
+            log.warning("unclaimable-queued sweep error: %s", e)
+        # The doctor FIXES the backlog it just classified (operator 2026-10-31).
+        # The kill switch (HIVE_DOCTOR_REMEDIATE=0) and the dry-run flag are
+        # honoured inside run_remediation_sweep, so the sweep is always called
+        # and reports which of the two applied; its own try/except keeps a
+        # failed listing or an unavailable durable store from stopping the loop.
+        try:
+            log.info("remediation sweep: %s", run_remediation_sweep())
+        except Exception as e:
+            log.warning("remediation sweep error: %s", e)
+
+    # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
+    if now - last["last_scan"] >= SCAN_INTERVAL:
+        last["last_scan"] = now
+        try:
+            clusters = scan_for_failure_clusters()
+            if clusters:
+                log.info("scan: %d failed-clusters above threshold", len(clusters))
+                for c in clusters[:5]:  # cap to avoid burst-submit
+                    submit_auto_triage(c["base_kind"], c["count"], c["sample_job_id"])
+                broadcast_doctor_message(
+                    "doctor.scan",
+                    {
+                        "host": AGENT_HOST,
+                        "clusters_found": len(clusters),
+                        "auto_triaged": min(5, len(clusters)),
+                    },
+                )
+        except Exception as e:
+            log.warning("scan error: %s", e)
+
+    # Periodic terminal-job retention sweep (bounded interval — never
+    # every tick): keeps the dead-job backlog at or under the cap.
+    if now - last["last_retention"] >= RETENTION_SWEEP_INTERVAL:
+        last["last_retention"] = now
+        try:
+            run_retention_sweep()
+        except Exception as e:
+            log.warning("retention sweep error: %s", e)
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -7374,76 +7638,19 @@ def main():
         )
         return 2
     log.info("starting on %s url=%s alias=%s dry_run=%s", AGENT_HOST, HIVE_URL, DOCTOR_AGENT_ALIAS, DRY_RUN)
+    log.info("%s", remediation_startup_line())
     register()
-    last_hb = time.time()
-    last_scan = 0.0
-    last_retention = 0.0
-    last_dlq = 0.0
-    last_needs_review = 0.0
+    last = {
+        "last_hb": time.time(),
+        "last_scan": 0.0,
+        "last_retention": 0.0,
+        "last_dlq": 0.0,
+        "last_needs_review": 0.0,
+    }
 
     while _running:
         try:
-            now = time.time()
-            if now - last_hb >= HEARTBEAT_INTERVAL:
-                heartbeat()
-                last_hb = now
-
-            # Periodic dead-letter-queue remediation (dry-run unless DLQ_APPLY=1).
-            if now - last_dlq >= DLQ_SCAN_INTERVAL:
-                last_dlq = now
-                try:
-                    s = handle_dead_letter_queue()
-                    log.info("dlq scan: %s (apply=%s)", s, DLQ_APPLY)
-                except Exception as e:
-                    log.warning("dlq scan error: %s", e)
-
-            if now - last_needs_review >= NEEDS_REVIEW_SCAN_INTERVAL:
-                last_needs_review = now
-                try:
-                    log.info("needs-review sweep: %s", run_needs_review_sweep())
-                except Exception as e:
-                    log.warning("needs-review sweep error: %s", e)
-                # The wrapper path is not the only way a failure must be acted
-                # on: a failed row whose base_kind was already triaged inside the
-                # marker window would otherwise sit forever (operator: "triage
-                # queue has a loop_unresolved").
-                try:
-                    log.info("orphan-failure sweep: %s", sweep_orphan_failures())
-                except Exception as e:
-                    log.warning("orphan-failure sweep error: %s", e)
-                try:
-                    log.info("unclaimable-queued sweep: %s", sweep_unclaimable_queued())
-                except Exception as e:
-                    log.warning("unclaimable-queued sweep error: %s", e)
-
-            # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
-            if now - last_scan >= SCAN_INTERVAL:
-                last_scan = now
-                try:
-                    clusters = scan_for_failure_clusters()
-                    if clusters:
-                        log.info("scan: %d failed-clusters above threshold", len(clusters))
-                        for c in clusters[:5]:  # cap to avoid burst-submit
-                            submit_auto_triage(c["base_kind"], c["count"], c["sample_job_id"])
-                        broadcast_doctor_message(
-                            "doctor.scan",
-                            {
-                                "host": AGENT_HOST,
-                                "clusters_found": len(clusters),
-                                "auto_triaged": min(5, len(clusters)),
-                            },
-                        )
-                except Exception as e:
-                    log.warning("scan error: %s", e)
-
-            # Periodic terminal-job retention sweep (bounded interval — never
-            # every tick): keeps the dead-job backlog at or under the cap.
-            if now - last_retention >= RETENTION_SWEEP_INTERVAL:
-                last_retention = now
-                try:
-                    run_retention_sweep()
-                except Exception as e:
-                    log.warning("retention sweep error: %s", e)
+            doctor_loop_body(last)
 
             job = claim_next_job()
             if not job:

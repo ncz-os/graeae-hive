@@ -59,9 +59,7 @@ def _override_ok(req: Any) -> bool:
 
 async def _budget_row(tx, job_id: str):
     """(status, max_retries, retry_count, claimed_by) for job_id, or None."""
-    async with tx.execute(
-        "SELECT status, max_retries, retry_count, claimed_by FROM jobs WHERE id=?", (job_id,)
-    ) as cur:
+    async with tx.execute("SELECT status, max_retries, retry_count, claimed_by FROM jobs WHERE id=?", (job_id,)) as cur:
         row = await cur.fetchone()
     if not row:
         return None
@@ -71,6 +69,66 @@ async def _budget_row(tx, job_id: str):
         row[1] if len(row) > 1 else None,
         row[2] if len(row) > 2 else None,
         row[3] if len(row) > 3 else None,
+    )
+
+
+#: Where a field patch parks a ``result`` it cannot merge into (a legacy bare
+#: string or list). No patch field may claim this key -- see ``_merge_field_patch``.
+PREVIOUS_RESULT_KEY = "previous_result"
+
+
+async def _read_result(tx, job_id: str) -> str | None:
+    """The row's raw ``result`` TEXT, exactly as stored (None when empty)."""
+    async with tx.execute("SELECT result FROM jobs WHERE id=?", (job_id,)) as cur:
+        row = await cur.fetchone()
+    return row[0] if row else None
+
+
+def _merge_field_patch(raw: str | None, fields: dict[str, Any]) -> dict[str, Any]:
+    """Merge a field patch into the parsed result, preserving what it cannot merge.
+
+    The result is a JSON object everywhere the API writes it (``dict | None``),
+    but the column is free-form TEXT. A value that is not an object is kept
+    under ``previous_result`` rather than replaced, so a repair never silently
+    destroys evidence it does not understand."""
+    merged: dict[str, Any] = {}
+    decoded: Any = None
+    if raw:
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            # Not JSON at all (legacy bare text): keep the text itself.
+            decoded = raw
+    if isinstance(decoded, dict):
+        merged = decoded
+    elif decoded is not None:
+        # A key that cannot be produced by the patch itself, so preserving the
+        # original value can never be overwritten by the fields it carries.
+        merged = {PREVIOUS_RESULT_KEY: decoded}
+    for key, value in fields.items():
+        name = str(key)
+        if name == PREVIOUS_RESULT_KEY:
+            # A caller may not claim the preservation slot: it would destroy the
+            # very value this merge exists to keep.
+            continue
+        merged[name] = value
+    return merged
+
+
+async def _patch_result_cas(
+    tx, job_id: str, sets: dict[str, Any], expected_status: str, raw: str | None, fields: dict[str, Any]
+) -> int:
+    """Apply a status move AND a result merge in one compare-and-set UPDATE.
+
+    ``expected_status`` guards the transition (as ``patch_job_status`` does);
+    the repository's null-safe payload guard (``raw`` None matches a NULL
+    result) means a write that replaced ``result`` after we read it returns 0
+    (reported as a conflict) instead of overwriting the other writer. The
+    compare is the backend's: sqlite's ``result IS ?`` was a 500 on Oracle
+    (ORA-00908, 2026-11-01)."""
+    sets = {**sets, "result": json.dumps(_merge_field_patch(raw, fields))}
+    return await hive_repo().patch_job_result_cas(
+        tx, job_id, sets=sets, expected_status=expected_status, expected_result=raw
     )
 
 
@@ -297,8 +355,7 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
             if dead_letter_override and not _override_ok(req):
                 raise HTTPException(
                     422,
-                    "dead-letter -> queued requires override_max_retries=true "
-                    "with a non-empty override_reason",
+                    "dead-letter -> queued requires override_max_retries=true with a non-empty override_reason",
                 )
             if req.status == "queued" and _retry_budget_exhausted(row[1], row[2]):
                 # reclassify -> queued is a requeue: same retry-budget rule.
@@ -363,7 +420,18 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
                     )
             else:
                 sets = {"status": req.status, "claimed_by": None, "claimed_at": None}
-                changed = await hive_repo().patch_job_status(tx, job_id, sets=sets, expected_status=row[0])
+                if req.fields:
+                    # A FIELD repair rides the same status move. The merge is
+                    # written by ONE compare-and-set (see `_patch_result_cas`): a
+                    # null-safe match on the value read here guards the payload
+                    # as well as `status`, so a concurrent writer
+                    # that replaced the result between this read and the write
+                    # makes the WHERE fail and the row is reported as a conflict --
+                    # never a merge that silently drops their value.
+                    raw = await _read_result(tx, job_id)
+                    changed = await _patch_result_cas(tx, job_id, sets, row[0], raw, req.fields)
+                else:
+                    changed = await hive_repo().patch_job_status(tx, job_id, sets=sets, expected_status=row[0])
             if changed != 1:
                 results["skipped_conflict"].append(job_id)
                 continue

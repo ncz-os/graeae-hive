@@ -685,6 +685,9 @@ class _Db2Pool:
 class Db2HiveRepository(SqliteHiveRepository):
     #: Db2 row-lock for the auto-retry read.
     _retry_lock_clause = " FOR UPDATE WITH RS USE AND KEEP UPDATE LOCKS"
+    #: hive_jobs.result is a CLOB: no null-safe SQL compare exists for a LOB
+    #: (SQL0401N), so the payload guard is a locked read + Python compare.
+    _result_cas_sql = None
 
     def __init__(
         self,
@@ -759,8 +762,7 @@ class Db2HiveRepository(SqliteHiveRepository):
         # FB51: the result archive is additive, so a database created before it
         # existed gets the table converged in on the next start.
         async with db.execute(
-            "SELECT tabname FROM syscat.tables "
-            "WHERE tabschema = CURRENT SCHEMA AND tabname = 'HIVE_JOB_RESULT_HISTORY'"
+            "SELECT tabname FROM syscat.tables WHERE tabschema = CURRENT SCHEMA AND tabname = 'HIVE_JOB_RESULT_HISTORY'"
         ) as cur:
             has_result_history = await cur.fetchall()
         if not has_result_history:

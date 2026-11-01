@@ -22,6 +22,7 @@ Everything is hermetic: no bus, no probes, no deployed resolver modules.
 """
 
 import importlib
+import inspect
 import os
 
 import pytest
@@ -182,6 +183,107 @@ def test_a_negative_cap_is_clamped_to_zero():
     finally:
         monkeypatch.undo()
         importlib.reload(__import__("hive.workers.doctor", fromlist=["doctor"]))
+
+
+def test_every_module_scope_env_int_can_warn_before_the_logger_binding():
+    """Regression (review 2026-10-31, high): ``_env_int`` read ``log`` before
+    the module bound it.
+
+    ``_env_int`` is called at MODULE SCOPE (``ZEROCLAW_TIMEOUT``, ``MIN_HOST_
+    COOLDOWN``, ...) but the ``log = logging.getLogger("doctor")`` binding sat
+    ~400 lines below the first call. A valid value never touches ``log``, so
+    the hole was invisible -- but ANY malformed one raised
+    ``NameError: name 'log' is not defined`` at import, which is the crash loop
+    ``_env_int`` exists to prevent. Every module-scope caller is exercised here,
+    under a value that forces the warning branch.
+
+    The import must happen in a CLEAN SUBPROCESS: ``importlib.reload`` reuses
+    the module's existing namespace, so the ``log`` bound by the first import
+    is still there and the bug is invisible (verified: a reload-based version
+    of this test passed on the unfixed source). Only a fresh interpreter
+    reproduces an import-time failure.
+    """
+    import ast
+    import inspect
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    tree = ast.parse(inspect.getsource(__import__("hive.workers.doctor", fromlist=["doctor"])))
+    # Every env-var name passed to a module-scope ``_env_int(...)`` call.
+    names: list[str] = []
+    for node in tree.body:
+        for sub in ast.walk(node):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Name)
+                and sub.func.id == "_env_int"
+                and sub.args
+                and isinstance(sub.args[0], ast.Constant)
+                and isinstance(sub.args[0].value, str)
+            ):
+                names.append(sub.args[0].value)
+    assert names, "the doctor must parse its env ints through _env_int at module scope"
+
+    repo_root = str(Path(__file__).resolve().parent)
+    # Env vars ALSO parsed by a sibling module at ITS import time. The doctor
+    # routes them through `_env_int`, but e.g. `hive/workers/retention.py`
+    # still does a bare `int(os.environ...)`, so a malformed value fails in
+    # THAT module first and says nothing about the doctor's own `log` read.
+    # Those siblings are out of this task's scope (reported, not fixed).
+    shared_with_siblings = {"RETENTION_MAX_DEAD"}
+    owned = [name for name in names if name not in shared_with_siblings]
+    assert owned, "the doctor must own at least one module-scope env int"
+    for name in owned:
+        # A non-integer forces the warning branch, i.e. the ``log`` read.
+        env = {**os.environ, name: "notanint"}
+        proc = subprocess.run(
+            # basicConfig: do not rely on logging.lastResort to reach stderr.
+            [
+                sys.executable,
+                "-c",
+                "import logging, sys; logging.basicConfig(stream=sys.stderr); import hive.workers.doctor",
+            ],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert proc.returncode == 0, f"importing the doctor with {name}=notanint failed:\n{proc.stderr[-2000:]}"
+        assert "NameError" not in proc.stderr, f"{name}: {proc.stderr[-2000:]}"
+        # The warning must be EMITTED, not merely absent-with-a-crash: this is
+        # what keeps the test from passing vacuously.
+        assert f"{name}='notanint' is not an integer" in proc.stderr, (
+            f"{name} must warn and fall back, not fail silently:\n{proc.stderr[-2000:]}"
+        )
+
+
+def test_the_module_logger_is_bound_before_the_first_env_int_call():
+    """The structural cause of the NameError above, pinned directly: ``log``
+    must be assigned before the first module-scope ``_env_int`` call, or only
+    a malformed env var ever reaches the NameError.
+
+    Compared by SOURCE LINE (via ``ast``), not character offset: offsets shift
+    with any whitespace or comment edit and would make the test brittle."""
+    import ast
+
+    from hive.workers import doctor
+
+    tree = ast.parse(inspect.getsource(doctor))
+    bound: list[int] = []
+    calls: list[int] = []
+    for node in tree.body:  # module scope only: import time is what matters
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "log" for t in node.targets):
+            bound.append(node.lineno)
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name) and sub.func.id == "_env_int":
+                calls.append(sub.lineno)
+    assert bound, "the doctor must bind ``log`` at module scope"
+    assert calls, "the doctor must call _env_int at module scope"
+    assert min(bound) < min(calls), (
+        f"``log`` must be bound (line {min(bound)}) before the first module-scope _env_int call (line {min(calls)})"
+    )
 
 
 def test_every_import_time_env_int_in_the_doctor_is_guarded():

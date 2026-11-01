@@ -56,6 +56,7 @@ COUNTER_TTLS = {
     "review": 30 * 86400.0,  # doctor REVIEW_FOLLOWUP_TTL_SEC
     "verdict_completion": 86400.0,  # doctor VERDICT_COMPLETION_TTL
     "verdict_completion_retry": 600.0,  # doctor VERDICT_COMPLETION_RETRY_TTL
+    "remediation": 30 * 86400.0,  # doctor_remediation MARK_TTL_SEC
 }
 
 
