@@ -495,6 +495,10 @@ def test_every_durable_counter_has_a_ttl():
         "review",
         "verdict_completion",
         "verdict_completion_retry",
+        # doctor_remediation's keys (mark_key / _attempt_key / escalation_key):
+        # an unnamed prefix is pruned at the longest configured window, so the
+        # per-row "already fixed" marker depended on another counter's clock.
+        "remediation",
     }
     assert all(ttl > 0 for ttl in COUNTER_TTLS.values())
 

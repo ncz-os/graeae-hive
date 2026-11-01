@@ -284,3 +284,39 @@ source first; the tests are in `test_doctor_remediation_r7_20261031.py`.
   `rescue_workspace`. With them unset, MISSING_BRANCH ends `no_provable_fix`,
   STRANDED_WIP and missing-head repairs end `FAILED no_workspace_rescuer`
   (nothing written), and the composite check is shape-only.
+
+## Review round 12 (2026-11-01) — the sweep is finally CALLED, and a first live sweep works
+
+The remediation module and `doctor.run_remediation_sweep` shipped to PYTHIA on
+2026-10-31, but nothing ever called the sweep. The doctor's main loop ran the
+DLQ scan, the needs-review sweep, the orphan-failure sweep and the
+unclaimable-queued sweep and never the one that fixes rows: the live log showed
+`needs-review report-only` lines and zero `remediation` lines, so the doctor
+still only reported the backlog it was built to drain. The loop's per-interval
+body is now the function `doctor.doctor_loop_body(last)` (extracted from `main`
+so the order is testable, and so the next un-called sweep is a failing test
+rather than a live discovery), and it runs the remediation sweep once per
+`NEEDS_REVIEW_SCAN_INTERVAL`, after `run_needs_review_sweep` (whose
+classification it reads) and inside its own `try/except` that logs
+`remediation sweep error: ...` and never kills the loop. Its summary is logged
+as `remediation sweep: <summary>`, the same shape as its siblings; the startup
+line now says `remediation enabled|disabled dry_run=... max_per_sweep=...
+max_attempts_per_row=...` so an operator can tell from the first log line
+whether the doctor will fix and whether that is only a preview. The kill switch
+(`HIVE_DOCTOR_REMEDIATE=0`) and the dry-run flag are honoured where they always
+were — inside `run_remediation_sweep` — and `MAX_REMEDIATIONS_PER_SWEEP` still
+caps a pass. Three defects that would have stopped or poisoned a first live
+sweep are fixed with it: the durable-state guard now precedes the bus listing (a
+refused sweep no longer reads the board first), an unreadable/empty reviewer
+roster is a refused sweep instead of "no route serves any model" (which, with a
+missing roster file, is every row), and the `remediation:` key prefix now has a
+`COUNTER_TTLS` window — without one the store pruned those keys at the longest
+configured window, so a per-head "already fixed" marker never aged on its own
+clock. The doctor's `STATE` is a file at `DOCTOR_STATE_PATH` (default
+`$XDG_STATE_HOME`/`$HOME/.local/state/hive-doctor/state.json`); the container
+mounts `/srv/agent-bus`, which is the BUS's database path, not the doctor's
+state path, so the deployment must set `DOCTOR_STATE_PATH` inside that writable
+mount for the sweep to run at all — otherwise every pass refuses with
+`remediation refused: durable state unavailable`. Regressions:
+`test_doctor_remediation_wiring_20261101.py` and the `remediation` TTL pin in
+`test_doctor_remediation_20261031.py`; all fail on the base.

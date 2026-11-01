@@ -310,6 +310,26 @@ def test_a_capped_route_is_classified_as_unavailable_model():
     assert dr.healthy_alternative(job) is not None, "a capped row needs a healthy alternative"
 
 
+def test_the_state_path_of_the_remediation_keys_is_a_configured_prefix():
+    """The sweep's durable keys must expire.
+
+    ``DurableStateStore`` prunes an unrecognised key prefix at the LONGEST
+    configured window (``_ttl_for``/``_prune_ttl_of``), so a ``remediation:``
+    prefix is a record that never ages on its own clock: a per-row "already
+    fixed for this head" marker would outlive the row forever, and the store
+    module's own rule -- every durable counter has a named window -- would be
+    false for the keys this module writes. Pinned against the module's REAL key
+    builders, so a rename here fails here."""
+    from hive.workers import doctor_state
+
+    for key in (
+        dr.mark_key("job-1", dr.Cause(dr.HOST_PINNED, "eligible_hosts_pin"), "0" * 40),
+        dr._attempt_key("job-1"),
+        dr.escalation_key("job-1"),
+    ):
+        assert key.split(":", 1)[0] in doctor_state.COUNTER_TTLS, key
+
+
 def test_the_sweep_cap_reads_the_applied_counter_it_seeds():
     """The per-sweep cap is enforced against the same key the summary seeds and
     the outcome increments. A literal read against a renamed seed lets the cap

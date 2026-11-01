@@ -5332,11 +5332,19 @@ def run_remediation_sweep(*, dry_run: bool | None = None, now: float | None = No
     ``HIVE_DOCTOR_REMEDIATE=0``."""
     if not doctor_remediation.REMEDIATE_ENABLED:
         return {"enabled": False, "applied": 0, "reason": "HIVE_DOCTOR_REMEDIATE=0"}
-    rows = fetch_remediable_rows()
+    # The durable store is checked BEFORE the bus is read: every guard in the
+    # module is durable, so without the store a sweep would re-fix the same row
+    # forever -- and a refused sweep must not have listed the board first.
     if not STATE.loaded_ok or not STATE.persist_ok:
-        # Every guard in the module is durable; without the store a sweep would
-        # re-fix the same row forever.
         raise RuntimeError("remediation refused: durable state unavailable")
+    rows = fetch_remediable_rows()
+    roster = review_queue.load_roster()
+    if not roster:
+        # The classifier would read an empty roster as "no route serves this
+        # model" and switch rows onto a route that does not exist. On a host
+        # where the roster file is missing that is every row, so an unreadable
+        # roster is a refused sweep, not an empty one (same rule as the store).
+        raise RuntimeError("remediation refused: reviewer roster unavailable")
     summary = doctor_remediation.sweep(
         rows,
         state=STATE,
@@ -5348,7 +5356,7 @@ def run_remediation_sweep(*, dry_run: bool | None = None, now: float | None = No
         # capped/down route is only visible through the probe, so leaving both
         # unset would have the sweep classify rows against a roster nobody
         # checked and switch them to a model that cannot serve them.
-        roster=review_queue.load_roster(),
+        roster=roster,
         health=_review_route_health(),
         dry_run=doctor_remediation.DRY_RUN if dry_run is None else dry_run,
         now=now,
@@ -6728,6 +6736,102 @@ def _gate_review_queue_stuck(row: dict, job: dict, now: float | None) -> None:
     row["suggested_action"] = view["suggested_action"]
 
 
+def remediation_startup_line() -> str:
+    """The startup line for the remediation sweep: on/off, preview, cap.
+
+    Read through the module (never cached here) so one line answers the three
+    questions an operator has at start: is the doctor going to FIX rows, does
+    that only preview, and how many rows can one pass touch."""
+    state = "enabled" if doctor_remediation.REMEDIATE_ENABLED else "disabled"
+    return (
+        f"remediation {state} dry_run={doctor_remediation.DRY_RUN} "
+        f"max_per_sweep={doctor_remediation.MAX_REMEDIATIONS_PER_SWEEP} "
+        f"max_attempts_per_row={doctor_remediation.MAX_AUTO_REMEDIATIONS}"
+    )
+
+
+def doctor_loop_body(last: dict) -> None:
+    """One pass of the loop's periodic (interval-gated) work.
+
+    ``last`` is the loop's schedule (``last_hb``, ``last_scan``, ``last_dlq``,
+    ``last_needs_review``, ``last_retention``): each interval block stamps its
+    own key in place, so the cadence lives in the loop and not in this function.
+    Extracted from ``main`` (operator 2026-11-01) so the ORDER of the sweeps is
+    testable -- the remediation sweep had shipped without a call site and only a
+    test of this body could have caught it.
+    """
+    now = time.time()
+    if now - last["last_hb"] >= HEARTBEAT_INTERVAL:
+        heartbeat()
+        last["last_hb"] = now
+
+    # Periodic dead-letter-queue remediation (dry-run unless DLQ_APPLY=1).
+    if now - last["last_dlq"] >= DLQ_SCAN_INTERVAL:
+        last["last_dlq"] = now
+        try:
+            s = handle_dead_letter_queue()
+            log.info("dlq scan: %s (apply=%s)", s, DLQ_APPLY)
+        except Exception as e:
+            log.warning("dlq scan error: %s", e)
+
+    if now - last["last_needs_review"] >= NEEDS_REVIEW_SCAN_INTERVAL:
+        last["last_needs_review"] = now
+        try:
+            log.info("needs-review sweep: %s", run_needs_review_sweep())
+        except Exception as e:
+            log.warning("needs-review sweep error: %s", e)
+        # The wrapper path is not the only way a failure must be acted
+        # on: a failed row whose base_kind was already triaged inside the
+        # marker window would otherwise sit forever (operator: "triage
+        # queue has a loop_unresolved").
+        try:
+            log.info("orphan-failure sweep: %s", sweep_orphan_failures())
+        except Exception as e:
+            log.warning("orphan-failure sweep error: %s", e)
+        try:
+            log.info("unclaimable-queued sweep: %s", sweep_unclaimable_queued())
+        except Exception as e:
+            log.warning("unclaimable-queued sweep error: %s", e)
+        # The doctor FIXES the backlog it just classified (operator 2026-10-31).
+        # The kill switch (HIVE_DOCTOR_REMEDIATE=0) and the dry-run flag are
+        # honoured inside run_remediation_sweep, so the sweep is always called
+        # and reports which of the two applied; its own try/except keeps a
+        # failed listing or an unavailable durable store from stopping the loop.
+        try:
+            log.info("remediation sweep: %s", run_remediation_sweep())
+        except Exception as e:
+            log.warning("remediation sweep error: %s", e)
+
+    # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
+    if now - last["last_scan"] >= SCAN_INTERVAL:
+        last["last_scan"] = now
+        try:
+            clusters = scan_for_failure_clusters()
+            if clusters:
+                log.info("scan: %d failed-clusters above threshold", len(clusters))
+                for c in clusters[:5]:  # cap to avoid burst-submit
+                    submit_auto_triage(c["base_kind"], c["count"], c["sample_job_id"])
+                broadcast_doctor_message(
+                    "doctor.scan",
+                    {
+                        "host": AGENT_HOST,
+                        "clusters_found": len(clusters),
+                        "auto_triaged": min(5, len(clusters)),
+                    },
+                )
+        except Exception as e:
+            log.warning("scan error: %s", e)
+
+    # Periodic terminal-job retention sweep (bounded interval — never
+    # every tick): keeps the dead-job backlog at or under the cap.
+    if now - last["last_retention"] >= RETENTION_SWEEP_INTERVAL:
+        last["last_retention"] = now
+        try:
+            run_retention_sweep()
+        except Exception as e:
+            log.warning("retention sweep error: %s", e)
+
+
 def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -6745,76 +6849,19 @@ def main():
         )
         return 2
     log.info("starting on %s url=%s alias=%s dry_run=%s", AGENT_HOST, HIVE_URL, DOCTOR_AGENT_ALIAS, DRY_RUN)
+    log.info("%s", remediation_startup_line())
     register()
-    last_hb = time.time()
-    last_scan = 0.0
-    last_retention = 0.0
-    last_dlq = 0.0
-    last_needs_review = 0.0
+    last = {
+        "last_hb": time.time(),
+        "last_scan": 0.0,
+        "last_retention": 0.0,
+        "last_dlq": 0.0,
+        "last_needs_review": 0.0,
+    }
 
     while _running:
         try:
-            now = time.time()
-            if now - last_hb >= HEARTBEAT_INTERVAL:
-                heartbeat()
-                last_hb = now
-
-            # Periodic dead-letter-queue remediation (dry-run unless DLQ_APPLY=1).
-            if now - last_dlq >= DLQ_SCAN_INTERVAL:
-                last_dlq = now
-                try:
-                    s = handle_dead_letter_queue()
-                    log.info("dlq scan: %s (apply=%s)", s, DLQ_APPLY)
-                except Exception as e:
-                    log.warning("dlq scan error: %s", e)
-
-            if now - last_needs_review >= NEEDS_REVIEW_SCAN_INTERVAL:
-                last_needs_review = now
-                try:
-                    log.info("needs-review sweep: %s", run_needs_review_sweep())
-                except Exception as e:
-                    log.warning("needs-review sweep error: %s", e)
-                # The wrapper path is not the only way a failure must be acted
-                # on: a failed row whose base_kind was already triaged inside the
-                # marker window would otherwise sit forever (operator: "triage
-                # queue has a loop_unresolved").
-                try:
-                    log.info("orphan-failure sweep: %s", sweep_orphan_failures())
-                except Exception as e:
-                    log.warning("orphan-failure sweep error: %s", e)
-                try:
-                    log.info("unclaimable-queued sweep: %s", sweep_unclaimable_queued())
-                except Exception as e:
-                    log.warning("unclaimable-queued sweep error: %s", e)
-
-            # Periodic failed-cluster scan — emit triage:* jobs targeting doctor.
-            if now - last_scan >= SCAN_INTERVAL:
-                last_scan = now
-                try:
-                    clusters = scan_for_failure_clusters()
-                    if clusters:
-                        log.info("scan: %d failed-clusters above threshold", len(clusters))
-                        for c in clusters[:5]:  # cap to avoid burst-submit
-                            submit_auto_triage(c["base_kind"], c["count"], c["sample_job_id"])
-                        broadcast_doctor_message(
-                            "doctor.scan",
-                            {
-                                "host": AGENT_HOST,
-                                "clusters_found": len(clusters),
-                                "auto_triaged": min(5, len(clusters)),
-                            },
-                        )
-                except Exception as e:
-                    log.warning("scan error: %s", e)
-
-            # Periodic terminal-job retention sweep (bounded interval — never
-            # every tick): keeps the dead-job backlog at or under the cap.
-            if now - last_retention >= RETENTION_SWEEP_INTERVAL:
-                last_retention = now
-                try:
-                    run_retention_sweep()
-                except Exception as e:
-                    log.warning("retention sweep error: %s", e)
+            doctor_loop_body(last)
 
             job = claim_next_job()
             if not job:
