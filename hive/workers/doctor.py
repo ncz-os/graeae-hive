@@ -5875,12 +5875,16 @@ def merge_handoff(job: dict) -> str:
         approved["head_sha"], _review_head(job, _row_result_dict(job))
     ):
         return "stale_approval"
-    if (
-        approved.get("approved_sha")
-        and not review_verdict.same_sha(approved["approved_sha"], approved["head_sha"])
-        and not _verdict_only_descendant_approval(job, approved)
-    ):
-        if _descent_proof(job, approved) == "not_proven":
+    # ONE descent proof per decision: asking git twice lets the workspace change
+    # between the questions, so "refused" could be reported as "not proven" (or
+    # the reverse). It is only asked when the reviewer signed a different commit.
+    proof = (
+        _descent_proof(job, approved)
+        if approved.get("approved_sha") and not review_verdict.same_sha(approved["approved_sha"], approved["head_sha"])
+        else "proven"
+    )
+    if proof != "proven":
+        if proof == "not_proven":
             # A verdict-only basis no workspace can re-prove: not stale (nothing
             # says the head moved) and NOT mergeable -- the gate fails closed.
             return "approval_not_proven"

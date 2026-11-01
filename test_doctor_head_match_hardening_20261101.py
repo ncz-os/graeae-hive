@@ -379,9 +379,11 @@ def test_m1_an_unprovable_workspace_is_refused_never_trusted(worker, tmp_path):
     ws = origin.review_workspace("ws")
     reason = _violation(worker, _review_job(), {"files_changed": []}, ws, "f" * 40)
     assert reason and "not proven" in reason
-    # And the self report still adds doubt to a git-clean workspace.
-    reason = _violation(worker, _review_job(), {"files_changed": ["pkg/widget.py"]}, ws, origin.tip)
-    assert reason and "pkg/widget.py" in reason
+    # The self report adds doubt only where git cannot answer (r3, DeepSeek
+    # item 5: a git-clean workspace is accepted whatever the report says --
+    # see test_doctor_head_match_review_churn_r3_20261101.py).
+    reason = _violation(worker, _review_job(), {"files_changed": ["pkg/widget.py"]}, None, origin.tip)
+    assert reason and "not proven" in reason and "pkg/widget.py" in reason
 
 
 def test_m2_only_this_jobs_own_verdict_names_are_allowed(worker, tmp_path):

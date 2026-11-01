@@ -994,7 +994,8 @@ def test_moved_tip_stays_stale_even_with_a_recorded_descendant(monkeypatch, tmp_
 
     # Even if the descent were accepted outright, a tip that no longer matches
     # approved.head_sha must be stale.
-    monkeypatch.setattr(doctor, "_verdict_only_descendant_approval", lambda job, approved: True)
+    # (merge_handoff asks the ONE descent proof directly since r3.)
+    monkeypatch.setattr(doctor, "_descent_proof", lambda job, approved: "proven")
     row["result"]["head_sha"] = "c" * 40  # the branch moved after the approve
     assert doctor.merge_handoff(row) == "stale_approval"
 

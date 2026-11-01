@@ -49,6 +49,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 
@@ -222,6 +223,14 @@ def _git(repo: str, *args: str) -> tuple[int, str]:
     return out.returncode, out.stdout
 
 
+_FULL_SHA = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def is_full_sha(sha: str) -> bool:
+    """Whether ``sha`` is a full 40-hex object name (never a ref name or an abbreviation)."""
+    return bool(_FULL_SHA.fullmatch(str(sha or "").strip()))
+
+
 def has_commit(repo: str, sha: str) -> bool:
     """Whether ``sha`` names a commit this workspace holds."""
     sha = str(sha or "").strip()
@@ -272,7 +281,10 @@ def verdict_only_between(repo: str | None, tip: str, reviewed: str) -> bool:
     if not os.path.isdir(str(repo)):
         return False
     if tip == reviewed:
-        return True
+        # The same head only when git proves it IS a head: two identical
+        # strings that name no commit (garbage, a ref name, an abbreviation)
+        # are not an approval of anything.
+        return is_full_sha(tip) and has_commit(repo, tip)
     if not has_commit(repo, reviewed) or not has_commit(repo, tip):
         return False
     if not is_ancestor_or_same(repo, tip, reviewed):
