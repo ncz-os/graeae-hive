@@ -578,3 +578,67 @@ def test_a_review_of_a_review_is_never_reviewed(state):
     fake = Loop({row["id"]: [rc_with(row, "high")]})
     fake.sweep([row], state)
     assert fake.specs == [] and fake.lookups == []
+
+
+# ── the module resolves every name it uses ──────────────────────────────────
+
+
+def test_every_name_the_module_loads_is_defined_or_imported():
+    """A bare NameError is the one defect a diff-only reader cannot see.
+
+    Operators (and reviewers reading a patch without the module) have flagged
+    ``GRIND_DIFF_BUDGET``, ``COST_CLASSES``, ``FOLLOW_UP``, ``CODEX_WORKER_KIND``
+    and ``CONTINUATION_MAX_ROUNDS`` as undefined. Each is defined here or used
+    through its module (``review_queue.CODEX_WORKER_KIND``); this test proves it
+    mechanically so the claim cannot recur.
+    """
+    import ast
+    import builtins
+
+    src = Path(dr.__file__).read_text()
+    tree = ast.parse(src)
+    bound: set[str] = set(dir(builtins))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(node.name)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add((alias.asname or alias.name).split(".")[0])
+        elif isinstance(node, ast.arg):
+            bound.add(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            bound.update(node.names)
+    loaded = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
+    assert not loaded - bound, f"undefined names in {dr.__file__}: {sorted(loaded - bound)}"
+
+
+@pytest.mark.parametrize("name", ["GRIND_DIFF_BUDGET", "COST_CLASSES", "FOLLOW_UP", "GRIND_MAX_ROUNDS"])
+def test_the_flagged_constants_are_defined(name):
+    assert hasattr(dr, name), name
+
+
+def test_the_review_queue_constants_are_reached_through_their_module():
+    """``CODEX_WORKER_KIND`` lives on review_queue: it is never a bare name here."""
+    assert rq.CODEX_WORKER_KIND
+    import ast
+
+    tree = ast.parse(Path(dr.__file__).read_text())
+    bare = {
+        n.id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id == "CODEX_WORKER_KIND"
+    }
+    assert not bare, "CODEX_WORKER_KIND must be used as review_queue.CODEX_WORKER_KIND"
+
+
+def test_the_sweep_records_follow_ups_without_a_name_error(state):
+    """The ``summary[FOLLOW_UP]`` branch actually runs (medium + low, no block)."""
+    row = work_row()
+    fake = Loop({row["id"]: [rc_with(row, "medium", round_no=1), rc_with(row, "low", round_no=1)]})
+    summary = fake.sweep([row], state)
+    assert summary[dr.FOLLOW_UP] == 2, summary
+    assert fake.specs == []
