@@ -320,3 +320,100 @@ mount for the sweep to run at all — otherwise every pass refuses with
 `remediation refused: durable state unavailable`. Regressions:
 `test_doctor_remediation_wiring_20261101.py` and the `remediation` TTL pin in
 `test_doctor_remediation_20261031.py`; all fail on the base.
+
+## Continuation rounds (2026-11-01) — request_changes → continuation → re-review
+
+The orchestrator used to run this loop by hand: a cross-family review asked for
+changes, someone wrote a continuation job carrying the findings, and the
+continuation's head went back to the review queue. The doctor now runs it
+(`doctor_remediation.continuation_sweep`, called from `run_remediation_sweep`
+after the field-fix sweep, summary under `continuations`). Conflicts and
+merged-tree failures are **not** handled here; they belong to the merge-pass
+tool (fleet-ops). Only the review-driven path lives in this module.
+
+**Who qualifies.** A `needs-review` WORK row (not `review:`/`triage:`, not
+lane B, with a `head_branch`) whose BEST non-author review of the current tip
+is `request_changes` with located findings, and whose lineage has had fewer
+than `CONTINUATION_MAX_ROUNDS` (2, `HIVE_DOCTOR_CONTINUATION_MAX_ROUNDS`)
+automatic rounds. The reviews are the row's `review:` children
+(`_needs_review_child_review_jobs`). A review counts only if:
+
+* it is not refused as overreach;
+* its verdict reads as approve or request_changes (`review_verdict.child_verdict`, else
+  the `review_evidence.reviewers` verdicts);
+* its reviewer family differs from the author's (an unknown author family proves
+  nothing and counts nothing);
+* its head is the row's delivered tip, or a **verdict-only descendant** of it proven
+  on disk (`classify_review_head` → `doctor_head_match.VERDICT_ONLY`; the live
+  2026-11-01 shape where the reviewer reports the commit adding its verdict
+  artifact). An unproven descendant is not the tip.
+
+Any approve of the tip outranks every request_changes. Among the request_changes
+reviews with located findings, the most severe finding wins, then the most
+findings, then the newest. A finding is *located* when it names a place: a
+`location` string, a `location` object (`path`/`file` + `line`) or top-level
+`file`/`path` + `line`. It also needs a title or a body. Findings are read from
+`result.findings`, `verdict`/`reviewer`/`review_evidence` and their per-reviewer
+entries (an approving reviewer's notes are skipped), the loop log's last
+iteration and a JSON `tail`/`stdout`.
+
+**The job.** One continuation per row and tip:
+
+* the same `kind`, `repo` and `project`;
+* `base_branch` = the row's `head_branch`, `head_branch` = `<slug>-rN`. The slug
+  loses a previous `-rN` only when the row is itself a continuation;
+* `parent_job_id` = the WORK row. A review row is refused by `continuation_spec`,
+  so the never-review-a-review guard stands;
+* submitted as the doctor (`submit_job_spec`);
+* `idempotency_key` = `doctor-continuation:<root>:r<N>:<tip12>`.
+
+The brief names the round, the base branch and tip, and the new branch. It then
+quotes every located finding of the best review verbatim (severity, location,
+title, body) and ends with the standing instruction (`CONTINUATION_INSTRUCTION`):
+*verify every finding against source first; failing test first when it holds;
+pinning test and a note when it does not; never change correct code to satisfy
+a disproved claim; push your final HEAD and confirm with git ls-remote.*
+
+**Model ladder.**
+
+* **Round 1:** the author's own model (same family as the author), refused if
+  that family requested changes.
+* **Round 2:** the strongest hard-lane route, meaning roster routes with a
+  positive `hard_lane_priority`, ordered by `review_queue._bulk_key(..., LANE_HARD)`.
+  The route's family must not have requested changes on the tip and must not be
+  forbidden. Today that is `codex-worker` (`gpt-6-luna`, openai). The job gets
+  `eligible_kinds: ["codex"]` and `max_concurrency: 1`, like a Codex review, and
+  its cost tier is raised to the route's class.
+* **No model:** when no model qualifies (for example an openai reviewer in round
+  2), the row escalates.
+
+**Bounds.**
+
+* The marker `remediation:continuation:<row>:<tip12>:r<N>` is written after a
+  successful submit. A row with a marker for its tip at any round is a no-op, so
+  the original row does not mint round 2 while its round-1 continuation is in
+  review.
+* The lineage `{root, round}` is recorded on the new job id, and the per-root
+  round count is durable, so a continuation whose idempotency key the bus dropped
+  still counts its rounds.
+* After two rounds, or with no ladder model, the doctor escalates ONCE per root
+  through `doctor.needs_review_stuck` (`_remediate_escalate`) and stops.
+* At most `CONTINUATION_MAX_PER_SWEEP` (3, `HIVE_DOCTOR_CONTINUATION_MAX_PER_SWEEP`)
+  new continuations per sweep, oldest first. The rest are `deferred`.
+* A failed submit writes no marker and is retried next sweep. The idempotency
+  key keeps the bus from minting a duplicate.
+* `HIVE_DOCTOR_REMEDIATE=0` stops the pass before any read.
+* A dry run (`HIVE_DOCTOR_REMEDIATE_DRY_RUN`, or the doctor-wide `DRY_RUN`)
+  submits, marks and escalates nothing and lists `would_submit`.
+
+Regressions: `test_doctor_continuation_rounds_20261101.py` (fixture
+`tests/fixtures/doctor_continuation_rows.json`, plus the `waiting_review` row
+of `doctor_remediation_rows.json` and the live `work_root` of
+`doctor_review_chain_rows.json`); all fail on the base.
+
+Not verified: the operator's routing note
+`~/.claude/rules/coding-slot-routing-20261031.md` was not available. The round-2
+"stronger hard-lane model" is taken from `hive/core/reviewer-roster.json`
+(`hard_lane_priority`) and `docs/REVIEW_QUEUE.md`, not from that note. The
+Codex gate (plan usage, cooldown, online worker) is not consulted at submit
+time: the job waits for a codex worker to claim it.
