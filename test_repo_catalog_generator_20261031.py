@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import hive.registry as regmod  # noqa: E402
@@ -55,19 +56,53 @@ def _clean_env():
     return p
 
 
-def _build(overlay=OVERLAY, skip=(), discoverers=None):
-    """build_registry with mocked sources and a temp overlay file."""
+def _build(overlay=OVERLAY, skip=(), discoverers=None, creds=None, called=None):
+    """build_registry with mocked sources and a temp overlay file.
+
+    Returns ``(registry, {discover_name: mock})`` so a caller can assert a
+    source was actually consulted; pass ``called`` to receive that same dict
+    instead of the returned copy.
+
+    A source is only consulted when its credential is set (see
+    ``build_registry``): no PAT, no ``discover_*`` call. The test must not
+    depend on which host's ``~/.api_keys_master.json`` is reachable, so it
+    supplies a fixed, fake credential for every forge source and pins the
+    operator-config module constants it reads -- a box without the key file
+    (the Linux build host) or with a different one (macOS) then builds the
+    same registry.
+    """
     td = tempfile.TemporaryDirectory()
     op = Path(td.name) / "overlay.json"
     op.write_text(json.dumps(overlay))
-    patches = [mock.patch.object(regmod, "ARGONAS_SSH_HOST", "")]
+    fake_creds = {
+        "gitlab_pat": "test-gitlab-pat",
+        "github_token": "test-github-token",
+        "buildkite_token": "test-buildkite-token",
+        "r2_account_id": "test-r2-account",
+        "r2_token": "test-r2-token",
+        "argonas_password": None,
+        **(creds or {}),
+    }
+    record: dict[str, mock.Mock] = called if called is not None else {}
+    patches = [
+        mock.patch.object(regmod, "ARGONAS_SSH_HOST", ""),
+        mock.patch.object(regmod, "_keys", return_value={}),
+        mock.patch.object(
+            regmod,
+            "get_settings",
+            return_value=SimpleNamespace(
+                gitlab_pat="", github_pat="", buildkite_api_token="", r2_account_id="", argonas_ssh_pass=""
+            ),
+        ),
+    ]
     for name in FAKE_DISCOVER:
         value = (discoverers or {}).get(name, FAKE_DISCOVER[name])
-        patches.append(mock.patch.object(regmod, name, return_value=value))
+        record[name] = mock.Mock(return_value=value)
+        patches.append(mock.patch.object(regmod, name, record[name]))
     for p in patches:
         p.start()
     try:
-        return regmod.build_registry(overlay_path=op, skip=skip)
+        return regmod.build_registry(overlay_path=op, skip=skip, **fake_creds), record
     finally:
         for p in reversed(patches):
             p.stop()
@@ -81,7 +116,7 @@ def canonical_bytes(reg):
 class DeterminismTests(unittest.TestCase):
     def test_double_build_is_byte_identical(self):
         """Invariant: the same inputs always produce the same bytes."""
-        self.assertEqual(canonical_bytes(_build()), canonical_bytes(_build()))
+        self.assertEqual(canonical_bytes(_build()[0]), canonical_bytes(_build()[0]))
 
     def test_byte_identical_across_hash_seeds(self):
         """Invariant: no set-ordering hazard — two fresh interpreters with
@@ -132,8 +167,13 @@ class NoDropTests(unittest.TestCase):
 
     def test_every_source_slug_survives(self):
         """Invariant: a slug known to exactly one source is in the output
-        with the right source tag — the merge drops nothing."""
-        reg = _build()
+        with the right source tag — the merge drops nothing.
+
+        The call count assertions keep a skipped source from passing
+        vacuously: a forge with no credential is never discovered, so its
+        slug would come back overlay-only and the tag check below would be
+        asserting against the one source it excluded."""
+        reg, called = _build()
         by_id = {e["id"]: e for e in reg["repos"]}
         for slug, tag in (
             ("g-only", "gitlab"),
@@ -144,13 +184,23 @@ class NoDropTests(unittest.TestCase):
         ):
             self.assertIn(slug, by_id, slug)
             self.assertIn(tag, by_id[slug]["sources"], slug)
+        # A forge discoverer takes its credential positionally; the
+        # credential-free sources take no argument.
+        for name in ("discover_gitlab", "discover_github", "discover_buildkite"):
+            called[name].assert_called_once()
+        called["discover_argonas"].assert_called_once_with(password=None)
+        called["discover_r2"].assert_called_once()
         self.assertEqual(reg["_meta"]["r2_buckets"], ["r2-bucket"])
 
     def test_overlay_curated_fields_land_on_discovered_entries(self):
-        reg = _build()
+        """Invariant: curated overlay fields attach to the entry DISCOVERY
+        built; the source tag proves the entry was discovered, not merely
+        created by ``merge_overlay``."""
+        reg, called = _build()
         by_id = {e["id"]: e for e in reg["repos"]}
         self.assertEqual(by_id["g-only"]["notes"], "curated note")
         self.assertIn("gitlab", by_id["g-only"]["sources"])
+        called["discover_gitlab"].assert_called_once_with("test-gitlab-pat")
 
 
 class MissingRemoteTests(unittest.TestCase):
@@ -165,7 +215,7 @@ class MissingRemoteTests(unittest.TestCase):
         """Invariant (the flag): an entry with no live remote is marked
         sources==["overlay"] and carries NO clone_ssh/clone_nfs — it cannot
         be mistaken for a healthy, clonable repo."""
-        reg = _build()
+        reg, _ = _build()
         entry = next(e for e in reg["repos"] if e["id"] == "o-only")
         self.assertEqual(entry["sources"], ["overlay"])
         self.assertNotIn("clone_ssh", entry)
@@ -175,7 +225,7 @@ class MissingRemoteTests(unittest.TestCase):
         """Invariant: a dead remote (the discover_* failure shape is an empty
         result — they swallow HTTP/transport errors internally) still yields a
         successful build of the rest; the gap stays visible as overlay-only."""
-        reg = _build(
+        reg, _ = _build(
             discoverers={
                 "discover_gitlab": {},
                 "discover_github": {},
@@ -195,7 +245,7 @@ class BusRoundTripTests(unittest.TestCase):
         resolves via find_exact — the generator output IS bus knowledge."""
         import hive.repos as repos_mod
 
-        reg = _build()
+        reg, _ = _build()
         with tempfile.TemporaryDirectory() as td:
             cat = Path(td) / "repos.json"
             cat.write_bytes(canonical_bytes(reg))

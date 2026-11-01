@@ -50,3 +50,24 @@ via temp file; `HOME` pointed at temp dir in subprocesses so no real
 - `merge_overlay` mutates the passed entries dict — pass fresh copies per build
   in determinism comparisons (or compare across processes only).
 - Full suite ~150 s; file first, then full suite once.
+
+## Continuation 2026-10-31 (Linux/HYDRA): the NoDrop failures were a host leak, not ordering
+
+Merged with `deploy/integrate-20261017` the Linux build host failed
+`NoDropTests` on both tests; integrate alone passed, and two macOS sessions
+could not reproduce. Cause: `_build` cleared the credential ENV but
+`build_registry` falls back to `_keys()` (`~/.api_keys_master.json`) and to
+`get_settings()` (`lru_cache`, read on first use — `conftest` had already
+imported doctor). Only a source **with** a credential is discovered; on a box
+where that fallback is empty, gitlab/github/buildkite/R2 are silently skipped
+and `g-only` comes back overlay-only, so the tag assertion fails. Not
+`os.listdir`/glob order, case, clone path or a tracked file — discovery here is
+mocked; the leak is in which sources are enabled.
+
+Fix (test-only; generator behaviour unchanged): `_build` passes fixed fake
+credentials explicitly, pins `_keys` and `regmod.get_settings`, and the two
+NoDrop tests now assert each `discover_*` was actually called — a skipped
+source can no longer pass/fail the tag check vacuously. Verified: base helper +
+new assertions → 6 failed (incl. a `SimpleNamespace` R2-credential AttributeError,
+same leak class); fixed test → 9 passed with an empty HOME and with the real one.
+No `sorted()` added to `discover_r2`: that is the pinned emitted order, unchanged.
