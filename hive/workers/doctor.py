@@ -74,7 +74,16 @@ from hive.core import fleet_inventory
 # container still runs this module standalone.
 from hive.review_queue import pick_reviewers
 from hive.workers import doctor_decline_paths as decline_paths
-from hive.workers import doctor_gates, doctor_models, doctor_rules, doctor_v2, loop_outcome, remediation, retention
+from hive.workers import (
+    doctor_gates,
+    doctor_models,
+    doctor_remediation,
+    doctor_rules,
+    doctor_v2,
+    loop_outcome,
+    remediation,
+    retention,
+)
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "")
@@ -95,6 +104,14 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
+
+# The module logger must exist BEFORE the first ``_env_int`` call below. Those
+# calls run at import time and their warning branches read ``log``; a later
+# binding meant a malformed env var raised ``NameError: name 'log' is not
+# defined`` at import -- the exact crash loop ``_env_int`` exists to prevent
+# (review 2026-10-31, high). This is the ONLY binding: ``getLogger`` is
+# idempotent, so a second assignment further down was dead duplication.
+log = logging.getLogger("doctor")
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
@@ -519,8 +536,6 @@ def all_fleet_hosts() -> dict[str, dict]:
         for name, entry in fleet_inventory.load_inventory().items()
     }
 
-
-log = logging.getLogger("doctor")
 
 _running = True
 _urn: str = ""
@@ -5263,6 +5278,83 @@ def run_review_followup_sweep() -> dict:
             broadcast_doctor_message(
                 "doctor.sweep_error", {"sweep": "review-followup", "job_id": jid, "error": str(exc)}
             )
+    return summary
+
+
+# ── Remediation sweep (the doctor FIXES rows, it does not only report) ──────
+
+
+def fetch_remediable_rows(limit: int = 300) -> list[dict]:
+    """The failed / needs-review / dead-letter rows the remediation sweep reads.
+
+    A failed listing is a HARD error, not an empty list: an unreadable bus must
+    never read as "nothing left to fix"."""
+    rows: list[dict] = []
+    for status in doctor_remediation.SCAN_STATUSES:
+        code, resp = _http("GET", f"/v1/jobs?status={status}&limit={int(limit)}", timeout=20.0)
+        if code != 200 or not isinstance(resp, dict) or not isinstance(resp.get("jobs"), list):
+            broadcast_doctor_message(
+                "doctor.sweep_error", {"sweep": "remediation", "status": status, "http_status": code}
+            )
+            raise RuntimeError(f"remediation listing incomplete status={status} http={code}")
+        rows.extend(j for j in resp["jobs"] if isinstance(j, dict))
+    return rows
+
+
+def _remediate_apply_fields(jid: str, changes: dict, reason: str) -> tuple[int, Any]:
+    """Write the changed fields onto the row (the audit trail rides along)."""
+    body = {"job_ids": [jid], "fields": {name: change.get("after") for name, change in changes.items()}}
+    return _http("POST", "/v1/admin/jobs/reclassify", {**body, "reason": f"doctor-remediate:{reason}"}, timeout=20.0)
+
+
+def _remediate_reclassify(jid: str, status: str, reason: str, override: bool, override_reason: str) -> tuple[int, Any]:
+    """Move the row through the EXISTING admin reclassify path."""
+    body: dict[str, Any] = {"job_ids": [jid], "status": status, "reason": f"doctor-remediate:{reason}"}
+    if override:
+        body["override_max_retries"] = True
+        body["override_reason"] = override_reason
+    return _http("POST", "/v1/admin/jobs/reclassify", body, timeout=20.0)
+
+
+def _remediate_escalate(job: dict, why: str) -> None:
+    """Escalate a row past the attempt cap (never a verdict, never a merge)."""
+    jid = str(job.get("id") or "")
+    broadcast_doctor_message("doctor.needs_review_stuck", {"host": AGENT_HOST, "job_ids": [jid], "reason": why})
+    log.warning("remediation escalated %s: %s", jid[:12], why)
+
+
+def run_remediation_sweep(*, dry_run: bool | None = None, now: float | None = None) -> dict:
+    """Classify and FIX the triage backlog: one thin call site for the module.
+
+    All the decision logic lives in :mod:`hive.workers.doctor_remediation` (so
+    the sibling review-adoption branch merges cleanly); this function only wires
+    the doctor's bus access and safety state to it. Disabled by
+    ``HIVE_DOCTOR_REMEDIATE=0``."""
+    if not doctor_remediation.REMEDIATE_ENABLED:
+        return {"enabled": False, "applied": 0, "reason": "HIVE_DOCTOR_REMEDIATE=0"}
+    rows = fetch_remediable_rows()
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        # Every guard in the module is durable; without the store a sweep would
+        # re-fix the same row forever.
+        raise RuntimeError("remediation refused: durable state unavailable")
+    summary = doctor_remediation.sweep(
+        rows,
+        state=STATE,
+        apply_fields=_remediate_apply_fields,
+        reclassify=_remediate_reclassify,
+        escalate=_remediate_escalate,
+        advance_review=lambda job: ensure_review_followup({**job, "status": "needs-review"}),
+        # The real reviewer roster and the doctor's own route-health view: a
+        # capped/down route is only visible through the probe, so leaving both
+        # unset would have the sweep classify rows against a roster nobody
+        # checked and switch them to a model that cannot serve them.
+        roster=review_queue.load_roster(),
+        health=_review_route_health(),
+        dry_run=doctor_remediation.DRY_RUN if dry_run is None else dry_run,
+        now=now,
+    )
+    summary["enabled"] = True
+    broadcast_doctor_message("doctor.remediation", {"host": AGENT_HOST, **summary})
     return summary
 
 

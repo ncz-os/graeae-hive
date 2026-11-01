@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -286,3 +288,11 @@ class ReclassifyRequest(BaseModel):
     # Same operator override as RequeueRequest; only consulted for status="queued".
     override_max_retries: bool = False
     override_reason: str | None = None
+    # A FIELD repair, not a status move: the doctor's remediation plans
+    # {row_field: {before, after}} and its executor posts the flattened
+    # {name: after} map here. Until this existed the route dropped it (pydantic
+    # ignores unknown keys), so the doctor "fixed" rows whose fields never
+    # changed and re-classified the same cause until the attempt cap.
+    # Merged into the row's result; only consulted when the row stays out of
+    # the queue (a requeue archives and clears the result, FB51).
+    fields: dict[str, Any] | None = None
