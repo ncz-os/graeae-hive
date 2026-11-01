@@ -417,3 +417,58 @@ Not verified: the operator's routing note
 (`hard_lane_priority`) and `docs/REVIEW_QUEUE.md`, not from that note. The
 Codex gate (plan usage, cooldown, online worker) is not consulted at submit
 time: the job waits for a codex worker to claim it.
+
+### The continuation pass fails closed (2026-11-01, DeepSeek HIGH)
+
+This pass makes the doctor CREATE jobs by itself, and a remediation runaway
+earlier the same day built a ten-deep review chain. The round number came from
+`rounds_spent` = max(the row's own lineage, the per-root counter). The own
+lineage is known only from the durable `_lineage_key(<job id>)` record
+(`MARK_TTL_SEC`) or a `doctor-continuation:` idempotency key. With both gone it
+fell back to `(own id, 0)`, so the row became round 1 again on the author's
+family and started a new chain (the regression reproduced
+`hv/...-r1` → `hv/...-r1-r1`). If the per-root counter is lost too, that repeats
+forever. Three guards now stand in front of every submit. Each one works on
+its own.
+
+1. **`lineage_unknown`: a lost continuation is refused, not restarted.** When
+   neither the lineage record nor a well-formed key exists,
+   `continuation_evidence` looks for continuation markers that do not depend on
+   either. The markers are: a `doctor-continuation:` key prefix; the brief's
+   `Continuation round N of M for work job` line (or the standing instruction)
+   in `description`/`brief`/`prompt`/`task` on the row or its result; a `-rN`
+   head branch; a parent the store shows the doctor continued (a lineage,
+   rounds or continuation marker); or, through `_chain_job`, a parent chain
+   where a work row's `head_branch` is this row's `base_branch` or carries a
+   marker itself. When any marker is present, the doctor creates nothing. The
+   outcome is `refused` with `lineage_unknown`, and the doctor logs one WARNING
+   and escalates once through `doctor.needs_review_stuck`. The escalation
+   repeats at most once per `ESCALATE_TTL_SEC`
+   (`remediation:continuation_lineage_unknown:<id>`). Repeat refusals are
+   logged at DEBUG. A dry run escalates nothing. If the parent chain can't be
+   read, the result is `refused`/`lineage_lookup_failed`: nothing is created
+   or escalated, and the next sweep reads the chain again. A genuinely new root
+   with no marker anywhere still gets round 1. A parent whose head is not this
+   row's base, and which the doctor never continued, does not count as a
+   marker.
+2. **A global hourly brake.** At most `HIVE_DOCTOR_CONTINUE_MAX_PER_HOUR`
+   (default 6) continuation jobs per rolling hour across ALL rows. The limit is
+   counted in its own durable record (`remediation:continuation_hourly`, a list
+   of stamps) and read independently of every per-row record. The stamp is
+   written BEFORE the submit, so a submit that fails (and may still have
+   created the job) also counts. A clock that moves backwards never frees the
+   brake. Rows over the limit are `throttled`, and the sweep logs one WARNING.
+   Dry runs do not count. `0` creates nothing, and an unreadable value means 6.
+3. **A durable store or nothing.** `continuation_sweep` refuses before any read
+   (`refused: durable_state_unavailable`) when `STATE.loaded_ok` or
+   `STATE.persist_ok` is false, and `doctor.run_continuation_sweep` raises.
+   This is the same rule `run_remediation_sweep` already applied. Each submit
+   checks the store again, before and after the brake's own write, because a
+   counter that did not persist is no brake.
+
+**Kill switch.** `HIVE_DOCTOR_REMEDIATE=0` stops both halves (the field-fix
+sweep and the continuation pass) before any read. `HIVE_DOCTOR_CONTINUE_MAX_PER_HOUR=0`
+stops only the creation of continuation jobs.
+
+Regressions: `test_doctor_continuation_guards_20261101.py`. Every test in it
+failed on `836a28d`.
