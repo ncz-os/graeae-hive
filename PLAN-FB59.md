@@ -80,3 +80,10 @@ assertions prove every source is consulted; an untouched `_keys` only made
 that dependent on the host). Kept both patches, documented why in `_build`;
 loosened the discoverer-argument assertion to "one positional arg" so it
 neither pins the credential string nor a keyword-only change.
+
+Review round 2 (accepted): `_build` keeping its tuple return was a needless
+API break -- `canonical_bytes(_build())` (determinism test, and any future
+caller) would get `(registry, record)`. Reverted: `_build` returns the
+registry as before, and the `{discover_name: mock}` map is handed to the
+caller through the optional `called` out-param that the two NoDrop tests
+already use. No test has to know about a pair.

@@ -59,9 +59,10 @@ def _clean_env():
 def _build(overlay=OVERLAY, skip=(), discoverers=None, creds=None, called=None):
     """build_registry with mocked sources and a temp overlay file.
 
-    Returns ``(registry, {discover_name: mock})`` so a caller can assert a
-    source was actually consulted; pass ``called`` to receive that same dict
-    instead of the returned copy.
+    Returns the registry, exactly as before: every ``canonical_bytes(_build())``
+    caller keeps working. Pass ``called`` (a dict) to receive the
+    ``{discover_name: mock}`` map so a caller can assert a source was actually
+    consulted.
 
     A source is only consulted when its credential is set (see
     ``build_registry``): no PAT, no ``discover_*`` call. The test must not
@@ -111,7 +112,7 @@ def _build(overlay=OVERLAY, skip=(), discoverers=None, creds=None, called=None):
     for p in patches:
         p.start()
     try:
-        return regmod.build_registry(overlay_path=op, skip=skip, **fake_creds), record
+        return regmod.build_registry(overlay_path=op, skip=skip, **fake_creds)
     finally:
         for p in reversed(patches):
             p.stop()
@@ -125,7 +126,7 @@ def canonical_bytes(reg):
 class DeterminismTests(unittest.TestCase):
     def test_double_build_is_byte_identical(self):
         """Invariant: the same inputs always produce the same bytes."""
-        self.assertEqual(canonical_bytes(_build()[0]), canonical_bytes(_build()[0]))
+        self.assertEqual(canonical_bytes(_build()), canonical_bytes(_build()))
 
     def test_byte_identical_across_hash_seeds(self):
         """Invariant: no set-ordering hazard — two fresh interpreters with
@@ -182,7 +183,8 @@ class NoDropTests(unittest.TestCase):
         vacuously: a forge with no credential is never discovered, so its
         slug would come back overlay-only and the tag check below would be
         asserting against the one source it excluded."""
-        reg, called = _build()
+        called = {}
+        reg = _build(called=called)
         by_id = {e["id"]: e for e in reg["repos"]}
         for slug, tag in (
             ("g-only", "gitlab"),
@@ -208,7 +210,8 @@ class NoDropTests(unittest.TestCase):
         """Invariant: curated overlay fields attach to the entry DISCOVERY
         built; the source tag proves the entry was discovered, not merely
         created by ``merge_overlay``."""
-        reg, called = _build()
+        called = {}
+        reg = _build(called=called)
         by_id = {e["id"]: e for e in reg["repos"]}
         self.assertEqual(by_id["g-only"]["notes"], "curated note")
         self.assertIn("gitlab", by_id["g-only"]["sources"])
@@ -227,7 +230,7 @@ class MissingRemoteTests(unittest.TestCase):
         """Invariant (the flag): an entry with no live remote is marked
         sources==["overlay"] and carries NO clone_ssh/clone_nfs — it cannot
         be mistaken for a healthy, clonable repo."""
-        reg, _ = _build()
+        reg = _build()
         entry = next(e for e in reg["repos"] if e["id"] == "o-only")
         self.assertEqual(entry["sources"], ["overlay"])
         self.assertNotIn("clone_ssh", entry)
@@ -237,7 +240,7 @@ class MissingRemoteTests(unittest.TestCase):
         """Invariant: a dead remote (the discover_* failure shape is an empty
         result — they swallow HTTP/transport errors internally) still yields a
         successful build of the rest; the gap stays visible as overlay-only."""
-        reg, _ = _build(
+        reg = _build(
             discoverers={
                 "discover_gitlab": {},
                 "discover_github": {},
@@ -257,7 +260,7 @@ class BusRoundTripTests(unittest.TestCase):
         resolves via find_exact — the generator output IS bus knowledge."""
         import hive.repos as repos_mod
 
-        reg, _ = _build()
+        reg = _build()
         with tempfile.TemporaryDirectory() as td:
             cat = Path(td) / "repos.json"
             cat.write_bytes(canonical_bytes(reg))
