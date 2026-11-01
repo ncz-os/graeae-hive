@@ -663,6 +663,31 @@ def test_dry_run_reports_the_fix_and_writes_nothing(state):
     assert fake.fields == [] and fake.reclassify == [] and dr.attempts(state, row("host_pinned")["id"]) == 0
 
 
+def test_a_dry_run_sweep_keeps_the_flag_and_the_would_apply_counter_apart(state):
+    """Review 2026-10-31 (high): the summary carried the boolean flag under
+    ``"dry_run"`` AND counted the would-apply outcome under the same key, so a
+    dry-run sweep turned ``True`` into ``2``. The flag stays a bool and the
+    counter has its own name."""
+    fake = Fake()
+    rows = [row("host_pinned", id=f"01a18c66-7b02-7c44-a01e-58d2f3b9c6{i:02d}") for i in range(3)]
+    summary = dr.sweep(
+        rows,
+        state=state,
+        apply_fields=fake.apply_fields,
+        reclassify=fake.reclassify_to,
+        escalate=fake.escalate,
+        default_branch=lambda _j: "deploy/integrate-20261017",
+        branch_exists=lambda _b: True,
+        roster=ROSTER,
+        now=500.0,
+        dry_run=True,
+    )
+    assert summary["dry_run"] is True
+    assert summary[dr.DRY_WOULD_APPLY] == 3
+    assert dr.DRY_WOULD_APPLY != "dry_run"
+    assert fake.fields == [] and fake.reclassify == []
+
+
 # ── the fake clock ─────────────────────────────────────────────────────────
 
 

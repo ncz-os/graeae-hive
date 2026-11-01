@@ -115,7 +115,7 @@ CAUSES = (
 
 #: Results of :func:`remediate_one`.
 APPLIED = "applied"
-DRY_WOULD_APPLY = "dry_run"
+DRY_WOULD_APPLY = "would_apply"
 NO_CHANGE = "no_change"
 SKIPPED = "skipped"
 ESCALATED = "escalated"

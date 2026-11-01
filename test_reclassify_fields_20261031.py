@@ -187,10 +187,6 @@ class ReclassifyFieldsTests(unittest.TestCase):
             self.assertNotIn("baseline", self._result(jid))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DoctorPlanRoundTripTests(unittest.TestCase):
     """The seam the two modules meet on: the doctor's PLAN keys, its real
     executor's body shape, and this route's merge must agree end to end.
@@ -447,3 +443,7 @@ class DisprovedRound9Tests(unittest.TestCase):
         )
         self.assertEqual(merged["previous_result"], "ORIGINAL")
         self.assertEqual(merged["baseline"], "old")
+
+
+if __name__ == "__main__":
+    unittest.main()
