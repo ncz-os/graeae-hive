@@ -585,3 +585,15 @@ def test_run_remediation_sweep_honours_the_global_dry_run(monkeypatch):
     summary = doctor.run_remediation_sweep(dry_run=False, now=NOW)
     assert posts == []
     assert summary["continuations"].get(dr.DRY_WOULD_APPLY) == 1, summary
+
+
+def test_a_row_with_no_delivered_head_never_crashes_the_escalation_message(state):
+    """Muse 2026-11-01 claimed ``tip[:12]`` raises on a headless row; delivered_head returns ''."""
+    row = continuation_row(2)
+    rc = rc_on(row, "rc_meta")
+    row["result"] = {}
+    row.pop("head_sha", None)
+    assert dr.delivered_head(row) == ""
+    fake = Fake({row["id"]: [rc]})
+    fake.sweep([row], state)  # must not raise
+    assert fake.specs == []
