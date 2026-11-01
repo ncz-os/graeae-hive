@@ -71,3 +71,12 @@ source can no longer pass/fail the tag check vacuously. Verified: base helper +
 new assertions → 6 failed (incl. a `SimpleNamespace` R2-credential AttributeError,
 same leak class); fixed test → 9 passed with an empty HOME and with the real one.
 No `sorted()` added to `discover_r2`: that is the pinned emitted order, unchanged.
+
+Review round 1 (non-author local reviewer, cerberus): two findings on the
+`_keys`/`get_settings` patches. Checked against `build_registry`: the
+credential chain is `explicit keyword or settings or key file`, so the fakes
+are the keywords and empty fallbacks cannot disable a source (the call-count
+assertions prove every source is consulted; an untouched `_keys` only made
+that dependent on the host). Kept both patches, documented why in `_build`;
+loosened the discoverer-argument assertion to "one positional arg" so it
+neither pins the credential string nor a keyword-only change.

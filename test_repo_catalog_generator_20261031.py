@@ -70,6 +70,15 @@ def _build(overlay=OVERLAY, skip=(), discoverers=None, creds=None, called=None):
     operator-config module constants it reads -- a box without the key file
     (the Linux build host) or with a different one (macOS) then builds the
     same registry.
+
+    ``_keys`` and ``get_settings`` are pinned to EMPTY on purpose. The fake
+    credentials are the ``*_pat``/``*_token`` keywords: ``build_registry``
+    resolves each as ``explicit keyword or settings or key file``, and an
+    explicit keyword short-circuits that chain, so discovery runs even with
+    both fallbacks empty. Pinning them keeps the other direction true too --
+    a host key or a cached ``get_settings()`` cannot inject a live credential
+    into a build that omitted one, and the call-count assertions in the
+    NoDrop tests prove each source really was consulted.
     """
     td = tempfile.TemporaryDirectory()
     op = Path(td.name) / "overlay.json"
@@ -184,10 +193,13 @@ class NoDropTests(unittest.TestCase):
         ):
             self.assertIn(slug, by_id, slug)
             self.assertIn(tag, by_id[slug]["sources"], slug)
-        # A forge discoverer takes its credential positionally; the
-        # credential-free sources take no argument.
+        # A forge discoverer takes its credential as the first positional
+        # argument (asserted loosely: the credential itself is `fake_creds`,
+        # not a contract of this test); the credential-free sources take none,
+        # except ARGONAS, which is always handed the (None) password.
         for name in ("discover_gitlab", "discover_github", "discover_buildkite"):
             called[name].assert_called_once()
+            self.assertEqual(len(called[name].call_args.args), 1, name)
         called["discover_argonas"].assert_called_once_with(password=None)
         called["discover_r2"].assert_called_once()
         self.assertEqual(reg["_meta"]["r2_buckets"], ["r2-bucket"])
