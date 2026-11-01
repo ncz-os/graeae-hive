@@ -74,7 +74,16 @@ from hive.core import fleet_inventory
 # container still runs this module standalone.
 from hive.review_queue import pick_reviewers
 from hive.workers import doctor_decline_paths as decline_paths
-from hive.workers import doctor_gates, doctor_models, doctor_rules, doctor_v2, loop_outcome, remediation, retention
+from hive.workers import (
+    doctor_gates,
+    doctor_head_match,
+    doctor_models,
+    doctor_rules,
+    doctor_v2,
+    loop_outcome,
+    remediation,
+    retention,
+)
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "")
@@ -5633,10 +5642,18 @@ def merge_handoff(job: dict) -> str:
     state = review_queue.review_state(job) or {}
     approved = state.get("approved")
     if not isinstance(approved, dict) or not approved.get("reviewers"):
+        approved = state.get("approved_mergeable")
+    if not isinstance(approved, dict) or not approved.get("reviewers"):
         return "needs_review"
     if approved.get("head_sha") and not review_verdict.same_sha(
         approved["head_sha"], _review_head(job, _row_result_dict(job))
     ):
+        return "stale_approval"
+    if approved.get("approved_sha") and not review_verdict.same_sha(approved["approved_sha"], approved["head_sha"]):
+        # An approval recorded at a verdict-only DESCENDANT covers the delivered
+        # head only when the reviewed sha is that head or its descendant -- which
+        # the classifier proved before recording it. A row rewritten since then
+        # (a new tip) is stale, never mergeable.
         return "stale_approval"
     if review_followup_protected(job):
         return "protected"
@@ -5804,7 +5821,81 @@ def _review_child_outcome(child: dict, *, head_sha: str = "", author_families: s
             return interpret_review_outcome(candidate, head_sha=head_sha, author_families=author_families)
         except ValueError as exc:
             failure = str(exc)
+    if failure == "review_head_mismatch":
+        # A structured approve for a head OTHER than the delivered one. It is
+        # not an approval of this head -- but the verdict itself is real, so it
+        # is returned for the caller's verdict-descendant rule to judge
+        # (verdict-only descendant / newer work / overreach). Judging it here
+        # would close the bug the other way round: the exact-head rule was the
+        # defect (production 2026-10-31), so the shape must survive to the
+        # classifier rather than collapse into "reviewer_failure".
+        # The source that NAMES the head wins: a parallel evidence block may
+        # carry the same verdict without one.
+        structured = [
+            verdict
+            for verdict in (_structured_verdict(c, author_families=author_families) for c in sources)
+            if verdict is not None and verdict.get("kind") == "approve"
+        ]
+        for verdict in sorted(structured, key=lambda v: not v.get("head_sha")):
+            if verdict.get("head_sha"):
+                return verdict
+        if structured:
+            return structured[0]
     return {"kind": "reviewer_failure", "failure": failure or "review_no_reviewers", "reviewers": []}
+
+
+def _structured_verdict(raw: Any, *, author_families: set | frozenset | None = None) -> dict | None:
+    """A structured verdict read WITHOUT the head check (cross-family still enforced).
+
+    ``{"kind": "approve" | "request_changes" | "reviewer_failure", "reviewers",
+    "head_sha", "verdicts"}``, or None when ``raw`` is not a usable structured
+    verdict. The reviewed head is whatever the payload names ('' when none).
+    """
+    payload = raw
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text or text[:1] not in "{[":
+            return None
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            return None
+    if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+        payload = payload["result"]
+    if not isinstance(payload, dict):
+        return None
+    entries = payload.get("reviewers")
+    if not isinstance(entries, list) or not entries:
+        return None
+    blocked = {f for f in (author_families or ()) if f}
+    cross = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        model = str(entry.get("model") or entry.get("model_id") or "").strip()
+        verdict = review_verdict.normalize_verdict(entry.get("verdict"))
+        if not model or not verdict:
+            return None
+        if review_queue.family_of(model) in blocked:
+            continue
+        cross.append((model, verdict))
+    if not cross:
+        return None
+    verdicts = [verdict for _, verdict in cross]
+    if "approve" in verdicts and "request_changes" not in verdicts:
+        kind = "approve"
+    elif "request_changes" in verdicts or review_verdict.normalize_verdict(payload.get("verdict")) == "request_changes":
+        kind = "request_changes"
+    elif all(v == "blocked" for v in verdicts):
+        kind = "reviewer_failure"
+    else:
+        return None
+    return {
+        "kind": kind,
+        "reviewers": [model for model, _ in cross],
+        "head_sha": str(payload.get("head_sha") or "").strip(),
+        "verdicts": verdicts,
+    }
 
 
 def _tried_entry(entry: dict, failure: str, now: float) -> dict:
@@ -5902,6 +5993,12 @@ def _review_kind_for(base_kind: str) -> str:
     return f"review:{base_kind}-{date}" if base_kind else f"review:{date}"
 
 
+def _review_ref_slug(branch: str | None) -> str:
+    """The verdict-artifact branch part: the branch name, path and glob characters folded to ``-``."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(branch or "").strip("/") or "no-branch").strip("-")
+    return slug or "no-branch"
+
+
 def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: float) -> tuple[str, dict]:
     """Submit ONE read-only review job naming the cross-family pick(s)."""
     jid = str(job.get("id") or "")
@@ -5929,7 +6026,16 @@ def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: 
         f"review with {', '.join(names)}). "
         "Return a structured verdict JSON with a 'reviewers' list of {model, verdict} entries "
         "(verdict: approve | request-changes | blocked), a 'head_sha' field containing the exact reviewed commit, "
-        f"and a 'reason' field. Prose is not a verdict. Reviewed job id: {jid}. No commits expected."
+        f"and a 'reason' field. Prose is not a verdict. Reviewed job id: {jid}. "
+        # The verdict artifact goes to its OWN ref, never onto the author's branch
+        # (production 2026-10-31: four rows would not close because the review job
+        # committed its verdict json onto the author branch). The ref is keyed by
+        # the reviewer so the brief can name it before the child id exists.
+        "The ONLY write a review job makes is its verdict artifact "
+        f"(REVIEW_VERDICT_{_review_ref_slug(head)}.json or review-verdict-<job id>.json); push it to the "
+        "SEPARATE ref review/<author branch>-<your job id> (never the author branch). "
+        f"Never commit, push or amend anything on the author branch {head or '(see job)'}: "
+        "any other file changed there is review overreach and the review is refused. No commits expected."
     )
     attempt = int(state.get("attempt") or 0)
     codex = review_queue.is_codex_route(reviewers[0]) if reviewers else False
@@ -5972,6 +6078,470 @@ def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: 
             break
         return str(candidate["id"]), spec
     raise RuntimeError(f"review submit failed code={code} resp={str(resp)[:160]}")
+
+
+# ── an approve at a verdict-only descendant covers the delivered head ───────
+# Operator report 2026-10-31 (the doctor's exact-head rule): four production
+# rows (01a19270 hv/bl-ct-dialect, 1007c484 hv/bl-ct-system, 01a1922a
+# hv/zf-failure-contract-r3, 01a18fe6 hv/zc-master-prompt) had a review child
+# with a structured approve from cerberus-reviewer and still sat needs-review
+# with "approved, but the review job advanced the branch". The review job had
+# committed its verdict artifact onto the AUTHOR's branch, so the head it
+# approved was the author tip plus one json file. The classifier and its git
+# questions live in hive/workers/doctor_head_match.py; this is the call site:
+#
+#   verdict_only    -> record approved_mergeable with the approved sha (status
+#                      stays needs-review: the MERGE PASS acts, the doctor never
+#                      merges);
+#   code_descendant -> "approval covers newer work not on the head branch": push
+#                      it only as a pure fast-forward from the review child's own
+#                      workspace (the rescue path), else report the exact sha and
+#                      a one-line action, and re-review at the tip;
+#   overreach       -> a review that changed code on the author branch: its
+#                      approval is NOT counted (review_overreach) and another
+#                      reviewer is asked for the tip;
+#   not_descendant  -> unchanged: head-exact, never an approval.
+#
+# Everything is still per-row, still bounded by one per-sweep cap, and
+# HIVE_DOCTOR_VERDICT_DESCENDANT (default on) turns the descendant rule off.
+HIVE_DOCTOR_VERDICT_DESCENDANT = doctor_head_match.env_switch("HIVE_DOCTOR_VERDICT_DESCENDANT", default=True)
+HIVE_DOCTOR_HEAD_MATCH_DRY_RUN = doctor_head_match.env_switch("HIVE_DOCTOR_HEAD_MATCH_DRY_RUN", default=False)
+HIVE_DOCTOR_HEAD_MATCH_MAX = _env_int("HIVE_DOCTOR_HEAD_MATCH_MAX", 25, minimum=0)
+
+#: Every outcome a sweep can record per row (the phase-0 and phase-1 keys that
+#: are merged into one report; ``scanned``/``adopted``/``submitted``/dry-run are
+#: phase facts, not row outcomes).
+_PER_ROW_OUTCOMES = frozenset(
+    {
+        "awaited",
+        "deferred",
+        "capacity",
+        "parked",
+        "exhausted",
+        "approved",
+        "request_changes",
+        "review_failed",
+        "resolved",
+        "capped",
+        "approved_mergeable",
+        "review_overreach",
+        "approval_not_on_head",
+        "awaiting_review_after_rescue",
+        "head_match_previewed",
+        "head_match_capped",
+    }
+)
+
+#: The sweep outcome (and summary key) per non-covering verdict. ``overreach``
+#: and a plain non-descendant head share "the approval is not counted"; the
+#: code-descendant case names what an operator does about it.
+_HEAD_MATCH_OUTCOMES = {
+    doctor_head_match.OVERREACH: "review_overreach",
+    doctor_head_match.CODE_DESCENDANT: "approval_not_on_head",
+    doctor_head_match.NOT_DESCENDANT: "approval_not_on_head",
+}
+
+#: The per-sweep head-match budget: rows past the cap wait unchanged for the
+#: next pass. Reset by ``run_review_queue_sweep``; a direct per-row call (a
+#: test, a replay) is never capped.
+_HEAD_MATCH_BUDGET = {"left": None, "capped": 0}
+
+
+def reset_head_match_budget(limit: int | None = None) -> None:
+    """Start a sweep's head-match budget (``None``: uncapped)."""
+    _HEAD_MATCH_BUDGET["left"] = None if limit is None else int(limit)
+    _HEAD_MATCH_BUDGET["capped"] = 0
+
+
+def head_match_budget_capped() -> int:
+    """How many rows the CURRENT pass skipped because the cap was spent."""
+    return int(_HEAD_MATCH_BUDGET.get("capped") or 0)
+
+
+def _head_match_budget_left() -> bool:
+    """Spend one unit of the pass's head-match budget.
+
+    A refusal is tallied here and ONLY here: the per-row caller has not looked
+    at the row yet, so it returns the row UNCHANGED (not ``head_match_capped``)
+    and ``run_review_queue_sweep`` records one cap for it. Counting both would
+    report two capped rows for one budget.
+    """
+    left = _HEAD_MATCH_BUDGET.get("left")
+    if left is None:
+        return True
+    if left <= 0:
+        _HEAD_MATCH_BUDGET["capped"] = int(_HEAD_MATCH_BUDGET.get("capped") or 0) + 1
+        return False
+    _HEAD_MATCH_BUDGET["left"] = left - 1
+    return True
+
+
+#: The workspace a row's review child ran in, by kind (the worker's layout).
+_WORKSPACE_ROOT = os.environ.get("HIVE_WORKSPACE_ROOT", os.path.expanduser("~/hive-workspaces"))
+
+
+def _child_workspace(child: dict) -> str | None:
+    """The review child's own checkout -- the only place its commits are known to exist.
+
+    The worker clones into ``<HIVE_WORKSPACE_ROOT>/<job id>``; a child that
+    recorded its ``workdir`` wins. Never the head branch's clone: a rescue must
+    push a commit the child actually holds. The workspace SURVIVES the child's
+    terminal state (the worker preserves it), so a finished review's commits are
+    still on disk when the sweep reads them.
+    """
+    for container in (child, child.get("result") if isinstance(child.get("result"), dict) else {}):
+        for key in ("workdir", "workspace", "workspace_preserved"):
+            path = str(container.get(key) or "").strip()
+            if path and os.path.isdir(path):
+                return path
+    jid = str(child.get("id") or "").strip()
+    path = os.path.join(_WORKSPACE_ROOT, jid) if jid else ""
+    return path if path and os.path.isdir(path) else None
+
+
+def classify_review_head(
+    job: dict, head_sha: str, reviewed: str, *, child: dict | None = None
+) -> doctor_head_match.HeadMatch:
+    """Classify an approval at ``reviewed`` against the row's delivered ``head_sha``.
+
+    The workspace that answers is the review CHILD's own (it holds the reviewed
+    commit); a row with no reachable workspace falls back to the head branch's
+    clone, which can only ever see the delivered tip. A verdict that gained
+    neither workspace answers ``not_descendant``: head-exact, which is exactly
+    the pre-fix rule. ``child`` is the listing row the sweep already read.
+    """
+    reviewed = str(reviewed or "").strip()
+    head_sha = str(head_sha or "").strip()
+    if not reviewed or not head_sha:
+        return doctor_head_match.HeadMatch(doctor_head_match.NOT_DESCENDANT, reviewed, head_sha, reason="no head")
+    child = child if child is not None else (_head_match_child(job) or {})
+    pushed = child.get("result") if isinstance(child.get("result"), dict) else {}
+    # ``checkout_for`` refuses a workspace that does not hold BOTH commits: the
+    # classifier diffs ``tip..reviewed`` and a tip-only clone would answer
+    # ``not_descendant`` for every review -- the exact-head bug this fixes.
+    for repo in (_child_workspace(child) if child else None, _head_branch_workspace(job)):
+        if repo and doctor_head_match.checkout_for(repo, head_sha, reviewed):
+            return doctor_head_match.classify_descendant(
+                repo,
+                head_sha,
+                reviewed,
+                pushed_files=pushed.get("files_changed"),
+                pushed_commits=pushed.get("commits"),
+            )
+    return doctor_head_match.HeadMatch(
+        doctor_head_match.NOT_DESCENDANT,
+        reviewed,
+        head_sha,
+        reason=f"reviewed head {doctor_head_match._shown(reviewed)} is not in any reachable workspace",
+    )
+
+
+def _head_branch_workspace(job: dict) -> str | None:
+    """The row's own checkout (the delivered tip), by job id, when it exists."""
+    for root in (_WORKSPACE_ROOT, os.path.expanduser("~/hive-workspaces")):
+        path = os.path.join(root, str(job.get("id") or ""))
+        if str(job.get("id") or "") and os.path.isdir(path):
+            return path
+    return None
+
+
+def _review_head_mismatch(outcome: dict, head: str) -> bool:
+    """The child answered an approve/request-changes for a head OTHER than the delivered one."""
+    reviewed = str((outcome or {}).get("head_sha") or "").strip()
+    return bool(reviewed) and not review_verdict.same_sha(reviewed, head or "")
+
+
+def _head_match_enabled(state: dict) -> bool:
+    """Whether the descendant rule may judge this row (switch on, row not already resolved)."""
+    if not HIVE_DOCTOR_VERDICT_DESCENDANT:
+        return False
+    # A row holding an approval (mergeable, or the legacy ``approved`` block) is
+    # resolved: a later child of the SAME row can never replace that approval.
+    return not state.get("approved") and not state.get("approved_mergeable")
+
+
+def _head_match_evidence(result: doctor_head_match.HeadMatch, *, action: str, **extra) -> dict:
+    """The one ``review_head_match`` record kept on the row (stable, idempotent)."""
+    record = {**result.as_dict(), "action": action}
+    record.update({k: v for k, v in extra.items() if v is not None})
+    if action:
+        record["action"] = " ".join(str(action).split())
+    return record
+
+
+def _head_match_path(
+    job: dict,
+    state: dict,
+    child: dict,
+    head: str,
+    *,
+    review_job_id: str,
+    now: float,
+    allow_work: bool = True,
+    child_outcome: dict | None = None,
+) -> tuple[str, dict, None]:
+    """Judge an approve for a head other than the delivered one (the bug's four shapes).
+
+    ``verdict_only`` -> ``approved_mergeable`` with the approved sha (status
+    unchanged: the merge pass acts). ``overreach`` -> not counted, one retry
+    at the tip. ``code_descendant`` -> rescue by pure fast-forward when the
+    review child's workspace holds it, else report the exact sha and the
+    one-line action, and re-review. ``not_descendant`` -> unchanged, head-exact.
+
+    ``allow_work=False`` (the per-sweep cap is spent) returns ``head_match_capped``
+    and writes nothing: the row is read again on the next pass.
+    """
+    reviewed = str((child_outcome or {}).get("head_sha") or "")
+    result = classify_review_head(job, head, reviewed, child=child)
+    if not allow_work:
+        # The pass's budget is spent: the row is left EXACTLY as it was (its
+        # state object, so nothing is re-PATCHed) and judged next sweep. The
+        # budget itself counted the skip; the caller returns the outcome.
+        return "head_match_capped", state, None
+    if result.ok_for_tip and result.verdict == doctor_head_match.VERDICT_ONLY:
+        if HIVE_DOCTOR_HEAD_MATCH_DRY_RUN:
+            return "head_match_previewed", _record_head_match_preview(job, state, result, now=now), None
+        return _approved_mergeable(job, state, result, child_outcome or {}, now=now)
+    rescue = rescue_reviewed_head(job, reviewed, head, child=child) if result.newer_work else {}
+    if rescue.get("action") in ("pushed", "would_push"):
+        # The head branch now carries the reviewed commit: the row is re-reviewed
+        # at the NEW tip next pass. Nothing is approved and no attempt is spent.
+        record_state = _record_head_match_preview(
+            job, state, result, now=now, action=_head_match_action(result, rescue), rescued=rescue
+        )
+        return "awaiting_review_after_rescue", record_state, None
+    return _head_match_failure(job, state, result, now=now, rescue=rescue, reason=result.verdict)
+
+
+def _record_head_match_preview(
+    job: dict,
+    state: dict,
+    result: doctor_head_match.HeadMatch,
+    *,
+    now: float,
+    action: str | None = None,
+    rescued: dict | None = None,
+) -> dict:
+    """Write (or dry-run log) the head-match record without changing the row's disposition.
+
+    ``rescued`` marks the fast-forward path: the child FINISHED (its slot is
+    free, the row is re-reviewed at the new tip), so ``review_job_id`` is
+    cleared. A dry run writes nothing at all.
+    """
+    action = action or (
+        "merge pass may merge the delivered head" if result.ok_for_tip else _head_match_action(result, rescued or {})
+    )
+    record = _head_match_evidence(
+        result,
+        action=action,
+        approved_sha=result.reviewed if result.ok_for_tip else None,
+        rescued_sha=result.reviewed if rescued else None,
+    )
+    record["at"] = now
+    if HIVE_DOCTOR_HEAD_MATCH_DRY_RUN:
+        log.info(
+            "DRY_RUN head-match: job=%s verdict=%s reviewed=%s tip=%s action=%s",
+            str(job.get("id") or "")[:12],
+            result.verdict,
+            result.reviewed[:12],
+            result.tip[:12],
+            record["action"],
+        )
+        return {**state, "review_head_match": record}
+    # ``at`` is bookkeeping, not evidence: two records that describe the same
+    # git state are the SAME record, so a second pass over the row writes
+    # nothing (idempotency is what keeps a sweep from re-PATCHing every row).
+    if _same_head_match(state.get("review_head_match"), record):
+        return state
+    new_state = {
+        **state,
+        "review_head_match": record,
+        "updated_at": now,
+    }
+    if result.ok_for_tip or rescued:
+        # The review is settled (or its commits were fast-forwarded): the child
+        # is closed out so the next pass reviews the new tip, not this child.
+        new_state["review_job_id"] = None
+    _patch_review_state(job, new_state)
+    return new_state
+
+
+def _same_head_match(recorded: Any, record: dict) -> bool:
+    """Whether ``recorded`` already says exactly what ``record`` says (bar ``at``)."""
+    if not isinstance(recorded, dict):
+        return False
+    left = {k: v for k, v in recorded.items() if k != "at"}
+    right = {k: v for k, v in record.items() if k != "at"}
+    return left == right
+
+
+def _head_match_child(job: dict) -> dict | None:
+    """The row's in-flight review child, from the listing the sweep already read."""
+    child_id = str(
+        (review_queue.review_state(job) or {}).get("review_job_id")
+        or _row_result_dict(job).get("auto_review_job_id")
+        or ""
+    )
+    if not child_id:
+        return None
+    try:
+        for child in _needs_review_child_review_jobs(job):
+            if str(child.get("id")) == child_id:
+                return child
+    except RuntimeError:
+        return None
+    return None
+
+
+def rescue_reviewed_head(job: dict, reviewed: str, tip: str, *, child: dict | None = None) -> dict:
+    """Fast-forward the head branch to ``reviewed`` from the review child's workspace.
+
+    Only a pure fast-forward the CHILD holds (``git push <sha>:refs/heads/<branch>``
+    -- never a merge, never a force). Any other shape is refused and reported.
+    """
+    child = child if child is not None else (_head_match_child(job) or {})
+    repo = _child_workspace(child)
+    branch = job.get("head_branch")
+    if not repo or not os.path.isdir(repo):
+        return {"action": "unavailable", "sha": reviewed, "old": tip, "reason": "no review workspace"}
+    return doctor_head_match.rescue_ff(
+        repo, tip, reviewed, branch=branch, dry_run=HIVE_DOCTOR_HEAD_MATCH_DRY_RUN
+    )
+
+
+def _head_match_action(result: doctor_head_match.HeadMatch, rescue: dict) -> str:
+    """ONE line an operator (or the next pass) can act on."""
+    short = doctor_head_match._shown
+    if result.verdict == doctor_head_match.CODE_DESCENDANT:
+        if rescue.get("action") in ("pushed", "would_push"):
+            verb = "fast-forwarded" if rescue["action"] == "pushed" else "would fast-forward"
+            return f"{verb} the head branch to {short(result.reviewed)}; re-review the new tip"
+        return f"reviewed {short(result.reviewed)} is not on the head branch: {doctor_head_match.Actions.RESCUE_OR_CONFIRM}"
+    if result.verdict == doctor_head_match.OVERREACH:
+        return doctor_head_match.Actions.RE_REVIEW
+    return doctor_head_match.Actions.RE_REVIEW_EXACT
+
+
+def _head_match_failure(
+    job: dict,
+    state: dict,
+    result: doctor_head_match.HeadMatch,
+    *,
+    now: float,
+    rescue: dict | None = None,
+    reason: str | None = None,
+) -> tuple[str, dict, None]:
+    """Record a non-covering approval and schedule the next review attempt.
+
+    The approval is NOT counted: no ``approved`` block, the row stays
+    ``awaiting_review`` and either a review is asked for the tip (overreach) or
+    the new tip (code descendant). Idempotent: an unchanged verdict on the same
+    head is not re-PATCHed.
+    """
+    record = {
+        **result.as_dict(),
+        "action": _head_match_action(result, rescue or {}),
+        "at": now,
+    }
+    if rescue:
+        record["rescue"] = rescue.get("action")
+        if rescue.get("action") in ("pushed", "would_push"):
+            record["rescued_sha"] = result.reviewed
+    outcome = _HEAD_MATCH_OUTCOMES.get(result.verdict, "approval_not_on_head")
+    # ``reason`` is the verdict ('overreach'/'code_descendant'/'not_descendant');
+    # the row records the FAILURE kind, which is prefixed like the other ones.
+    failure = reason or result.verdict
+    if failure == doctor_head_match.OVERREACH:
+        failure = "review_overreach"
+    if _same_head_match(state.get("review_head_match"), record) and state.get("last_failure") == failure:
+        return outcome, state, None
+    tried = list(state.get("tried") or [])
+    new_state = {
+        **state,
+        "review_job_id": None,
+        # Explicit ``None`` on the row the rule judged: "this approval is NOT
+        # mergeable" is a recorded fact, distinct from a row never judged.
+        "approved_mergeable": None,
+        "review_head_match": record,
+        "last_failure": failure,
+        "next_attempt_at": now + review_queue.backoff_seconds(int(state.get("attempt") or 0)),
+        "updated_at": now,
+    }
+    _patch_review_state(job, new_state)
+    broadcast_doctor_message(
+        "doctor.review_approval_not_counted",
+        {
+            "host": AGENT_HOST,
+            "job_id": job.get("id"),
+            "verdict": result.verdict,
+            "reviewed": result.reviewed,
+            "head": result.tip,
+            "action": record["action"],
+            "tried": len(tried),
+        },
+    )
+    return outcome, new_state, None
+
+
+def _approved_mergeable(
+    job: dict, state: dict, result: doctor_head_match.HeadMatch, outcome: dict, *, now: float
+) -> tuple[str, dict, None]:
+    """Record ``approved_mergeable`` with the approved sha; the merge pass acts.
+
+    The row's STATUS stays needs-review (the review queue IS the triage queue):
+    only the merge pass merges, never the doctor. ``approved.head_sha`` stays
+    the DELIVERED tip and ``approved.approved_sha`` is the commit the reviewer
+    signed, so the merge pass can prove one covers the other.
+    """
+    approved = {
+        "reviewers": list(outcome.get("reviewers") or []),
+        "head_sha": result.tip,
+        "approved_sha": result.reviewed,
+        "basis": result.verdict,
+        "review_job_id": state.get("review_job_id"),
+        "at": now,
+    }
+    if result.verdict == doctor_head_match.VERDICT_ONLY and result.reviewed != result.tip:
+        approved["verdict_only_descendant"] = True
+    record = {**result.as_dict(), "action": "merge pass may merge the delivered head", "at": now}
+    new_state = {
+        **state,
+        "state": doctor_head_match.APPROVED_MERGEABLE,
+        "review_job_id": None,
+        "approved": approved,
+        # The merge pass reads THIS key; ``approved`` is the legacy spelling that
+        # makes the row resolvable to the queue (``is_resolved``). Both name the
+        # same commit: the delivered tip, plus the sha the reviewer signed.
+        "approved_mergeable": approved,
+        "review_head_match": record,
+        "last_failure": None,
+        "next_attempt_at": None,
+        "updated_at": now,
+    }
+    _patch_review_state(
+        job,
+        new_state,
+        verdict={
+            "reviewers": [{"model": m, "verdict": "approve"} for m in outcome.get("reviewers") or []],
+            "head_sha": result.tip,
+            "approved_sha": result.reviewed,
+            "basis": result.verdict,
+        },
+    )
+    broadcast_doctor_message(
+        "doctor.review_approved",
+        {
+            "host": AGENT_HOST,
+            "job_id": job.get("id"),
+            "reviewers": outcome.get("reviewers"),
+            "review_job_id": approved["review_job_id"],
+            "head_sha": result.tip,
+            "approved_sha": result.reviewed,
+            "state": doctor_head_match.APPROVED_MERGEABLE,
+            "merge": merge_handoff({**job, "result": {**_row_result_dict(job), "review_state": new_state}}),
+        },
+    )
+    return "approved_mergeable", new_state, None
 
 
 def process_awaiting_review_row(
@@ -6044,6 +6614,41 @@ def process_awaiting_review_row(
             )
             if outcome is None:
                 return "awaited", state, None
+            if outcome["kind"] == "approve" and _review_head_mismatch(outcome, head):
+                # THE BUG (production 2026-10-31): the approve names a head other
+                # than the delivered tip. Before this, the exact-head rule turned
+                # it into review_failed and the four rows never cleared. The
+                # verdict-descendant rule judges it from the child's commits on
+                # disk; with the switch off it is the old refusal, unchanged.
+                if _head_match_enabled(state):
+                    # ONE unit of the pass's budget, spent here and passed in:
+                    # a plain exact-head approve never reaches this line, and a
+                    # capped row leaves the state byte-identical (the sweep
+                    # counts it exactly once).
+                    allow_work = _head_match_budget_left()
+                    held_outcome, held_state, _ = _head_match_path(
+                        job,
+                        state,
+                        child,
+                        head,
+                        review_job_id=in_flight,
+                        now=now,
+                        allow_work=allow_work,
+                        child_outcome=outcome,
+                    )
+                    if not allow_work:
+                        # ``_head_match_path`` was refused: leave the row as it
+                        # was and let the sweep record the cap.
+                        return "head_match_capped", held_state, None
+                    return held_outcome, held_state, None
+                # Switch off: the pre-fix exact-head verdict, unchanged.
+                failure = "review_head_mismatch"
+                tried = list(state.get("tried") or [])
+                catalog = roster or review_queue.load_roster()
+                for model in outcome.get("reviewers") or []:
+                    entry = next((r for r in catalog if _same_model(r.get("model_id"), model)), None)
+                    tried.append(_tried_entry(entry or {"model_id": model}, failure, now))
+                return _schedule_retry(job, state, tried, failure, now=now, review_job_id="")
             if outcome["kind"] == "approve":
                 approved = {
                     "reviewers": outcome["reviewers"],
@@ -6358,11 +6963,25 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
     and tagged alike -- under the per-sweep submit cap.
     """
     now = time.time() if now is None else float(now)
+    # The head-match (verdict-descendant) budget for THIS pass: bounded work per
+    # sweep, and a row past it is simply read again next time. Reset BEFORE
+    # phase 0 -- that phase advances rows through the same per-row path and
+    # spends the same budget.
+    reset_head_match_budget(int(HIVE_DOCTOR_HEAD_MATCH_MAX) if HIVE_DOCTOR_VERDICT_DESCENDANT else 0)
+    caller_rows = rows is not None
     if rows is None:
         rows = fetch_needs_review_jobs(limit=1000)
     adoption = submit_adopted_reviews(rows=rows, now=now, **{k: v for k, v in kwargs.items() if k != "load"})
     handled = adoption.pop("_handled_rows", None)
-    rows = _review_queue_rows(rows)
+    # The caller's own list (a test, a replay) is judged exactly as passed. The
+    # full queue gate is for rows FETCHED from the bus, which carry every
+    # needs-review job whatever its shape; a caller's list still has to be rows
+    # the queue can advance.
+    rows = (
+        [row for row in rows if review_queue.review_state(row)]
+        if caller_rows
+        else _review_queue_rows(rows)
+    )
     summary = {
         "scanned": len(rows),
         "adopted": adoption.get("adopted", 0),
@@ -6379,7 +6998,20 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
         "review_failed": 0,
         "resolved": 0,
         "capped": 0,
+        "approved_mergeable": 0,
+        "review_overreach": 0,
+        "approval_not_on_head": 0,
+        "awaiting_review_after_rescue": 0,
+        "head_match_previewed": 0,
+        "head_match_capped": 0,
     }
+    # Phase 0 already ADVANCED every row it touched (it calls the same per-row
+    # advance), so its outcomes are this pass's outcomes: leaving them out would
+    # report "approved 0" for a pass that approved rows (the head-match and
+    # overreach counts included).
+    for key, value in adoption.items():
+        if not key.startswith("_") and key in _PER_ROW_OUTCOMES and isinstance(value, int):
+            summary[key] = summary.get(key, 0) + value
     if adoption.get("errors"):
         summary["errors"] = adoption["errors"]
     # Per-route concurrency cap across the whole pass: reviews already in
@@ -6428,6 +7060,9 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
             in_flight[route_id] = in_flight.get(route_id, 0) + 1
             budget -= 1
         summary[outcome] = summary.get(outcome, 0) + 1
+    # The budget's refusals are the rows this pass could not judge: phase 0's
+    # rows were capped through the same budget, so the tally is the pass's.
+    summary["head_match_capped"] = max(summary["head_match_capped"], head_match_budget_capped())
     return summary
 
 

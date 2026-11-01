@@ -74,6 +74,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import fcntl
+import fnmatch
 import glob
 import hashlib
 import json
@@ -121,6 +122,7 @@ from hive import (
     review_evidence,
     review_queue,
     review_record,
+    review_verdict,
 )
 from hive.core import fleet_inventory
 from hive.codex_delivery import fleet_git_env
@@ -6884,6 +6886,15 @@ def _run_job_inner(job: dict) -> None:
             run_models=run_models,
             reviewer=launched_reviewer_route(None),
         )
+    # REVIEW OVERREACH (2026-10-31): a ``review:*`` job writes ONLY its verdict
+    # artifact, and only to ``review/<branch>-<job>``. A review whose commits
+    # touch anything else on the author branch is refused here -- never as a
+    # plain ``done`` -- so its approve can never appear to cover edits the
+    # reviewer was not asked to make (production shape (b): bl-ct-system).
+    review_violation = review_result_violation(job, result)
+    if review_violation:
+        result["review_overreach"] = review_violation
+        status, failure_reason = "failed", "review_overreach"
     if failure_reason:
         result["failure_reason"] = failure_reason
         if failure_reason == "ai_attribution_trailer":
@@ -6997,6 +7008,90 @@ def _run_job_inner(job: dict) -> None:
 def review_queue_roster() -> list:
     """The reviewer roster (every reviewer-capable route), from the one data file."""
     return review_queue.load_roster()
+
+
+# ── the review job's verdict artifact goes to its OWN ref (2026-10-31) ──────
+# Production: four needs-review rows (01a19270 hv/bl-ct-dialect, 1007c484
+# hv/bl-ct-system, 01a1922a hv/zf-failure-contract-r3, 01a18fe6
+# hv/zc-master-prompt) had a structured approve from cerberus-reviewer and
+# still would not close, because the review job committed its verdict file onto
+# the AUTHOR's branch. The doctor's exact-head rule then saw "approved head X"
+# != "delivered head T" and (correctly, before the fix) refused it. A review
+# job now publishes its verdict to a SEPARATE ref, ``review/<branch>-<job>``,
+# and never commits to the author's head branch -- and a review result whose
+# commits touch anything but the verdict artifact on the author branch is
+# refused as review_overreach, so an approval can never appear to cover edits
+# nobody asked the reviewer to make.
+
+REVIEW_ARTIFACT_KINDS = ("review:",)
+
+
+def review_verdict_ref(head_branch: str | None, job_id: str) -> str:
+    """The ref a review job publishes its verdict artifact on: ``review/<branch>-<job>``."""
+    branch = str(head_branch or "").strip().strip("/") or "no-branch"
+    job = str(job_id or "").strip().strip("/") or "no-job"
+    return f"review/{branch}-{job}"
+
+
+def _review_artifact_name(path: str) -> bool:
+    """Whether ``path`` is a review verdict artifact (mirrors hive/workers/doctor_head_match.py).
+
+    Matched on the BASENAME so a nested ``.hive/review/REVIEW_VERDICT_x.json``
+    counts -- the same rule the doctor's classifier applies to ``T..R``.
+    """
+    base = str(path or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
+    return bool(base) and (
+        fnmatch.fnmatchcase(base, "REVIEW_VERDICT_*.json") or fnmatch.fnmatchcase(base, "review-verdict-*.json")
+    )
+
+
+def review_verdict_paths(head_branch: str | None, job_id: str) -> list[str]:
+    """The verdict artifact names a review job may write (its own, either spelling)."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(head_branch or "").strip("/") or "no-branch").strip("-")
+    return [f"REVIEW_VERDICT_{slug}.json", f"review-verdict-{job_id}.json"]
+
+
+def review_brief_text(
+    *, head_branch: str | None, job_id: str, head_sha: str | None = None, reviewer_id: str | None = None
+) -> str:
+    """The review brief's artifact paragraph: where the verdict goes, and what it may not touch."""
+    ref = review_verdict_ref(head_branch, reviewer_id or job_id)
+    names = review_verdict_paths(head_branch, reviewer_id or job_id)
+    return (
+        "Verdict artifact: commit the structured verdict JSON as "
+        f"{names[0]} (or {names[1]}) and push it to the SEPARATE ref {ref} "
+        f"(git push origin HEAD:{ref}). Never commit, push or amend anything on the author branch "
+        f"{head_branch or '(see job)'}: the review job writes ONLY its verdict artifact, on {ref}. "
+        "Any other file changed on the author branch is review overreach and the review is refused."
+        + (f" The exact reviewed commit is {head_sha}." if head_sha else "")
+    )
+
+
+def review_result_violation(spec: dict, result: dict | None) -> str | None:
+    """Why a review result cannot be accepted as read-only -- or None.
+
+    A ``review:*`` job must leave the author branch exactly as it found it. Its
+    result may report the verdict artifact (on the review ref) and nothing
+    else: any other changed file is code committed onto the author's branch by
+    the reviewer, which is review overreach -- the approval covers the
+    reviewer's edits, not the author's tip. Returns a one-line reason prefixed
+    ``review_overreach`` so the finalizer can report it verbatim.
+    """
+    if not str((spec or {}).get("kind") or "").startswith(REVIEW_ARTIFACT_KINDS):
+        return None
+    result = result if isinstance(result, dict) else {}
+    files = result.get("files_changed")
+    files = [str(p) for p in files if str(p).strip()] if isinstance(files, list) else []
+    allowed = set(review_verdict_paths(spec.get("head_branch"), spec.get("id") or spec.get("parent_job_id") or ""))
+    extras = [path for path in files if path not in allowed and not _review_artifact_name(path)]
+    if not extras:
+        return None
+    shown = ", ".join(extras[:3])
+    return (
+        f"review_overreach: the review job changed {shown} on the author branch "
+        f"{spec.get('head_branch') or '(see job)'}; a review may only publish its verdict artifact "
+        f"to {review_verdict_ref(spec.get('head_branch'), spec.get('id') or spec.get('parent_job_id') or '')}"
+    )
 
 
 def review_queue_reviewers(

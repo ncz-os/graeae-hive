@@ -408,3 +408,31 @@ and `HIVE_DOCTOR_ADOPT_DRY_RUN` are read at import from the process env only.
   cross-family and head-bound approvals, retry/exhaust progression, per-route
   caps, EIH ordering, inventory-resolved root probe URLs, JSON-text results,
   report classification and owner escalation.
+
+## Approvals on descendant heads (`hive/workers/doctor_head_match.py`)
+
+Production 2026-10-31: four rows stayed `needs-review` with doctor reason
+`approved, but the review job advanced the branch` — review children commit
+their verdict file onto the author's branch, so the head they approved is never
+the row's tip. The exact-head rule now runs through `classify_descendant`:
+
+* **verdict-only descendant** — `R` descends from tip `T` and `T..R` touches
+  only `REVIEW_VERDICT_*.json` / `review-verdict-*.json`. The approve counts:
+  recorded as *approved at R (verdict-only descendant of T)*, blocker cleared
+  to `result.review_state.state = approved_mergeable` with `approved_sha` so the
+  merge pass can act. The doctor never merges.
+* **review_overreach** — the review's own commits touched code on the author
+  branch (schema fix + test). The approval is **not** counted for `T`, and the
+  row records `review_overreach` with a re-review action.
+* **newer work** — `R` descends from `T` with code changes: classified
+  *approval covers newer work not on the head branch*; the doctor fast-forwards
+  `R` onto the head branch only from the review child's workspace (pure FF,
+  existing rescue path), otherwise reports the exact sha plus one-line action.
+* **everything else stays head-exact** — a non-descendant head is still not an
+  approval.
+
+Review jobs publish their verdict to `review/<branch>-<job>`, never the author's
+head branch; the worker/doctor refuse a review result whose commits touch files
+outside the verdict artifact. The rule is idempotent, per-sweep capped, honours
+dry-run, and is switched by `HIVE_DOCTOR_VERDICT_DESCENDANT` (default on).
+Tests: `test_doctor_review_head_match_20261031.py`.
