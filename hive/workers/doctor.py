@@ -5484,9 +5484,23 @@ def record_green_mergeable(row: dict, green: dict) -> bool:
     Same shape the head-match path writes (:func:`_approved_mergeable`), plus
     the fields the merge pass reads (``reviewer_model``, ``reviewed_sha``) and
     the gate evidence. The row's STATUS stays needs-review."""
+    head = str(green.get("head") or "").strip()
+    gates = green.get("gates")
+    # Fail closed: a GREEN without an exact head or without BOTH objective gates
+    # literally clean must never reach the merge pass (reviewed_sha would be
+    # empty or the gate evidence meaningless).
+    if (
+        not head
+        or not isinstance(gates, dict)
+        or not all(
+            isinstance(gates.get(name), dict) and gates[name].get("clean") is True
+            for name in ("suite", "import_preflight")
+        )
+    ):
+        log.warning("record_green_mergeable refused for %s: missing head or unclean gates", row.get("id"))
+        return False
     now = time.time()
     state = review_queue.review_state(row) or {}
-    head = str(green.get("head") or "")
     reviewers = [str(m) for m in green.get("reviewers") or [] if m]
     approved = {
         "reviewers": reviewers,
@@ -5504,7 +5518,7 @@ def record_green_mergeable(row: dict, green: dict) -> bool:
         "approved_mergeable": approved,
         "reviewer_model": reviewers[0] if reviewers else None,
         "reviewed_sha": head,
-        "gates": green.get("gates"),
+        "gates": gates,
         "last_failure": None,
         "next_attempt_at": None,
         "updated_at": now,

@@ -609,3 +609,28 @@ def test_a_verify_row_is_never_handed_to_review(monkeypatch):
     monkeypatch.setattr(doctor, "_http", no_bus)
     job = verify_job(status="needs-review")
     assert doctor.ensure_review_followup(job) == "skipped_verify_job"
+
+
+def test_record_green_mergeable_refuses_an_empty_head_or_unclean_gates(monkeypatch):
+    """DeepSeek 2026-11-01: the recorder must fail closed on a malformed GREEN."""
+    from hive.workers import doctor
+
+    patched = []
+    monkeypatch.setattr(doctor, "_patch_review_state", lambda row, state: patched.append(state) or True)
+    monkeypatch.setattr(doctor, "broadcast_doctor_message", lambda *a, **k: None)
+    clean = {"suite": {"clean": True, "detail": "812 passed"}, "import_preflight": {"clean": True, "detail": ""}}
+    row = {"id": "01a1b000-0000-7000-8000-000000000001", "result": {}}
+    good = {"head": "a" * 40, "reviewers": ["muse-spark-1.3"], "gates": clean}
+    assert doctor.record_green_mergeable(row, dict(good)) is True
+    assert len(patched) == 1
+    for bad in (
+        {**good, "head": ""},
+        {**good, "head": None},
+        {**good, "gates": None},
+        {**good, "gates": {}},
+        {**good, "gates": {"suite": {"clean": True}}},
+        {**good, "gates": {"suite": {"clean": False}, "import_preflight": {"clean": True}}},
+        {**good, "gates": {"suite": {"clean": True}, "import_preflight": {"clean": "yes"}}},
+    ):
+        assert doctor.record_green_mergeable(row, bad) is False, bad
+    assert len(patched) == 1
