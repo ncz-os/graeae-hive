@@ -5639,16 +5639,22 @@ def interpret_review_outcome(
 def _verdict_only_descendant_approval(job: dict, approved: dict) -> bool:
     """Whether ``approved`` names a REVIEWED commit that only descends from the delivered head by a verdict.
 
-    The record itself says so (``basis == "verdict_only"`` / the
-    ``verdict_only_descendant`` flag -- only the classifier ever writes them),
-    and the question is re-asked of git whenever a workspace still holds both
-    commits. A workspace that no longer exists cannot disprove a record the
-    clinician's classifier proved, so it does not revoke the approve; a
-    workspace that DOES exist and shows a code change refuses it, which is the
-    only way the record could ever be wrong (a hand-edited row).
+    ``approved["basis"]`` is the PROOF-BEARING field: only the classifier writes
+    it, and only after it has diffed ``T..R`` against git and found nothing but
+    verdict artifacts. It is re-asked of git whenever a workspace still holds
+    both commits: a workspace that now shows a CODE change refuses the approve
+    (the only way a recorded proof could be wrong -- a hand-edited row, or a
+    force-push rewriting the descent).
+
+    A missing workspace does not revoke a recorded proof: the sweep that wrote
+    it had to hold both commits to classify at all, and the review child's
+    checkout is cleaned up routinely -- requiring it here would re-break the
+    production bug this fixes (the approve is cleared, then re-reported stale
+    the moment the workspace ages out). ``verdict_only_descendant`` alone is NOT
+    proof: it is a flag any writer can set, so on its own it does not clear the
+    blocker, and such a row stays stale.
     """
-    recorded = str(approved.get("basis") or "") == BASIS_VERDICT_ONLY or approved.get("verdict_only_descendant") is True
-    if not recorded:
+    if str(approved.get("basis") or "") != BASIS_VERDICT_ONLY:
         return False
     tip = str(approved.get("head_sha") or "").strip()
     reviewed = str(approved.get("approved_sha") or "").strip()

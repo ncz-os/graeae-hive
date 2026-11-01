@@ -459,13 +459,15 @@ A verdict-only descendant approve is recorded with `approved.head_sha` set to
 the **delivered tip** `T` and `approved.approved_sha` to the commit the reviewer
 signed `R`. Those two shas are different *by construction* (that is what a
 descendant is), so `merge_handoff` must not treat their difference as staleness:
-it exempts `basis == "verdict_only"` (re-proving ancestry and the artifact-only
-diff against git whenever a workspace still holds both commits). A row whose
-tip has moved since the approve is still `stale_approval`, and a row carrying
-`state = approved_mergeable` is read even though `review_state()` only admits
-the in-flight `awaiting_review` shape. Without both, the doctor cleared the
-blocker and the merge pass refused to act — the row was stuck in a different
-place.
+it exempts a recorded `basis == "verdict_only"`, re-proving ancestry and the
+artifact-only diff against git whenever a workspace still holds both commits.
+`verdict_only_descendant: true` on its own is **not** proof — it is a flag any
+writer can set — so a row carrying the flag without the basis stays
+`stale_approval`. A row whose tip has moved since the approve is still
+`stale_approval`, and a row carrying `state = approved_mergeable` is read even
+though `review_state()` only admits the in-flight `awaiting_review` shape.
+Without both, the doctor cleared the blocker and the merge pass refused to act —
+the row was stuck in a different place.
 
 `_head_branch_workspace` resolves a row's clone under `HIVE_WORKSPACE_ROOT`
 only: no `~/hive-workspaces` fallback, and a job id that escapes the root (or

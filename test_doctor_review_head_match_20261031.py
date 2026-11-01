@@ -793,3 +793,79 @@ def test_merge_handoff_does_not_exempt_a_non_verdict_basis(bus):
     # Record the basis and it is mergeable: the only difference is the proof.
     state["approved"]["basis"] = dhm.VERDICT_ONLY
     assert doctor.merge_handoff(row) == "ready_to_merge"
+
+
+def test_only_the_proof_bearing_basis_clears_the_stale_check(bus, monkeypatch, tmp_path):
+    """The bare ``verdict_only_descendant`` flag is not proof (r2 review, high).
+
+    ``basis`` is written only by the classifier, after it diffed ``T..R`` and
+    found nothing but verdict artifacts. The flag is a boolean any writer can
+    set, so on its own it must NOT let a divergent approval through -- that
+    would be a hole in the head-exact rule wide enough to merge unreviewed
+    code. A recorded basis, with the workspace gone, still clears (otherwise
+    the blocker returns as soon as the review child's checkout ages out).
+    """
+    monkeypatch.setattr(doctor, "_WORKSPACE_ROOT", str(tmp_path / "empty"))
+    tip, reviewed = "a" * 40, "b" * 40
+    row = _reviewing_row(head=tip)
+    state = row["result"]["review_state"]
+    state["state"] = "approved_mergeable"
+    state["approved"] = {"reviewers": ["gemma4-31b"], "head_sha": tip, "approved_sha": reviewed}
+    # Flag only: not proof.
+    state["approved"]["verdict_only_descendant"] = True
+    assert doctor.merge_handoff(row) == "stale_approval"
+    # No claim at all: still stale (the head-exact rule).
+    del state["approved"]["verdict_only_descendant"]
+    assert doctor.merge_handoff(row) == "stale_approval"
+    # The classifier's basis is the proof.
+    state["approved"]["basis"] = dhm.VERDICT_ONLY
+    assert doctor.merge_handoff(row) == "ready_to_merge"
+
+
+def test_a_workspace_showing_a_code_change_refuses_the_recorded_basis(monkeypatch, tmp_path):
+    """A recorded basis is re-proved against git when the descent is still on disk."""
+    repo = tmp_path / "ws"
+    repo.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+    run = lambda *a: __import__("subprocess").run(  # noqa: E731
+        ["git", "-C", str(repo), *a], check=True, capture_output=True, env={**__import__("os").environ, **env}
+    )
+    run("init", "-q", "-b", "main")
+    (repo / "a.txt").write_text("1\n")
+    run("add", "a.txt")
+    run("commit", "-q", "-m", "tip")
+    tip = run("rev-parse", "HEAD").stdout.decode().strip()
+    (repo / "pkg.py").write_text("CODE = 1\n")
+    run("add", "pkg.py")
+    run("commit", "-q", "-m", "review changed CODE")
+    reviewed = run("rev-parse", "HEAD").stdout.decode().strip()
+
+    monkeypatch.setattr(doctor, "_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setattr(doctor, "_head_match_child", lambda job: {})
+    row = _reviewing_row(head=tip)
+    row["id"] = "ws"
+    state = row["result"]["review_state"]
+    state["state"] = "approved_mergeable"
+    state["approved"] = {
+        "reviewers": ["gemma4-31b"],
+        "head_sha": tip,
+        "approved_sha": reviewed,
+        "basis": dhm.VERDICT_ONLY,
+    }
+    # The descent exists and touched CODE: the recorded basis is refused.
+    assert doctor.merge_handoff(row) == "stale_approval"
+    # The same descent with only a verdict artifact is the approval it claims.
+    run("checkout", "-q", "-B", "v")
+    for name in ("REVIEW_VERDICT_x.json",):
+        (repo / name).write_text("{}")
+    run("rm", "-q", "--cached", "pkg.py")
+    run("add", "REVIEW_VERDICT_x.json")
+    run("commit", "-q", "-m", "verdict only")
+    verdict_only = run("rev-parse", "HEAD").stdout.decode().strip()
+    state["approved"]["approved_sha"] = verdict_only
+    assert doctor.merge_handoff(row) == "ready_to_merge"
