@@ -104,6 +104,9 @@ class _MyExecute:
 
 
 class MySqlHiveRepository(SqliteHiveRepository):
+    #: MySQL/MariaDB null-safe equality (``IS %s`` does not parse here).
+    _result_cas_sql = "result <=> ?"
+
     def __init__(self, dsn: str) -> None:
         super().__init__(":memory:")
         self.dsn = dsn

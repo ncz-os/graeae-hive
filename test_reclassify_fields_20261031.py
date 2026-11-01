@@ -391,14 +391,28 @@ class DisprovedRound9Tests(unittest.TestCase):
         self.assertEqual(con.execute("SELECT COUNT(*) FROM t WHERE result = ?", (None,)).fetchone()[0], 0)
 
     def test_the_cas_predicate_stays_is_not_equals(self):
-        """The CAS must keep ``result IS ?``: the NULL case depends on it."""
+        """The CAS must stay a NULL-safe match, never ``= ?``: the NULL case
+        depends on it. Since 2026-11-01 the predicate is the backend's own
+        (``result IS ?`` is sqlite-only; Oracle answered ORA-00908), so pin it
+        where it lives: the sqlite reference keeps ``IS``, every other backend
+        uses its null-safe form or the locked compare, and none uses ``=``."""
         import inspect
 
         from hive.bus.routers import admin as _admin
+        from hive.persistence.db2 import Db2HiveRepository
+        from hive.persistence.mysql import MySqlHiveRepository
+        from hive.persistence.oracle import OracleHiveRepository
+        from hive.persistence.postgres import PostgresHiveRepository
+        from hive.persistence.sqlite import SqliteHiveRepository
 
         src = inspect.getsource(_admin._patch_result_cas)
-        self.assertIn("result IS ?", src)
+        self.assertIn("patch_job_result_cas(", src)
         self.assertNotIn("result = ?", src)
+        self.assertEqual(SqliteHiveRepository._result_cas_sql, "result IS ?")
+        self.assertEqual(PostgresHiveRepository._result_cas_sql, "result IS NOT DISTINCT FROM ?")
+        self.assertEqual(MySqlHiveRepository._result_cas_sql, "result <=> ?")
+        self.assertIsNone(OracleHiveRepository._result_cas_sql)
+        self.assertIsNone(Db2HiveRepository._result_cas_sql)
 
     def test_the_modules_the_findings_called_unresolvable_do_import(self):
         from hive.workers import doctor_models, loop_outcome

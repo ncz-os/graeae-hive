@@ -467,6 +467,12 @@ class OracleHiveRepository(SqliteHiveRepository):
 
     #: Oracle row-lock for the auto-retry read.
     _retry_lock_clause = " FOR UPDATE"
+    #: ``IS :n`` is ORA-00908, and HIVE_JOBS.RESULT comes from the canonical
+    #: MNEMOS schema (not in this repo; every JSON column added here is
+    #: ``CLOB CHECK (... IS JSON)``) -- a CLOB/JSON value cannot be an ``=``
+    #: operand (ORA-00932). So the payload guard is a locked read + Python
+    #: compare, which holds whatever the column's LOB/JSON/VARCHAR2 type.
+    _result_cas_sql = None
 
     connection_class: Any = OracleConnection
 

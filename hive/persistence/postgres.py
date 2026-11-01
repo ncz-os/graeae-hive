@@ -121,6 +121,8 @@ class _PgExecute:
 
 class PostgresHiveRepository(SqliteHiveRepository):
     list_jobs_sql_reason = True  # reason_prefix is expressed in SQL here too
+    #: Standard SQL null-safe equality (``IS $n`` does not parse on postgres).
+    _result_cas_sql = "result IS NOT DISTINCT FROM ?"
 
     def __init__(self, dsn: str) -> None:
         super().__init__(":memory:")

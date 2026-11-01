@@ -59,9 +59,7 @@ def _override_ok(req: Any) -> bool:
 
 async def _budget_row(tx, job_id: str):
     """(status, max_retries, retry_count, claimed_by) for job_id, or None."""
-    async with tx.execute(
-        "SELECT status, max_retries, retry_count, claimed_by FROM jobs WHERE id=?", (job_id,)
-    ) as cur:
+    async with tx.execute("SELECT status, max_retries, retry_count, claimed_by FROM jobs WHERE id=?", (job_id,)) as cur:
         row = await cur.fetchone()
     if not row:
         return None
@@ -123,17 +121,15 @@ async def _patch_result_cas(
     """Apply a status move AND a result merge in one compare-and-set UPDATE.
 
     ``expected_status`` guards the transition (as ``patch_job_status`` does);
-    ``result IS ?`` guards the payload, so a write that replaced ``result``
-    after we read it makes the WHERE miss and this returns 0 (reported as a
-    conflict) instead of overwriting the other writer."""
+    the repository's null-safe payload guard (``raw`` None matches a NULL
+    result) means a write that replaced ``result`` after we read it returns 0
+    (reported as a conflict) instead of overwriting the other writer. The
+    compare is the backend's: sqlite's ``result IS ?`` was a 500 on Oracle
+    (ORA-00908, 2026-11-01)."""
     sets = {**sets, "result": json.dumps(_merge_field_patch(raw, fields))}
-    assign = ", ".join(f"{col}=?" for col in sets)
-    args: list[Any] = [*sets.values(), job_id, expected_status, raw]
-    async with tx.execute(
-        f"UPDATE jobs SET {assign} WHERE id=? AND status=? AND result IS ?",
-        args,
-    ) as cur:
-        return cur.rowcount
+    return await hive_repo().patch_job_result_cas(
+        tx, job_id, sets=sets, expected_status=expected_status, expected_result=raw
+    )
 
 
 async def _emit_overrides(overrides: list[dict], actor: str, reason: str) -> None:
@@ -359,8 +355,7 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
             if dead_letter_override and not _override_ok(req):
                 raise HTTPException(
                     422,
-                    "dead-letter -> queued requires override_max_retries=true "
-                    "with a non-empty override_reason",
+                    "dead-letter -> queued requires override_max_retries=true with a non-empty override_reason",
                 )
             if req.status == "queued" and _retry_budget_exhausted(row[1], row[2]):
                 # reclassify -> queued is a requeue: same retry-budget rule.
@@ -427,9 +422,9 @@ async def admin_reclassify_jobs(req: ReclassifyRequest, actor: str = Depends(req
                 sets = {"status": req.status, "claimed_by": None, "claimed_at": None}
                 if req.fields:
                     # A FIELD repair rides the same status move. The merge is
-                    # written by ONE conditional UPDATE (see `_patch_result_cas`):
-                    # `result IS <the value read here>` makes it a compare-and-set
-                    # on the payload as well as on `status`, so a concurrent writer
+                    # written by ONE compare-and-set (see `_patch_result_cas`): a
+                    # null-safe match on the value read here guards the payload
+                    # as well as `status`, so a concurrent writer
                     # that replaced the result between this read and the write
                     # makes the WHERE fail and the row is reported as a conflict --
                     # never a merge that silently drops their value.
