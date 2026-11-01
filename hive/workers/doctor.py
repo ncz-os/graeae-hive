@@ -5660,9 +5660,29 @@ def _verdict_only_descendant_approval(job: dict, approved: dict) -> bool:
     reviewed = str(approved.get("approved_sha") or "").strip()
     if not tip or not reviewed:
         return False
+    checked = False
     for repo in (_head_branch_workspace(job), _child_workspace(_head_match_child(job) or {})):
         if repo and doctor_head_match.checkout_for(repo, tip, reviewed):
-            return doctor_head_match.verdict_only_between(repo, tip, reviewed)
+            # At least one workspace was actually consulted; its answer is final
+            # (a code change in the descent refuses the approve).
+            checked = True
+            if not doctor_head_match.verdict_only_between(repo, tip, reviewed):
+                return False
+    if checked:
+        return True
+    # No workspace could be consulted at all. The recorded basis is then the
+    # only evidence there is, and it is the classifier's -- it was written only
+    # after a sweep held BOTH commits and diffed them. A missing checkout is
+    # routine (the worker cleans it up), so refusing here would re-break the
+    # production bug: the approve would be cleared and then re-reported stale
+    # the moment the review child's workspace aged out. Callers that must be
+    # certain can consult ``verification`` in the record.
+    log.info(
+        "head-match: no workspace holds %s..%s; accepting the recorded verdict-only basis for %s",
+        str(tip)[:12],
+        str(reviewed)[:12],
+        str(job.get("id") or "")[:12],
+    )
     return True
 
 
@@ -6470,9 +6490,7 @@ def rescue_reviewed_head(job: dict, reviewed: str, tip: str, *, child: dict | No
     branch = job.get("head_branch")
     if not repo or not os.path.isdir(repo):
         return {"action": "unavailable", "sha": reviewed, "old": tip, "reason": "no review workspace"}
-    return doctor_head_match.rescue_ff(
-        repo, tip, reviewed, branch=branch, dry_run=HIVE_DOCTOR_HEAD_MATCH_DRY_RUN
-    )
+    return doctor_head_match.rescue_ff(repo, tip, reviewed, branch=branch, dry_run=HIVE_DOCTOR_HEAD_MATCH_DRY_RUN)
 
 
 def _head_match_action(result: doctor_head_match.HeadMatch, rescue: dict) -> str:
@@ -7049,11 +7067,7 @@ def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None 
     # full queue gate is for rows FETCHED from the bus, which carry every
     # needs-review job whatever its shape; a caller's list still has to be rows
     # the queue can advance.
-    rows = (
-        [row for row in rows if review_queue.review_state(row)]
-        if caller_rows
-        else _review_queue_rows(rows)
-    )
+    rows = [row for row in rows if review_queue.review_state(row)] if caller_rows else _review_queue_rows(rows)
     summary = {
         "scanned": len(rows),
         "adopted": adoption.get("adopted", 0),
