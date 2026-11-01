@@ -2107,7 +2107,10 @@ def green_verdict(reviews: list[dict[str, Any]]) -> dict[str, Any]:
     structured APPROVE on the exact head. A strong approve whose gates were
     never run is not green: absence of proof is not proof. A strong approve
     from a FIXER family is not green either -- a fixer never approves its own
-    commit. The newest strong approve wins when several qualify."""
+    commit; that exclusion is applied by the grind sweep (it drops readings from
+    the row's fixer families before asking ``green_blocker``), not by this pure
+    helper, which only sees one review at a time. The newest strong approve wins
+    when several qualify."""
     reasons: list[str] = []
     for review in reviews or []:
         if not isinstance(review, dict) or review.get("verdict") != "approve":
@@ -2179,6 +2182,10 @@ def suite_text(value: Any) -> str | None:
     that does not read clean -- a failure, an error, a skip, no run at all --
     is None, so a caller can never treat "unreadable" as "clean"."""
     if isinstance(value, dict):
+        if "clean" in value and "returncode" not in value:
+            # An already-evaluated gate ({"clean": bool, "detail": str}): trust
+            # only a literal True, so a malformed value never reads clean.
+            return (str(value.get("detail") or "") or "clean") if value.get("clean") is True else None
         gate = suite_gate(value)
         return gate["detail"] if gate["clean"] else None
     text = str(value or "").strip()

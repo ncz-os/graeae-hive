@@ -755,3 +755,19 @@ def test_the_follow_up_branch_counts_attempts_on_a_real_sweep(state):
     summary = fake.sweep([row], state)
     assert summary[dr.FOLLOW_UP] == 1, summary
     assert isinstance(summary[dr.FOLLOW_UP], int)
+
+
+def test_a_gate_dict_from_suite_gate_reads_clean_in_green_blocker():
+    """Muse 2026-11-01: suite_text documented {'clean','detail'} but treated it as a run."""
+    clean = dr.suite_gate({"returncode": 0, "summary": "812 passed in 41.20s"})
+    assert dr.suite_text(clean) == "812 passed in 41.20s"
+    dirty = dr.suite_gate({"returncode": 0, "summary": "1 failed, 811 passed"})
+    assert dr.suite_text(dirty) is None
+    review = green_review(child("approve_google", claimed_model="muse-spark-1.3"))
+    review["gates"] = {"suite": clean, "import_preflight": {"clean": True, "detail": ""}}
+    assert dr.green_blocker(review) == ""
+    review["gates"] = {"suite": dirty, "import_preflight": {"clean": True, "detail": ""}}
+    assert dr.green_blocker(review) == "suite_not_clean"
+    # a malformed gate dict never reads clean
+    assert dr.suite_text({"clean": "yes"}) is None
+    assert dr.suite_text({}) is None
