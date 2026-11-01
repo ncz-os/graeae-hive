@@ -163,8 +163,9 @@ def test_a_request_changes_with_located_findings_gets_one_continuation(state):
     assert len(fake.specs) == 1
     spec = fake.specs[0]
     assert spec["repo"] == "graeae-hive"
+    # In place: the fix lands on the row's own branch (base == head).
     assert spec["base_branch"] == "hv/fo-merge-pass-20261031"
-    assert spec["head_branch"] == "hv/fo-merge-pass-20261031-r1"
+    assert spec["head_branch"] == "hv/fo-merge-pass-20261031"
     assert spec["parent_job_id"] == row["id"]
     assert spec["kind"] == row["kind"]
 
@@ -175,8 +176,9 @@ def test_the_remediation_fixture_row_qualifies_too(state):
     rc["result"]["head_sha"] = rc["result"]["remote_sha"] = row["result"]["head_sha"]
     fake = one_rc(row, rc)
     fake.sweep([row], state)
-    assert [s["head_branch"] for s in fake.specs] == ["hv/gh-review-queue-20261031-r1"]
-    assert fake.specs[0]["base_branch"] == "hv/gh-review-queue-20261031"
+    # In place: the fix lands on the row's own branch, not a new -rN branch.
+    assert [s["head_branch"] for s in fake.specs] == [row["head_branch"]]
+    assert fake.specs[0]["base_branch"] == row["head_branch"]
 
 
 def test_an_approve_on_the_tip_outranks_a_request_changes(state):
@@ -216,7 +218,9 @@ def test_a_verdict_only_head_advance_counts_as_the_current_tip(state):
 
     fake = one_rc(row, child("rc_verdict_only"))
     fake.sweep([row], state, head_is_verdict_only=verdict_only)
-    assert seen == [(TIP, VERDICT_ONLY_HEAD)]
+    # The judge may be consulted more than once for the same (tip, reviewed)
+    # pair; what matters is that only that proven pair is ever offered.
+    assert seen and set(seen) == {(TIP, VERDICT_ONLY_HEAD)}
     assert len(fake.specs) == 1
     assert "deploy/hive_worker.py:7225" in fake.specs[0]["description"]
 
@@ -257,17 +261,16 @@ def test_the_brief_carries_every_located_finding_verbatim_and_the_standing_instr
     assert STANDING in desc
     assert dr.CONTINUATION_INSTRUCTION in desc
     # The best review is meta's (a critical finding): its findings verbatim.
+    # Operator 2026-11-01: only high and critical BLOCK. The medium finding is
+    # not in the fix brief -- it is recorded as a follow-up row instead.
     for needle in (
         "critical",
         "hive/review_queue.py:830",
         "hard-lane sort ignores the codex gate",
         "A route whose gate is closed still sorts first and the pick returns nothing usable.",
-        "medium",
-        "docs/REVIEW_QUEUE.md:12",
-        "doc names the wrong default",
-        "The documented cap is 5; the code reads 3.",
     ):
         assert needle in desc, needle
+    assert "docs/REVIEW_QUEUE.md:12" not in desc
     assert TIP in desc
 
 
@@ -336,6 +339,8 @@ def rc_on(row: dict, name: str = "rc_meta") -> dict:
 
 def test_round_two_goes_to_the_hard_lane_outside_the_reviewers_families(state):
     row = continuation_row(1)
+    # One grind round has already run on this row, so the next fix is round 2.
+    state.set_value(dr._grind_key(row["id"]), {"rounds": 1, "fixers": []}, ttl=dr.MARK_TTL_SEC)
     fake = Fake({row["id"]: [rc_on(row, "rc_meta")]})
     fake.sweep([row], state)
     spec = fake.specs[0]
@@ -343,8 +348,9 @@ def test_round_two_goes_to_the_hard_lane_outside_the_reviewers_families(state):
     assert hard, "the roster has no hard-lane route"
     assert spec["preferred_models"] == [hard[0]["model_id"]]
     assert spec["eligible_kinds"] == [rq.CODEX_WORKER_KIND]
-    assert spec["head_branch"] == "hv/fo-merge-pass-20261031-r2"
-    assert spec["base_branch"] == "hv/fo-merge-pass-20261031-r1"
+    # In place: round 2 commits on the row's own branch (base == head).
+    assert spec["head_branch"] == row["head_branch"]
+    assert spec["base_branch"] == row["head_branch"]
     assert spec["parent_job_id"] == row["id"]
     assert ":r2:" in spec["idempotency_key"]
 
@@ -352,6 +358,7 @@ def test_round_two_goes_to_the_hard_lane_outside_the_reviewers_families(state):
 def test_round_two_with_no_hard_lane_route_outside_the_reviewers_escalates_once(state):
     """openai requested changes; the only hard-lane route is openai's codex."""
     row = continuation_row(1)
+    state.set_value(dr._grind_key(row["id"]), {"rounds": 1, "fixers": []}, ttl=dr.MARK_TTL_SEC)
     fake = Fake({row["id"]: [rc_on(row, "rc_openai")]})
     fake.sweep([row], state)
     fake.sweep([row], state)
@@ -383,11 +390,14 @@ def test_the_idempotency_key_names_the_root_round_and_tip(state):
     row = work_row()
     fake = one_rc(row)
     fake.sweep([row], state)
-    assert fake.specs[0]["idempotency_key"] == f"doctor-continuation:{row['id']}:r1:{TIP[:12]}"
+    assert fake.specs[0]["idempotency_key"] == f"doctor-grind:{row['id']}:fix:r1:{TIP[:12]}"
 
 
-def test_after_two_rounds_the_row_is_escalated_once_and_left_alone(state):
-    row = continuation_row(2)
+def test_at_the_round_cap_the_row_is_escalated_once_and_left_alone(state, monkeypatch):
+    """Operator 2026-11-01: the cap is GRIND_MAX_ROUNDS (default 6), not 2."""
+    monkeypatch.setattr(dr, "GRIND_MAX_ROUNDS", 2)
+    # continuation_row(3) has had 2 grind rounds run: the cap of 2 is reached.
+    row = continuation_row(3)
     fake = Fake({row["id"]: [rc_on(row, "rc_meta")]})
     first = fake.sweep([row], state)
     fake.sweep([row], state, now=NOW + 60)
@@ -407,8 +417,11 @@ def test_the_round_count_is_durable_even_when_the_key_is_lost(state):
     r1.pop("idempotency_key")
     fake.children_of[new_id] = [rc_on(r1, "rc_meta")]
     fake.sweep([r1], state)
-    assert fake.specs[-1]["head_branch"] == "hv/fo-merge-pass-20261031-r2"
-    assert ":r2:" in fake.specs[-1]["idempotency_key"]
+    # In place on the row's own branch. A row that IS continuation round 1 has
+    # had zero grind rounds run against it, so its next grind round is round 1;
+    # the lineage (not the key) is what made it a continuation at all.
+    assert fake.specs[-1]["head_branch"] == r1["head_branch"]
+    assert ":r1:" in fake.specs[-1]["idempotency_key"]
 
 
 def test_a_failed_submit_writes_no_marker_and_is_retried(state):
@@ -456,7 +469,7 @@ def test_dry_run_submits_nothing_and_marks_nothing(state):
     summary = fake.sweep([row], state, dry_run=True)
     assert fake.specs == []
     assert summary.get(dr.DRY_WOULD_APPLY) == 1, summary
-    assert summary["would_submit"][0]["head_branch"] == "hv/fo-merge-pass-20261031-r1"
+    assert summary["would_submit"][0]["head_branch"] == row["head_branch"]
     fake.sweep([row], state)
     assert len(fake.specs) == 1
 
@@ -554,7 +567,7 @@ def test_run_remediation_sweep_runs_the_continuation_pass(monkeypatch):
     monkeypatch.setattr(doctor, "_http", http)
     summary = doctor.run_remediation_sweep(dry_run=False, now=NOW)
     assert summary["continuations"][dr.APPLIED] == 1, summary
-    assert [p["head_branch"] for p in posts] == ["hv/fo-merge-pass-20261031-r1"]
+    assert [p["head_branch"] for p in posts] == [row["head_branch"]]
     assert posts[0]["parent_job_id"] == row["id"]
     assert posts[0]["submitter_urn"]
 

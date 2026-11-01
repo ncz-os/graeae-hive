@@ -2641,10 +2641,21 @@ def fixer_pick(
     ``{"model", "route"}`` or None (the row escalates: no cross-family fixer)."""
     blocked = {f for f in [*(review.get("requested_by") or []), *(review.get("families") or []), *(fixers or [])] if f}
     blocked |= set(review_queue.FORBIDDEN_FAMILIES) | set(review_queue.NEVER_REVIEW_FAMILIES)
-    # The FIXER's family must differ from the branch author's as well: a
-    # same-family fixer could not be reviewed by the author's family either,
-    # and the operator rule pairs reviewer and author across families.
     author_family = _author_family(row)
+    # Round 1 fixes in the AUTHOR's own family: the author knows its own code
+    # and is not a reviewer, so it is never "a fixer approving its own commit"
+    # -- the REVIEWER of the next round is what must differ from the fixer.
+    if int(round_no) <= 1:
+        author = author_model(row)
+        if not author or not author_family:
+            return None
+        if author_family in blocked:
+            return None
+        route = roster_route_for(author, roster=roster) if roster else None
+        return {"model": author, "route": route}
+    # Later rounds take the strongest hard-lane route outside every family that
+    # reviewed, fixed, or authored this row: the fixer must be cross-family
+    # from the reviewer, and a fixer never approves its own commit.
     for route in _hard_lane_routes(list(roster if roster is not None else review_queue.load_roster())):
         family = str(route.get("family") or "")
         if not family or family in blocked or family == author_family:
@@ -2905,7 +2916,10 @@ def grind_spec(
         "repo": row.get("repo"),
         "project": row.get("project"),
         "head_branch": head,
-        "base_branch": row.get("base_branch"),
+        # In place: the job checks the row's OWN branch out and commits onto
+        # it, so the base of that work is the same branch (the worker only
+        # consults base_branch when head_branch is absent upstream).
+        "base_branch": head if is_fix else str(row.get("base_branch") or head),
         "eligible_kinds": list(row.get("eligible_kinds") or []),
         "preferred_models": [model],
         "max_cost_tier": _ceil_tier(row, route),

@@ -288,10 +288,15 @@ def test_a_fix_that_cannot_be_read_is_rejected(repo):
 # ── the loop ────────────────────────────────────────────────────────────────
 
 
-def rc_with(row: dict, severity: str, *, model: str = "muse-spark-1.3", round_no: int = 1) -> dict:
+def rc_with(
+    row: dict, severity: str, *, model: str = "muse-spark-1.3", round_no: int = 1, head: str | None = None
+) -> dict:
     """A request_changes review of ``row``'s tip with ONE located finding."""
     rc = rc_on(row, "rc_meta")
     rc["claimed_model"] = model
+    if head is not None:
+        rc["result"]["head_sha"] = head
+        rc["result"]["remote_sha"] = head
     rc["result"]["reviewer"] = {"model": model, "models": [model], "verdict": "request_changes"}
     rc["result"].pop("review_evidence", None)
     findings = [
@@ -399,7 +404,8 @@ def test_a_blocking_finding_gets_a_fix_job_in_place_on_the_branch(state):
     spec = fake.specs[0]
     # fix IN PLACE: a continuation commit on the row's own branch, not a new one.
     assert spec["head_branch"] == row["head_branch"]
-    assert spec["base_branch"] == row["base_branch"]
+    # In place: the row's own branch is both the head and the base of the fix.
+    assert spec["base_branch"] == row["head_branch"]
     assert spec["parent_job_id"] == row["id"]
     assert ":fix:" in spec["idempotency_key"]
     assert dr.CONTINUATION_INSTRUCTION in spec["description"]
@@ -415,16 +421,16 @@ def test_the_next_round_is_reviewed_by_a_family_that_did_not_fix(state):
     # The fix lands; the review of the new head comes from the fixer's own family.
     new_tip = "7" * 40
     row["result"]["head_sha"] = row["result"]["commits"][0] = new_tip
-    same_family = rc_with(row, "high", model=fixer, round_no=2)
+    same_family = rc_with(row, "high", model=fixer, round_no=2, head=new_tip)
     fake.children_of[row["id"]].append(same_family)
     fake.sweep([row], state, now=NOW + 60)
     assert len(fake.specs) == 1, "a fixer's own review must not drive another round"
     # A different family's review of that head does drive a round.
-    other = rc_with(row, "high", model="qwen38", round_no=2)
+    other = rc_with(row, "high", model="deepseek-v3", round_no=2, head=new_tip)
     fake.children_of[row["id"]].append(other)
     fake.sweep([row], state, now=NOW + 120)
     assert len(fake.specs) == 2
-    assert rq.family_of(fake.specs[1]["preferred_models"][0]) not in {rq.family_of(fixer), "alibaba"}
+    assert rq.family_of(fake.specs[1]["preferred_models"][0]) not in {rq.family_of(fixer), "alibaba", "deepseek"}
 
 
 def test_a_reviewer_never_approves_its_own_fix(state):

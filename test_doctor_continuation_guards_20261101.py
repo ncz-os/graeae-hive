@@ -189,7 +189,8 @@ def test_the_recorded_lineage_still_wins_over_the_markers(state):
     state.set_value(dr._lineage_key(row["id"]), {"root": work_row()["id"], "round": 1}, ttl=dr.MARK_TTL_SEC)
     fake = Fake({row["id"]: [rc_on(row, "rc_meta")]})
     sweep_one(fake, row, state)
-    assert [s["head_branch"] for s in fake.specs] == ["hv/fo-merge-pass-20261031-r2"]
+    # In place: round 2 fixes on the row's own branch, not a new -rN branch.
+    assert [s["head_branch"] for s in fake.specs] == [row["head_branch"]]
 
 
 # ── guard 1b: a genuinely new root is still round 1 ─────────────────────────
@@ -201,7 +202,8 @@ def test_a_genuinely_new_root_still_gets_round_one(state):
     fake = one_rc(row)
     summary = sweep_one(fake, row, state)
     assert summary.get(dr.REFUSED, 0) == 0 and summary[dr.APPLIED] == 1, summary
-    assert fake.specs[0]["head_branch"] == "hv/fo-merge-pass-20261031-r1"
+    # In place: the fix commits on the row's own branch.
+    assert fake.specs[0]["head_branch"] == row["head_branch"]
     assert fake.escalated == []
 
 
@@ -212,7 +214,8 @@ def test_a_new_root_with_an_unrelated_parent_still_gets_round_one(state):
     row = work_row(parent_job_id=parent["id"])
     fake = one_rc(row)
     sweep_one(fake, row, state, job_lookup=lambda jid: parent if jid == parent["id"] else None)
-    assert [s["head_branch"] for s in fake.specs] == ["hv/fo-merge-pass-20261031-r1"]
+    # In place: the fix commits on the row's own branch.
+    assert [s["head_branch"] for s in fake.specs] == [row["head_branch"]]
 
 
 # ── guard 2: the global hourly brake ────────────────────────────────────────
