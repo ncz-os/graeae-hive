@@ -244,6 +244,78 @@ def _resolve(ref: str, spec: dict) -> dict:
     return node if isinstance(node, dict) else {}
 
 
+#: Cross-cutting contract appended to every generated document. It is here, not
+#: in a hand-written trailing section, so a regeneration cannot drop it. Every
+#: row is checked against live behaviour by `test_pagination_20261030.py` and
+#: every non-2xx shape by `test_error_shapes_20261030.py`.
+_PAGINATION_AND_ERRORS = [
+    "## Pagination and errors",
+    "",
+    "Cross-cutting contract for every list route. It is generated (not hand-",
+    "written) so a regeneration keeps it, and it is asserted against live",
+    "behaviour by `test_pagination_20261030.py` (limits, ordering) and",
+    "`test_error_shapes_20261030.py` (error bodies).",
+    "",
+    "### Pagination",
+    "",
+    "A page parameter is an integer query parameter named `limit` (a few",
+    "aggregates call it `top_n`). The rules are the same everywhere:",
+    "",
+    "- Absent, `0` and negative values all mean the route's **default**; none of",
+    '  them means "no rows" and none means "unbounded".',
+    "- A value above the route's **max** is clamped to the max, never rejected:",
+    "  a caller asking for a million rows gets one page of at most the max.",
+    "- A value that is not an integer (`limit=abc`, `limit=1.5`) is a **422** from",
+    "  the framework's own query validation, with the standard `detail` list.",
+    "- Ordering is deterministic: the same request twice returns the same rows in",
+    "  the same order, and `limit=N` is a prefix of `limit=M` for `M > N`.",
+    "- Only `/v1/events/log` offers a cursor (`since_id`): its ids strictly",
+    "  increase and `last_id` from one page is the `since_id` of the next.",
+    "- A listing's order is not a claim's order. `GET /v1/jobs` is newest first so",
+    "  an operator sees recent work; `POST /v1/jobs/next` dispatches priority DESC",
+    "  then started_at ASC, so the oldest high-priority row goes first.",
+    "",
+    "| route | parameter | default | max | ordering |",
+    "| --- | --- | --- | --- | --- |",
+    "| `GET /v1/jobs` | `limit` | 100 | 1000 | started_at/ended_at DESC (newest first), then priority DESC for open rows |",
+    "| `GET /v1/messages` | `limit` | 100 | 1000 | ts DESC, newest first |",
+    "| `GET /v1/events/log` | `limit` | 100 | 1000 | id ASC, cursor via since_id |",
+    "| `GET /v1/admin/jobs/{job_id}/history` | `limit` | 50 | 500 | archived_at DESC, attempt DESC; out of range is 422, not a clamp |",
+    "| `GET /v1/stats/cache` | `top_n` | 20 | 500 | hit_count DESC, cost_saved_usd DESC |",
+    "| `GET /v1/stats/workers` | `top_n` | 30 | 500 | success_count DESC, success_pct DESC |",
+    "",
+    "`GET /v1/agents`, `/v1/events`, `/v1/hosts`, `/v1/repos` and `/v1/schedules`",
+    "take no page parameter: they return the whole (small, bounded) collection.",
+    "",
+    "### Errors",
+    "",
+    "One shape for every non-2xx JSON body:",
+    "",
+    '- a route\'s own refusal: `{"detail": "<one sentence, no internals>"}`;',
+    '- a framework schema refusal: `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}`.',
+    "",
+    "No error body carries a traceback, a filesystem path, a SQL fragment or a",
+    "driver message. The framework's own 422 echoes only the offending field",
+    "value, under `input`. `500` is reserved for an unhandled fault and is not",
+    "used for a client mistake.",
+    "",
+    "| status | when |",
+    "| --- | --- |",
+    "| 400 | a filter or enum value that is not valid (`status=`, `review_state=`, unknown MCP method) |",
+    "| 401 | a mutating call with no `X-Hive-Actor` (and no admin token), or a bad `X-Hive-Token` |",
+    "| 403 | an actor that is neither the admin tier nor the resource's owner, or a denylisted host |",
+    "| 404 | an unknown job, agent, repo or schedule id |",
+    "| 409 | an illegal status transition, a claim conflict, or a concurrent modification (retry) |",
+    "| 422 | a schema violation, or a limit outside a route's accepted range |",
+    "| 503 | `GET /health` only: the bus is up but the DB probe or the reaper is not |",
+    "",
+    "Documented exceptions to the envelope: `GET /health` answers 503 with the",
+    "health document (`ts`, `service`, `version`, `status`, `detail`) rather than",
+    'a bare error, and `POST /mcp` is JSON-RPC and answers `{"error": ...}`.',
+    "",
+]
+
+
 def generate() -> str:
     app = _load_app()
     spec = app.openapi()
@@ -366,6 +438,7 @@ def generate() -> str:
     lines.append("failed rows may be requeued to queued (budget permitting) or parked")
     lines.append("as needs-review; dead-letter/cancelled are terminal.")
     lines.append("")
+    lines.extend(_PAGINATION_AND_ERRORS)
     return "\n".join(lines)
 
 

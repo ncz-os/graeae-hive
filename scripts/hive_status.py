@@ -28,7 +28,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from hive.workers import loop_outcome  # noqa: E402
+from hive import review_queue  # noqa: E402
+from hive.workers import doctor_rules, loop_outcome  # noqa: E402
 
 ACTIVE_JOB_STATUSES = ("claimed", "running")
 ATTENTION_STATUSES = ("failed", "needs-review")
@@ -141,17 +142,29 @@ def build_status(rows: dict, *, older_than_hours: float = 24.0, now: float | Non
             cls = loop_outcome.classify(job, events_fetcher=lambda _jid: None)
             local_only = cls == loop_outcome.KILLED_BY_SIGNAL and loop_outcome.has_local_only_commits(job)
             action = loop_outcome.decide(cls, 0, reviewer_ok=lambda: True, local_commits_only=local_only)
-            attention.append(
-                {
-                    "id": str(job.get("id") or ""),
-                    "kind": str(job.get("kind") or ""),
-                    "status": str(job.get("status") or ""),
-                    "class": cls,
-                    "doctor_action": action,
-                    "age": _age_str(_job_ts(job), now),
-                    "head_branch": str(job.get("head_branch") or "-"),
-                }
-            )
+            row = {
+                "id": str(job.get("id") or ""),
+                "kind": str(job.get("kind") or ""),
+                "status": str(job.get("status") or ""),
+                "class": cls,
+                "doctor_action": action,
+                "age": _age_str(_job_ts(job), now),
+                "head_branch": str(job.get("head_branch") or "-"),
+            }
+            # The review queue IS the triage queue: an awaiting_review row is an
+            # ordinary needs-review row that also says why it is waiting.
+            state = review_queue.review_state(job)
+            if state is not None:
+                row.update(
+                    {
+                        "review_state": review_queue.AWAITING_REVIEW,
+                        "family": state.get("author_family"),
+                        "review_reason": review_queue.awaiting_review_reason(job),
+                        "next_attempt_at": state.get("next_attempt_at"),
+                        "review_attempt": int(state.get("attempt") or 0),
+                    }
+                )
+            attention.append(row)
     cutoff = now - float(older_than_hours) * 3600
     stale = [
         {"id": str(j.get("id") or ""), "status": str(j.get("status") or ""), "age": _age_str(_job_ts(j), now)}
@@ -166,12 +179,25 @@ def build_status(rows: dict, *, older_than_hours: float = 24.0, now: float | Non
         for a in agents
         if str(a.get("status") or "") == "offline" and str(a.get("urn") or "") in claiming_urns
     ]
+    # The doctor's model-call counter (operator 2026-10-31): carried on the
+    # snapshot so the weekend triage line shows how much the doctor leaned on
+    # a model this hour, and how often it found its free slot taken.
+    doctor = rows.get("doctor") if isinstance(rows.get("doctor"), dict) else {}
+    model_calls = doctor.get("model_calls") if isinstance(doctor.get("model_calls"), dict) else {}
     return {
         "queue": {"by_status": by_status, "by_kind": by_kind, "total": len(jobs)},
         "agents": {"by_kind": agents_by_kind, "by_status": agents_by_status, "total": len(agents)},
         "active": sorted(active, key=lambda r: r["id"]),
         "attention": sorted(attention, key=lambda r: r["id"]),
         "flags": {"stale": sorted(stale, key=lambda r: r["id"]), "offline_claiming": offline_claiming},
+        "doctor": {
+            "model_calls": {
+                "calls_last_hour": int(model_calls.get("calls_last_hour") or 0),
+                "slot_taken_last_hour": int(model_calls.get("slot_taken_last_hour") or 0),
+                "alert": bool(model_calls.get("alert")),
+                "alert_reason": model_calls.get("alert_reason"),
+            }
+        },
     }
 
 
@@ -200,10 +226,15 @@ def render_text(snapshot: dict) -> str:
     if not snapshot["attention"]:
         lines.append("  (none)")
     for row in snapshot["attention"]:
-        lines.append(
+        line = (
             f"  {row['id'][:12]} {row['status']} {row['kind']} class={row['class']} "
             f"doctor={row['doctor_action']} age={row['age']}"
         )
+        if row.get("review_state"):
+            line += f" review={row['review_state']} reason={row['review_reason']}"
+        lines.append(line)
+    model_calls = (snapshot.get("doctor") or {}).get("model_calls") or {}
+    lines.append(doctor_rules.format_counter_line(model_calls))
     lines.append("flags:")
     if not snapshot["flags"]["stale"] and not snapshot["flags"]["offline_claiming"]:
         lines.append("  (none)")

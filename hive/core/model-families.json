@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "_comment": [
+    "THE model-family table (operator rule 2026-10-31): one source of truth.",
+    "A reviewer and an author must ALWAYS come from different families, so the",
+    "family of every roster model has to be answered in exactly one place.",
+    "Order inside a pattern list does not matter: the LONGEST matching pattern",
+    "wins, so 'gemma4' never shadows a more specific 'gemma4-31b' entry.",
+    "Names are matched case-insensitively. A roster route id or fleet role id",
+    "(cerberus-reviewer, tydeus-qwen38) resolves through reviewer-roster.json",
+    "to its model first. An unknown model is its own family",
+    "('model:<lower-cased id>') and matches nothing but itself."
+  ],
+  "exact": {
+    "qwen38": {"family": "alibaba", "patterns": ["qwen*"]},
+    "gemma4-31b": {"family": "google", "patterns": ["gemma*"]},
+    "gpt-oss-20b": {"family": "openai", "patterns": ["gpt-oss*", "gpt-6*", "codex*", "*-codex*"]},
+    "nemotron-3-ultra-550b-a55b": {"family": "nvidia", "patterns": ["nemotron*", "nvidia/nemotron*"]},
+    "MiniMax-M3": {"family": "minimax", "patterns": ["minimax*"]},
+    "MiniMax-M3.1-Flash-Preview": {"family": "minimax", "patterns": ["minimax*"]},
+    "gpt-6-luna": {"family": "openai", "patterns": ["gpt-6-luna"]},
+    "gpt-6.1-terra": {"family": "openai", "patterns": ["gpt-6.1-terra"]},
+    "gpt-6-sol": {"family": "openai", "patterns": ["gpt-6-sol"]},
+    "gpt-6-astra": {"family": "openai", "patterns": ["gpt-6-astra"]},
+    "deepseek-flash": {"family": "deepseek", "patterns": ["deepseek*"]},
+    "muse-spark-1.3": {"family": "meta", "patterns": ["muse-spark*"]},
+    "mimo-v2.6-flash": {"family": "xiaomi", "patterns": ["mimo*"]},
+    "stepfun-3.5": {"family": "stepfun", "patterns": ["stepfun*"]},
+    "claude-sonnet-4-6": {"family": "anthropic", "patterns": ["claude*"]}
+  }
+}

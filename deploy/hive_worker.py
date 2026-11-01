@@ -114,7 +114,14 @@ import provenance
 # commits, reviews and pushes the driver's edits from outside the sandbox.
 # ``fleet_git_env`` is the one ARGONAS credential helper shared by the clone,
 # the zeroclaw push and the codex push.
-from hive import codex_delivery, llm_roles, push_policy, review_evidence, review_record
+from hive import (
+    codex_delivery,
+    llm_roles,
+    push_policy,
+    review_evidence,
+    review_queue,
+    review_record,
+)
 from hive.core import fleet_inventory
 from hive.codex_delivery import fleet_git_env
 
@@ -6865,6 +6872,18 @@ def _run_job_inner(job: dict) -> None:
         status = "failed"
         failure_reason = BUDGET_EXCEEDED_FAILURE
         result.update(budget_fields)
+    if WORKER_KIND != "codex" and codex_delivery_result is None:
+        # REVIEW QUEUE (2026-10-31): a delivered branch whose reviewer could
+        # not answer waits for a cross-family review instead of failing.
+        status, failure_reason = apply_awaiting_review(
+            status,
+            failure_reason,
+            result,
+            evidence=evidence,
+            cancelled=cancelled,
+            run_models=run_models,
+            reviewer=launched_reviewer_route(None),
+        )
     if failure_reason:
         result["failure_reason"] = failure_reason
         if failure_reason == "ai_attribution_trailer":
@@ -6959,6 +6978,165 @@ def _run_job_inner(job: dict) -> None:
     # Retain even successful workspaces. A 200 from the bus acknowledges a
     # request, not independent validation of the code or a safe cleanup lease.
 
+
+# ── review queue inside the triage queue: the WORKER side (operator 2026-10-31)
+# The review queue IS the triage queue: the Hive job rows in needs-review the
+# doctor's needs-review sweep already reads. When a loop finishes authoring and
+# its reviewer cannot answer (busy endpoint, timeout, prose-only, empty,
+# truncated or 503 output) the worker must NOT fail the job: it pushes the
+# branch and leaves the row needs-review with
+# result.review_state.state='awaiting_review', naming the author, its family,
+# the tried reviewers and their failure kinds. The doctor's sweep then pairs
+# the row with a CROSS-FAMILY reviewer from hive/core/reviewer-roster.json.
+#
+# The family table, the roster and the pairing function live in
+# hive/review_queue.py: ONE data file and one implementation shared by the
+# worker and the bus lines. These are thin seams over it.
+
+
+def review_queue_roster() -> list:
+    """The reviewer roster (every reviewer-capable route), from the one data file."""
+    return review_queue.load_roster()
+
+
+def review_queue_reviewers(
+    author_model: str,
+    *,
+    health=None,
+    load=None,
+    co_authors: list | None = None,
+    repo: str | None = None,
+    author_routes: list | None = None,
+) -> list:
+    """Ordered CROSS-FAMILY reviewers for ``author_model``; ``[]`` means PARK.
+
+    An empty list is a verdict, not an error: with no cross-family reviewer
+    available the row is parked awaiting_review -- never self-reviewed.
+    """
+    return review_queue.pick_reviewers(
+        author_model,
+        review_queue_roster(),
+        health=health,
+        load=load,
+        co_authors=co_authors,
+        repo=repo,
+        author_routes=author_routes,
+    )
+
+
+#: Error substrings that name WHY a reviewer route could not answer. Ordered
+#: most-specific first; the first match wins.
+_REVIEWER_FAILURE_PATTERNS = (
+    ("review_http_503", ("answered 503", "http 503", " 503")),
+    ("review_truncated", ("truncat", "max_tokens", "finish_reason: length")),
+    ("review_timeout", ("timed out", "timeout")),
+    ("review_prose_only", ("prose", "not a verdict", "non-json", "no json")),
+    # "No review chunks" is the CERBERUS-endpoint-busy signature (the loop could
+    # not get a slot at all), which the loop layer already reads as
+    # reviewer_unavailable -- so it is a busy route, not an empty review.
+    ("review_busy", ("no review chunks", "all healthy endpoints failed", "busy", "reviewer_unavailable")),
+    ("review_empty", ("empty",)),
+)
+
+
+def reviewer_failure_kind(evidence: dict | None, *, author_model: str = "", head_sha: str | None = None) -> str | None:
+    """The structured failure kind of a reviewer attempt, or None on success.
+
+    None means the reviewer produced a STRUCTURED verdict for this head: only a
+    JSON ``reviewers`` list naming its model(s) counts. A prose-only, empty,
+    truncated, 503 or non-JSON review is a failure kind, NEVER an approval.
+    """
+    payload = evidence if isinstance(evidence, dict) else {}
+    if review_queue.has_structured_verdict(payload, head_sha=head_sha):
+        return None
+    haystack = " ".join(
+        str(payload.get(key) or "") for key in ("error", "reason", "verdict", "detail", "message")
+    ).lower()
+    for kind, needles in _REVIEWER_FAILURE_PATTERNS:
+        if any(needle in haystack for needle in needles):
+            return kind
+    # No structured verdict and no recognisable cause: the safe reading of a
+    # reviewer that answered nothing usable is a busy route, which retries.
+    return "review_busy"
+
+
+def awaiting_review_state(
+    author_model: str,
+    tried: list | None = None,
+    *,
+    attempt: int = 0,
+    next_attempt_at: float | None = None,
+    now: float | None = None,
+    author_family: str | None = None,
+    parked_reason: str | None = None,
+    last_failure: str | None = None,
+) -> dict:
+    """The ``result.review_state`` block the worker writes instead of failing."""
+    return review_queue.make_review_state(
+        author_model,
+        tried,
+        attempt=attempt,
+        next_attempt_at=next_attempt_at,
+        now=now,
+        author_family=author_family,
+        parked_reason=parked_reason,
+        last_failure=last_failure,
+    )
+
+
+def awaiting_review_disposition(
+    loop_teardown: str | None, *, exit_code: int, ready: bool, cancelled: bool
+) -> tuple[str, str | None]:
+    """Row disposition for a loop that got no reviewer: needs-review, not failed."""
+    return review_queue.awaiting_review_status(
+        loop_teardown, exit_code=exit_code, ready=ready, cancelled=cancelled
+    )
+
+
+def review_resume_delay(attempt: int) -> float:
+    """Delay before review attempt ``attempt+1`` (15 min doubling, capped at 2 h)."""
+    return review_queue.backoff_seconds(attempt)
+
+
+#: Dispositions the review queue may take over: the loop's own unresolved
+#: outcome. Integrity, attribution, protection and spend-cap failures always win.
+_REVIEW_QUEUE_TAKES_OVER = frozenset({"loop_unresolved", "loop_unresolved_work_rescued"})
+
+
+def apply_awaiting_review(
+    status: str,
+    failure_reason: str | None,
+    result: dict,
+    *,
+    evidence: dict,
+    cancelled: bool,
+    run_models: dict | None,
+    reviewer: str | None = None,
+    now: float | None = None,
+) -> tuple[str, str | None]:
+    """Put a delivered branch whose REVIEWER could not answer into the queue.
+
+    Only the loop's own unresolved outcome is taken over, only when the loop
+    ended ``reviewer_unavailable``, only for a verified delivery (there must be
+    a branch to review) and never for a cancelled job. The row becomes
+    ``needs-review`` / ``reviewer_unavailable`` with
+    ``result.review_state`` naming the author, its family and the reviewer
+    that failed; the doctor's needs-review sweep takes it from there. Anything
+    else returns the disposition unchanged.
+    """
+    if cancelled or failure_reason not in _REVIEW_QUEUE_TAKES_OVER:
+        return status, failure_reason
+    loop = result.get("loop_result") if isinstance(result.get("loop_result"), dict) else {}
+    teardown = loop.get("teardown") if isinstance(loop.get("teardown"), dict) else {}
+    final = str(teardown.get("final_verdict") or "").strip().lower().replace("-", "_")
+    if final != "reviewer_unavailable" or not completion_ready(evidence or {}):
+        return status, failure_reason
+    new_status, new_reason = awaiting_review_disposition(final, exit_code=1, ready=True, cancelled=False)
+    author = str((run_models or {}).get("author") or "") if isinstance(run_models, dict) else ""
+    kind = reviewer_failure_kind(teardown, author_model=author) or "review_busy"
+    tried = [{"model_id": str(reviewer), "failure": kind}] if str(reviewer or "").strip() else []
+    result["review_state"] = awaiting_review_state(author, tried, last_failure=kind, now=now)
+    return new_status, new_reason
 
 def main() -> None:
     if WORKER_KIND not in ("zeroclaw", "codex"):

@@ -48,6 +48,7 @@ Env:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import os
@@ -62,18 +63,18 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import deque
+from typing import Any
 
 # Fleet addresses come from operator config (HIVE_FLEET_INVENTORY), never source.
-from hive import review_verdict
+from hive import review_queue, review_record, review_verdict
 from hive.core import fleet_inventory
-from hive.workers import remediation, retention
 
 # SOP phase 3 (2026-10-22): durable safety state and the destructive-action rails.
 # Both are stdlib-only siblings, importable without the hive package, so the
 # container still runs this module standalone.
-from hive.workers import doctor_gates, doctor_v2
+from hive.review_queue import pick_reviewers
 from hive.workers import doctor_decline_paths as decline_paths
-from hive.workers import loop_outcome
+from hive.workers import doctor_gates, doctor_models, doctor_rules, doctor_v2, loop_outcome, remediation, retention
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
 HIVE_URL = os.environ.get("HIVE_URL", "")
@@ -94,22 +95,52 @@ HIVE_BUS_TOKEN = os.environ.get("HIVE_BUS_TOKEN", "")
 HIVE_BUS_ADMIN_TOKEN = os.environ.get("HIVE_BUS_ADMIN_TOKEN", "")
 ZEROCLAW_BIN = os.environ.get("ZEROCLAW_BIN", "/usr/local/bin/zeroclaw")
 DOCTOR_AGENT_ALIAS = os.environ.get("DOCTOR_AGENT_ALIAS", "hive_doctor")
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    """``os.environ[name]`` as an int, defensively: default, bounds, one warning.
+
+    A bare ``int(os.environ.get(...))`` at module scope raises on a typo
+    (``HIVE_DOCTOR_REVIEW_SUBMIT_MAX=three``) and takes the WHOLE doctor down at
+    import, which is a crash loop, not a config error. An unset or unparsable
+    value falls back to the default with a logged warning; ``minimum``/
+    ``maximum`` clamp a real value (the warning names it when they do), and a
+    clamped ``minimum=0`` cap is how "never submit" is spelled (review
+    2026-10-31, high).
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        log.warning("doctor: %s=%r is not an integer; using the default %d", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        log.warning("doctor: %s=%r is below the minimum %d; using %d", name, raw, minimum, minimum)
+        return minimum
+    if maximum is not None and value > maximum:
+        log.warning("doctor: %s=%r is above the maximum %d; using %d", name, raw, maximum, maximum)
+        return maximum
+    return value
+
+
 AGENT_HOST = os.environ.get("AGENT_HOST", socket.gethostname().split(".")[0])
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "30"))
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "15"))
-ZEROCLAW_TIMEOUT = int(os.environ.get("ZEROCLAW_TIMEOUT", "900"))
-MAX_SSH_PER_HOUR = int(os.environ.get("MAX_SSH_PER_HOUR", "3"))
+ZEROCLAW_TIMEOUT = _env_int("ZEROCLAW_TIMEOUT", 900)
+MAX_SSH_PER_HOUR = _env_int("MAX_SSH_PER_HOUR", 3, minimum=0)
 # The window the SSH rate cap is measured over. Named so the durable rate limiter
 # and the in-memory deque cannot drift onto different windows.
 SSH_RATE_WINDOW_SEC = float(os.environ.get("SSH_RATE_WINDOW_SEC", "3600"))
-MIN_HOST_COOLDOWN = int(os.environ.get("MIN_HOST_COOLDOWN", "1800"))
+MIN_HOST_COOLDOWN = _env_int("MIN_HOST_COOLDOWN", 1800)
 DRY_RUN = os.environ.get("DRY_RUN", "0") == "1"
 # Loop-detection: per-job-id (re)fail counter. If the same job_id keeps
 # coming back to the doctor (because we released it and some broken worker
 # re-failed it), we escalate instead of releasing it again.
 _seen_job_attempts: dict[str, list[float]] = {}
 LOOP_WINDOW_SEC = float(os.environ.get("LOOP_WINDOW_SEC", "1800"))  # 30 min
-LOOP_ESCALATE_THRESHOLD = int(os.environ.get("LOOP_ESCALATE_THRESHOLD", "3"))
+LOOP_ESCALATE_THRESHOLD = _env_int("LOOP_ESCALATE_THRESHOLD", 3, minimum=0)
 
 # ── Per-phase model selection (2026-06-02) ──
 # The doctor runs in phases; each phase picks its model independently.
@@ -142,7 +173,7 @@ _PHASE_MODELS = {
 DOCTOR_OPENWEIGHT_BASE_URL = os.environ.get("DOCTOR_OPENWEIGHT_BASE_URL", "").rstrip("/")
 DOCTOR_OPENWEIGHT_MODEL = os.environ.get("DOCTOR_OPENWEIGHT_MODEL", "gpt-oss-20b")
 DOCTOR_OPENWEIGHT_API_KEY = os.environ.get("DOCTOR_OPENWEIGHT_API_KEY", "")
-DOCTOR_OPENWEIGHT_TIMEOUT = int(os.environ.get("DOCTOR_OPENWEIGHT_TIMEOUT", "120"))
+DOCTOR_OPENWEIGHT_TIMEOUT = _env_int("DOCTOR_OPENWEIGHT_TIMEOUT", 120, minimum=1)
 # Per-phase bases. Triage and review default to CERBERUS (DOCTOR_OPENWEIGHT_BASE_URL);
 # the fix phase defaults to TYDEUS, where qwen38 is served — a phase model id
 # is sent to its phase base, so the two must agree. Override any phase to a
@@ -263,14 +294,16 @@ def _classify_attempt_failure(reason: str) -> str:
 # queue of 20+ dead jobs"). The doctor sweeps terminal rows on a bounded
 # interval; the pure planner + snapshot helpers live in hive.workers.retention.
 RETENTION_DRY_RUN = os.environ.get("RETENTION_DRY_RUN", "0") == "1"
-RETENTION_DEAD_TTL_SEC = float(os.environ.get("RETENTION_DEAD_TTL_SEC", "3600"))   # dead rows older than 1 h
-RETENTION_TRIAGE_TTL_SEC = float(os.environ.get("RETENTION_TRIAGE_TTL_SEC", "600"))  # triage work orders older than 10 min
-RETENTION_MAX_DEAD = int(os.environ.get("RETENTION_MAX_DEAD", "10"))   # hard cap on dead (failed+dead-letter+cancelled)
+RETENTION_DEAD_TTL_SEC = float(os.environ.get("RETENTION_DEAD_TTL_SEC", "3600"))  # dead rows older than 1 h
+RETENTION_TRIAGE_TTL_SEC = float(
+    os.environ.get("RETENTION_TRIAGE_TTL_SEC", "600")
+)  # triage work orders older than 10 min
+RETENTION_MAX_DEAD = _env_int("RETENTION_MAX_DEAD", 10, minimum=0)  # hard cap on dead (failed+dead-letter+cancelled)
 RETENTION_SWEEP_INTERVAL = float(os.environ.get("RETENTION_SWEEP_INTERVAL", "600"))  # seconds between retention sweeps
 
 # Self-triage scanner config
 SCAN_INTERVAL = float(os.environ.get("SCAN_INTERVAL", "300"))  # seconds between failed-cluster scans
-CLUSTER_THRESHOLD = int(os.environ.get("CLUSTER_THRESHOLD", "1"))  # min failures of same base_kind to trigger a triage
+CLUSTER_THRESHOLD = _env_int("CLUSTER_THRESHOLD", 1, minimum=0)  # min failures of same base_kind to trigger a triage
 CLUSTER_WINDOW_SEC = float(os.environ.get("CLUSTER_WINDOW_SEC", "21600"))  # only look at failures in last 6h
 # To avoid re-triaging the same cluster repeatedly, we remember kinds we've already
 # auto-triaged within this rolling window:
@@ -284,7 +317,7 @@ TRIAGE_SEEN_TTL_SEC = float(os.environ.get("TRIAGE_SEEN_TTL_SEC", str(30 * 86400
 # with no automatic remediation.
 DLQ_SCAN_INTERVAL = float(os.environ.get("DLQ_SCAN_INTERVAL", str(SCAN_INTERVAL)))
 DLQ_APPLY = os.environ.get("DLQ_APPLY", "0") == "1"
-DLQ_MAX_PER_CYCLE = int(os.environ.get("DLQ_MAX_PER_CYCLE", "20"))
+DLQ_MAX_PER_CYCLE = _env_int("DLQ_MAX_PER_CYCLE", 20, minimum=0)
 # The WORK one dead-letter cycle may do, counted in ATTEMPTS rather than in actions.
 # `DLQ_MAX_PER_CYCLE` is a budget for progress: a refusal for want of an approval
 # does not spend it, because a job the doctor was not allowed to act on is still a
@@ -293,7 +326,7 @@ DLQ_MAX_PER_CYCLE = int(os.environ.get("DLQ_MAX_PER_CYCLE", "20"))
 # which is one pass over the whole dead-letter queue per cycle for a queue that
 # cannot drain. This bounds the pass. It is at least `DLQ_MAX_PER_CYCLE`, so the
 # action budget still binds first whenever the doctor is actually making progress.
-DLQ_MAX_ATTEMPTS_PER_CYCLE = max(DLQ_MAX_PER_CYCLE, int(os.environ.get("DLQ_MAX_ATTEMPTS_PER_CYCLE", "50")))
+DLQ_MAX_ATTEMPTS_PER_CYCLE = max(DLQ_MAX_PER_CYCLE, _env_int("DLQ_MAX_ATTEMPTS_PER_CYCLE", 50, minimum=0))
 # Once a dead-letter job has a logged decision, don't re-decide it every cycle.
 _dlq_seen: dict[str, float] = {}
 DLQ_SEEN_TTL = float(os.environ.get("DLQ_SEEN_TTL", "21600"))  # 6h
@@ -357,7 +390,7 @@ SAME_SIGNATURE_RETRY_TTL = 30 * 24 * 3600
 # row and re-dispatch the same work once on the remaining hosts, excluding the
 # offending one. The cap and the markers are durable (STATE), so a restart
 # never re-purges or re-dispatches the same original job id.
-VIOLATION_MAX_RETRIES = int(os.environ.get("VIOLATION_MAX_RETRIES", "2"))
+VIOLATION_MAX_RETRIES = _env_int("VIOLATION_MAX_RETRIES", 2, minimum=0)
 PROTECTION_RETRY_TTL_SEC = 30 * 86400.0
 PROTECTION_ERROR_RE = re.compile(r"driver modified another session's checkout:\s*(\S+)")
 
@@ -369,7 +402,7 @@ PROTECTION_ERROR_RE = re.compile(r"driver modified another session's checkout:\s
 # big backlog cannot flood the queue. A row that HAS a review verdict is left
 # for a human/orchestrator, and a needs-review row is never auto-purged:
 # if it carries commits, those are delivered work.
-REVIEW_FOLLOWUP_MAX_PER_SWEEP = int(os.environ.get("REVIEW_FOLLOWUP_MAX_PER_SWEEP", "3"))
+REVIEW_FOLLOWUP_MAX_PER_SWEEP = _env_int("REVIEW_FOLLOWUP_MAX_PER_SWEEP", 3, minimum=0)
 REVIEW_FOLLOWUP_TTL_SEC = 30 * 86400.0
 REVIEW_FOLLOWUP_KIND_PREFIX = "review:"
 REVIEW_FOLLOWUP_ELIGIBLE_KINDS = []  # ANY reviewer family; scheduler owns capability matching
@@ -451,7 +484,7 @@ DLQ_TRANSIENT_RE = re.compile(
 # auto-dispatches a codex fix without burning an LLM call.
 # Rate-limit: max 3 fixes per host per hour to avoid loops.
 _token_fix_attempts: dict[str, list[float]] = {}
-MAX_TOKEN_FIX_PER_HOST = int(os.environ.get("MAX_TOKEN_FIX_PER_HOST", "3"))
+MAX_TOKEN_FIX_PER_HOST = _env_int("MAX_TOKEN_FIX_PER_HOST", 3, minimum=0)
 TOKEN_FIX_WINDOW_SEC = float(os.environ.get("TOKEN_FIX_WINDOW_SEC", "3600"))  # 1 hour
 # SECURITY (review C2/H3): no baked-in default. The prior literal
 # ('fleet-lan-token-2026-05-26') was a committed shared LAN secret embedded into
@@ -473,6 +506,7 @@ KNOWN_FAILURE_SIGNATURES: list[tuple[re.Pattern, str]] = [
 # carried them too. Empty inventory = no known host = the host-addressed actions
 # refuse by name instead of dialling a guess.
 
+
 def all_fleet_hosts() -> dict[str, dict]:
     """``host -> {ip, os, auth, user}`` from the fleet inventory.
 
@@ -484,6 +518,7 @@ def all_fleet_hosts() -> dict[str, dict]:
         name: {"ip": entry["address"], "os": entry["os"], "auth": entry["auth"], "user": entry["user"]}
         for name, entry in fleet_inventory.load_inventory().items()
     }
+
 
 log = logging.getLogger("doctor")
 
@@ -798,7 +833,49 @@ def register() -> str:
 REREGISTER_CODES = (404, 409)
 
 
+def _emit_light_model_alert() -> dict:
+    """Broadcast ``doctor.light_model_needed`` from the heartbeat, ONCE.
+
+    The ledger decides when a crossing happened (``CallLedger._alerted_reason``
+    de-duplicates per hour, and a quiet hour re-arms it); the heartbeat is the
+    one place that can broadcast without a model call issuing a second request.
+    """
+    try:
+        summary = _model_call_ledger().counter()
+    except Exception as exc:  # noqa: BLE001 -- telemetry never fails a heartbeat
+        log.warning("doctor model-call counter unavailable: %s", exc)
+        return {}
+    if summary.get("alert"):
+        log.warning(
+            "doctor %s reason=%s calls=%s slot_taken=%s",
+            doctor_rules.ALERT_TOPIC,
+            summary.get("alert_reason"),
+            summary.get("calls_last_hour"),
+            summary.get("slot_taken_last_hour"),
+        )
+        try:
+            broadcast_doctor_message(
+                doctor_rules.ALERT_TOPIC,
+                {
+                    "host": AGENT_HOST,
+                    "reason": summary.get("alert_reason"),
+                    "calls_last_hour": summary.get("calls_last_hour"),
+                    "slot_taken_last_hour": summary.get("slot_taken_last_hour"),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 -- telemetry never fails a heartbeat
+            log.warning("doctor %s broadcast failed: %s", doctor_rules.ALERT_TOPIC, exc)
+    return summary
+
+
 def heartbeat():
+    # Alert telemetry is best effort: a bus outage is exactly when an alert
+    # fires, and it must never cost the doctor its heartbeat. `_emit_...`
+    # already isolates what it can; this is the belt for the rest.
+    try:
+        _emit_light_model_alert()
+    except Exception as exc:  # noqa: BLE001 -- never let telemetry fail a heartbeat
+        log.warning("doctor alert broadcast failed (heartbeat continues): %s", exc)
     code, _ = _http("POST", "/v1/agents/heartbeat", {"urn": _urn, "status": "online"})
     if code in REREGISTER_CODES:
         # Without this a ghost doctor (URN reaped after a stall, or bus restored)
@@ -947,66 +1024,105 @@ and exact operator approvals; they are not model-selectable actions.
 """
 DOCTOR_SYSTEM += "\nDiagnostic hosts: " + "|".join(doctor_gates.restart_target_names())
 
+#: The residue prompt's system text: short, and it names ONLY the classes.
+#: The doctor asks a model for one enum value and a short reason, nothing else
+#: (operator 2026-10-31) -- so the schema, the grammar and the prompt agree.
+RESIDUE_SYSTEM = (
+    "You classify ONE failed Hive job row. Answer with one JSON object and nothing else: "
+    '{"action_type": <one of no_action | release_to_queue | escalate>, "confidence": <0..1>, '
+    '"reason": <at most 140 characters>}. '
+    "release_to_queue = the failure is transient and rerunning the SAME work is safe. "
+    "no_action = the row needs nothing from the doctor. "
+    "escalate = everything else, including anything you cannot quote from the evidence. "
+    "Do not call tools; purges, restarts and code fixes are never yours to choose."
+)
 
-def build_doctor_prompt(job: dict, base_kind: str, failed: list[dict], registry: dict, failure_count_hint: int) -> str:
-    msg = [
-        "TRIAGE REQUEST",
-        f"triage_job_id: {job.get('id', '')}",
-        f"triage_kind: {job.get('kind', '')}",
-        f"base_kind: {base_kind}",
-        f"failure_count_hint: {failure_count_hint}",
-        "",
-        "TRIAGE DESCRIPTION:",
-        (job.get("description") or "")[:6000],
-        "",
-        f"RECENT FAILED JOBS OF base_kind={base_kind!r} ({len(failed)} shown):",
-    ]
-    for fj in failed[:8]:
-        result_preview = ""
-        if fj.get("result"):
-            try:
-                rd = json.loads(fj["result"]) if isinstance(fj["result"], str) else fj["result"]
-                txt = " | ".join(
-                    str(rd.get(key) or "")[-4096:]
-                    for key in ("failure_reason", "error", "tail", "stderr", "stdout")
-                    if rd.get(key)
-                )
-                exit_code = rd.get("exit_code")
-                result_preview = (
-                    f"exit={exit_code} retry_count={fj.get('retry_count', rd.get('retry_count', 0))} | {txt[-16384:]}"
-                )
-            except Exception:
-                result_preview = str(fj["result"])[:400]
-        msg.append(
-            f"  - id={fj.get('id', '')[:12]} kind={fj.get('kind', '')} "
-            f"claimed_by={fj.get('claimed_by', '')} "
-            f"provider={fj.get('claimed_provider', '')} "
-            f"model={fj.get('claimed_model', '')}"
-        )
-        if result_preview:
-            msg.append(f"    result: {result_preview}")
-        msg.append(
-            f"    host={fj.get('host') or fj.get('claimed_host') or ''} head_branch={fj.get('head_branch') or ''}"
-        )
-    msg.extend(
+
+def build_residue_prompt(row: dict, cls: doctor_rules.RowClass | None = None) -> str:
+    """The SHORT prompt for the only model-classifiable part of triage.
+
+    The old prompt asked for evidence quotes, retry scopes and release kinds; it
+    now asks for one enum value and a short reason, and carries a bounded slice
+    of the evidence instead of a transcript."""
+    result = row.get("result")
+    if not isinstance(result, str):
+        result = json.dumps(result or {})
+    return "\n".join(
         [
-            "EVIDENCE RULE: A release_to_queue decision MUST include evidence_quote exactly as supplied below.",
-            "An invented or absent quote is invalid and will be escalated.",
-            "",
-            "AGENT REGISTRY SUMMARY:",
-            f"  by_kind: {json.dumps(registry.get('by_kind', {}))}",
-            f"  by_host: {json.dumps(registry.get('by_host', {}))}",
-            f"  by_status: {json.dumps(registry.get('by_status', {}))}",
-            "",
-            "Respond with the JSON action object only.",
+            "TRIAGE RESIDUE",
+            f"job_id: {str(row.get('id') or '')[:12]}",
+            f"kind: {row.get('kind') or ''}",
+            f"failure_reason: {str(row.get('failure_reason') or '')[:500]}",
+            f"result (truncated): {result[:2000]}",
+            f"rule_out: {cls.rule_id if cls else 'none'}; decision classes: {' | '.join(doctor_rules.CLASSES)}",
         ]
     )
-    return "\n".join(msg)
+
+
+def _classify_triage_state(row: dict, base_kind: str = "") -> dict:
+    """The deterministic classification of one triage row (operator 2026-10-31).
+
+    Called from ``process_triage_job`` at the ONE point a model used to be
+    dialled. ``doctor_rules.classify_row`` answers from the row's shape; the
+    only residue it cannot name (``ambiguous``) is asked of a model with a
+    CONSTRAINED reply, and a model that cannot produce one is escalated rather
+    than obeyed. Either way the return value is one of ``CLASSES``."""
+    cls = doctor_rules.classify_row(row)
+    if cls is not None and not cls.ambiguous:
+        log.info("doctor row=%s classified rule=%s action=%s", str(row.get("id", ""))[:12], cls.rule_id, cls.action)
+        return doctor_rules.as_action(cls)
+    if cls is None:
+        # A never-act class is owned by another caller; do not invent a
+        # second decision for it.
+        return doctor_rules.as_action(None)
+
+    # The residue: evidence no rule names. ONE constrained call, and the next
+    # rung when the reply does not parse (the chain and the legacy loop both
+    # retry); a final non-answer escalates, it never releases.
+    prompt = build_residue_prompt(row, cls)
+    started = time.monotonic()
+    ok, text = invoke_doctor_agent(prompt, phase="triage")
+    latency_ms = (time.monotonic() - started) * 1000.0
+    if not ok:
+        _note_doctor_model_call("triage", "unavailable", latency_ms)
+        return {
+            "action_type": "escalate",
+            "confidence": 1.0,
+            "reason": "residue model unavailable; escalated",
+            "rule_id": "residue:model_unavailable",
+            "needs_review": True,
+            "model_attempted": True,
+            "raw": text,
+        }
+    # ``parse_constrained`` takes the REPLY TEXT (it is the same parser the
+    # schema tests exercise), so the constraint is judged on what the model
+    # actually sent -- not on a re-serialisation of it.
+    parsed_ok, decision = doctor_rules.parse_constrained(text)
+    _note_doctor_model_call("triage", "ok" if parsed_ok else "unusable", latency_ms)
+    if not parsed_ok:
+        return {
+            "action_type": "escalate",
+            "confidence": 1.0,
+            "reason": f"residue model reply rejected ({decision.get('error')}); escalated",
+            "rule_id": "residue:rejected",
+            "needs_review": True,
+            "model_attempted": True,
+            "raw": text,
+        }
+    # Keep the model's own evidence quote: the residual validator below checks
+    # it verbatim against the row, and the schema deliberately drops it.
+    raw_reply = parse_doctor_response(text) or {}
+    quote = raw_reply.get("evidence_quote") or raw_reply.get("quote")
+    if quote:
+        decision["evidence_quote"] = str(quote)
+    decision["rule_id"] = f"residue:model:{decision['action_type']}"
+    decision["needs_review"] = decision["action_type"] == "escalate"
+    return decision
 
 
 DOCTOR_GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1").strip()
-DOCTOR_GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "42617"))
-DOCTOR_GATEWAY_TIMEOUT = int(os.environ.get("DOCTOR_GATEWAY_TIMEOUT", "180"))
+DOCTOR_GATEWAY_PORT = _env_int("GATEWAY_PORT", 42617, minimum=1, maximum=65535)
+DOCTOR_GATEWAY_TIMEOUT = _env_int("DOCTOR_GATEWAY_TIMEOUT", 180, minimum=1)
 
 
 def _invoke_gateway(prompt: str) -> tuple[bool, str]:
@@ -1083,13 +1199,21 @@ def _invoke_openweight(
     *,
     base_url: str | None = None,
     model: str | None = None,
+    urlopen=None,
+    structured: bool = False,
 ) -> tuple[bool, str]:
     """Run a non-codex phase via an OpenAI-compatible chat endpoint.
 
     Defaults to the LOCAL brain (CERBERUS, DOCTOR_OPENWEIGHT_MODEL) — pass
     ``base_url``/``model`` for a specific phase. Anthropic + Together remain
     FORBIDDEN per CLAUDE.md. Local endpoints accept a placeholder auth, so a
-    missing key is only fatal when a base is explicitly remote."""
+    missing key is only fatal when a base is explicitly remote.
+
+    ``structured=True`` constrains the reply (operator 2026-10-31): the request
+    carries ``response_format`` (honoured by every OpenAI-compatible rung) AND
+    ``json_schema``/``grammar`` (what llama-server and vLLM compile into a
+    grammar), so a small or overloaded model cannot answer outside the
+    enumerated classes."""
     base = (base_url or DOCTOR_OPENWEIGHT_BASE_URL).rstrip("/")
     model_id = model or DOCTOR_OPENWEIGHT_MODEL
     if not base:
@@ -1112,6 +1236,8 @@ def _invoke_openweight(
         "temperature": 0.0,
         "stream": False,
     }
+    if structured:
+        body.update(doctor_rules.structured_request_fields())
     url = f"{base}/chat/completions"
     data = json.dumps(body).encode()
     headers = {"content-type": "application/json"}
@@ -1121,8 +1247,9 @@ def _invoke_openweight(
         log.warning("no open-weight API key; calling %s unauthenticated (ok for local)", base)
     req = urllib.request.Request(url, data=data, method="POST", headers=headers)
     log.info("invoking model=%s at %s (alias=%s, prompt_chars=%d)", model_id, base, model_alias, len(prompt))
+    opener = urlopen or urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=DOCTOR_OPENWEIGHT_TIMEOUT) as r:
+        with opener(req, timeout=DOCTOR_OPENWEIGHT_TIMEOUT) as r:
             resp = json.loads(r.read())
         text = (resp.get("choices") or [{}])[0].get("message", {}).get("content", "")
         if text and text.strip():
@@ -1146,6 +1273,25 @@ def _is_codex_alias(model_alias: str) -> bool:
     return alias in _CODEX_ALIASES or alias.startswith("gpt-")
 
 
+def _chain():
+    """The slot-aware chain for this call, or ``None`` for the legacy path.
+
+    A thin seam so tests (and a future caller) can inject a chain without
+    patching the module that defines it: ``chain_from_env`` reads
+    DOCTOR_MODEL_CHAIN and returns None when unset, which is the default."""
+    chain = doctor_models.chain_from_env(
+        # Count the doctor's own calls per rung; a rung at its cap is skipped,
+        # not dialled (the "free slot found taken" evidence the alert reads).
+        urlopen=_ledger_urlopen(),
+        clock=_model_chain_clock,
+    )
+    return chain
+
+
+#: Re-exported so a caller/test can name the chain factory from this module.
+chain_from_env = doctor_models.chain_from_env
+
+
 def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     """Run the doctor LLM for a given PHASE using its configured model.
 
@@ -1164,6 +1310,43 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     gateway is never called automatically. Remote/paid providers are never a
     fallback rung — every rung is an on-prem llama-server."""
     global _codex_alias_warned
+    # Slot-aware model chain (operator 2026-10-31): a DOCTOR_MODEL_CHAIN file
+    # opts in. Unset means `chain_from_env` returns None and the legacy
+    # single-base-per-phase chain below runs exactly as before.
+    # `is not None` is load-bearing: tests patch chain_from_env with a falsy
+    # sentinel to assert the legacy path consults no chain at all.
+    model_chain = _chain()
+    if model_chain is not None:
+        # A structured reply that does not parse is a failure of THAT rung, and
+        # the next rung must be tried (operator 2026-10-31: "reject and retry on
+        # the next rung when it does not parse"). The chain already walks its
+        # rungs inside one call; this loop covers a chain that returns a
+        # rejection, and it is bounded so a broken chain cannot spin.
+        max_rounds = int(getattr(doctor_models, "DEFAULT_MAX_ATTEMPTS", 5))
+        tried: list[str] = []
+        last = ""
+        for _round in range(max(1, int(max_rounds))):
+            outcome = model_chain.call(
+                phase,
+                system=DOCTOR_SYSTEM,
+                prompt=prompt,
+                structured=phase != "fix",
+                timeout=DOCTOR_OPENWEIGHT_TIMEOUT,
+            )
+            tried.extend(outcome.attempts)
+            if outcome.ok:
+                log.info(
+                    "doctor phase=%s answered by chain rung=%s attempts=%s",
+                    phase,
+                    outcome.rung,
+                    outcome.attempts,
+                )
+                return True, outcome.text
+            last = outcome.text
+            if not str(outcome.text).startswith("unusable reply"):
+                break
+        return False, f"model chain failed for phase {phase}; tried {tried}: {last}"
+
     model_alias = _PHASE_MODELS.get(phase, DOCTOR_TRIAGE_MODEL)
     if _is_codex_alias(model_alias):
         if not _codex_alias_warned:
@@ -1188,8 +1371,25 @@ def invoke_doctor_agent(prompt: str, phase: str = "triage") -> tuple[bool, str]:
     for idx, (base, model) in enumerate(chain):
         # Pass the model ONLY as the keyword: _invoke_openweight's second
         # positional parameter is the alias label, not the model id.
-        ok, text = _invoke_openweight(prompt, model_alias, base_url=base, model=model)
-        if ok and text.strip():
+        # Constrained output (operator 2026-10-31): a triage/review reply must
+        # parse into the enumerated classes, so every rung inherits the schema.
+        structured = phase != "fix"
+        started = time.monotonic()
+        ok, text = _invoke_openweight(prompt, model_alias, base_url=base, model=model, structured=structured)
+        latency_ms = (time.monotonic() - started) * 1000.0
+        # A reply that arrived but does not parse into the classes is a failure
+        # of THIS rung; the next rung is tried in the same call.
+        parsed_ok = True
+        if ok and text.strip() and structured:
+            parsed_ok = _reply_satisfies_schema(text)
+        _record_model_call(
+            rung=model or model_alias or base,
+            phase=phase,
+            latency_ms=latency_ms,
+            outcome=("ok" if ok and parsed_ok else "unusable" if ok else _classify_attempt_failure(text)),
+            skipped_because=None if ok else str(text)[:200],
+        )
+        if ok and text.strip() and parsed_ok:
             if idx == 0:
                 log.info("doctor phase=%s answered by %s model=%s", phase, base, model)
             else:
@@ -1266,6 +1466,163 @@ def parse_doctor_response(text: str) -> dict | None:
         except Exception:
             continue
     return best
+
+
+def _reply_satisfies_schema(text: str) -> bool:
+    """Is this legacy reply usable, or must the next rung be tried?
+
+    The legacy chain predates the constraint and its bytes/behaviour must not
+    change when ``DOCTOR_MODEL_CHAIN`` is unset: prose is still returned to the
+    caller, exactly as before. Only a MALFORMED framed reply -- an action
+    object that was started and did not close or did not parse -- is a failure
+    of this rung, so a truncated/garbled answer rolls to the next rung instead
+    of being handed to the residue validator as if it were a diagnosis.
+
+    The chain path is the strict one: it passes ``structured=True`` and judges
+    replies with ``doctor_models._acceptable`` against ``doctor_rules.CLASSES``.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    if "{" not in stripped and "`" not in stripped:
+        return True  # plain prose: legacy-legal, and the caller escalates on it
+    return parse_doctor_response(stripped) is not None
+
+
+def _model_chain_clock() -> float:
+    """The chain's clock, patched by tests; the ledger stamps with it too."""
+    return time.time()
+
+
+def _ledger_urlopen():
+    """Wrap urlopen so every probe that finds a rung BUSY is evidence.
+
+    The chain probes a rung before choosing it; a second probe on a rung whose
+    cached reading (a few seconds old) said "busy" is the doctor finding the
+    free slot TAKEN (the chain's re-probe). Recording that here is the only
+    place it is observable without a slot-level contract.
+    """
+    real = urllib.request.urlopen
+
+    # The wrapper must be transparent: it forwards every positional argument
+    # and keeps urlopen's own timeout default, so a caller that leaves the
+    # timeout out does not silently get a 0 s one (and a positional argument
+    # does not become a TypeError).
+    def opener(request, *args, **kwargs):
+        busy = False
+        try:
+            with real(request, *args, **kwargs) as response:
+                body = response.read(1 << 20)
+                status = getattr(response, "status", _REPLAY_OK_STATUS)
+        except Exception:
+            # A probe that cannot be read is not proof of capacity; it is not
+            # evidence of a taken slot either.
+            raise
+        try:
+            text = body.decode("utf-8", "replace") if isinstance(body, bytes) else str(body)
+            if "/slots" in getattr(request, "full_url", ""):
+                data = json.loads(text)
+                slots = data.get("slots") if isinstance(data, dict) else data
+                busy = _slots_report_full(slots)
+        except (ValueError, AttributeError):
+            busy = False
+        if busy:
+            _record_model_call(
+                rung="slot-probe",
+                phase="probe",
+                latency_ms=0.0,
+                outcome="busy",
+                skipped_because="free slot found taken",
+                slot_taken=True,
+            )
+
+        class _Replay(io.BytesIO):
+            pass
+
+        replay = _Replay(body)
+        replay.status = status
+        return replay
+
+    return opener
+
+
+def _slots_report_full(slots: Any) -> bool:
+    """Is this llama-server ``/slots`` body every-slot-busy?
+
+    An EMPTY list is UNKNOWN, not busy: llama-server reports every configured
+    slot, so a body with no slots measures nothing (the server may be between
+    a restart and its allocation) -- and ``all()`` over nothing is vacuously
+    true, which turned "nothing to read" into "the free slot was taken". Only
+    a non-empty list of processing slots is evidence. The chain's
+    ``_llama_busy`` reads the same body the same way (0 busy, hence free).
+    """
+    if not isinstance(slots, list) or not slots:
+        return False
+    return all(isinstance(slot, dict) and slot.get("is_processing") for slot in slots)
+
+
+#: What a replayed response reports when the real one carried no status.
+_REPLAY_OK_STATUS = 200
+
+
+def _model_call_ledger() -> doctor_rules.CallLedger:
+    """The process-wide ledger (one JSONL file, like the safety state)."""
+    global _MODEL_CALL_LEDGER
+    if _MODEL_CALL_LEDGER is None:
+        _MODEL_CALL_LEDGER = doctor_rules.CallLedger(clock=_model_chain_clock)
+    return _MODEL_CALL_LEDGER
+
+
+_MODEL_CALL_LEDGER: doctor_rules.CallLedger | None = None
+
+
+def _record_model_call(**entry) -> dict:
+    """One ledger line per rung; returns the counter (and the ONCE-alert flag).
+
+    The alert is NOT broadcast from here: a model call must never issue a
+    second network request (an outage is exactly when it fires). The caller --
+    the doctor heartbeat, where a broadcast is expected -- reads
+    ``alert`` and emits ``doctor.light_model_needed``.
+
+    ``doctor.light_model_needed`` is emitted when more than 30 doctor model
+    calls happen in an hour, or the doctor's free slot is found taken more than
+    3 times in an hour (operator rule 2026-10-31) -- that is the evidence the
+    restoration rule reads before a dedicated light model is put back."""
+    try:
+        summary = _model_call_ledger().record(**entry)
+    except Exception as exc:  # noqa: BLE001 -- telemetry never fails a triage
+        log.warning("doctor model-call ledger unavailable: %s", exc)
+        return {}
+    if summary.get("alert"):
+        log.warning(
+            "doctor %s reason=%s calls=%s slot_taken=%s",
+            doctor_rules.ALERT_TOPIC,
+            summary.get("alert_reason"),
+            summary.get("calls_last_hour"),
+            summary.get("slot_taken_last_hour"),
+        )
+    return summary
+
+
+def _note_doctor_model_call(phase: str, outcome: str, latency_ms: float = 0.0, rung: str = "") -> dict:
+    """Thin, patchable seam for call sites outside ``invoke_doctor_agent``."""
+    return _record_model_call(rung=rung, phase=phase, latency_ms=latency_ms, outcome=outcome)
+
+
+def doctor_model_call_counter() -> dict:
+    """The counter the doctor status and the weekend triage line expose."""
+    try:
+        return _model_call_ledger().counter()
+    except Exception:  # noqa: BLE001 -- a status read never raises
+        return doctor_rules.model_call_counter([], now=time.time())
+
+
+def doctor_agent_status() -> dict:
+    """The extra health payload the doctor status carries (heartbeat metadata)."""
+    return {
+        "model_calls": doctor_model_call_counter(),
+        "doctor_state_loaded": bool(STATE.loaded_ok),
+    }
 
 
 # ───────────────────────── Playbook actions ─────────────────────────
@@ -1399,6 +1756,7 @@ def action_resubmit_jobs(
         and not dlq_protected(j)
         and str(j.get("id") or "") not in (exclude_ids or set())
     ]
+
     # A job whose retry budget is spent (max_retries 0, or retry_count >= max_retries)
     # is never requeued by the doctor: it is reported for review, nothing else.
     # A replacement this doctor submitted is never resubmitted again: its own
@@ -1427,8 +1785,7 @@ def action_resubmit_jobs(
         because re-dispatching review children is the dispatcher's job.
         """
         return bool(job.get("parent_job_id")) or bool(
-            _as_dict(job.get("result")).get("resubmitted_from")
-            or _as_dict(job.get("result")).get("resubmitted_as")
+            _as_dict(job.get("result")).get("resubmitted_from") or _as_dict(job.get("result")).get("resubmitted_as")
         )
 
     held, eligible, chain = [], [], []
@@ -1481,7 +1838,9 @@ def action_resubmit_jobs(
                     "head_branch": j.get("head_branch"),
                     "base_branch": j.get("base_branch"),
                     "eligible_kinds": j.get("eligible_kinds"),
-                    "eligible_hosts": json.loads(j["eligible_hosts"]) if isinstance(j.get("eligible_hosts"), str) else j.get("eligible_hosts"),
+                    "eligible_hosts": json.loads(j["eligible_hosts"])
+                    if isinstance(j.get("eligible_hosts"), str)
+                    else j.get("eligible_hosts"),
                     "max_retries": 2,
                     "parent_job_id": j.get("id"),
                     "idempotency_key": f"doctor-resubmit-{j.get('id')}",
@@ -1505,7 +1864,10 @@ def action_resubmit_jobs(
                     payload["idempotency_key"] = f"doctor-resubmit-{j.get('id')}-{short}"
                     log.warning(
                         "resubmit %s: %s refused on the original ref (http=%s); retrying on %s",
-                        base_kind, j.get("id"), code3, derived,
+                        base_kind,
+                        j.get("id"),
+                        code3,
+                        derived,
                     )
                     code3, resp3 = _http("POST", "/v1/jobs", payload)
                 if code3 in (200, 201) and isinstance(resp3, dict) and resp3.get("id"):
@@ -1531,7 +1893,9 @@ def action_resubmit_jobs(
                         # generation. It must be VISIBLE though.
                         log.warning(
                             "resubmit %s: could not mark %s as resubmitted (http=%s)",
-                            base_kind, j.get("id"), patch_code,
+                            base_kind,
+                            j.get("id"),
+                            patch_code,
                         )
                         unmarked.append(j.get("id"))
                 else:
@@ -1549,11 +1913,11 @@ def action_resubmit_jobs(
             )
             log.warning(
                 "resubmit %s: submitted %d new job(s) for budget-spent failures%s",
-                base_kind, len(made), held_note,
+                base_kind,
+                len(made),
+                held_note,
             )
-            chain_note = (
-                f"; {len(chain)} replacement(s) left alone (one generation only)" if chain else ""
-            )
+            chain_note = f"; {len(chain)} replacement(s) left alone (one generation only)" if chain else ""
             if made:
                 return f"resubmitted {len(made)} budget-spent job(s) of {base_kind} as new{held_note}{chain_note}"
             return f"could not resubmit budget-spent jobs of {base_kind}{held_note}{chain_note}"
@@ -1639,7 +2003,9 @@ def _unknown_signature_decision(job: dict, reason: str) -> dict | None:
         # One retry on a different eligible host: the normal release path keeps
         # 'doctor' out of eligible_kinds, so the requeued work lands on a
         # different worker. The signature is tagged on the job result.
-        text, released = apply_release(job["id"], job.get("kind", "").startswith("triage:"), _base_kind(job.get("kind") or ""), None)
+        text, released = apply_release(
+            job["id"], job.get("kind", "").startswith("triage:"), _base_kind(job.get("kind") or ""), None
+        )
         if not released:
             log.warning("unknown_signature %s: release rejected; retry not queued", signature)
         return {
@@ -1890,9 +2256,7 @@ def _online_worker_kinds() -> set[str] | None:
     if not isinstance(agents, list):
         return None
     return {
-        str(a.get("kind") or "")
-        for a in agents
-        if isinstance(a, dict) and str(a.get("kind") or "") in _WORKER_KINDS
+        str(a.get("kind") or "") for a in agents if isinstance(a, dict) and str(a.get("kind") or "") in _WORKER_KINDS
     }
 
 
@@ -2028,9 +2392,7 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         cls = loop_outcome.classify(j)
         class_counts[cls] = class_counts.get(cls, 0) + 1
         local_only = cls == loop_outcome.KILLED_BY_SIGNAL and loop_outcome.has_local_only_commits(j)
-        verdict = loop_outcome.decide(
-            cls, _loop_requeue_count(jid), reviewer_probe, local_commits_only=local_only
-        )
+        verdict = loop_outcome.decide(cls, _loop_requeue_count(jid), reviewer_probe, local_commits_only=local_only)
         if cls != loop_outcome.UNKNOWN:
             outcome_notes[jid[:12]] = f"{cls}->{verdict}"
         if verdict in ("hold", "skip"):
@@ -2051,7 +2413,7 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         bases[kind] = bases.get(kind, 0) + 1
         base_ids.setdefault(kind, []).append(jid)
     acted, skipped = {}, []
-    for base_kind in sorted(bases, key=lambda k: -bases[k])[:max(0, int(max_bases))]:
+    for base_kind in sorted(bases, key=lambda k: -bases[k])[: max(0, int(max_bases))]:
         # 2026-10-29: this is a COOLDOWN, so ask `seen(key, ttl)`. `last_mark()` returns when the key was
         # last marked and never expires: with `is not None` the first requeue of a base_kind suppressed every
         # later failure of that kind (operator: the triage backlog was never serviced).
@@ -2060,9 +2422,12 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
         # kind for the whole window. Key it on the SET of failed rows instead: the same rows
         # inside the window are still skipped (no requeue loop), but a row that failed since
         # the last pass changes the set and is acted on at once.
-        set_key = "orphan_resubmit:" + base_kind + ":" + hashlib.sha1(
-            ",".join(sorted(base_ids.get(base_kind, []))).encode()
-        ).hexdigest()[:12]
+        set_key = (
+            "orphan_resubmit:"
+            + base_kind
+            + ":"
+            + hashlib.sha1(",".join(sorted(base_ids.get(base_kind, []))).encode()).hexdigest()[:12]
+        )
         if STATE.seen(set_key, ORPHAN_RESUBMIT_TTL_SEC):
             skipped.append(base_kind)
             continue
@@ -2095,8 +2460,12 @@ def sweep_orphan_failures(max_bases: int = 5) -> dict:
     if class_counts:
         log.info("orphan-failure sweep class_counts: %s", class_counts)
     return {
-        "scanned": len(failed), "bases": len(bases), "acted": acted, "skipped": skipped,
-        "outcomes": outcome_notes, "class_counts": class_counts,
+        "scanned": len(failed),
+        "bases": len(bases),
+        "acted": acted,
+        "skipped": skipped,
+        "outcomes": outcome_notes,
+        "class_counts": class_counts,
     }
 
 
@@ -2722,12 +3091,12 @@ def run_retention_sweep() -> dict:
         # ALL candidates go in ONE explicit-ids purge call (the operator's
         # "oldest first" ordering is the plan order — split calls would lose it
         # and the purge endpoint's own active guard is the second line).
-        code, resp = _http("POST", "/v1/jobs/purge",
-                           {"ids": to_purge, "reason": "doctor-retention-sweep"}, timeout=30.0)
+        code, resp = _http(
+            "POST", "/v1/jobs/purge", {"ids": to_purge, "reason": "doctor-retention-sweep"}, timeout=30.0
+        )
         purged = int((resp or {}).get("deleted", 0) or 0)
         if code not in (200, 201, 204):
-            log.warning("retention sweep: purge failed code=%s resp=%s",
-                        code, str(resp)[:200])
+            log.warning("retention sweep: purge failed code=%s resp=%s", code, str(resp)[:200])
 
     ages = [e.get("age_sec") for e in entries if isinstance(e.get("age_sec"), (int, float))]
     report = {
@@ -2763,32 +3132,37 @@ def run_retention_sweep() -> dict:
         for j in recount:
             st = j.get("status") or "(null)"
             counts_by_status[st] = counts_by_status.get(st, 0) + 1
-        report["dead_after_sweep"] = sum(
-            1 for j in recount if j.get("status") in retention.DEAD_STATUSES
-        )
+        report["dead_after_sweep"] = sum(1 for j in recount if j.get("status") in retention.DEAD_STATUSES)
         report["invariant_satisfied"] = report["dead_after_sweep"] <= RETENTION_MAX_DEAD
     report["counts_by_status"] = counts_by_status
 
     log.info(
         "retention sweep: %s planned=%d purged=%d skipped=%d dead_after=%s invariant=%s",
-        "dry-run" if RETENTION_DRY_RUN else "sweep", len(purge_ids), report["purged"],
-        skipped, report["dead_after_sweep"], report["invariant_satisfied"],
+        "dry-run" if RETENTION_DRY_RUN else "sweep",
+        len(purge_ids),
+        report["purged"],
+        skipped,
+        report["dead_after_sweep"],
+        report["invariant_satisfied"],
     )
 
-    broadcast_doctor_message("doctor.retention", {
-        "host": AGENT_HOST,
-        "dry_run": RETENTION_DRY_RUN,
-        "purged": report["purged"],
-        "skipped": skipped,
-        "counts_by_reason": report["counts_by_reason"],
-        "counts_by_status": report["counts_by_status"],
-        "dead_after_sweep": report["dead_after_sweep"],
-        "invariant_satisfied": report["invariant_satisfied"],
-        "max_dead": RETENTION_MAX_DEAD,
-        "oldest_purged_sec": report["oldest_purged_sec"],
-        "newest_purged_sec": report["newest_purged_sec"],
-        "snapshot_file": snap_path,
-    })
+    broadcast_doctor_message(
+        "doctor.retention",
+        {
+            "host": AGENT_HOST,
+            "dry_run": RETENTION_DRY_RUN,
+            "purged": report["purged"],
+            "skipped": skipped,
+            "counts_by_reason": report["counts_by_reason"],
+            "counts_by_status": report["counts_by_status"],
+            "dead_after_sweep": report["dead_after_sweep"],
+            "invariant_satisfied": report["invariant_satisfied"],
+            "max_dead": RETENTION_MAX_DEAD,
+            "oldest_purged_sec": report["oldest_purged_sec"],
+            "newest_purged_sec": report["newest_purged_sec"],
+            "snapshot_file": snap_path,
+        },
+    )
     return report
 
 
@@ -2931,7 +3305,9 @@ def _build_retry_spec(job: dict, offending_host: str, retry_note: str) -> dict:
 def submit_job_spec(spec: dict) -> tuple[int, dict | None]:
     """Submit one job via the bus as the doctor (the doctor's registered URN
     satisfies the orchestrator-submitter tier)."""
-    body = {k: v for k, v in spec.items() if v is not None or k in ("repo", "head_branch", "base_branch", "max_cost_tier")}
+    body = {
+        k: v for k, v in spec.items() if v is not None or k in ("repo", "head_branch", "base_branch", "max_cost_tier")
+    }
     body["submitter_urn"] = _urn or "urn:agent:doctor:pythia:unknown"
     if not body.get("eligible_kinds"):
         body.pop("eligible_kinds", None)
@@ -2983,7 +3359,10 @@ def handle_protection_violation(job: dict) -> str:
             _http(
                 "PATCH",
                 f"/v1/jobs/{jid}",
-                {"status": job.get("status") or "failed", "result": {**result, "doctor_reason": reason, "needs_operator": True}},
+                {
+                    "status": job.get("status") or "failed",
+                    "result": {**result, "doctor_reason": reason, "needs_operator": True},
+                },
             )
         except Exception:
             log.warning("protection violation: could not annotate row %s", jid[:12])
@@ -3018,9 +3397,8 @@ def handle_protection_violation(job: dict) -> str:
 
     offending_host = protection_offending_host(job)
     offending_path = protection_offending_path(job)
-    note = (
-        f"protection_violation on original {jid[:12]}"
-        + (f" (checkout {offending_path} on {offending_host})" if offending_host else " (offending host unparseable)")
+    note = f"protection_violation on original {jid[:12]}" + (
+        f" (checkout {offending_path} on {offending_host})" if offending_host else " (offending host unparseable)"
     )
 
     re_dispatched = False
@@ -3040,7 +3418,9 @@ def handle_protection_violation(job: dict) -> str:
             if code in (200, 201) and new_id:
                 protection_violation_record_retry(jid)
                 re_dispatched = True
-                steps.append(f"re-dispatched {new_id[:12]} excluding host={offending_host} (retry {used + 1}/{VIOLATION_MAX_RETRIES})")
+                steps.append(
+                    f"re-dispatched {new_id[:12]} excluding host={offending_host} (retry {used + 1}/{VIOLATION_MAX_RETRIES})"
+                )
             else:
                 steps.append(f"re-dispatch FAILED code={code} resp={str(resp)[:160]}")
                 needs_operator = True
@@ -3053,7 +3433,10 @@ def handle_protection_violation(job: dict) -> str:
         _http(
             "PATCH",
             f"/v1/jobs/{jid}",
-            {"status": job.get("status") or "failed", "result": {**result, "doctor_reason": reason, "needs_operator": needs_operator}},
+            {
+                "status": job.get("status") or "failed",
+                "result": {**result, "doctor_reason": reason, "needs_operator": needs_operator},
+            },
         )
     except Exception:
         log.warning("protection violation: could not annotate row %s", jid[:12])
@@ -3080,6 +3463,7 @@ def handle_protection_violation(job: dict) -> str:
 # verdict is left for a human/orchestrator. A needs-review row is NEVER
 # auto-purged: if it carries commits, those are delivered work.
 
+
 def review_followup_row_has_verdict(job: dict) -> bool:
     """True when a verdict exists or a review submission is already recorded.
 
@@ -3089,6 +3473,64 @@ def review_followup_row_has_verdict(job: dict) -> bool:
     if res.get("review_evidence") or res.get("verdict"):
         return True
     return bool(str(res.get("auto_review_job_id") or "").strip())
+
+
+def awaiting_review_entry(job: dict) -> dict | None:
+    """The row's ``result.review_state`` (review queue) block, or None.
+
+    Operator rule 2026-10-31: a loop that finished authoring without a review
+    is QUEUED work, not failed. There is no separate queue table: the review
+    queue IS the needs-review listing, and ``review_state.state ==
+    'awaiting_review'`` marks where a row is inside it. This helper is how the
+    sweep tells "waiting for a reviewer" from "waiting for a human".
+    """
+    return review_queue.review_state({"result": _job_result_dict(job)})
+
+
+def is_awaiting_review(job: dict) -> bool:
+    """True while the review queue still owes this row a review."""
+    return awaiting_review_entry(job) is not None
+
+
+def _awaiting_review_state_key(job: dict) -> str:
+    """Which of the dashboard buckets an awaiting_review row belongs in."""
+    state = awaiting_review_entry(job) or {}
+    if state.get("approved"):
+        return "approved"
+    if state.get("request_changes"):
+        return "request_changes"
+    if review_queue.is_parked(state):
+        return "parked"
+    if _review_queue_exhausted(state):
+        return "exhausted"
+    if review_queue.in_backoff(state):
+        return "backoff"
+    return "queued"
+
+
+def needs_review_queue_counts(jobs: list[dict], result_key: str = "needs_review_result") -> dict:
+    """Counts for the dashboard/report: queued, parked, exhausted and unreviewed rows."""
+    counts = {
+        "total": 0,
+        "queued": 0,
+        "backoff": 0,
+        "parked": 0,
+        "exhausted": 0,
+        "approved": 0,
+        "request_changes": 0,
+        "unreviewed": 0,
+    }
+    for job in jobs:
+        if not isinstance(job, dict):
+            continue
+        counts["total"] += 1
+        if is_awaiting_review(job):
+            counts[_awaiting_review_state_key(job)] += 1
+        else:
+            counts["unreviewed"] += 1
+    counts["awaiting_review"] = counts["queued"] + counts["backoff"] + counts["parked"] + counts["exhausted"]
+    counts[result_key] = dict(counts)
+    return counts
 
 
 def _needs_review_child_review_jobs(job: dict) -> list[dict]:
@@ -3465,7 +3907,6 @@ def process_triage_job(job: dict) -> dict:
     )
 
     failed = fetch_failed_jobs_for_kind(base_kind, limit=10)
-    registry = fetch_agent_registry_summary()
 
     # ── Deterministic decline paths (2026-10-27) ──
     # The decline vocabulary is decided by table, not by prompt: every reason
@@ -3601,7 +4042,12 @@ def process_triage_job(job: dict) -> dict:
         a = unknown_action.get("action_type", "no_action")
         released = bool(unknown_action.get("released_to_queue", False))
         release_text = unknown_action.get("release_text", "")
-        parts = [f"action={a}", f"conf={unknown_action.get('confidence', 1.0):.2f}", f"unknown_signature={unknown_action.get('unknown_signature', '')}", f"reason={unknown_action.get('reason', '')}"]
+        parts = [
+            f"action={a}",
+            f"conf={unknown_action.get('confidence', 1.0):.2f}",
+            f"unknown_signature={unknown_action.get('unknown_signature', '')}",
+            f"reason={unknown_action.get('reason', '')}",
+        ]
         if a == "release_to_queue" and release_text:
             parts.append(release_text)
         log.info("doctor decision (UNKNOWN-SIGNATURE): action=%s signature=%s", a, unknown_action.get("signature", "?"))
@@ -3617,35 +4063,61 @@ def process_triage_job(job: dict) -> dict:
             "result": unknown_action.get("result"),
         }
 
-    prompt = build_doctor_prompt(job, base_kind, failed, registry, failure_count)
-
-    # Diagnose = triage phase (cheap open-weight by default). The doctor emits a
-    # JSON action; any code FIX is dispatched to open-weight workers, and
-    # adversarial REVIEW of that fix runs on codex (DOCTOR_REVIEW_MODEL).
-    ok, text = invoke_doctor_agent(prompt, phase="triage")
-    if not ok:
+    # ── The residue: everything above answered from the row. What is left is
+    # ambiguous, and that is the ONLY reason a model is dialled (operator
+    # 2026-10-31). ``_classify_triage_state`` asks one CONSTRAINED question --
+    # one enum value and a short reason -- and rejects/retries down the chain
+    # when the reply does not parse; when no rung parses, the row escalates.
+    # Deployment-dependent worker_error (no_repo_mapping) is NOT a row the
+    # table may answer for: whether it is unschedulable depends on the catalog,
+    # which only this process can read. A genuinely absent repo escalates with
+    # no model call; a catalog-present one falls through to the ordinary path.
+    _unsched = _is_unschedulable(failed or [job])
+    if _unsched:
         return {
-            "exit_code": 2,
-            "stdout": "doctor agent failed",
-            "stderr": text[:2000],
-            "action_type": "escalate",
-            "reason": "doctor LLM call failed",
+            "exit_code": 0,
+            "stdout": f"action=escalate; reason=unschedulable ({_unsched}); no model call",
+            "action": {
+                "action_type": "escalate",
+                "confidence": 1.0,
+                "reason": f"unschedulable ({_unsched}): the submitter must create the branch or map the repo",
+            },
+            "base_kind": base_kind,
+            "needs_review": True,
+            "doctor_model_calls": doctor_model_call_counter(),
         }
 
-    action = parse_doctor_response(text)
-    if not action:
+    residue_row = _classify_triage_state(failed[0] if failed else job)
+    # ``parse_constrained`` bounds a model reply to the decision schema, which
+    # deliberately drops extras -- including ``evidence_quote``. Carry the raw
+    # quote through so the residual validator below can still verify it against
+    # the row's own evidence (the quote gate is not weakened by the schema).
+    action = {**residue_row, **(residue_row.get("model_action") or {})}
+
+    if residue_row.get("action_type") == "escalate" and residue_row.get("model_attempted"):
         return {
             "exit_code": 3,
-            "stdout": "could not parse doctor response",
-            "raw": text[-2000:],
+            "stdout": "could not parse doctor response on any rung",
+            "raw": str(residue_row.get("raw") or "")[-2000:],
             "action_type": "escalate",
+            "base_kind": base_kind,
+            "needs_review": True,
+            "action": {"action_type": "escalate", "reason": residue_row.get("reason") or ""},
+            "doctor_model_calls": doctor_model_call_counter(),
         }
 
     # Residual release decisions must cite the original evidence and obey the
-    # same durable per-signature retry ceiling as deterministic rules.
+    # same durable per-signature retry ceiling as deterministic rules. A TABLE
+    # decision is not residual: it names its own rule, so it needs no evidence
+    # quote -- the quote gate exists for free-form model diagnoses.
     residual_evidence = doctor_v2.collect_evidence(failed[0] if failed else job)
     used_retries = len(_signature_resubmits(base_kind, residual_evidence.signature))
-    if "evidence_quote" in action or "quote" in action or action.get("action_type") == "release_to_queue":
+    from_table = bool(
+        residue_row.get("rule_id", "").startswith(("retryable_", "residue:no_action", "loop:", "empty_result"))
+    )
+    if not from_table and (
+        "evidence_quote" in action or "quote" in action or action.get("action_type") == "release_to_queue"
+    ):
         residual = doctor_v2.validate_llm_decision(
             action,
             residual_evidence,
@@ -3709,6 +4181,9 @@ def process_triage_job(job: dict) -> dict:
             if v2
             else None
         ),
+        # The doctor call counter rides on the result so the weekend triage
+        # line and the status can read it without a second source of truth.
+        "doctor_model_calls": doctor_model_call_counter(),
     }
 
 
@@ -3766,9 +4241,7 @@ def _resubmit_job_once(job: dict, fields: dict, note: str) -> dict:
     body = {
         k: v
         for k, v in job.items()
-        if isinstance(v, (str, int, float))
-        and v is not None
-        and k not in _RESUBMIT_BODY_EXCLUDES
+        if isinstance(v, (str, int, float)) and v is not None and k not in _RESUBMIT_BODY_EXCLUDES
     }
     body.update(fields)
     # DRY_RUN is the doctor-wide submit switch; the DLQ switch is unrelated to
@@ -4035,7 +4508,9 @@ def remediate_dead_letter(job: dict, decision: str, reason: str) -> str:
             ensure_review_followup({**job, "status": "needs-review"})
         except Exception as exc:
             log.error("immediate DLQ review dispatch failed job=%s: %s", jid, exc)
-            broadcast_doctor_message("doctor.sweep_error", {"sweep": "immediate-review", "job_id": jid, "error": str(exc)})
+            broadcast_doctor_message(
+                "doctor.sweep_error", {"sweep": "immediate-review", "job_id": jid, "error": str(exc)}
+            )
         return f"re-tagged {jid[:12]} -> needs-review"
     if code == 404:
         return f"needs-review PENDING {jid[:12]}: /v1/admin/jobs/reclassify not on bus yet"
@@ -4147,7 +4622,15 @@ def fetch_needs_review_jobs(limit: int = 1000) -> list[dict]:
     total = response.get("total", len(rows))
     if isinstance(total, int) and total > len(rows):
         log.error("needs-review backlog truncated: fetched=%s total=%s; API has no pagination", len(rows), total)
-        broadcast_doctor_message("doctor.sweep_error", {"sweep": "needs-review", "error": "backlog truncated; API has no pagination", "scanned": len(rows), "total": total})
+        broadcast_doctor_message(
+            "doctor.sweep_error",
+            {
+                "sweep": "needs-review",
+                "error": "backlog truncated; API has no pagination",
+                "scanned": len(rows),
+                "total": total,
+            },
+        )
     return rows
 
 
@@ -4584,6 +5067,15 @@ def review_followup_blocker(job: dict) -> str | None:
     """
     if str(job.get("kind") or "").startswith("triage:"):
         return "a triage report: it needs a human, not a code review"
+    if is_awaiting_review(job):
+        # Queued work, not a row a human must chase: the review queue retries
+        # with backoff (see review_queue_stuck_owned).
+        kind = _awaiting_review_state_key(job)
+        if kind == "parked":
+            return "awaiting review in the review queue (parked: no cross-family reviewer)"
+        if kind == "exhausted":
+            return "awaiting review in the review queue (review attempts exhausted)"
+        return "awaiting review in the review queue (queued for the next cross-family reviewer)"
     result = _job_result_dict(job)
     if result.get("verdict"):
         return "the row already carries a verdict"
@@ -4633,10 +5125,26 @@ def escalate_stuck_needs_review(jobs: list[dict], *, evidence_fn, now: float | N
             continue
         if str(job.get("kind") or "").startswith("triage:"):
             continue  # a triage report is meant to wait for a human; one message each would be noise
+        exhausted = False
+        if is_awaiting_review(job) and not review_queue.is_resolved(awaiting_review_entry(job)):
+            # Operator rule 2026-10-31: an awaiting-review row is QUEUED work for
+            # the review queue (it retries with backoff), not a row a human must
+            # chase -- until its attempts are spent. Then only the owner can act,
+            # and the row is escalated to them once like any other stuck row.
+            if review_queue_stuck_owned(job, now=now):
+                continue
+            exhausted = True
         touched = _row_touched_at(job)
         if touched is None or now - touched <= NEEDS_REVIEW_ESCALATE_SECONDS:
             continue
-        blocker = review_followup_blocker(job)
+        if exhausted:
+            entry = awaiting_review_entry(job) or {}
+            blocker = (
+                f"cross-family review attempts exhausted ({int(entry.get('attempt') or 0)} tried, "
+                f"last failure {entry.get('last_failure') or 'unknown'}): waiting for the owner"
+            )
+        else:
+            blocker = review_followup_blocker(job)
         if blocker is None:
             continue
         state = "|".join([str(row["classification"]), str(row["evidence_summary"]), blocker])
@@ -4669,6 +5177,17 @@ def report_needs_review_sweep() -> dict:
     already in ``result.tail`` (one ``doctor.verdict_completed`` message per
     row, dry-run via ``DOCTOR_VERDICT_COMPLETION_DRY_RUN=1``)."""
     jobs = fetch_needs_review_jobs()
+    # The review queue IS this listing: awaiting_review rows are advanced
+    # BEFORE the report so the row it prints is the state the sweep just left
+    # (submitted / parked / approved / backoff), never a stale one.
+    try:
+        # The sweep records each outcome on the row object it was handed, so
+        # the report below reads the post-sweep state without a second fetch.
+        review_queue_summary = run_review_queue_sweep(rows=jobs)
+    except Exception as exc:  # noqa: BLE001 -- the report still has to run
+        log.error("review queue sweep failed: %s", exc)
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "review-queue", "error": str(exc)})
+        review_queue_summary = {"errors": 1}
     rows = doctor_v2.sweep_needs_review(
         jobs, older_than_hours=NEEDS_REVIEW_OLDER_HOURS, summarize=review_verdict.evidence_summary
     )
@@ -4683,6 +5202,11 @@ def report_needs_review_sweep() -> dict:
         row["evidence"] = evidence
         row["suggested_action"] = needs_review_suggestion(evidence)
     for row in rows:
+        job = by_id.get(str(row.get("job_id")))
+        if job is not None:
+            # The review queue's view of the row (reason, next_attempt_at,
+            # attempts) and "not stale while the queue still owns it".
+            _gate_review_queue_stuck(row, job, None)
         _log_report_row_once(row)
         broadcast_doctor_message("doctor.needs_review", {"host": AGENT_HOST, **row})
     seen_ids = {str(r.get("job_id")) for r in rows}
@@ -4691,7 +5215,13 @@ def report_needs_review_sweep() -> dict:
     verdicts = complete_stuck_verdict_jobs(jobs)
     log.info("needs-review verdict completion: %s", verdicts)
     escalated = escalate_stuck_needs_review(jobs, evidence_fn=evidence_fn)
-    return {"scanned": len(rows), "rows": rows, "verdict_completion": verdicts, "escalated": escalated}
+    return {
+        "scanned": len(rows),
+        "rows": rows,
+        "verdict_completion": verdicts,
+        "escalated": escalated,
+        "review_queue": review_queue_summary,
+    }
 
 
 def run_needs_review_sweep() -> dict:
@@ -4708,6 +5238,9 @@ def run_needs_review_sweep() -> dict:
     report = report_needs_review_sweep()
     followup = run_review_followup_sweep()
     report["review_followup"] = followup
+    # ``report["review_queue"]`` is the review-queue half (awaiting_review rows
+    # advanced on this same listing); the follow-up half only sees rows the
+    # queue does not own.
     return report
 
 
@@ -4738,6 +5271,32 @@ def review_followup_protected(job: dict) -> bool:
     return dlq_protected(job) or decline_paths.review_is_never_act(job)
 
 
+# ── lane B / RiskyEats: never the doctor's rows to review (2026-10-31) ──────
+# The operator's lane-B work (RiskyEats, and the test/ refactor/ fix/ docs/
+# perf/ ops/ feat/ branch families) has its own owner, as do two owner-wait
+# chains whose jobs the operator is holding. The review queue must not adopt,
+# submit for, or touch them: their verdict is the owner's.
+LANE_B_JOB_ID_PREFIXES = ("01a18ab8-0a4f", "01a18a8d-9ffa")
+LANE_B_BRANCH_PREFIXES = ("test/", "refactor/", "fix/", "docs/", "perf/", "ops/", "feat/")
+LANE_B_PROJECTS = frozenset({"riskyeats"})
+
+
+def lane_b_row(job: dict) -> bool:
+    """Whether this row belongs to lane B / RiskyEats or a lane-B owner-wait chain."""
+    if not isinstance(job, dict):
+        return False
+    jid = str(job.get("id") or "").strip().lower()
+    if jid.startswith(LANE_B_JOB_ID_PREFIXES):
+        return True
+    if str(job.get("project") or "").strip().lower() in LANE_B_PROJECTS:
+        return True
+    repo = str(job.get("repo") or "").strip().lower()
+    if repo.rsplit("/", 1)[-1] in LANE_B_PROJECTS:
+        return True
+    head = str(job.get("head_branch") or "").strip().lower()
+    return head.startswith(LANE_B_BRANCH_PREFIXES)
+
+
 def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     """Shared immediate/reconciliation path; never mutate protected lanes."""
     jid = str(job.get("id") or "")
@@ -4753,6 +5312,11 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     result = _row_result_dict(job)
     if result.get("verdict"):
         return "skipped_verdict"
+    if review_queue.review_state(job) is not None:
+        # The review queue owns this row (cross-family pairing, backoff, park):
+        # dispatching the generic family-unpinned follow-up here would submit a
+        # SECOND review under a different idempotency key.
+        return "skipped_review_queue"
     children = _needs_review_child_review_jobs(job)
     gap = review_evidence_gap(job, result)
     for child in children:
@@ -4822,6 +5386,1254 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
         payload["re_review"] = rereview_reason
     broadcast_doctor_message("doctor.needs_review", payload)
     return "submitted"
+
+
+# ── review queue inside the triage queue (operator 2026-10-31) ─────────────
+# The review queue IS the triage queue: the Hive job rows in needs-review this
+# sweep already reads. A row whose loop authored work but got no reviewer (the
+# endpoint was busy, timed out, answered prose, or returned 503) is a
+# needs-review row carrying result.review_state.state='awaiting_review' -- the
+# worker puts it there instead of failing it. This sweep consumes those rows:
+# it picks a CROSS-FAMILY reviewer from hive/core/reviewer-roster.json for the
+# author's family, submits ONE read-only review job naming that reviewer,
+# records the attempt on the same row, and on a structured APPROVE hands the
+# row to the merge path, on request_changes back to the author path, and on a
+# reviewer failure schedules the next attempt with exponential backoff bounded
+# by a per-route concurrency cap. A row with no cross-family reviewer available
+# stays awaiting_review (parked): never self-reviewed, never failed.
+
+# ── route health ─────────────────────────────────────────────────────────────
+# ``REVIEW_QUEUE_ROUTE_HEALTH`` is the doctor's view of each reviewer route by
+# roster route id (``{"cerberus-gpt-oss": False}``): a route a HOST has marked
+# down (or that failed its last probe) must not receive more work. It is
+# process state the doctor's health loop fills; an UNLISTED route is unknown,
+# not down -- a provider route has no local probe and rate limits are "busy",
+# which the load/concurrency cap already models. Rows are matched on the route
+# id, the model id and every role id the route serves.
+REVIEW_QUEUE_ROUTE_HEALTH: dict = {}
+# Override for the per-route load reader (a callable returning one); None uses
+# the cached 30 s llama-server ``/slots`` / vLLM metrics probe over the roster.
+REVIEW_QUEUE_ROUTE_LOAD = None
+# Codex (operator 2026-10-31): the plan-usage probe the roster's quota guard
+# reads. None means "no readable share", which the gate treats as fail-closed
+# (``codex_usage_unknown``); a host with a probe overrides it with a callable
+# returning ``{"remaining_pct": float}``. The doctor NEVER logs in, refreshes or
+# reads the OAuth token for this: PYTHIA holds the master token and the confined
+# codex worker spends it.
+CODEX_REVIEW_USAGE = None
+
+
+def _codex_worker_online() -> bool | None:
+    """Whether a ``codex``-kind worker is online (``None``: the bus cannot say)."""
+    kinds = _online_worker_kinds()
+    if kinds is None:
+        # Bus unreachable: not "offline", just unknown. The gate fails closed
+        # either way, but the reason it reports must be the true one.
+        return None
+    return review_queue.CODEX_WORKER_KIND in kinds
+
+
+def review_queue_codex_gate() -> dict:
+    """The doctor's Codex gate: config switch + online worker + usage guard."""
+    return review_queue.codex_gate(
+        worker_online=_codex_worker_online(),
+        usage=CODEX_REVIEW_USAGE,
+    )
+
+
+def _review_lane(job: dict, result: dict, roster: list[dict]) -> str:
+    """The row's review lane: hard for architecture/security-sensitive work."""
+    paths = result.get("files_changed") if isinstance(result.get("files_changed"), list) else []
+    return review_queue.review_lane(
+        repo=job.get("repo"),
+        paths=[str(p) for p in paths if str(p).strip()],
+        kind=str(job.get("kind") or ""),
+    )
+
+
+# ── adopting legacy rows (operator 2026-10-31) ──────────────────────────────
+# The deployed worker line does not write ``result.review_state``, so every one
+# of its needs-review rows was invisible to the queue above (production logged
+# ``scanned=0 submitted=0`` while thirteen rows sat unapproved). With this
+# switch ON (the default, operator 2026-10-31) the sweep ADOPTS such a row --
+# builds its review_state from the row, status untouched -- and reviews it like
+# any other queue row. ``HIVE_DOCTOR_ADOPT_DRY_RUN`` only logs what it would
+# submit; the per-sweep cap bounds how many review jobs one pass sends.
+HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS = os.environ.get("HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+)
+HIVE_DOCTOR_REVIEW_SUBMIT_MAX = _env_int("HIVE_DOCTOR_REVIEW_SUBMIT_MAX", 3, minimum=0)
+HIVE_DOCTOR_ADOPT_DRY_RUN = os.environ.get("HIVE_DOCTOR_ADOPT_DRY_RUN", "0").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+
+def _review_route_health():
+    """``health(route) -> bool`` for ``pick_reviewers``."""
+
+    def healthy(route: dict) -> bool:
+        for key in (route.get("id"), route.get("model_id"), route.get("role_id"), *(route.get("roles") or [])):
+            if key and str(key) in REVIEW_QUEUE_ROUTE_HEALTH:
+                return bool(REVIEW_QUEUE_ROUTE_HEALTH[str(key)])
+        return True
+
+    return healthy
+
+
+def review_queue_load_reader():
+    """The cached (30 s) per-route load reader ``pick_reviewers`` takes."""
+    override = REVIEW_QUEUE_ROUTE_LOAD
+    if override is None:
+        return review_queue.route_load_fn()
+    if callable(override):
+        return lambda route: override(route) if override.__code__.co_argcount else override()
+    return lambda route: override
+
+
+def _review_children_by_key(job: dict, idempotency_key: str) -> list[dict]:
+    """The row's review children that hold ``idempotency_key`` ([] when none).
+
+    Read through the same child listing the verdict read uses; a failed
+    listing is not an answer and yields nothing here (the caller then reports
+    the submit failure it already has).
+    """
+    try:
+        children = _needs_review_child_review_jobs(job)
+    except RuntimeError:
+        return []
+    return [child for child in children if str(child.get("idempotency_key") or "") == idempotency_key]
+
+
+def _same_model(a: Any, b: Any) -> bool:
+    return str(a or "").strip().lower() == str(b or "").strip().lower()
+
+
+def _author_model(job: dict, result: dict) -> str:
+    """The author model of a row: result.review_state, models, or the claim."""
+    state = review_queue.review_state(job) or {}
+    for candidate in (
+        state.get("author"),
+        (result.get("models") or {}).get("author") if isinstance(result.get("models"), dict) else None,
+        result.get("author_model"),
+        job.get("claimed_model"),
+    ):
+        if str(candidate or "").strip():
+            return str(candidate).strip()
+    return ""
+
+
+def _review_head(job: dict, result: dict) -> str:
+    return review_verdict.delivered_head(job, result) or str(result.get("head_sha") or job.get("head_sha") or "")
+
+
+def _excluded_families(author: str, *others: Any) -> set:
+    """Every family a reviewer may not have: the author's and each co-author's."""
+    families = {review_queue.family_of(m) for m in [author, *others] if str(m or "").strip()}
+    families.discard("")
+    return families
+
+
+def interpret_review_outcome(
+    raw: Any, *, head_sha: str | None = None, author_families: set | frozenset | None = None
+) -> dict:
+    """Read a review job's output as a structured verdict -- or refuse it.
+
+    Only a structured JSON verdict naming ``reviewers[].model`` counts
+    (operator 2026-10-31). Prose, an empty body, a truncated fragment, a
+    503-style error object or JSON without a reviewer list is NOT an approval:
+    every one raises ValueError with the failure kind the sweep records on the
+    row (``review_prose_only``, ``review_empty``, ``review_truncated``,
+    ``review_http_503``, ``review_non_json``).
+
+    Only CROSS-family reviewers count: an entry whose model is in one of
+    ``author_families`` is the author grading itself and is ignored; a verdict
+    with no cross-family entry left is ``review_same_family``. An approve must
+    name the delivered head: a different head is ``review_head_mismatch``, a
+    verdict (or a row) that names no head is ``review_head_missing``.
+    """
+    payload = raw
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            raise ValueError("review_empty")
+        if text[:1] not in "{[":
+            # Text that never started a JSON document is prose, whatever its
+            # last character; only a cut-off JSON document is "truncated".
+            raise ValueError("review_prose_only")
+        try:
+            payload = json.loads(text)
+        except ValueError:
+            raise ValueError("review_truncated" if text[-1:] not in "}]" else "review_non_json") from None
+    if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+        payload = payload["result"]  # a raw job row: read its result
+    if not isinstance(payload, dict):
+        raise ValueError("review_non_json")
+    if payload.get("http_status") == 503 or payload.get("status_code") == 503:
+        raise ValueError("review_http_503")
+    entries = payload.get("reviewers")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("review_no_reviewers")
+    reviewers, verdicts = [], []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("review_no_reviewers")
+        model = str(entry.get("model") or entry.get("model_id") or "").strip()
+        verdict = review_verdict.normalize_verdict(entry.get("verdict"))
+        if not model or not verdict:
+            raise ValueError("review_no_reviewers")
+        reviewers.append(model)
+        verdicts.append(verdict)
+    blocked = {f for f in (author_families or ()) if f}
+    cross = [(m, v) for m, v in zip(reviewers, verdicts, strict=True) if review_queue.family_of(m) not in blocked]
+    if not cross:
+        raise ValueError("review_same_family")
+    unreviewed = False
+    reviewers = [m for m, _ in cross]
+    verdicts = [v for _, v in cross]
+    reviewing = verdicts
+    reviewed_head = str(payload.get("head_sha") or "").strip()
+    if "approve" in reviewing and "request_changes" not in reviewing:
+        if not head_sha or not reviewed_head:
+            raise ValueError("review_head_missing")
+        if not review_verdict.same_sha(reviewed_head, head_sha):
+            raise ValueError("review_head_mismatch")
+        kind = "approve"
+    # ``normalize_verdict`` returns ``request_changes`` (``-`` read as ``_``),
+    # so the comparison is against the normalized spelling, not the prose one.
+    elif (
+        "request_changes" in reviewing or review_verdict.normalize_verdict(payload.get("verdict")) == "request_changes"
+    ):
+        kind = "request_changes"
+    elif reviewing and all(v == "blocked" for v in reviewing):
+        kind = "reviewer_failure"
+    else:
+        raise ValueError("review_undecided")
+    return {
+        "kind": kind,
+        "reviewers": reviewers,
+        "head_sha": reviewed_head or head_sha or "",
+        "verdicts": verdicts,
+        "unreviewed": unreviewed,
+    }
+
+
+def merge_handoff(job: dict) -> str:
+    """The merge path's verdict on a row: approved rows are ready to merge.
+
+    ``doctor.review_approved`` names the row and the approving reviewers; the
+    merge train (``hive/workers/merge_train.py``) consumes needs-review rows,
+    so an approved row stays exactly where it was -- in the triage queue.
+    """
+    state = review_queue.review_state(job) or {}
+    approved = state.get("approved")
+    if not isinstance(approved, dict) or not approved.get("reviewers"):
+        return "needs_review"
+    if approved.get("head_sha") and not review_verdict.same_sha(
+        approved["head_sha"], _review_head(job, _row_result_dict(job))
+    ):
+        return "stale_approval"
+    if review_followup_protected(job):
+        return "protected"
+    return "ready_to_merge"
+
+
+def _review_queue_rows(rows: list[dict]) -> list[dict]:
+    """The rows the queue owns, oldest-owed first (adopted rows go last).
+
+    A row with a complete review_state is advanced exactly as before. A LEGACY
+    row (one the older worker line left without review_state) is admitted too:
+    it is owed a review, and the operator's point is that the queue must do the
+    reviewing (2026-10-31). Adopted rows are ordered LAST so a backlog of rows
+    the queue already owns drains first, and so a single legacy backlog cannot
+    starve them.
+    """
+
+    def _owed(row: dict) -> tuple:
+        state = review_queue.usable_review_state(row)
+        if state is not None:
+            return (0, state.get("next_attempt_at") or 0)
+        if _adoptable_row(row):
+            return (1, row.get("ended_at") or row.get("started_at") or row.get("last_update_at") or 0)
+        return (2, 0)
+
+    ordered = [row for row in rows if review_queue.review_state(row) is not None or _adoptable_row(row)]
+    return sorted(ordered, key=_owed)
+
+
+def _adoptable_row(job: dict) -> bool:
+    """True when this sweep must ACT on the row: adopt it, or advance it.
+
+    A row still carrying a complete ``review_state`` is already the queue's
+    (adopted by an earlier sweep, or written by the newer worker line): it is
+    not adopted again, but its in-flight review, backoff, approve and retry
+    bookkeeping still have to be advanced, so it stays in the pass.
+    """
+    if _adoption_for(job) is not None:
+        return True
+    return _review_state_row(job) is not None
+
+
+def _review_state_row(job: dict) -> dict | None:
+    """The complete review_state of a needs-review row this sweep may advance."""
+    if not HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS:
+        return None
+    if str(job.get("status") or "") != "needs-review":
+        return None
+    if str(job.get("kind") or "").startswith("triage:"):
+        return None
+    if lane_b_row(job):
+        return None
+    return review_queue.usable_review_state(job)
+
+
+def _adoption_for(job: dict) -> dict | None:
+    """The review_state a legacy row would be adopted with, or None.
+
+    Lane B / RiskyEats rows and the lane-B owner-wait chains are never adopted
+    (operator 2026-10-31): another owner is already waiting on them.
+    """
+    if not HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS:
+        return None
+    if str(job.get("status") or "") != "needs-review":
+        return None
+    if str(job.get("kind") or "").startswith("triage:"):
+        return None
+    if lane_b_row(job):
+        return None
+    return review_queue.adoption_review_state(job)
+
+
+def _in_flight_review_job_id(job: dict, result: dict) -> str:
+    """The row's live review child id, or "" -- the guard before route picking.
+
+    Two sources, both recorded on the row rather than in review_state: the
+    worker's own ``result.auto_review_job_id`` and any ``review:`` child the
+    bus still lists as non-terminal. A row whose review is already running is
+    never submitted again (operator 2026-10-31: no duplicate review jobs).
+    """
+    recorded = str(result.get("auto_review_job_id") or "").strip()
+    if recorded:
+        return recorded
+    try:
+        children = _needs_review_child_review_jobs(job)
+    except RuntimeError:
+        # An unreadable listing is not "no review": the caller falls through to
+        # its own in-flight handling, which reports the error.
+        return ""
+    for child in children:
+        if str(child.get("status") or "") not in _REVIEW_CHILD_TERMINAL:
+            return str(child.get("id") or "").strip()
+    return ""
+
+
+def _review_is_in_flight(job: dict) -> bool:
+    """Whether a review child for this row is still running (never re-adopt)."""
+    try:
+        children = _needs_review_child_review_jobs(job)
+    except RuntimeError:
+        # Cannot prove the row is unclaimed: treat it as in flight so a sweep
+        # never submits a second review on an unreadable listing.
+        return True
+    return any(str(c.get("status") or "") not in _REVIEW_CHILD_TERMINAL for c in children)
+
+
+def adopt_legacy_review_row(job: dict, *, now: float | None = None) -> bool:
+    """Give a legacy needs-review row the review_state the queue advances.
+
+    The row's STATUS is not touched (still needs-review: the queue IS triage);
+    only ``result.review_state`` is added, built from what the row already
+    records. Returns True when the row now carries a state it did not before.
+    """
+    if review_queue.usable_review_state(job) is not None:
+        return False
+    if _review_is_in_flight(job):
+        # A review child is already running: the row is not legacy, it is busy.
+        return False
+    state = _adoption_for(job)
+    if state is None:
+        return False
+    result = _row_result_dict(job)
+    result["review_state"] = state
+    job["result"] = result
+    return True
+
+
+def _review_child_outcome(child: dict, *, head_sha: str = "", author_families: set | None = None) -> dict | None:
+    """Read one child review job's output; None while it has not finished.
+
+    ``head_sha`` is the SOURCE row's delivered head and ``author_families`` the
+    families that may not review it. Neither is read from the child: the
+    child's own ``head_sha`` is whatever the reviewer claims it reviewed, so
+    checking a verdict against it would accept a review of any commit.
+    """
+    status = str(child.get("status") or "")
+    if status not in _REVIEW_CHILD_TERMINAL:
+        return None
+    proof = _row_result_dict(child)
+    sources = []
+    for key in ("review_evidence", "verdict"):
+        if proof.get(key):
+            sources.append(proof[key])
+    if proof.get("reviewers"):
+        # A review job whose verdict IS its result (reviewers[].model plus the
+        # reviewed head), with no prose beside it. Without this the finished
+        # review read as empty and the row was retried instead of resolved.
+        sources.append(proof)
+    tail = proof.get("tail")
+    if isinstance(tail, str) and tail.strip():
+        sources.append(tail)
+    if result_text := proof.get("stdout"):
+        sources.append(result_text) if isinstance(result_text, str) else None
+    if not sources:
+        return {"kind": "reviewer_failure", "failure": "review_empty", "reviewers": []}
+    if status != "done" and not proof.get("verdict"):
+        return {
+            "kind": "reviewer_failure",
+            "failure": "review_http_503" if "503" in str(tail) else "review_failed",
+            "reviewers": [],
+        }
+    failure = None
+    for candidate in sources:
+        try:
+            return interpret_review_outcome(candidate, head_sha=head_sha, author_families=author_families)
+        except ValueError as exc:
+            failure = str(exc)
+    return {"kind": "reviewer_failure", "failure": failure or "review_no_reviewers", "reviewers": []}
+
+
+def _tried_entry(entry: dict, failure: str, now: float) -> dict:
+    return {"model_id": entry.get("model_id"), "family": entry.get("family"), "failure": failure, "at": now}
+
+
+def _patch_review_state(job: dict, state: dict, *, verdict: dict | None = None) -> bool:
+    """Record the queue state on the SAME row (still needs-review: the queue IS triage)."""
+    jid = str(job.get("id") or "")
+    res = _row_result_dict(job)
+    body_result = {**res, "review_state": state}
+    body: dict = {"status": "needs-review", "result": body_result}
+    if verdict is not None:
+        body_result["verdict"] = verdict
+        body_result["review_evidence"] = {
+            **(body_result.get("review_evidence") if isinstance(body_result.get("review_evidence"), dict) else {}),
+            **verdict,
+            "review_job_id": state.get("review_job_id"),
+        }
+        review_record.apply(
+            body_result, launched=verdict.get("reviewers", [""])[0] if verdict.get("reviewers") else None
+        )
+    if job.get("claimed_by"):
+        body["claimed_by"] = job["claimed_by"]
+    code, _ = _http("PATCH", f"/v1/jobs/{jid}", body)
+    if code not in (200, 201, 204):
+        broadcast_doctor_message(
+            "doctor.sweep_error", {"sweep": "review-queue", "job_id": jid, "error": f"annotation failed http={code}"}
+        )
+        return False
+    # Mirror the accepted state onto the in-memory row, so the report built from
+    # THIS listing prints what the queue just left -- without a second GET of
+    # the same rows (the report is read-only: exactly one listing fetch).
+    if isinstance(job, dict):
+        job["result"] = body_result
+        job["status"] = "needs-review"
+        if body.get("claimed_by"):
+            job["claimed_by"] = body["claimed_by"]
+    return True
+
+
+def _resume_state(state: dict) -> dict:
+    """Clear a parked reason before a new attempt (a retry is possible again).
+
+    Both park reasons are TRANSIENT: no cross-family reviewer right now, or the
+    attempts were spent. A fresh attempt that fails again re-parks the row with
+    the same or a higher count, so the state never claims a park it has left.
+    """
+    out = dict(state)
+    if out.get("parked_reason") in (
+        "in_backoff_or_parked_not_supported",
+        "no_cross_family_reviewer",
+        "attempts_exhausted_owner_wait",
+    ):
+        out.pop("parked_reason", None)
+    return out
+
+
+def _pick_routes(
+    author: str,
+    job: dict | None,
+    roster: list[dict],
+    health,
+    load,
+    co_authors: list[str],
+    *,
+    lane: str = review_queue.LANE_BULK,
+) -> list[dict]:
+    """The cross-family pick, saturated routes last, never a blocked family.
+
+    Every Codex pick is behind the roster gate (``review_queue_codex_gate``:
+    config switch, online codex worker, plan usage, cooldown marker), so no
+    cron or hook can start a Codex review without it; an UNSET
+    ``CODEX_REVIEW_USAGE`` probe makes the gate refuse (fail closed).
+    """
+    job = job or {}
+    cohort = _excluded_families(author, *co_authors)
+    picked = pick_reviewers(
+        author,
+        roster,
+        health=health,
+        load=load,
+        co_authors=[m for m in co_authors if str(m or "").strip()],
+        repo=job.get("repo"),
+        author_routes=[str(job.get("claimed_agent") or "")] if job.get("claimed_agent") else None,
+        lane=lane,
+        codex_worker_online=_codex_worker_online(),
+        codex_usage=CODEX_REVIEW_USAGE,
+    )
+    return [route for route in _sort_routes_by_family_load(picked, load) if route["family"] not in cohort]
+
+
+def _review_kind_for(base_kind: str) -> str:
+    date = time.strftime("%Y%m%d", time.gmtime())
+    return f"review:{base_kind}-{date}" if base_kind else f"review:{date}"
+
+
+def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: float) -> tuple[str, dict]:
+    """Submit ONE read-only review job naming the cross-family pick(s)."""
+    jid = str(job.get("id") or "")
+    res = _row_result_dict(job)
+    kind = str(job.get("kind") or "").strip()
+    base_kind = (
+        kind[len("review:") :]
+        if kind.startswith("review:")
+        else (kind[len("triage:") :] if kind.startswith("triage:") else _base_kind(kind))
+    )
+    date = time.strftime("%Y%m%d", time.gmtime())
+    review_kind = f"review:{base_kind}-{date}" if base_kind else f"review:{date}"
+    head = job.get("head_branch") or ""
+    # The reviewed head: the delivered commit; a row that recorded none is
+    # reviewed against the branch tip (the job says so in its description).
+    head_sha = _review_head(job, res) or "unrecorded"
+    base = job.get("base_branch") or ""
+    author = state.get("author") or ""
+    names = [r["model_id"] for r in reviewers]
+    desc = (
+        "READ-ONLY review. Do not modify any file, branch, or commit. "
+        f"Review the branch {head or '(see job)'} at HEAD {head_sha or '(resolve and report)'} against base {base or '(default)'} "
+        "with a reviewer from a DIFFERENT model family than the author "
+        f"(author {author or 'unknown'}, family {state.get('author_family') or 'unknown'}; "
+        f"review with {', '.join(names)}). "
+        "Return a structured verdict JSON with a 'reviewers' list of {model, verdict} entries "
+        "(verdict: approve | request-changes | blocked), a 'head_sha' field containing the exact reviewed commit, "
+        f"and a 'reason' field. Prose is not a verdict. Reviewed job id: {jid}. No commits expected."
+    )
+    attempt = int(state.get("attempt") or 0)
+    codex = review_queue.is_codex_route(reviewers[0]) if reviewers else False
+    spec = {
+        "kind": review_kind,
+        "description": desc,
+        "repo": job.get("repo"),
+        "head_branch": head or None,
+        "base_branch": base or None,
+        "eligible_kinds": list(REVIEW_FOLLOWUP_ELIGIBLE_KINDS),
+        "preferred_models": names[:1],
+        "max_cost_tier": REVIEW_FOLLOWUP_MAX_COST_TIER,
+        "priority": max(REVIEW_FOLLOWUP_PRIORITY, job.get("priority") or 0),
+        "project": job.get("project"),
+        "parent_job_id": jid,
+        "idempotency_key": f"review-queue:{jid}:{attempt}:{head_sha[:12] or 'nohead'}",
+    }
+    if codex:
+        # A Codex review is a normal Hive job (the same read-only ``review:``
+        # kind every reviewer gets, so the read-only completion gate and the
+        # child listing keep working) that ONLY the confined local codex
+        # worker may claim (workspace-write, one at a time): never zoder, EIH
+        # or any cloud route.
+        spec["eligible_kinds"] = [review_queue.CODEX_WORKER_KIND]
+        spec["max_concurrency"] = 1
+        spec["review_route"] = reviewers[0]["id"]
+        spec["review_lane"] = "codex"
+    code, resp = submit_job_spec(spec)
+    new_id = (resp or {}).get("id") if isinstance(resp, dict) else None
+    if code in (200, 201) and new_id:
+        return str(new_id), spec
+    # A submit that failed AFTER the bus already holds this exact review
+    # (the idempotency key names it, so a retry can never duplicate it) must
+    # still record the child it created -- otherwise this row resubmits
+    # forever while the child sits in its own retry budget.
+    for candidate in _review_children_by_key(job, spec["idempotency_key"]):
+        if str(candidate.get("idempotency_key") or "") != spec["idempotency_key"]:
+            continue
+        if str(candidate.get("status") or "") in _REVIEW_CHILD_TERMINAL:
+            break
+        return str(candidate["id"]), spec
+    raise RuntimeError(f"review submit failed code={code} resp={str(resp)[:160]}")
+
+
+def process_awaiting_review_row(
+    job: dict,
+    *,
+    now: float | None = None,
+    health=None,
+    load=None,
+    roster: list[dict] | None = None,
+    allow_submit: bool = True,
+) -> tuple[str, dict | None, dict | None]:
+    """Advance ONE awaiting_review row. Returns (outcome, new_state, verdict).
+
+    Outcomes: ``skipped_status``/``skipped_triage``/``skipped_protected``,
+    ``deferred`` (backoff not elapsed), ``awaited`` (a review job is in
+    flight), ``submitted``, ``parked`` (no cross-family reviewer),
+    ``exhausted`` (attempt budget spent: the row waits for an owner),
+    ``approved``, ``request_changes`` and ``review_failed``.
+
+    A LEGACY needs-review row (no complete review_state) is adopted first: the
+    state is built from the row and recorded on it, status untouched. So the
+    queue reviews what the older worker line left behind, not just what the new
+    line tags (operator 2026-10-31). ``allow_submit=False`` spends no attempt:
+    the row waits for the next sweep (the per-sweep submit cap).
+
+    The row never leaves needs-review: there is no separate review status.
+    """
+    now = time.time() if now is None else float(now)
+    jid = str(job.get("id") or "")
+    if not jid or job.get("status") != "needs-review":
+        return "skipped_status", None, None
+    if str(job.get("kind") or "").startswith("triage:"):
+        return "skipped_triage", None, None
+    state = review_queue.usable_review_state(job)
+    if state is None:
+        adopt_legacy_review_row(job, now=now)
+        state = review_queue.usable_review_state(job)
+    if state is None:
+        return "skipped_status", None, None
+    if review_queue.is_resolved(state):
+        return "resolved", state, None
+    if review_followup_protected(job):
+        return "skipped_protected", None, None
+    result = _row_result_dict(job)
+    head = _review_head(job, result)
+    # A submitted review in flight: read its outcome, never submit a second one.
+    in_flight = str(state.get("review_job_id") or "")
+    if not in_flight:
+        # An ADOPTED row can also carry the earlier worker's own review child
+        # (``result.auto_review_job_id`` / a live review: child) with no
+        # ``review_job_id`` in its state. Submitting again here would hand the
+        # same job to two reviewers, so the live child is adopted as in-flight.
+        in_flight = _in_flight_review_job_id(job, result)
+    if in_flight:
+        try:
+            children = [c for c in _needs_review_child_review_jobs(job) if str(c.get("id")) == in_flight]
+        except RuntimeError as exc:
+            # An unreadable listing is not "the child is gone": it is not an
+            # answer either, so the row waits and the sweep names the error.
+            broadcast_doctor_message("doctor.sweep_error", {"sweep": "review-queue", "job_id": jid, "error": str(exc)})
+            return "awaited", state, None
+        child = next((c for c in children if str(c.get("id")) == in_flight), None)
+        if child is not None:
+            outcome = _review_child_outcome(
+                child,
+                head_sha=head,
+                author_families=_excluded_families(
+                    state.get("author") or _author_model(job, result), *(state.get("co_authors") or [])
+                ),
+            )
+            if outcome is None:
+                return "awaited", state, None
+            if outcome["kind"] == "approve":
+                approved = {
+                    "reviewers": outcome["reviewers"],
+                    "head_sha": head,
+                    "review_job_id": in_flight,
+                    "at": now,
+                }
+                new_state = {**state, "review_job_id": None, "approved": approved, "updated_at": now}
+                _patch_review_state(
+                    job,
+                    new_state,
+                    verdict={
+                        "reviewers": [{"model": m, "verdict": "approve"} for m in outcome["reviewers"]],
+                        "head_sha": head,
+                    },
+                )
+                broadcast_doctor_message(
+                    "doctor.review_approved",
+                    {
+                        "host": AGENT_HOST,
+                        "job_id": jid,
+                        "reviewers": outcome["reviewers"],
+                        "review_job_id": in_flight,
+                        "merge": merge_handoff({**job, "result": {**result, "review_state": new_state}}),
+                    },
+                )
+                return "approved", new_state, outcome
+            if outcome["kind"] == "request_changes":
+                changes = {
+                    "reviewers": outcome["reviewers"],
+                    "head_sha": outcome["head_sha"] or head,
+                    "review_job_id": in_flight,
+                    "at": now,
+                }
+                new_state = {**state, "review_job_id": None, "request_changes": changes, "updated_at": now}
+                _patch_review_state(
+                    job,
+                    new_state,
+                    verdict={
+                        "reviewers": [{"model": m, "verdict": "request-changes"} for m in outcome["reviewers"]],
+                        "head_sha": outcome["head_sha"] or head,
+                    },
+                )
+                broadcast_doctor_message(
+                    "doctor.review_request_changes",
+                    {
+                        "host": AGENT_HOST,
+                        "job_id": jid,
+                        "reviewers": outcome["reviewers"],
+                        "review_job_id": in_flight,
+                        "head_sha": outcome["head_sha"] or head,
+                    },
+                )
+                return "request_changes", new_state, outcome
+            failure = outcome.get("failure") or "review_no_reviewers"
+            tried = list(state.get("tried") or [])
+            catalog = roster or review_queue.load_roster()
+            # The reviewer that failed, from this attempt only: ``tried`` is
+            # grown below, so re-reading it here would record the same failure
+            # twice (and inflate the backoff step).
+            failing = list(outcome.get("reviewers") or [])
+            for model in failing:
+                entry = next((r for r in catalog if _same_model(r.get("model_id"), model)), None)
+                tried.append(_tried_entry(entry or {"model_id": model}, failure, now))
+            if not failing:
+                # The reviewer route this attempt ran on, by the attempt record.
+                launched = [
+                    r
+                    for r in catalog
+                    if r["id"] == state.get("review_route") or r["model_id"] == state.get("review_model")
+                ]
+                if launched:
+                    tried.append(_tried_entry(launched[0], failure, now))
+            # The child answered (badly): clear it so the next attempt submits a new one.
+            return _schedule_retry(job, state, tried, failure, now=now, review_job_id="")
+        # The child is gone from the listing: fall through to a new attempt.
+    if review_queue.attempts_remain(state) and review_queue.in_backoff(state, now=now):
+        return "deferred", state, None
+    if not review_queue.attempts_remain(state):
+        return _park_exhausted(job, state, now)
+    author = state.get("author") or _author_model(job, result)
+    models = result.get("models") if isinstance(result.get("models"), dict) else {}
+    co_authors = [
+        *(models.get("reviewers") if isinstance(models.get("reviewers"), list) else []),
+        *state.get("co_authors", []),
+    ]
+    roster = list(roster if roster is not None else review_queue.load_roster())
+    health = health or _review_route_health()
+    load = load or review_queue_load_reader()
+    co_authors = [str(m) for m in co_authors if str(m or "").strip()]
+    lane = _review_lane(job, result, roster)
+    picked = _ordered_routes(_pick_routes(author, job, roster, health, load, co_authors, lane=lane), state)
+    if not picked and _pick_routes(author, job, roster, health, lambda _route: 0, co_authors, lane=lane):
+        # A cross-family reviewer EXISTS but every one is at its concurrency
+        # cap (in-flight reviews included). That is not a park and costs no
+        # attempt: the row waits unchanged for the next sweep.
+        return "capacity", state, None
+    if not picked:
+        # Same count, more attempts spent: a parked row still ages toward the
+        # owner instead of sitting at attempt 0 forever.
+        attempts = int(state.get("attempt") or 0)
+        new_state = {
+            **_resume_state(state),
+            "attempt": min(attempts + 1, int(state.get("max_attempts") or review_queue.MAX_REVIEW_ATTEMPTS)),
+            "parked_reason": "no_cross_family_reviewer",
+            # A retry is scheduled for a row that can still take one; a park
+            # reason only survives while another pick is worth trying.
+            "next_attempt_at": (
+                now + review_queue.backoff_seconds(int(state.get("attempt") or 0))
+                if review_queue.attempts_remain(state)
+                else None
+            ),
+            "author": author,
+            "author_family": review_queue.family_of(author),
+            "updated_at": now,
+        }
+        _patch_review_state(job, new_state)
+        broadcast_doctor_message(
+            "doctor.review_queue_parked",
+            {
+                "host": AGENT_HOST,
+                "job_id": jid,
+                "author": author,
+                "author_family": new_state["author_family"],
+                "reason": "no_cross_family_reviewer",
+            },
+        )
+        return "parked", new_state, None
+    if not allow_submit:
+        # The per-sweep submit cap is spent. Nothing is written: the row is
+        # unchanged and the next sweep picks it up (no attempt is spent).
+        return "capped", state, None
+    if HIVE_DOCTOR_ADOPT_DRY_RUN:
+        _record_dry_run_submission(job, {**state, "author": author}, picked, now=now)
+        return "previewed", {**state, "author": author}, None
+    try:
+        review_id, spec = _review_queue_submit(job, {**state, "author": author}, picked, now=now)
+    except RuntimeError as exc:
+        broadcast_doctor_message("doctor.sweep_error", {"sweep": "review-queue", "job_id": jid, "error": str(exc)})
+        return _schedule_retry(
+            job, state, list(state.get("tried") or []), "review_submit_failed", now=now, review_job_id=""
+        )
+    tried = list(state.get("tried") or []) + [_tried_entry(picked[0], "review_submitted", now)]
+    new_state = {
+        **_resume_state(state),
+        "author": author,
+        "author_family": review_queue.family_of(author),
+        "tried": tried,
+        "attempt": int(state.get("attempt") or 0) + 1,
+        "review_job_id": review_id,
+        "review_kind": spec["kind"],
+        "review_route": picked[0]["id"],
+        "review_model": picked[0]["model_id"],
+        "next_attempt_at": None,
+        "last_failure": None,
+        "updated_at": now,
+    }
+    _patch_review_state(job, new_state)
+    broadcast_doctor_message(
+        "doctor.review_queue",
+        {
+            "host": AGENT_HOST,
+            "job_id": jid,
+            "review_job_id": review_id,
+            "reviewers": [picked[0]["model_id"]],
+            "author_family": new_state["author_family"],
+        },
+    )
+    return "submitted", new_state, None
+
+
+def _ordered_routes(routes: list[dict], state: dict) -> list[dict]:
+    """Put the cross-family routes the row's own ``tried[]`` names at the back.
+
+    The roster pairing is unchanged (``pick_reviewers`` already excluded the
+    author's family and every saturated or unhealthy route). What this adds is
+    least-tried-first, so a row that already spent attempts on the CERBERUS
+    endpoint tries TYDEUS qwen38, MiniMax M3, Muse, DeepSeek or the EIH route
+    before going back to the one that just failed.
+    """
+    tried = {
+        str(entry.get("model_id") or "").strip().lower()
+        for entry in state.get("tried") or []
+        if isinstance(entry, dict)
+    }
+    if not tried:
+        return list(routes)
+    # Tried routes last, and the roster order kept explicitly among the rest
+    # (no reliance on sort stability).
+    return [
+        route
+        for _, route in sorted(
+            enumerate(routes),
+            key=lambda item: (str(item[1].get("model_id") or "").strip().lower() in tried, item[0]),
+        )
+    ]
+
+
+def _record_dry_run_submission(job: dict, state: dict, picked: list[dict], *, now: float) -> None:
+    """Log what a real sweep would submit, writing nothing (``HIVE_DOCTOR_ADOPT_DRY_RUN``)."""
+    log.info(
+        "DRY_RUN: would submit review for %s at %s: reviewers=%s author=%s (%s)",
+        str(job.get("id") or "")[:12],
+        (_review_head(job, _row_result_dict(job)) or "unrecorded")[:12],
+        ",".join(str(route.get("model_id") or "") for route in picked[:2]),
+        state.get("author") or "unknown",
+        state.get("author_family") or "unknown",
+    )
+
+
+def _sort_routes_by_family_load(routes: list[dict], load) -> list[dict]:
+    """Least-loaded first WITHIN a priority tier; a lower tier is always later.
+
+    The roster's ``flags.priority`` (EIH Nemotron is -10: 39 s for a one-word
+    reply) and location class come first, so load can reorder routes of the
+    same tier but never lift a slow route above a usable faster one. Ties keep
+    ``pick_reviewers``' deterministic order.
+    """
+
+    def family_load(route):
+        try:
+            value = load(route)
+        except Exception:  # noqa: BLE001
+            return 1e9
+        return value if review_queue.finite_load(value) else 1e9
+
+    def key(item):
+        index, route = item
+        priority = int((route.get("flags") or {}).get("priority") or 0)
+        location = {"local": 0, "provider": 1, "eih": 2}.get(str(route.get("location")), 3)
+        return (-priority, location == "eih", family_load(route), index)
+
+    return [route for _, route in sorted(enumerate(routes), key=key)]
+
+
+def _schedule_retry(
+    job: dict, state: dict, tried: list[dict], failure: str, *, now: float, review_job_id: str
+) -> tuple[str, dict, None]:
+    """Record a failed review attempt and schedule the next one.
+
+    ``attempt`` is the SUBMISSION budget (it is spent when a review is sent, in
+    the submit path, not here), so a failure records the failure and the
+    backoff without spending a second attempt.
+    """
+    attempt = int(state.get("attempt") or 0)
+    if attempt >= int(state.get("max_attempts") or review_queue.MAX_REVIEW_ATTEMPTS):
+        return _park_exhausted(job, {**state, "tried": tried, "last_failure": failure, "review_job_id": None}, now)
+    new_state = {
+        **_resume_state(state),
+        "tried": tried,
+        "last_failure": failure,
+        # The failed child answered (badly) or was never created: it is not in
+        # flight any more, so the next sweep after the backoff submits a NEW one.
+        "review_job_id": None,
+        "claimed_failure": failure,
+        "next_attempt_at": now + review_queue.backoff_seconds(attempt),
+        "updated_at": now,
+    }
+    _patch_review_state(job, new_state)
+    broadcast_doctor_message(
+        "doctor.review_retry",
+        {
+            "host": AGENT_HOST,
+            "job_id": job.get("id"),
+            "failure": failure,
+            "attempt": attempt,
+            "next_attempt_at": new_state["next_attempt_at"],
+        },
+    )
+    return "review_failed", new_state, None
+
+
+def _park_exhausted(job: dict, state: dict, now: float) -> tuple[str, dict, None]:
+    """Attempts spent: stay needs-review, with the owner-wait reason visible.
+
+    Recorded once. A row already parked for its owner is left exactly as it
+    is: rewriting it on every sweep would be a PATCH (and a broadcast) per row
+    per pass for rows nobody can act on but the owner -- whom the needs-review
+    escalation names.
+    """
+    if state.get("parked_reason") == "attempts_exhausted_owner_wait" and not state.get("review_job_id"):
+        return "exhausted", state, None
+    new_state = {
+        **_resume_state(state),
+        "parked_reason": "attempts_exhausted_owner_wait",
+        "next_attempt_at": None,
+        "updated_at": now,
+    }
+    _patch_review_state(job, new_state)
+    broadcast_doctor_message(
+        "doctor.review_queue_exhausted",
+        {
+            "host": AGENT_HOST,
+            "job_id": job.get("id"),
+            "attempts": state.get("attempt"),
+            "last_failure": state.get("last_failure"),
+        },
+    )
+    return "exhausted", new_state, None
+
+
+def run_review_queue_sweep(*, rows: list[dict] | None = None, now: float | None = None, **kwargs) -> dict:
+    """The review-queue half of the needs-review sweep (one pass).
+
+    Rows come from the SAME needs-review listing the triage report reads --
+    there is no separate queue. Outcomes are counted per row so one bad row
+    cannot stop the sweep; a listing failure is raised, never read as empty.
+
+    Phase 0 ADOPTS the legacy rows in the listing (the older worker line never
+    wrote ``result.review_state``, so without this the queue scanned 0 of them
+    in production), then ONE pass advances every row the queue owns -- adopted
+    and tagged alike -- under the per-sweep submit cap.
+    """
+    now = time.time() if now is None else float(now)
+    if rows is None:
+        rows = fetch_needs_review_jobs(limit=1000)
+    adoption = submit_adopted_reviews(rows=rows, now=now, **{k: v for k, v in kwargs.items() if k != "load"})
+    handled = adoption.pop("_handled_rows", None)
+    rows = _review_queue_rows(rows)
+    summary = {
+        "scanned": len(rows),
+        "adopted": adoption.get("adopted", 0),
+        "submitted": adoption.get("submitted", 0),
+        "would_submit": adoption.get("would_submit", 0),
+        "dry_run": adoption.get("dry_run", False),
+        "awaited": 0,
+        "deferred": 0,
+        "capacity": 0,
+        "parked": 0,
+        "exhausted": 0,
+        "approved": 0,
+        "request_changes": 0,
+        "review_failed": 0,
+        "resolved": 0,
+        "capped": 0,
+    }
+    if adoption.get("errors"):
+        summary["errors"] = adoption["errors"]
+    # Per-route concurrency cap across the whole pass: reviews already in
+    # flight on the bus plus the ones this pass submits count against each
+    # route's ``concurrency`` on top of the probed server load (a queued review
+    # is not yet visible to the probe). Counting a running review twice errs
+    # on the side of the cap; exceeding it is what overloaded CERBERUS.
+    in_flight: dict[str, int] = {}
+    for job in rows:
+        state = review_queue.review_state(job) or {}
+        if state.get("review_job_id") and state.get("review_route") and not review_queue.is_resolved(state):
+            in_flight[str(state["review_route"])] = in_flight.get(str(state["review_route"]), 0) + 1
+    base_load = kwargs.pop("load", None) or review_queue_load_reader()
+
+    def load(route: dict):
+        value = base_load(route)
+        if not review_queue.finite_load(value):
+            return value
+        return value + in_flight.get(str(route.get("id")), 0)
+
+    # The per-sweep submit cap is shared with the adoption phase; the review
+    # jobs that phase already sent count against it.
+    budget = max(0, int(HIVE_DOCTOR_REVIEW_SUBMIT_MAX) - summary["submitted"])
+    if HIVE_DOCTOR_ADOPT_DRY_RUN:
+        budget = 0
+    for job in rows:
+        if handled and id(job) in handled:
+            continue  # phase 0 advanced (or capped) this legacy row already
+        before = review_queue.review_state(job) or {}
+        held = str(before.get("review_route") or "") if before.get("review_job_id") else ""
+        try:
+            outcome, new_state, _ = process_awaiting_review_row(
+                job, now=now, load=load, allow_submit=budget > 0, **kwargs
+            )
+        except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
+            summary["errors"] = summary.get("errors", 0) + 1
+            log.error("review queue failed job=%s: %s", str(job.get("id"))[:12], exc)
+            broadcast_doctor_message(
+                "doctor.sweep_error", {"sweep": "review-queue", "job_id": job.get("id"), "error": str(exc)}
+            )
+            continue
+        if held and outcome != "awaited" and in_flight.get(held):
+            in_flight[held] -= 1  # the child finished: its slot is free
+        if outcome == "submitted" and new_state and new_state.get("review_route"):
+            route_id = str(new_state["review_route"])
+            in_flight[route_id] = in_flight.get(route_id, 0) + 1
+            budget -= 1
+        summary[outcome] = summary.get(outcome, 0) + 1
+    return summary
+
+
+def submit_adopted_reviews(
+    *,
+    rows: list[dict] | None = None,
+    now: float | None = None,
+    roster: list[dict] | None = None,
+    health=None,
+    load=None,
+) -> dict:
+    """Adopt the legacy needs-review rows and review them (one capped pass).
+
+    This is the operator's point made real (2026-10-31): the triage queue is
+    supposed to be REVIEWING. Rows the older worker line left without
+    ``result.review_state`` are adopted and advanced exactly like queue rows --
+    cross-family reviewer from ``hive/core/reviewer-roster.json``, retry
+    backoff, owner-wait at the attempt cap -- with:
+
+    * the row's STATUS untouched (still needs-review: the queue IS triage);
+    * at most ``HIVE_DOCTOR_REVIEW_SUBMIT_MAX`` review jobs per pass;
+    * ``HIVE_DOCTOR_ADOPT_DRY_RUN`` logging what it would submit, writing
+      nothing;
+    * lane B / RiskyEats rows and the lane-B owner-wait chains never touched.
+
+    The doctor neither merges nor cancels anything here: a structured approve
+    is RECORDED on the row (``review_state.approved`` with the reviewers named)
+    for the operator-merge pass.
+    """
+    now = time.time() if now is None else float(now)
+    summary = {
+        "scanned": 0,
+        "adopted": 0,
+        "would_submit": 0,
+        "submitted": 0,
+        "awaited": 0,
+        "deferred": 0,
+        "capacity": 0,
+        "capped": 0,
+        "parked": 0,
+        "exhausted": 0,
+        "approved": 0,
+        "request_changes": 0,
+        "review_failed": 0,
+        "resolved": 0,
+        "skipped_status": 0,
+        "skipped_triage": 0,
+        "skipped_protected": 0,
+        "previewed": 0,
+        "dry_run": HIVE_DOCTOR_ADOPT_DRY_RUN,
+    }
+    if not HIVE_DOCTOR_ADOPT_LEGACY_REVIEWS:
+        # A disabled pass keeps the SAME report shape, all zero: the sweep
+        # reads ``adopted``/``submitted``/``would_submit``/``_handled_rows``
+        # off this summary unconditionally, so dropping them (or leaving the
+        # caller to default a missing key) would make a switched-off phase
+        # indistinguishable from a broken one.
+        summary["disabled"] = True
+        summary["_handled_rows"] = set()
+        return summary
+    if rows is None:
+        rows = fetch_needs_review_jobs(limit=1000)
+    # Every row this phase ADOPTS is claimed here, so the phase-1 pass over the
+    # same listing cannot touch it a second time (it is already in flight).
+    adoptable = {id(row) for row in rows if _adoptable_row(row)}
+    claimed: set[int] = set()
+    summary["_handled_rows"] = claimed
+    summary["scanned"] = len(adoptable)
+    # A dry run spends no real submit but previews up to the same cap; a real
+    # pass allows one submission only while budget is left (never negative).
+    budget = max(0, int(HIVE_DOCTOR_REVIEW_SUBMIT_MAX))
+    for row in list(rows):
+        jid = str(row.get("id") or "")
+        if id(row) not in adoptable:
+            continue
+        claimed.add(id(row))
+        try:
+            adopted = adopt_legacy_review_row(row, now=now)
+            if (
+                adopted
+                and not HIVE_DOCTOR_ADOPT_DRY_RUN
+                and not _patch_review_state(row, review_queue.usable_review_state(row) or {})
+            ):
+                summary["errors"] = summary.get("errors", 0) + 1
+                continue
+            if adopted:
+                summary["adopted"] += 1
+                state = review_queue.usable_review_state(row) or {}
+                log.info(
+                    "adopted legacy needs-review row %s (%s, author %s/%s)",
+                    jid[:12],
+                    state.get("adopted_from"),
+                    state.get("author") or "unknown",
+                    state.get("author_family") or "unknown",
+                )
+            outcome, _state, _verdict = process_awaiting_review_row(
+                row,
+                now=now,
+                health=health,
+                load=load,
+                roster=roster,
+                allow_submit=budget > 0,
+            )
+        except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
+            summary["errors"] = summary.get("errors", 0) + 1
+            log.error("legacy review adoption failed job=%s: %s", jid[:12], exc)
+            broadcast_doctor_message(
+                "doctor.sweep_error", {"sweep": "adopt-legacy-reviews", "job_id": jid, "error": str(exc)}
+            )
+            continue
+        if outcome == "previewed":
+            summary["would_submit"] += 1
+        if outcome in ("submitted", "previewed"):
+            budget -= 1
+        summary[outcome] = summary.get(outcome, 0) + 1
+    if summary["adopted"] and not HIVE_DOCTOR_ADOPT_DRY_RUN:
+        broadcast_doctor_message(
+            "doctor.review_adopted",
+            {
+                "host": AGENT_HOST,
+                "adopted": summary["adopted"],
+                "submitted": summary["submitted"],
+                "would_submit": summary["would_submit"],
+            },
+        )
+    return summary
+
+
+def _review_queue_exhausted(state: dict | None) -> bool:
+    """Attempts spent and nothing in flight: only the owner can move the row."""
+    if not state or review_queue.is_resolved(state) or state.get("review_job_id"):
+        return False
+    return state.get("parked_reason") == "attempts_exhausted_owner_wait" or not review_queue.attempts_remain(state)
+
+
+def review_queue_triage_row(job: dict, now: float | None = None) -> dict | None:
+    """The triage view of an awaiting_review row (reason, next_attempt_at, states)."""
+    state = review_queue.review_state(job)
+    if state is None:
+        return None
+    now = time.time() if now is None else float(now)
+    reason = review_queue.awaiting_review_reason(job)
+    if state.get("approved"):
+        action = f"approved by {', '.join(state['approved'].get('reviewers') or [])}; hand to the merge path"
+    elif state.get("request_changes"):
+        action = f"changes requested by {', '.join(state['request_changes'].get('reviewers') or [])}; back to the author path"
+    elif review_queue.is_parked(state):
+        action = f"awaiting cross-family review: parked, no cross-family reviewer is available ({reason})"
+    elif state.get("review_job_id"):
+        action = f"awaiting cross-family review: review job {state['review_job_id'][:12]} in flight"
+    elif _review_queue_exhausted(state):
+        # No attempt budget left (whether or not a sweep already recorded it).
+        action = f"review attempts exhausted: the owner must review or re-queue this row ({reason})"
+    elif review_queue.in_backoff(state, now=now):
+        action = f"awaiting cross-family review: next attempt scheduled ({reason})"
+    else:
+        action = f"awaiting cross-family review ({reason})"
+    exhausted = _review_queue_exhausted(state)
+    view = {
+        "review_state": review_queue.AWAITING_REVIEW,
+        "review_reason": reason,
+        "next_attempt_at": state.get("next_attempt_at"),
+        "review_attempt": int(state.get("attempt") or 0),
+        "review_parked": review_queue.is_parked(state),
+        "review_exhausted": exhausted,
+        "review_in_backoff": review_queue.in_backoff(state, now=now),
+        "suggested_action": action,
+        # Attempts remain (backoff not elapsed, a review in flight, or a parked
+        # pick to retry): NOT stale, never escalated while the queue owns it.
+        # Spent attempts with nothing in flight: stale, and the owner's move.
+        "stale": exhausted,
+    }
+    if not review_queue.is_resolved(state):
+        view["classification"] = "stale" if exhausted else review_queue.AWAITING_REVIEW
+        attempts = (
+            f"attempt {view['review_attempt']}/{int(state.get('max_attempts') or review_queue.MAX_REVIEW_ATTEMPTS)}"
+        )
+        view["orchestrator_note"] = (
+            f"report-only needs-review sweep: review attempts exhausted ({attempts}), waiting for the owner"
+            if exhausted
+            else f"report-only needs-review sweep: awaiting cross-family review ({attempts})"
+        )
+    return view
+
+
+def review_queue_stuck_owned(job: dict, now: float | None = None) -> bool:
+    """Whether the review queue can still act on this row (so it is not stuck).
+
+    Attempts remain (backoff running, a review child in flight, or a parked
+    pick to retry) => the row ages inside the queue, never against the owner.
+    """
+    state = review_queue.review_state(job)
+    if state is None or review_queue.is_resolved(state):
+        return False
+    return not _review_queue_exhausted(state)
+
+
+def _gate_review_queue_stuck(row: dict, job: dict, now: float | None) -> None:
+    """A triage row must not suggest an action for a row the queue still owns."""
+    view = review_queue_triage_row(job, now=now)
+    if view is None:
+        return
+    if "orchestrator_note" in view and row.get("evidence_summary"):
+        view["orchestrator_note"] += f"; evidence={row['evidence_summary']}"
+    row.update({k: v for k, v in view.items() if k != "suggested_action"})
+    row["suggested_action"] = view["suggested_action"]
 
 
 def main():
