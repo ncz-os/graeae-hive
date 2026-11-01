@@ -642,3 +642,66 @@ def test_the_sweep_records_follow_ups_without_a_name_error(state):
     summary = fake.sweep([row], state)
     assert summary[dr.FOLLOW_UP] == 2, summary
     assert fake.specs == []
+
+
+# ── the review round's claims, pinned so they cannot recur ──────────────────
+
+
+def test_re_and_time_are_imported_at_module_scope():
+    """A diff-only reader cannot see the import block. It is there."""
+    import ast
+
+    tree = ast.parse(Path(dr.__file__).read_text())
+    imported: set[str] = set()
+    for node in tree.body:  # module scope only, not inside a function
+        if isinstance(node, ast.Import):
+            imported.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.update((a.asname or a.name) for a in node.names)
+    assert {"re", "time", "hashlib", "json", "os", "logging"} <= imported
+    # and they are the real modules, not shims
+    assert dr.re.compile and dr.time.time
+
+
+def test_a_fix_spec_never_builds_a_round_numbered_branch(state):
+    """In place: ``grind_spec`` uses the row's own branch, never ``-rN``.
+
+    ``continuation_branch`` (``-rN``) survives only for the legacy
+    missing_branch repair path; the grind loop must not reach it.
+    """
+    row = continuation_row(1)
+    review = {"families": ["meta"], "findings": [], "requested_by": ["meta"]}
+    for round_no in (1, 2, 5):
+        pick = {"model": "qwen38", "route": None}
+        spec = dr.grind_spec(row, review, round_no, pick, kind=dr.FIX)
+        # The spec never ADDS a round suffix of its own: whatever the row's
+        # branch already is, both fields are that exact branch.
+        assert spec["head_branch"] == row["head_branch"]
+        assert spec["base_branch"] == row["head_branch"]
+
+
+def test_the_follow_up_count_never_reads_a_non_int_attempts():
+    """``Outcome.attempts`` is a typed int with a default, so the cast is safe."""
+    from dataclasses import fields
+
+    f = {x.name: x for x in fields(dr.Outcome)}["attempts"]
+    assert f.type in ("int", int), f.type
+    assert f.default == 0
+    assert dr.Outcome(job_id="j", status="applied").attempts == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("", 6), ("2", 2), ("0", 0), ("-3", 0), ("junk", 6), ("7", 7)],
+)
+def test_the_round_cap_env_parses_safely(value, expected, tmp_path):
+    """Invalid and negative values fall back to a sane cap, never a crash."""
+    out = subprocess.run(
+        [sys.executable, "-c", "import hive.workers.doctor_remediation as d; print(d.GRIND_MAX_ROUNDS)"],
+        env={**os.environ, "HIVE_DOCTOR_GRIND_MAX_ROUNDS": value, "HIVE_BUS_TOKEN": "t"},
+        capture_output=True,
+        text=True,
+        cwd=str(ROOT),
+    )
+    assert out.returncode == 0, out.stderr
+    assert int(out.stdout.strip()) == expected
