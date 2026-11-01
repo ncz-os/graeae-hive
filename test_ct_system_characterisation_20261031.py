@@ -12,9 +12,10 @@ current behaviour of the two parts of the system this branch carries:
      diff), a rename with unchanged content is one ``only-A`` row plus one
      ``only-B`` row sharing a blob, and a deletion is ``only-<the other
      side>``.
-  2. The ``completion`` gate in ``/opt/graeae/hive_worker.py`` -- the
+  2. The ``completion`` gate in the tracked ``deploy/hive_worker.py`` -- the
      ``verify-delivery`` contract this job itself is subject to: it is a pure
-     function of Git state, never of model prose.
+     function of Git state, never of model prose. The tracked file is loaded
+     (not the fleet's deployed copy) so the suite runs on any checkout.
 
 Scope notes (deliberate, per the job's read-only restriction):
 
@@ -22,7 +23,10 @@ Scope notes (deliberate, per the job's read-only restriction):
   against a throwaway fixture repo built in a pytest tmp dir, and the
   ``completion_evidence`` / ``completion_ready`` probes run ``git`` against
   that fixture with a bounded env. The fixture is the only repo in sight for
-  those calls.
+  those calls: every repo-local ``GIT_*`` variable (``git rev-parse
+  --local-env-vars``: GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ...) is
+  scrubbed, so a host that exports them (a git hook, a scripted caller)
+  cannot redirect a fixture write into another repository's index.
 * No network: the fixture has no remote, so ``remote_verified`` stays False
   and ``completion_ready`` stays False -- which is exactly the contract
   being pinned (no pushed remote ref, no ready delivery).
@@ -43,6 +47,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import types
 
 import pytest
 
@@ -60,11 +65,44 @@ HEAD_SHA = "db4d9106829488b034628c87f411d98b7998e13d"
 JOB_ID = "01a1926d-d41d-7c9a-af07-40262f4eb964"
 
 
-def _git(repo, *args, check=True):
-    """Read-only git against the fixture; a host-exported GIT_DIR must not bleed in."""
+# Every variable git itself treats as repo-local (GIT_DIR, GIT_WORK_TREE,
+# GIT_INDEX_FILE, GIT_OBJECT_DIRECTORY, ...). Asked of git rather than
+# hardcoded so a newer git's additions are covered too.
+_GIT_LOCAL_ENV = tuple(
+    subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+)
+
+
+# Host git config (diff.renames, init.defaultBranch, ...) must not change a
+# pinned value either: global and system config are switched off.
+_GIT_ISOLATED_CONFIG = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+def _scrubbed_env():
     env = dict(os.environ)
-    env.pop("GIT_DIR", None)
-    env.pop("GIT_WORK_TREE", None)
+    for name in _GIT_LOCAL_ENV:
+        env.pop(name, None)
+    env.update(_GIT_ISOLATED_CONFIG)
+    return env
+
+
+@pytest.fixture(autouse=True)
+def _no_host_git_env(monkeypatch):
+    """``verify_delivery`` reads ``os.environ`` itself: scrub it for every test."""
+    for name in _GIT_LOCAL_ENV:
+        monkeypatch.delenv(name, raising=False)
+    for name, value in _GIT_ISOLATED_CONFIG.items():
+        monkeypatch.setenv(name, value)
+
+
+def _git(repo, *args, check=True):
+    """Git against the fixture; no host-exported repo-local GIT_* may bleed in."""
+    env = _scrubbed_env()
     proc = subprocess.run(
         ["git", "-C", str(repo), *args],
         capture_output=True,
@@ -152,8 +190,7 @@ def test_union_rows_classified_by_blob_identity(fixture_repo):
     assert got["keep.txt"].ins == 0 and got["keep.txt"].dels == 0
     # Same path, different content on both tips.
     assert got["edit.py"].cls == "differs"
-    # Deletion on Y -> only-X (X is ref A); the rename keeps the blob under
-    # its old name on X only.
+    # Deleted on Y, still present on X (ref A) -> only-A.
     assert got["gone.txt"].cls == "only-A"
     # Rename with unchanged content: new name only-X, old name only-Y, ONE blob.
     # X is the ref that renamed; Y branched at the root, so it still holds the
@@ -174,10 +211,11 @@ def test_union_rows_classified_by_blob_identity(fixture_repo):
 
 
 def test_stats_are_from_ref_a_perspective(fixture_repo):
-    """`git diff B A`: A=X turns edit.py's 2 lines into 2 different ones
-    (2 ins, 2 dels) plus one added line (c is B's, not A's -- wait: A adds a
-    third line relative to B's 3? No: B has 3 lines, A has 2, all different
-    where they overlap): 2 ins, 3 dels. gone.txt is only-A -> (1, 0)."""
+    """Stats come from `git diff B A`, i.e. what A adds/removes relative to B.
+
+    edit.py: B=Y is ``a = 1 / b = 2 / c = 3``, A=X is ``a = 10 / b = 20``.
+    No line is shared, so A adds its 2 lines and removes B's 3: (2, 3).
+    gone.txt exists only on A (1 line): (1, 0)."""
     repo = fixture_repo["repo"]
     got = {r.path: r for r in lineage_diff_ct.lineage_diff(
         str(repo), fixture_repo["x"], fixture_repo["y"]
@@ -218,42 +256,49 @@ def test_header_names_both_tips_and_the_divergence(fixture_repo):
     assert "A +2" in header and "B +1" in header
 
 
-def test_unrelated_histories_degrade_to_no_common_base(fixture_repo, tmp_path):
-    """Two repos with no shared object database: rev-parse resolves each ref
-    inside its own repo, the classifier works per-repo (the cross-check is
-    per-side), and the shared merge-base degrades to the documented
-    "no common merge-base" header line instead of crashing."""
-    a_repo, b_repo = fixture_repo["repo"], tmp_path / "ct-repo-unrelated"
-    b_repo.mkdir()
-    _git(b_repo, "init", "--quiet")
-    _git(b_repo, "config", "user.name", "CT Fixture")
-    _git(b_repo, "config", "user.email", "ct-fixture@example.invalid")
-    (b_repo / "only.txt").write_text("unrelated\n")
-    _git(b_repo, "add", "--all")
-    _git(b_repo, "commit", "--quiet", "--no-gpg-sign", "-m", "unrelated root")
-    other_sha = _git(b_repo, "rev-parse", "HEAD").strip()
+def test_unrelated_histories_degrade_to_no_common_base(fixture_repo):
+    """Two tips in ONE repo whose histories share no commit (an orphan root).
 
-    # The header probe is the only cross-repo call: it must report the
-    # missing merge-base, not raise.
-    header = lineage_diff_ct._header(
-        str(a_repo), other_sha, fixture_repo["y"]
+    Both tips are real commit objects in the same object database, so the
+    only thing missing is a common ancestor: ``git merge-base`` exits 1 and
+    the header degrades to the documented "no common merge-base" line
+    instead of raising. Classification is by content, not history, so a file
+    whose bytes match across the unrelated tips is still ``same``.
+
+    (An earlier form pointed at a sha from a second repo; that sha is not an
+    object in the first repo at all, so it exercised "unknown object", not
+    unrelated histories.)"""
+    repo = str(fixture_repo["repo"])
+    _git(repo, "checkout", "--quiet", "--orphan", "Z")
+    _git(repo, "rm", "-r", "--quiet", "--cached", ".")
+    for leftover in pathlib.Path(repo).iterdir():
+        if leftover.name != ".git":
+            leftover.unlink()
+    (pathlib.Path(repo) / "keep.txt").write_text("kept on both tips\n")
+    (pathlib.Path(repo) / "only.txt").write_text("unrelated\n")
+    _git(repo, "add", "--all")
+    _git(repo, "commit", "--quiet", "--no-gpg-sign", "-m", "unrelated root")
+    z = _git(repo, "rev-parse", "HEAD").strip()
+    for sha in (z, fixture_repo["y"]):
+        _git(repo, "cat-file", "-e", f"{sha}^{{commit}}")
+    merge_base = subprocess.run(
+        ["git", "-C", repo, "merge-base", z, fixture_repo["y"]],
+        capture_output=True,
+        text=True,
+        env=_scrubbed_env(),
     )
-    assert "no common merge-base" in header
-    # Per-repo classification still returns the full union of each side.
-    got_a = {
-        r.path: r for r in lineage_diff_ct.lineage_diff(
-            str(a_repo), fixture_repo["x"], fixture_repo["y"]
-        )
+    assert (merge_base.returncode, merge_base.stdout) == (1, "")
+
+    header = lineage_diff_ct._header(repo, z, fixture_repo["y"])
+    assert header == f"A={z}  B={fixture_repo['y']}  no common merge-base (unrelated histories)"
+
+    got = {r.path: r.cls for r in lineage_diff_ct.lineage_diff(repo, z, fixture_repo["y"])}
+    assert got == {
+        "keep.txt": "same",
+        "only.txt": "only-A",
+        "edit.py": "only-B",
+        "old_name.txt": "only-B",
     }
-    for r in got_a.values():
-        assert r.cls in ("same", "differs", "only-A", "only-B")
-    got_b = {
-        r.path: r for r in lineage_diff_ct.lineage_diff(
-            str(b_repo), other_sha, other_sha
-        )
-    }
-    assert got_b == {"only.txt": got_b["only.txt"]}
-    assert got_b["only.txt"].cls == "same"
 
 
 def test_cli_json_contract(fixture_repo):
@@ -298,59 +343,58 @@ def test_unknown_ref_is_a_bounded_error(fixture_repo):
         text=True,
     )
     assert proc.returncode == 2
-    assert "error" in proc.stderr.lower()
+    assert proc.stdout == ""
+    # One "error: ..." line, git's stderr capped at 400 chars, no traceback.
+    lines = proc.stderr.strip().splitlines()
+    assert lines and lines[0].startswith("error: git rev-parse no-such-ref-ct failed")
+    assert "Traceback" not in proc.stderr
+    assert len(proc.stderr) <= 600
 
 
 # ---------------------------------------------------------------------------
 # 2. The completion gate (hive_worker): pure Git evidence, never prose.
 # ---------------------------------------------------------------------------
 
-# The deployed worker lives outside this repo (fleet path /opt/graeae); import
-# it by file so the review pins the worker that is actually running the gate.
-_WORKER_PATH = pathlib.Path("/opt/graeae/hive_worker.py")
+# The TRACKED worker, not a fleet path: the suite must run on any checkout
+# (docs/TEST_PORTABILITY_INTEGRATE.md). Same loading recipe as
+# test_terra_worker_delivery.py.
+_WORKER_PATH = REPO / "deploy" / "hive_worker.py"
 
 
 @pytest.fixture
-def hive_worker(tmp_path):
-    assert _WORKER_PATH.is_file(), f"deployed worker missing: {_WORKER_PATH}"
-    # The worker imports its sibling fleet modules (hive_budget, provenance,
-    # the hive package) by bare name; they live next to the deployed script.
-    # The DEPLOYED `hive` package is the one that ships with the deployed
-    # worker -- the bus-side `hive/` tree of this repo lacks
-    # hive/codex_delivery.py and would shadow it if the repo won sys.path.
-    # A scratch sys.path with only /opt/graeae (prepended, not appended)
-    # keeps both the real hive package and this repo's conftest out of the
-    # import while the module loads.
-    saved_path = sys.path[:]
-    saved_modules = {
-        name: sys.modules.pop(name)
-        for name in list(sys.modules)
-        if name == "hive" or name.startswith("hive.")
-        or name in ("hive_budget", "provenance")
-    }
-    sys.path.insert(0, str(_WORKER_PATH.parent))
-    try:
-        spec = importlib.util.spec_from_file_location("hive_worker_ct", _WORKER_PATH)
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["hive_worker_ct"] = mod
-        spec.loader.exec_module(mod)
-    finally:
-        sys.path[:] = saved_path
-        for name in list(sys.modules):
-            if name == "hive" or name.startswith("hive.") or name in (
-                "hive_budget",
-                "provenance",
-            ):
-                del sys.modules[name]
-        sys.modules.update(saved_modules)
+def hive_worker(monkeypatch):
+    # Sidecars deployed next to the worker but absent from this checkout are
+    # stubbed; the gate under test (completion_evidence / completion_ready /
+    # verify_delivery) uses none of them and runs real Git against the
+    # fixture. monkeypatch restores sys.modules afterwards.
+    budget = types.ModuleType("hive_budget")
+    budget.FAILURE_REASON = "budget_exceeded"
+    provenance = types.ModuleType("provenance")
+    provenance.STATIC_AGENT_MODELS = {}
+    provenance.KNOWN_COST_TIERS = set()
+    monkeypatch.setitem(sys.modules, "hive_budget", budget)
+    monkeypatch.setitem(sys.modules, "provenance", provenance)
+    for name in ("codex_delivery", "llm_roles", "push_policy", "review_evidence"):
+        module = types.ModuleType("hive." + name)
+        if name == "codex_delivery":
+            module.fleet_git_env = lambda *a, **kw: {}
+        if name == "push_policy":
+            module.argonas_url_for_slug = lambda slug: slug
+        monkeypatch.setitem(sys.modules, "hive." + name, module)
+    spec = importlib.util.spec_from_file_location("hive_worker_ct", _WORKER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
     return mod
 
 
+def test_worker_under_test_is_the_tracked_file(hive_worker):
+    """The gate pinned here is the one in this checkout, never a host path."""
+    assert pathlib.Path(hive_worker.__file__).resolve() == _WORKER_PATH
+    assert REPO in _WORKER_PATH.parents
+
+
 def _completion_env():
-    env = dict(os.environ)
-    env.pop("GIT_DIR", None)
-    env.pop("GIT_WORK_TREE", None)
-    return env
+    return _scrubbed_env()
 
 
 def test_completion_gate_is_pure_git_state(fixture_repo, hive_worker):
@@ -422,9 +466,10 @@ def test_completion_ready_requires_a_verified_remote(hive_worker):
 
 
 def test_verify_delivery_reports_bounded_evidence(fixture_repo, hive_worker, capsys):
-    """`--verify-delivery` prints one bounded JSON line and exits 1 for an
-    unpushed fixture: the report names the required steps, never Git stderr
-    or remote URLs."""
+    """`--verify-delivery` prints one JSON line and exits 1 for an unpushed
+    fixture. The report carries counts, capped path lists, the required
+    steps, and a capped ``verification_error`` naming the failed git probe
+    (here: no upstream) -- the reason is the Git fact, never prose."""
     _git(fixture_repo["repo"], "checkout", "--quiet", "X")
     rc = hive_worker.verify_delivery(
         str(fixture_repo["repo"]), fixture_repo["root"]
@@ -434,7 +479,11 @@ def test_verify_delivery_reports_bounded_evidence(fixture_repo, hive_worker, cap
     report = json.loads(out.strip().splitlines()[-1])
     assert report["delivery_ready"] is False
     assert report["commit_count"] == 2  # X: edit commit + rename commit
-    assert report["changed_file_count"] >= 2  # edit.py, old_name.txt, gone.txt
+    # `git diff --name-only root X`: rename detection folds old_name.txt into
+    # new_name.txt; gone.txt is untouched on X.
+    assert report["changed_file_count"] == 2
+    assert report["files_changed"] == ["edit.py", "new_name.txt"]
+    assert "upstream" in report["verification_error"]
     assert report["worktree_clean"] is True
     assert report["remote_verified"] is False
     for key in (
@@ -446,4 +495,40 @@ def test_verify_delivery_reports_bounded_evidence(fixture_repo, hive_worker, cap
         "required",
     ):
         assert key in report
-    assert report["files_changed"]  # X changed edit.py, renamed old_name.txt
+
+
+def test_suite_is_hermetic_against_host_git_env(tmp_path):
+    """Re-run this file with a host that exports repo-local GIT_* variables
+    pointing at a decoy repo and a decoy index (as a git hook or scripted
+    caller would). Every test must still pass, and no fixture write may land
+    in the decoy index."""
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _git(decoy, "init", "--quiet")
+    index = tmp_path / "decoy-index"
+    env = dict(os.environ)
+    env.update(
+        GIT_DIR=str(decoy / ".git"),
+        GIT_WORK_TREE=str(decoy),
+        GIT_INDEX_FILE=str(index),
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(pathlib.Path(__file__).resolve()),
+            "-k",
+            "not hermetic_against_host_git_env",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=REPO,
+        env=env,
+        timeout=600,
+    )
+    assert proc.returncode == 0, proc.stdout[-3000:]
+    assert not index.exists()
