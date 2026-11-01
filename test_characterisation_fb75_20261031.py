@@ -32,6 +32,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import shutil
 import sys
 
 import pytest
@@ -691,18 +692,78 @@ class WatcherCapabilityTests:
         assert len(caps) == len(set(caps))
 
 
+_ROCm_SMI = "rocm-smi"
+
+
+def _make_executable(path: pathlib.Path, mode: int = 0o755) -> pathlib.Path:
+    """Write a stub program and set its mode bits EXPLICITLY.
+
+    ``Path.write_text`` gives whatever the umask allows and a checkout can carry
+    an odd mode, so every fixture here states ``mode`` rather than inheriting it.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(mode)
+    return path
+
+
+@pytest.fixture
+def no_path_tools(monkeypatch, tmp_path):
+    """Run ``_find_bin`` with a PATH that holds no tool but the ones we built.
+
+    The fallback tests below pin the EXTRA-DIRECTORY branch, which is only
+    reached when ``shutil.which`` misses. Leaving the host's PATH in place turns
+    them into a probe of what happens to be installed: they pass on macOS, where
+    ``rocm-smi`` is absent, and fail on the Linux build host (HYDRA, Debian)
+    where a distro package or ``/opt/rocm*/bin`` puts a real ``rocm-smi`` first
+    on PATH. PATH is therefore replaced outright rather than prefixed, and the
+    production extra-dir list is emptied so neither half of the lookup can reach
+    the machine.
+    """
+    empty_bin = tmp_path / "empty-bin"
+    empty_bin.mkdir()
+    monkeypatch.setenv("PATH", str(empty_bin))
+    # The production default for extra_dirs is _rocm_bin_dirs(), which globs
+    # /opt/rocm*/bin; poison it so a call that relies on that default cannot
+    # reach a real install either.
+    monkeypatch.setattr(watcher, "_rocm_bin_dirs", lambda: [])
+    assert shutil.which(_ROCm_SMI) is None
+    assert watcher._find_bin(_ROCm_SMI, []) is None
+    return empty_bin
+
+
 class WatcherHelperTests:
     def test_find_bin_prefers_path(self):
         found = watcher._find_bin("sh")
         assert found and os.path.basename(found) == "sh"
 
-    def test_find_bin_falls_back_to_the_extra_directories(self, tmp_path):
-        busybox = tmp_path / "rocm-smi"
-        busybox.write_text("#!/bin/sh\n")
-        busybox.chmod(0o755)
-        assert watcher._find_bin("rocm-smi", [str(tmp_path)]) == str(busybox)
+    def test_find_bin_falls_back_to_the_extra_directories(self, tmp_path, no_path_tools):
+        busybox = _make_executable(tmp_path / "rocm" / _ROCm_SMI, 0o755)
+        assert watcher._find_bin(_ROCm_SMI, [str(busybox.parent)]) == str(busybox)
 
-    def test_find_bin_returns_none_when_absent(self, tmp_path):
+    def test_find_bin_reads_the_extra_directories_in_order(self, tmp_path, no_path_tools):
+        """The first extra dir holding the tool wins; a later one never shadows it."""
+        first = _make_executable(tmp_path / "rocm-6.4" / _ROCm_SMI)
+        _make_executable(tmp_path / "rocm-7.0" / _ROCm_SMI)
+        dirs = [str(first.parent), str(tmp_path / "rocm-7.0")]
+        assert watcher._find_bin(_ROCm_SMI, dirs) == str(first)
+
+    def test_find_bin_fallback_does_not_depend_on_the_host_path(self, tmp_path, no_path_tools):
+        """Regression: the extra-dir lookup must not consult a host-installed tool.
+
+        On the Linux build host a real ``rocm-smi`` sits earlier on PATH, so the
+        original version of this test never reached the fallback and asserted the
+        host's binary instead of the one it built. Pinning both halves keeps the
+        test honest on any host: a PATH stub is preferred, and an extra-dir stub
+        is used when PATH has none.
+        """
+        path_bin = _make_executable(no_path_tools / _ROCm_SMI)
+        extra = _make_executable(tmp_path / "rocm" / _ROCm_SMI)
+        assert watcher._find_bin(_ROCm_SMI, [str(extra.parent)]) == str(path_bin)
+        path_bin.unlink()
+        assert watcher._find_bin(_ROCm_SMI, [str(extra.parent)]) == str(extra)
+
+    def test_find_bin_returns_none_when_absent(self, tmp_path, no_path_tools):
         assert watcher._find_bin("definitely-not-installed-fb75", [str(tmp_path)]) is None
 
     @pytest.mark.xfail(
@@ -712,11 +773,11 @@ class WatcherHelperTests:
             "executable check, so a stray 0644 file would be returned and handed to subprocess."
         ),
     )
-    def test_find_bin_does_not_return_a_non_executable_file(self, tmp_path):
-        stray = tmp_path / "rocm-smi"
+    def test_find_bin_does_not_return_a_non_executable_file(self, tmp_path, no_path_tools):
+        stray = tmp_path / _ROCm_SMI
         stray.write_text("not a program\n")
-        stray.chmod(0o644)
-        assert watcher._find_bin("rocm-smi", [str(tmp_path)]) is None
+        stray.chmod(0o644)  # explicit: never inherit the umask or the checkout mode
+        assert watcher._find_bin(_ROCm_SMI, [str(tmp_path)]) is None
 
     def test_the_worker_target_is_a_bounded_integer(self):
         assert isinstance(watcher._target_workers({"cpu_count": 8, "ram_gb": 32}, {}), int)
