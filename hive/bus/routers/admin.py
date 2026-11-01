@@ -99,7 +99,8 @@ def _merge_field_patch(raw: str | None, fields: dict[str, Any]) -> dict[str, Any
         try:
             decoded = json.loads(raw)
         except (TypeError, ValueError):
-            decoded = None
+            # Not JSON at all (legacy bare text): keep the text itself.
+            decoded = raw
     if isinstance(decoded, dict):
         merged = decoded
     elif decoded is not None:

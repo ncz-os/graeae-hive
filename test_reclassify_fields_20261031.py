@@ -349,6 +349,15 @@ class PreservationSlotTests(unittest.TestCase):
         merged = _merge_field_patch('{"worker_error":"x"}', {"baseline": REAL_HEAD})
         self.assertEqual(merged, {"worker_error": "x", "baseline": REAL_HEAD})
 
+    def test_non_json_result_text_is_preserved_not_replaced(self):
+        """A bare-text result (not valid JSON) is evidence too: it is kept under
+        ``previous_result`` rather than silently replaced by the patch fields."""
+        from hive.bus.routers.admin import _merge_field_patch
+
+        merged = _merge_field_patch("legacy bare text, not json", {"baseline": REAL_HEAD})
+        self.assertEqual(merged["previous_result"], "legacy bare text, not json")
+        self.assertEqual(merged["baseline"], REAL_HEAD)
+
     def test_ordinary_patch_merges_normally(self):
         """Sanity companion to the slot tests: a normal patch is a plain merge."""
         from hive.bus.routers.admin import _merge_field_patch
