@@ -705,3 +705,53 @@ def test_the_round_cap_env_parses_safely(value, expected, tmp_path):
     )
     assert out.returncode == 0, out.stderr
     assert int(out.stdout.strip()) == expected
+
+
+def test_the_doctor_wiring_binds_to_the_sweep_signature():
+    """Every kwarg ``doctor.py`` passes exists on ``continuation_sweep``.
+
+    A diff-only reader cannot see the signature below the arguments it
+    reads. Bind the exact call the wiring makes: an unknown keyword would
+    raise TypeError here rather than at 3am in a sweep.
+    """
+    import inspect
+
+    from hive.workers import doctor
+
+    src = inspect.getsource(doctor.run_continuation_sweep)
+    bound = inspect.signature(dr.continuation_sweep).bind(
+        None,
+        state=None,
+        children=None,
+        submit=None,
+        escalate=None,
+        roster=None,
+        now=0.0,
+        dry_run=False,
+        head_is_verdict_only=None,
+        job_lookup=None,
+        add_followup=None,
+        integrity=None,
+    )
+    # the wiring really does pass the two newest keywords
+    assert "add_followup=" in src
+    assert "integrity=" in src
+    accepted = set(inspect.signature(dr.continuation_sweep).parameters)
+    assert {"gates", "integrity", "add_followup"} <= accepted
+    assert "add_followup" in bound.arguments and "integrity" in bound.arguments
+
+
+def test_outcome_always_carries_an_int_attempts():
+    """``outcome.attempts`` is a dataclass field, never an absent attribute."""
+    for status in ("applied", "follow_up", "escalated", "no_change"):
+        o = dr.Outcome(job_id="j", status=status)
+        assert isinstance(o.attempts, int), status
+
+
+def test_the_follow_up_branch_counts_attempts_on_a_real_sweep(state):
+    """The branch the review called an AttributeError runs and counts."""
+    row = work_row()
+    fake = Loop({row["id"]: [rc_with(row, "medium", round_no=1)]})
+    summary = fake.sweep([row], state)
+    assert summary[dr.FOLLOW_UP] == 1, summary
+    assert isinstance(summary[dr.FOLLOW_UP], int)
