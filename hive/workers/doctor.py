@@ -5462,6 +5462,12 @@ def run_continuation_sweep(
         head_is_verdict_only=_continuation_verdict_only,
         # The parent-chain read for a row whose lineage record and key are lost.
         job_lookup=_chain_job,
+        # A NON-BLOCKING finding becomes its own row (operator 2026-11-01): it
+        # never re-opens the grind loop and never blocks a merge.
+        add_followup=submit_job_spec,
+        # A fix commit that deletes or weakens tests fails its round (never
+        # merged) and escalates once.
+        integrity=doctor_remediation.test_integrity,
     )
 
 

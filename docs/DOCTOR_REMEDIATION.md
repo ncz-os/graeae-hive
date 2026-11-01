@@ -472,3 +472,95 @@ stops only the creation of continuation jobs.
 
 Regressions: `test_doctor_continuation_guards_20261101.py`. Every test in it
 failed on `836a28d`.
+
+## Grind until green (2026-11-01)
+
+*Operator rule 2026-11-01, amended after a soundness review: "doctor reviews
+GRIND UNTIL GREEN with ALTERNATING FIX-IN-PLACE reviewers, with hard limits."*
+
+The old continuation path ran two automatic rounds and then escalated. It is
+replaced by a **bounded loop**. Each round is one of two kinds on the same row:
+a `fix` round when the last review found blocking problems, or a `review` round
+when it did not. The loop stops the moment the row is objectively green.
+
+### Green is objective
+
+A row is green only when all three hold:
+
+1. the merged-tree suite is clean (`suite_gate`),
+2. the import preflight is clean, and
+3. a **structured `APPROVE` from a STRONG reviewer family** lands on the exact
+   head being judged.
+
+*Strong* families are `muse`, `deepseek`, `codex` (review-only, per the ladder)
+and `opus`. `cerberus-reviewer/gpt-oss-20b`, `qwen38` and the other local
+models may still review, but their approval never counts toward green.
+`astra` never counts.
+
+### Only high and critical block
+
+A `request_changes` verdict blocks only on **high** and **critical** findings.
+**Medium and low** findings are written to a follow-up row whose
+`parent_job_id` is the work row — recorded, never re-opening the loop, never
+blocking. One follow-up row is written per finding.
+
+### Each round reviews the delta
+
+A round reviews the **delta since the last reviewed head**, plus whether the
+previous round's blocking findings were resolved. It is not a fresh full
+review. A verdict-only head advance (the fix round changed nothing but the
+verdict) keeps the existing green review rather than forcing a re-review.
+
+### Rotation
+
+- The reviewer family differs from the **branch author** family.
+- The reviewer family differs from the **previous round's reviewer**.
+- A reviewer that finds blocking problems gets them fixed by a **fix job in
+  place** (a continuation commit on the branch); the next round is reviewed by
+  a family that is **not the fixer**.
+- A fixer never approves its own commit.
+
+`_reviewer_pick` orders the roster hard-lane routes first, then every other
+eligible route, and skips any family that is blocked, is the author's, or is
+the fixer's.
+
+### Verify before fixing (mandatory)
+
+The fix job first **reproduces each finding against source with a failing
+test**. If it cannot reproduce it, it adds a pinning test and a note, and the
+finding is **closed as disproved**. Correct code is never changed to satisfy a
+disproved claim.
+
+### Test integrity guard
+
+A fix commit that **deletes or weakens** existing assertions/tests, **skips or
+xfails** tests, or grows the diff by more than the per-round budget (default
+**+400 lines**, `GRIND_DIFF_BUDGET`) **fails the round and is never merged**.
+
+### Limits and escalation
+
+| Limit | Env | Default |
+| --- | --- | --- |
+| Rounds per row | `HIVE_DOCTOR_GRIND_MAX_ROUNDS` | 6 |
+| Per-row spend cap | `GRIND_MAX_SPEND_USD` | configurable |
+| Hourly global brake | `HIVE_DOCTOR_CONTINUE_MAX_PER_HOUR` | 6 |
+| Diff budget per round | `GRIND_DIFF_BUDGET` | 400 |
+
+- **Stall detection** is by finding fingerprint: the *same* fingerprint in two
+  rounds is a stall.
+- On **any** limit — round cap, spend cap, stall — the doctor escalates
+  **once** to the operator with the evidence (rounds, findings, spend) and
+  stops.
+
+### Rails kept
+
+- Fail **closed** on unknown lineage.
+- **Durable marker** keyed on `(row, tip, round)`.
+- `HIVE_DOCTOR_REMEDIATE=0` and `DRY_RUN` are honoured; a dry run fixes
+  nothing and marks nothing.
+- **Never review a review.**
+- **Never touch lane-B rows.**
+- Merge + deploy stays under the existing standing rule, and only after green.
+
+Regressions: `test_doctor_grind_until_green_20261101.py`. Every test in it
+failed on the base (`6710615`) and passes with this change.

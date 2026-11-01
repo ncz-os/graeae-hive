@@ -62,6 +62,7 @@ cause                   meaning                                         field fi
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +70,7 @@ import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from hive import delivery_ref, review_queue
@@ -1605,7 +1607,12 @@ def sweep(
         # One counter per outcome, and ``applied`` IS the APPLIED counter: it is
         # what the cap is measured against, so counting it twice would let the
         # cap through at half the configured size.
-        summary[outcome.status] = summary.get(outcome.status, 0) + 1
+        if outcome.status == FOLLOW_UP and outcome.attempts:
+            # One row can record SEVERAL non-blocking findings: the count is
+            # the findings written, not the rows that wrote them.
+            summary[FOLLOW_UP] = summary.get(FOLLOW_UP, 0) + int(outcome.attempts)
+        else:
+            summary[outcome.status] = summary.get(outcome.status, 0) + 1
         summary.setdefault("causes", {})
         if outcome.cause:
             summary["causes"][outcome.cause] = summary["causes"].get(outcome.cause, 0) + 1
@@ -1613,22 +1620,26 @@ def sweep(
     return summary
 
 
-# ── Continuation rounds: request_changes -> continuation -> re-review ───────
-# Operator 2026-11-01: the orchestrator ran this loop by hand. A cross-family
-# review asked for changes, a CONTINUATION job carried the findings to a new
-# branch cut from the delivered one, and the continuation's head went back to
-# the review queue like any other delivery. The doctor now runs it, bounded:
-# two automatic rounds per lineage, then one escalation and nothing more.
+# ── Continuation rounds: GRIND UNTIL GREEN (operator 2026-11-01, amended) ───
+# The orchestrator ran this loop by hand: a cross-family review asked for
+# changes, a fix job carried the findings onto the branch, and the new head
+# went back to the review queue like any other delivery. The doctor now runs
+# it, BOUNDED, with alternating fix-in-place reviewers.
 #
-# Conflicts and merged-tree failures are NOT handled here: they belong to the
+# GREEN is objective: the merged-tree suite is clean AND the import preflight
+# is clean AND a STRONG reviewer family returns a structured APPROVE on the
+# exact head. Only high/critical findings block; medium/low are recorded as a
+# follow-up row and never re-open the loop. Each round reviews the DELTA since
+# the last reviewed head plus whether the prior blocking findings were
+# resolved. Hard limits (rounds, spend, hourly brake, stall by fingerprint)
+# each escalate ONCE with the evidence and stop.
+#
+# Conflicts and merged-tree FAILURES are NOT repaired here: they belong to the
 # merge-pass tool (fleet-ops). Only the review-driven path lives in this module.
 
-#: Automatic continuation rounds per lineage (the original work row and the
-#: continuations cut from it). Past it the row is escalated ONCE.
-CONTINUATION_MAX_ROUNDS = int(os.environ.get("HIVE_DOCTOR_CONTINUATION_MAX_ROUNDS", str(MAX_AUTO_REMEDIATIONS)))
-
-#: New continuation jobs one sweep may submit (a dry run previews as many).
-CONTINUATION_MAX_PER_SWEEP = int(os.environ.get("HIVE_DOCTOR_CONTINUATION_MAX_PER_SWEEP", "3"))
+#: Hard cap on rounds per work row (``HIVE_DOCTOR_GRIND_MAX_ROUNDS``). Past it
+#: the row is escalated ONCE with its round count, findings and spend.
+GRIND_MAX_ROUNDS_DEFAULT = 6
 
 
 def _env_count(name: str, default: int) -> int:
@@ -1637,6 +1648,17 @@ def _env_count(name: str, default: int) -> int:
         return max(int(str(os.environ.get(name, "")).strip()), 0)
     except ValueError:
         return default
+
+
+GRIND_MAX_ROUNDS = _env_count("HIVE_DOCTOR_GRIND_MAX_ROUNDS", GRIND_MAX_ROUNDS_DEFAULT)
+
+#: Where the pre-2026-11-01 build read the old two-round rule; unused by the
+#: grind loop, kept only so an operator env file that still sets it is not a
+#: silent no-op (``docs/DOCTOR_REMEDIATION.md``).
+_CONTINUATION_MAX_ROUNDS_ENV = "HIVE_DOCTOR_CONTINUATION_MAX_ROUNDS"
+
+#: New continuation jobs one sweep may submit (a dry run previews as many).
+CONTINUATION_MAX_PER_SWEEP = int(os.environ.get("HIVE_DOCTOR_CONTINUATION_MAX_PER_SWEEP", "3"))
 
 
 #: The global brake: continuation jobs the doctor may create per rolling hour
@@ -1665,11 +1687,67 @@ CONTINUATION_KEY_PREFIX = "doctor-continuation"
 _CONTINUATION_KEY_RE = re.compile(r"^doctor-continuation:(?P<root>[^:]+):r(?P<round>\d+):")
 _ROUND_SUFFIX_RE = re.compile(r"-r\d+$")
 
+#: ``idempotency_key`` prefix of a GRIND job (operator 2026-11-01): the fix or
+#: the follow-up review of one round, ``<prefix>:<root>:<fix|review>:r<N>:<tip12>``.
+GRIND_KEY_PREFIX = "doctor-grind"
+#: ``idempotency_key`` prefix of a follow-up row for a NON-BLOCKING finding:
+#: ``<prefix>:<work row>:<fingerprint digest>:<reviewed head12>``.
+FOLLOW_UP_KEY_PREFIX = "doctor:followup"
+
 #: Severity order for picking the BEST request_changes review (most severe first).
 _SEVERITY_RANK = {"critical": 0, "blocker": 0, "high": 1, "medium": 2, "moderate": 2, "low": 3, "info": 4, "nit": 5}
 
 _APPROVE_WORDS = frozenset({"approve", "approved", "pass", "lgtm"})
 _CHANGES_WORDS = frozenset({"request_changes", "changes_requested", "reject", "fail", "blocked"})
+
+#: Severities that BLOCK green and re-open the loop. Every other severity is
+#: recorded as a follow-up row and never blocks (operator 2026-11-01).
+BLOCKING_SEVERITIES = frozenset({"critical", "blocker", "high"})
+
+#: The STRONG reviewer families (operator 2026-11-01): muse (meta), deepseek,
+#: Codex review-only per its ladder (openai) and opus. A local route
+#: (cerberus-reviewer/gpt-oss-20b, qwen38, gemma, nemotron) may review and
+#: request changes, but its approve never counts toward green. ``gpt-6-astra``
+#: is the codex AUTHORIZATION model: never a reviewer, never green.
+STRONG_REVIEW_FAMILIES = ("deepseek", "meta", "openai", "opus")
+STRONG_NEVER_MODELS = frozenset({"gpt-6-astra"})
+#: Opus is a model, not something the family table names: it answers
+#: ``model:claude-opus-...`` (or ``anthropic``), neither of which is a family
+#: the operator's strong list can be spelled with. It is recognised here, and
+#: ONLY here, so the strong list stays the operator list.
+_OPUS_RE = re.compile(r"claude[-_.]?opus|^opus", re.IGNORECASE)
+#: The codex ladder is review-only: ``codex_job_allowed`` decides the rest.
+CODEX_STRONG_ROUTE = review_queue.CODEX_ROUTE_ID
+
+#: Per-row spend cap (USD) across the grind loop. 0/negative disables the cap;
+#: an unreadable value is the default.
+GRIND_MAX_SPEND_DEFAULT = 12.0
+
+
+def _env_float(name: str, default: float) -> float:
+    """A float from the environment; an unreadable value is the default."""
+    try:
+        return float(str(os.environ.get(name, "")).strip())
+    except ValueError:
+        return default
+
+
+GRIND_MAX_SPEND_USD = _env_float("HIVE_DOCTOR_GRIND_MAX_SPEND_USD", GRIND_MAX_SPEND_DEFAULT)
+#: Lines a fix round may add before it is rejected (``HIVE_DOCTOR_GRIND_DIFF_BUDGET``).
+GRIND_DIFF_BUDGET = _env_count("HIVE_DOCTOR_GRIND_DIFF_BUDGET", 400)
+
+#: Outcomes of the grind loop beyond the field-fix ones.
+GREEN = "green"  # green proved on the head: nothing left to fix
+STALLED = "stalled"  # the same finding fingerprint in two rounds
+REJECTED = "rejected"  # a fix commit failed the test-integrity guard
+FOLLOW_UP = "follow_up"  # a non-blocking finding recorded as its own row
+FIX = "fix"  # a blocking finding handed to a fix job
+REVIEW = "review"  # the follow-up review of that fix (a different family)
+#: Why a row is not green (``green_verdict``'s ``why``).
+SUITE_NOT_CLEAN = "suite_not_clean"
+PREFLIGHT_NOT_CLEAN = "import_preflight_not_clean"
+GATES_UNKNOWN = "gates_unknown"
+NO_STRONG_APPROVE = "no_strong_approve"
 
 
 def _text(value: Any) -> str:
@@ -1776,8 +1854,80 @@ def located_findings(result: Any) -> list[dict[str, str]]:
     return found
 
 
+def blocking_findings(findings: list[dict[str, str]]) -> list[dict[str, str]]:
+    """The findings that BLOCK green: ``high`` and ``critical`` only.
+
+    Operator 2026-11-01: "Only high and critical findings block; medium/low
+    findings are recorded as a follow-up row and never re-open the loop." An
+    unlabelled severity (``unspecified``) is not a claim of severity, so it is
+    recorded and does not block; it never reads as high."""
+    return [f for f in findings if str(f.get("severity") or "").strip().lower() in BLOCKING_SEVERITIES]
+
+
+def finding_fingerprint(finding: dict[str, str]) -> str:
+    """A stable identity for one finding: its location and its normalized title.
+
+    Severity is NOT part of it: a reviewer that re-raises the same defect at a
+    lower severity has still not fixed it, and the stall detector must see one
+    fingerprint, not two."""
+    location = str(finding.get("location") or "").strip().lower()
+    title = " ".join(str(finding.get("title") or finding.get("body") or "").lower().split())
+    return f"{location}|{title}"
+
+
+def finding_fingerprints(findings: list[dict[str, str]]) -> list[str]:
+    """The fingerprints of ``findings``, de-duplicated, in order."""
+    out: list[str] = []
+    for finding in findings:
+        fingerprint = finding_fingerprint(finding)
+        if fingerprint not in out:
+            out.append(fingerprint)
+    return out
+
+
+def is_strong_reviewer(model: Any, *, job: dict | None = None) -> bool:
+    """Whether ``model`` is a STRONG reviewer family (operator 2026-11-01).
+
+    Strong: muse (``meta``), ``deepseek``, Codex on its own ladder (review-only,
+    ``openai``) and ``opus``. Local routes -- ``gpt-oss-20b`` on CERBERUS,
+    ``qwen38``, gemma, nemotron -- may review but never count; ``gpt-6-astra``
+    never counts, authorized or not (it is the codex authorization model, not
+    a reviewer). An unknown model is its own family and is not strong."""
+    name = str(model or "").strip()
+    if not name or name.lower() in STRONG_NEVER_MODELS:
+        return False
+    if _OPUS_RE.search(name):
+        return True
+    if name.lower() == CODEX_STRONG_ROUTE or name.lower().startswith("codex"):
+        # Review-only per the ladder: the ladder model, not the authorization
+        # model and not an operator-authorized one.
+        return review_queue.codex_job_allowed(None, name, job=job or {})
+    family = review_queue.family_of(name)
+    if family not in STRONG_REVIEW_FAMILIES:
+        return False
+    if family == "openai":
+        # An OPENAI-family local route (cerberus gpt-oss-20b, or any other
+        # ``gpt-oss`` build) is a LOCAL reviewer: it reviews, it never greens.
+        return name.lower().startswith(("gpt-6", "codex")) and review_queue.codex_job_allowed(None, name)
+    return True
+
+
+def fixer_families(models: list[str]) -> list[str]:
+    """The families of reviewers that REQUESTED CHANGES (branch authors of fixes).
+
+    A reviewer that asked for changes on a head caused a fix commit to be
+    written for it: it is a FIXER, and its approve of the resulting head can
+    never carry the row to green."""
+    return sorted({review_queue.family_of(m) for m in models if review_queue.family_of(m)})
+
+
 def _review_models(review: dict[str, Any], res: dict[str, Any]) -> list[str]:
-    """The reviewer models of one review row (verdict record first, then the claim)."""
+    """The reviewer models of one review row (verdict record first, then the claim).
+
+    The CLAIM always rides along when it names a model: a row run by a LOCAL
+    route must never be re-read as strong because its verdict record named only
+    a provider ladder model, and a local reviewer must never count as a fixer's
+    cross-family partner (operator 2026-11-01)."""
     from hive import review_record
 
     names: list[str] = []
@@ -1799,6 +1949,14 @@ def _review_models(review: dict[str, Any], res: dict[str, Any]) -> list[str]:
     if not names:
         claimed = review_record._named(review.get("claimed_model"))
         if claimed:
+            names.append(claimed)
+    elif review.get("claimed_model"):
+        # The CLAIM rides along: a row run by a LOCAL route must never be
+        # re-read as strong because its verdict record named only a provider
+        # ladder model, and a local reviewer must never count as a fixer's
+        # cross-family partner (operator 2026-11-01).
+        claimed = review_record._named(review.get("claimed_model"))
+        if claimed and claimed not in names:
             names.append(claimed)
     return names
 
@@ -1862,7 +2020,13 @@ def read_review(
         return None
     models = _review_models(review, res)
     families = sorted({review_queue.family_of(m) for m in models if review_queue.family_of(m)})
-    if not families or author_family in families:
+    if not families:
+        return None
+    # An APPROVE from the author's own family proves nothing -- the author is
+    # not an independent reviewer of its own commit. A REQUEST_CHANGES from it
+    # still names a real defect and must drive a fix: the family that raised it
+    # is then excluded from BOTH the fixer and the reviewer rotation.
+    if word == "approve" and author_family in families:
         return None
     from hive import review_verdict
 
@@ -1874,13 +2038,23 @@ def read_review(
         basis = "verdict_only"
     else:
         return None
+    findings = located_findings(res) if word == "request_changes" else []
     return {
         "verdict": word,
         "reviewers": models,
         "families": families,
+        # A structured APPROVE from a strong family is what green needs; a
+        # local route may approve and never counts (operator 2026-11-01). Any
+        # named reviewer model that is strong makes the approve strong: the
+        # claim rides along with the verdict record and either may be the
+        # strong one.
+        "strong": any(is_strong_reviewer(m) for m in models) if word == "approve" else False,
         "head": head,
         "basis": basis,
-        "findings": located_findings(res) if word == "request_changes" else [],
+        "findings": findings,
+        "blocking": blocking_findings(findings),
+        "fingerprints": finding_fingerprints(findings),
+        "fixers": fixer_families(models),
         "review_job_id": str(review.get("id") or ""),
         "ended_at": review.get("ended_at") or 0,
     }
@@ -1923,6 +2097,324 @@ def best_review(
     best = dict(sorted(changes, key=_review_rank)[0])
     best["requested_by"] = sorted({f for r in readings if r["verdict"] == "request_changes" for f in r["families"]})
     return best
+
+
+def green_verdict(reviews: list[dict[str, Any]]) -> dict[str, Any]:
+    """Whether a row is GREEN from its reviews, and why not when it is not.
+
+    GREEN is objective (operator 2026-11-01): the merged-tree suite is clean,
+    the import preflight is clean, and a STRONG reviewer family returns a
+    structured APPROVE on the exact head. A strong approve whose gates were
+    never run is not green: absence of proof is not proof. A strong approve
+    from a FIXER family is not green either -- a fixer never approves its own
+    commit. The newest strong approve wins when several qualify."""
+    reasons: list[str] = []
+    for review in reviews or []:
+        if not isinstance(review, dict) or review.get("verdict") != "approve":
+            continue
+        why = green_blocker(review)
+        if why:
+            reasons.append(why)
+            continue
+        return {"green": True, "why": "", "review": review}
+    why = reasons[0] if reasons else NO_STRONG_APPROVE
+    return {"green": False, "why": why, "review": None}
+
+
+def green_blocker(review: dict[str, Any]) -> str:
+    """Why one approving review is not GREEN: '' when it is."""
+    if not review.get("strong"):
+        return NO_STRONG_APPROVE
+    gates = review.get("gates")
+    if not isinstance(gates, dict) or "suite" not in gates or "import_preflight" not in gates:
+        return GATES_UNKNOWN
+    if suite_text(gates.get("suite")) is None:
+        return SUITE_NOT_CLEAN
+    if not _preflight_clean(gates.get("import_preflight")):
+        return PREFLIGHT_NOT_CLEAN
+    return ""
+
+
+#: The shape a gate result has: ``{"clean": bool, "detail": str}``.
+def _gate(clean: bool, detail: str = "") -> dict[str, Any]:
+    return {"clean": bool(clean), "detail": str(detail or "")}
+
+
+_PASSED_RE = re.compile(r"(?P<count>\d+)\s+passed")
+_BAD_SUMMARY_RE = re.compile(r"\b(\d+)\s+(failed|error|errors|skipped|xfailed|xpassed|deselected|warnings?)\b")
+_NO_TESTS_RE = re.compile(r"no tests ran|collected 0 items|collecting\s*\.\.\.\s*$", re.IGNORECASE)
+
+
+def suite_gate(run: dict[str, Any] | None) -> dict[str, Any]:
+    """The merged-tree suite gate from a finished run.
+
+    ``run`` is ``{"returncode": int, "summary": str}`` -- what the runner
+    printed. Clean means exit 0, at least one test PASSED, and nothing failed,
+    errored, was skipped/xfailed or was deselected: a skipped test is a test
+    that did not run, and a grind that accepts one can hide a real failure
+    behind ``pytest.skip``."""
+    if not isinstance(run, dict):
+        return _gate(False, "no run")
+    code = run.get("returncode")
+    if code != 0:
+        return _gate(False, f"returncode={code}")
+    summary = str(run.get("summary") or "").strip()
+    if not summary:
+        return _gate(False, "no summary")
+    if _NO_TESTS_RE.search(summary):
+        return _gate(False, "no tests ran")
+    bad = _BAD_SUMMARY_RE.search(summary)
+    if bad:
+        return _gate(False, summary)
+    if not _PASSED_RE.search(summary):
+        return _gate(False, summary)
+    return _gate(True, summary)
+
+
+def suite_text(value: Any) -> str | None:
+    """The suite summary ``value`` when it reads CLEAN, else None.
+
+    Accepts a gate dict (``{"clean", "detail"}``), the word ``clean``/``ok``,
+    or the runner's own summary line (``"812 passed in 41.20s"``). Anything
+    that does not read clean -- a failure, an error, a skip, no run at all --
+    is None, so a caller can never treat "unreadable" as "clean"."""
+    if isinstance(value, dict):
+        gate = suite_gate(value)
+        return gate["detail"] if gate["clean"] else None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.lower() in {"clean", "ok", "pass", "passed"}:
+        return text
+    gate = suite_gate({"returncode": 0, "summary": text})
+    return gate["detail"] if gate["clean"] else None
+
+
+def _preflight_clean(value: Any) -> bool:
+    """Whether an import-preflight result reads clean. Fails closed."""
+    if isinstance(value, dict):
+        return value.get("clean") is True
+    text = str(value or "").strip().lower()
+    return text in {"clean", "ok", "pass", "passed"}
+
+
+def import_preflight(path: str | Path, *, base: str, head: str, timeout: float = 300.0) -> dict[str, Any]:
+    """Compile every Python file the head changes against ``base``.
+
+    The floor under "import preflight clean": a file that does not even
+    COMPILE cannot be imported, and a suite that never imports it (an
+    unreachable module, a missing guard) would otherwise call the tree clean.
+    Fails closed: an unreadable base/head or a git failure is NOT clean. The
+    detail is bounded and carries paths only, never file contents."""
+    import subprocess
+
+    root = str(path)
+    try:
+        names = subprocess.run(
+            ["git", "-C", root, "diff", "--name-only", "--diff-filter=d", f"{base}..{head}", "--", "*.py"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=timeout,
+        ).stdout
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _gate(False, f"preflight cannot read the diff: {type(exc).__name__}")
+    failed: list[str] = []
+    for name in [line.strip() for line in names.splitlines() if line.strip()]:
+        try:
+            source = subprocess.run(
+                ["git", "-C", root, "show", f"{head}:{name}"],
+                capture_output=True,
+                check=True,
+                timeout=timeout,
+            ).stdout
+        except (subprocess.SubprocessError, OSError) as exc:
+            failed.append(f"{name}: unreadable ({type(exc).__name__})")
+            continue
+        try:
+            compile(source, name, "exec")
+        except SyntaxError as exc:
+            failed.append(f"{name}: SyntaxError line {exc.lineno}")
+    if failed:
+        return _gate(False, "; ".join(failed)[:500])
+    return _gate(True, f"{len(names.splitlines())} file(s) compiled")
+
+
+#: A test file by name: ``test_*.py``, ``*_test.py``, or under ``tests/``.
+_TEST_FILE_RE = re.compile(r"(^|/)(test_[^/]*|[^/]*_test)\.py$|(^|/)tests/")
+
+
+def _is_test_file(name: str) -> bool:
+    return bool(_TEST_FILE_RE.search(str(name or "")))
+
+
+#: Assertion mentions (for the weak/removed assertion guard).
+_ASSERT_RE = re.compile(r"^\s*(assert\b|self\.assert\w+|pytest\.raises\b|self\.fail\b)", re.MULTILINE)
+#: Skips, xfails and unconditional deselects a fix must never ADD.
+_SKIP_RE = re.compile(
+    r"pytest\.skip|pytest\.xfail|@pytest\.mark\.(skip|xfail)|\bskip_test\b|unittest\.skip|\bxfail\b",
+    re.IGNORECASE,
+)
+_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@", re.MULTILINE)
+
+
+def _not_ok(why: str, **extra: Any) -> dict[str, Any]:
+    return {"ok": False, "why": why, "lines": 0, **extra}
+
+
+def test_integrity(
+    path: str | Path, *, base: str, head: str, budget: int | None = None, timeout: float = 300.0
+) -> dict[str, Any]:
+    """The test-integrity guard on ONE fix commit range.
+
+    A fix commit that DELETES a test file, removes or weakens an assertion,
+    ADDS a skip/xfail, or grows the diff past ``budget`` lines is rejected: the
+    round fails, nothing merges and the operator is told. Reject, never repair
+    -- the guard is what stops a fixer from turning a red suite green by
+    editing the tests. Fails closed: an unreadable diff is a rejection."""
+    import subprocess
+
+    limit = GRIND_DIFF_BUDGET if budget is None else int(budget)
+    root = str(path)
+
+    def git(*args: str) -> str:
+        out = subprocess.run(
+            ["git", "-C", root, *args], capture_output=True, text=True, check=True, timeout=timeout
+        ).stdout
+        return out
+
+    try:
+        name_status = git("diff", "--name-status", "-M", f"{base}..{head}")
+        numstat = git("diff", "--numstat", f"{base}..{head}")
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _not_ok(f"cannot read the fix diff: {type(exc).__name__}")
+    deleted = [line.split("\t", 1)[1] for line in name_status.splitlines() if line.startswith(("D\t", "D "))]
+    for name in deleted:
+        if _is_test_file(name):
+            return _not_ok(f"deleted: {name}")
+    lines = 0
+    for row in numstat.splitlines():
+        parts = row.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            lines += int(parts[0]) + int(parts[1])
+        except ValueError:  # a binary file: "-\t-\tpath"
+            continue
+    if lines > limit:
+        return _not_ok(f"over the diff budget: {lines} > {limit}", lines=lines)
+    try:
+        diff = git("diff", "-U0", "-M", f"{base}..{head}")
+    except (subprocess.SubprocessError, OSError) as exc:
+        return _not_ok(f"cannot read the fix patch: {type(exc).__name__}")
+    current = ""
+    added_asserts = removed_asserts = 0
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            current = line[4:].strip()
+            if current.startswith("b/"):
+                current = current[2:]
+            added_asserts = removed_asserts = 0
+            continue
+        if line.startswith(("--- ", "@@", "diff ", "index ", "new file", "similarity", "rename", "deleted file")):
+            continue
+        if not line.startswith(("+", "-")):
+            continue
+        body = line[1:]
+        if line.startswith("+"):
+            if _SKIP_RE.search(body):
+                return _not_ok(f"skip added: {current}")
+            if _ASSERT_RE.search(body):
+                added_asserts += 1
+                continue
+        elif _ASSERT_RE.search(body):
+            removed_asserts += 1
+            continue
+        # Only a test file's non-assert LINE removal counts, and only when no
+        # assertion replaced it: a refactor that keeps the coverage is not a
+        # weakening.
+        if (
+            _is_test_file(current)
+            and line.startswith("-")
+            and body.strip()
+            and not body.lstrip().startswith("#")
+            and removed_asserts > added_asserts
+        ):
+            return _not_ok(f"assertion removed: {current}", lines=lines)
+    if removed_asserts > added_asserts:
+        return _not_ok(f"assertion removed: {current}", lines=lines)
+    return {"ok": True, "why": "", "lines": lines}
+
+
+def green_marker_key(job_id: str, head: str) -> str:
+    """The durable GREEN record for one (work row, head)."""
+    return f"{_KEY_MARK}:grind:green:{job_id}:{str(head or '')[:12]}"
+
+
+def green_marker(state: Any, job_id: str) -> dict[str, Any] | None:
+    """The GREEN record of ``job_id`` (newest head), or None."""
+    keys = getattr(state, "keys", None)
+    if not callable(keys):
+        return None
+    for key in reversed(keys(f"{_KEY_MARK}:grind:green:{job_id}:")):
+        value = state.value(key, None)
+        if isinstance(value, dict) and value.get("head"):
+            return value
+    return None
+
+
+def record_spend(state: Any, job_id: str, usd: float, *, now: float | None = None) -> float:
+    """Add ``usd`` to the row's grind spend and return the total."""
+    key = f"{_KEY_MARK}:grind:spend:{job_id}"
+    spent = 0.0
+    raw = state.value(key, None)
+    if isinstance(raw, dict):
+        try:
+            spent = float(raw.get("usd") or 0.0)
+        except (TypeError, ValueError):
+            spent = 0.0
+    total = max(spent, 0.0) + max(float(usd or 0.0), 0.0)
+    stamp = time.time() if now is None else float(now)
+    state.set_value(key, {"usd": round(total, 6), "at": stamp}, ttl=MARK_TTL_SEC)
+    return total
+
+
+def grind_spend(state: Any, job_id: str) -> float:
+    """What the row's grind has spent so far (USD)."""
+    raw = state.value(f"{_KEY_MARK}:grind:spend:{job_id}", None)
+    try:
+        return max(float((raw or {}).get("usd") or 0.0), 0.0) if isinstance(raw, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _grind_key(job_id: str) -> str:
+    return f"{_KEY_MARK}:grind:state:{job_id}"
+
+
+def grind_state(row: dict[str, Any], state: Any) -> dict[str, Any]:
+    """The row's durable grind state: rounds, reviewed heads, fingerprints, fixers."""
+    raw = state.value(_grind_key(str(row.get("id") or "")), None)
+    base = {
+        "rounds": 0,
+        "lineage_round": 0,
+        "reviewed": [],
+        "unresolved": [],
+        "fingerprints": [],
+        "fixers": [],
+        "fix_pending": None,
+        "rejections": 0,
+    }
+    if isinstance(raw, dict):
+        for name, default in base.items():
+            value = raw.get(name, default)
+            base[name] = value if isinstance(value, type(default)) or default is None else default
+    return base
+
+
+def save_grind_state(job_id: str, state: Any, data: dict[str, Any], *, now: float) -> None:
+    """Persist the grind state (durable: every guard on the loop reads it)."""
+    state.set_value(_grind_key(job_id), {**data, "at": now}, ttl=MARK_TTL_SEC)
 
 
 def continuation_lineage(row: dict[str, Any], state: Any = None) -> tuple[str, int]:
@@ -2126,6 +2618,41 @@ def _hard_lane_routes(roster: list[dict]) -> list[dict]:
     return sorted(hard, key=lambda r: review_queue._bulk_key(r, review_queue.LANE_HARD))
 
 
+def _author_family(row: dict[str, Any]) -> str:
+    author = author_model(row)
+    return review_queue.family_of(author) if author else ""
+
+
+def fixer_pick(
+    row: dict[str, Any],
+    review: dict[str, Any],
+    *,
+    fixers: list[str] | None = None,
+    round_no: int = 1,
+    roster: list[dict] | None = None,
+) -> dict[str, Any] | None:
+    """The model a FIX round runs on (in place, on the row's own branch).
+
+    Alternation (operator 2026-11-01): the fixer's family differs from the
+    branch author's, from every reviewer that requested changes, and from every
+    family that already fixed this row. Round 1 prefers the author's own
+    route (the author knows its own code and is not a reviewer), later rounds
+    take the strongest hard-lane route outside every one of those families.
+    ``{"model", "route"}`` or None (the row escalates: no cross-family fixer)."""
+    blocked = {f for f in [*(review.get("requested_by") or []), *(review.get("families") or []), *(fixers or [])] if f}
+    blocked |= set(review_queue.FORBIDDEN_FAMILIES) | set(review_queue.NEVER_REVIEW_FAMILIES)
+    # The FIXER's family must differ from the branch author's as well: a
+    # same-family fixer could not be reviewed by the author's family either,
+    # and the operator rule pairs reviewer and author across families.
+    author_family = _author_family(row)
+    for route in _hard_lane_routes(list(roster if roster is not None else review_queue.load_roster())):
+        family = str(route.get("family") or "")
+        if not family or family in blocked or family == author_family:
+            continue
+        return {"model": str(route.get("model_id") or ""), "route": route}
+    return None
+
+
 def ladder_pick(
     row: dict[str, Any], review: dict[str, Any], round_no: int, *, roster: list[dict] | None = None
 ) -> dict[str, Any] | None:
@@ -2151,11 +2678,70 @@ def ladder_pick(
     return None
 
 
+def _reviewer_pick(
+    row: dict[str, Any], review: dict[str, Any], *, fixers: list[str] | None, roster: list[dict] | None
+) -> dict[str, Any] | None:
+    """The model a FOLLOW-UP REVIEW round runs on: a STRONG family only.
+
+    The reviewer's family differs from the author's, from the fixers' and from
+    every family that requested changes (it is the next, independent round).
+    Only a strong family can carry a row to green, so a round that no strong
+    route can review does not run: the row escalates instead of burning a
+    round on a reviewer whose approve would not count."""
+    # ``fixers`` holds MODEL ids, not families: resolve them, or a fixer is
+    # offered its own commit to approve (which could never count).
+    fixer_families = [review_queue.family_of(str(m)) for m in (fixers or []) if m]
+    blocked = {f for f in [*(review.get("requested_by") or []), *(review.get("families") or []), *fixer_families] if f}
+    blocked |= set(review_queue.FORBIDDEN_FAMILIES)
+    author_family = _author_family(row)
+    routes = list(roster if roster is not None else review_queue.load_roster())
+    # Hard-lane routes first (the strongest), then any other STRONG route: a
+    # reviewer only has to be strong and cross-family, not hard-lane.
+    hard = _hard_lane_routes(routes)
+    ordered = hard + [r for r in routes if r not in hard]
+    for route in ordered:
+        model = str(route.get("model_id") or "")
+        family = str(route.get("family") or "")
+        if not family or family in blocked or family == author_family:
+            continue
+        if not is_strong_reviewer(model):
+            continue
+        return {"model": model, "route": route}
+    return None
+
+
+def _job_route(pick: dict[str, Any]) -> tuple[str, dict | None]:
+    """``(model, route)`` from a pick (a bare model string is a pick too)."""
+    if isinstance(pick, str):
+        return pick, None
+    route = pick.get("route") if isinstance(pick.get("route"), dict) else None
+    return str(pick.get("model") or ""), route
+
+
+def _ceil_tier(row: dict[str, Any], route: dict | None) -> str | None:
+    """The row's cost ceiling, raised to the route's class when that is higher."""
+    tier = str(row.get("max_cost_tier") or "").strip().upper()
+    route_tier = str((route or {}).get("cost_class") or "").strip().upper()
+    if route_tier in COST_CLASSES and (
+        tier not in COST_CLASSES or COST_CLASSES.index(route_tier) > COST_CLASSES.index(tier)
+    ):
+        tier = route_tier
+    return tier or None
+
+
+def _confine_to_codex(spec: dict[str, Any], route: dict | None) -> dict[str, Any]:
+    """A codex route's job is claimable by the local codex worker only."""
+    if route and review_queue.is_codex_route(route):
+        spec["eligible_kinds"] = [review_queue.CODEX_WORKER_KIND]
+        spec["max_concurrency"] = 1
+    return spec
+
+
 def continuation_brief(row: dict[str, Any], review: dict[str, Any], round_no: int, *, base: str, head: str) -> str:
     """The continuation job's description: context, findings verbatim, the rule."""
     tip = delivered_head(row) or "(unrecorded)"
     lines = [
-        f"Continuation round {int(round_no)} of {CONTINUATION_MAX_ROUNDS} for work job {row.get('id')} "
+        f"Continuation round {int(round_no)} of {GRIND_MAX_ROUNDS} for work job {row.get('id')} "
         f"({row.get('kind') or 'work'}) in {row.get('repo') or '(see job)'}.",
         f"Start from branch {base} at commit {tip}; create the NEW branch {head} from it, commit your fixes "
         f"there and push {head}. Never push to {base}.",
@@ -2173,27 +2759,181 @@ def continuation_brief(row: dict[str, Any], review: dict[str, Any], round_no: in
     return "\n".join(lines)
 
 
+def fix_brief(row: dict[str, Any], review: dict[str, Any], round_no: int, *, head: str) -> str:
+    """The FIX job's description: the blocking findings verbatim, the mandatory rule.
+
+    Verify before fixing is not advice here, it is the instruction: the fixer
+    first reproduces each finding against source with a failing test; when it
+    cannot, it adds a pinning test and a note and the finding is closed as
+    disproved, and correct code is never changed to satisfy a disproved claim.
+    The test-integrity guard rejects a fix that deletes or weakens a test."""
+    tip = delivered_head(row) or "(unrecorded)"
+    blocking = review.get("blocking") or []
+    lines = [
+        f"Fix round {int(round_no)} of {GRIND_MAX_ROUNDS} for work job {row.get('id')} "
+        f"({row.get('kind') or 'work'}) in {row.get('repo') or '(see job)'}.",
+        f"Fix IN PLACE on branch {head} at commit {tip}: commit the fix as a continuation commit on {head} "
+        f"and push {head}. Do not open a new branch and never push to {row.get('base_branch') or '(the base)'}.",
+        f"A cross-family review ({', '.join(review.get('reviewers') or []) or 'reviewer'}; families "
+        f"{', '.join(review.get('families') or []) or 'unknown'}) found {len(blocking)} BLOCKING finding(s) "
+        f"on {review.get('head') or tip}. Only these are in scope; medium and low findings are "
+        "recorded for follow-up and must not be chased here:",
+        "",
+    ]
+    for index, finding in enumerate(blocking, start=1):
+        lines.append(f"{index}. [{finding['severity']}] {finding['location']} -- {finding['title']}")
+        if finding.get("body"):
+            lines.append(f"   {finding['body']}")
+    lines += [
+        "",
+        f"Standing instruction: {CONTINUATION_INSTRUCTION}.",
+        "Do not delete or weaken an existing assertion or test, and never add a skip or xfail: "
+        f"such a commit is rejected and the round fails (diff budget +{GRIND_DIFF_BUDGET} lines).",
+    ]
+    return "\n".join(lines)
+
+
+def review_brief(row: dict[str, Any], review: dict[str, Any], *, head: str, gate: dict[str, Any]) -> str:
+    """The follow-up REVIEW job's description: the DELTA and the prior findings.
+
+    Each round reviews the DELTA since the last reviewed head plus whether the
+    prior blocking findings were resolved -- not a fresh full review."""
+    prior = review.get("blocking") or []
+    last = review.get("head") or delivered_head(row) or "(unrecorded)"
+    lines = [
+        "READ-ONLY review. Do not modify any file, branch, or commit. No commits expected.",
+        f"Grind round review for work job {row.get('id')} on branch {head or '(see job)'} at HEAD {last}.",
+        f"Review the DELTA since the last reviewed head {last} and whether each prior blocking finding "
+        "was resolved; do not repeat a fresh full review. Return a structured verdict JSON with a "
+        "'verdict' field (approve | request_changes | blocked), a 'head_sha' field with the exact reviewed "
+        "commit, a 'reason' and located findings.",
+        "",
+        "Prior blocking findings:",
+    ]
+    if prior:
+        for index, finding in enumerate(prior, start=1):
+            lines.append(f"{index}. [{finding['severity']}] {finding['location']} -- {finding['title']}")
+    else:
+        lines.append("(none: this is the first round)")
+    lines += [
+        "",
+        f"This round's objective gates: suite={gate.get('suite')}, import_preflight={gate.get('import_preflight')}.",
+        f"Reviewed job id: {row.get('id')}.",
+    ]
+    return "\n".join(lines)
+
+
+def follow_up_spec(
+    row: dict[str, Any], finding: dict[str, str], review: dict[str, Any], *, state: Any = None
+) -> dict[str, Any]:
+    """One follow-up row for a NON-BLOCKING finding (operator 2026-11-01).
+
+    ``parent_job_id`` is the WORK row, never a review job: the finding rides
+    with the work it came from, it never re-opens the grind loop and it never
+    blocks a merge. The key is per (row, finding fingerprint, reviewed head) so
+    the same finding is written once."""
+    if review_queue.is_review_kind(row) or str(row.get("kind") or "").startswith(("review:", "triage:")):
+        raise ValueError(f"refused follow-up: {row.get('id')} is not a work row")
+    jid = str(row.get("id") or "")
+    # The key carries the SEVERITY, which the stall fingerprint deliberately
+    # does not: a medium and a low raised at the same place are two rows to
+    # write, while a re-raised finding in the stall detector is still one.
+    fingerprint = f"{finding_fingerprint(finding)}|{str(finding.get('severity') or '').strip().lower()}"
+    digest = hashlib.sha1(fingerprint.encode("utf-8")).hexdigest()[:12]
+    base_kind = str(row.get("kind") or "work")
+    base_kind = re.sub(r"^(review|triage):", "", base_kind)
+    head = str(review.get("head") or delivered_head(row) or "")
+    lines = [
+        f"FOLLOW-UP (non-blocking) from a cross-family review of work job {jid} on {head or '(unrecorded)'}.",
+        f"[{finding['severity']}] {finding['location']} -- {finding['title']}",
+    ]
+    if finding.get("body"):
+        lines.append(finding["body"])
+    lines += [
+        "",
+        "This finding is medium/low: it did NOT block the merge and is recorded here so it is not "
+        "lost. Fix it on its own branch; do not touch the reviewed branch for it.",
+    ]
+    return {
+        "kind": f"followup:{base_kind}",
+        "description": "\n".join(lines),
+        "repo": row.get("repo"),
+        "project": row.get("project"),
+        "base_branch": row.get("base_branch"),
+        "priority": 0,
+        "parent_job_id": jid,
+        "idempotency_key": (
+            f"{FOLLOW_UP_KEY_PREFIX}:{jid}:{digest}:{head[:12] or 'nohead'}"
+            f":{str(review.get('review_job_id') or '')[:12]}"
+        ),
+    }
+
+
+def grind_spec(
+    row: dict[str, Any],
+    review: dict[str, Any],
+    round_no: int,
+    pick: dict[str, Any] | str,
+    *,
+    state: Any = None,
+    kind: str = FIX,
+    gate: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The fix (in place) or follow-up-review job for ``row``'s next round.
+
+    A FIX job commits on the row's OWN branch (``head_branch``): the fix is a
+    continuation commit on the branch under review, never a new branch, so the
+    next round sees the delta. A follow-up REVIEW job is read-only on that
+    branch. Raises ValueError for a review row: the parent is always the WORK
+    row, never a review job."""
+    if review_queue.is_review_kind(row) or str(row.get("kind") or "").startswith(("review:", "triage:")):
+        raise ValueError(f"refused continuation: {row.get('id')} is not a work row")
+    model, route = _job_route(pick)
+    head = str(row.get("head_branch") or "").strip()
+    if not head:
+        raise ValueError(f"refused continuation: {row.get('id')} has no head_branch")
+    root, _own = continuation_lineage(row, state)
+    tip = delivered_head(row)
+    is_fix = kind == FIX
+    if is_fix:
+        description = fix_brief(row, review, round_no, head=head)
+    else:
+        description = review_brief(row, review, head=head, gate=gate or {})
+    spec: dict[str, Any] = {
+        "kind": row.get("kind"),
+        "description": description,
+        "repo": row.get("repo"),
+        "project": row.get("project"),
+        "head_branch": head,
+        "base_branch": row.get("base_branch"),
+        "eligible_kinds": list(row.get("eligible_kinds") or []),
+        "preferred_models": [model],
+        "max_cost_tier": _ceil_tier(row, route),
+        "priority": row.get("priority") or 0,
+        "parent_job_id": str(row.get("id") or ""),
+        "idempotency_key": f"{GRIND_KEY_PREFIX}:{root}:{kind}:r{int(round_no)}:{(tip or 'nohead')[:12]}",
+    }
+    if not is_fix:
+        spec["kind"] = f"review:{re.sub(r'^(review|triage):', '', str(row.get('kind') or 'work'))}"
+    return _confine_to_codex(spec, route)
+
+
 def continuation_spec(
     row: dict[str, Any], review: dict[str, Any], round_no: int, pick: dict[str, Any] | str, *, state: Any = None
 ) -> dict[str, Any]:
-    """The continuation job for ``row``. Raises ValueError for a review row:
-    the parent of a continuation is always the WORK row, never a review job."""
+    """The continuation job for ``row`` (a NEW ``-rN`` branch cut from its head).
+
+    Kept for the ``missing_branch``/``stranded_wip`` style repair path; the
+    grind loop fixes IN PLACE and uses :func:`grind_spec`."""
     if review_queue.is_review_kind(row) or str(row.get("kind") or "").startswith(("review:", "triage:")):
         raise ValueError(f"refused continuation: {row.get('id')} is not a work row")
-    pick = {"model": pick, "route": None} if isinstance(pick, str) else pick
+    model, route = _job_route(pick)
     base = str(row.get("head_branch") or "").strip()
     if not base:
         raise ValueError(f"refused continuation: {row.get('id')} has no head_branch")
     head = continuation_branch(row, round_no, state)
     root, _own = continuation_lineage(row, state)
     tip = delivered_head(row)
-    route = pick.get("route") if isinstance(pick.get("route"), dict) else None
-    tier = str(row.get("max_cost_tier") or "").strip().upper()
-    route_tier = str((route or {}).get("cost_class") or "").strip().upper()
-    if route_tier in COST_CLASSES and (
-        tier not in COST_CLASSES or COST_CLASSES.index(route_tier) > COST_CLASSES.index(tier)
-    ):
-        tier = route_tier
     spec: dict[str, Any] = {
         "kind": row.get("kind"),
         "description": continuation_brief(row, review, round_no, base=base, head=head),
@@ -2202,17 +2942,13 @@ def continuation_spec(
         "head_branch": head,
         "base_branch": base,
         "eligible_kinds": list(row.get("eligible_kinds") or []),
-        "preferred_models": [pick["model"]],
-        "max_cost_tier": tier or None,
+        "preferred_models": [model],
+        "max_cost_tier": _ceil_tier(row, route),
         "priority": row.get("priority") or 0,
         "parent_job_id": str(row.get("id") or ""),
         "idempotency_key": f"{CONTINUATION_KEY_PREFIX}:{root}:r{int(round_no)}:{(tip or 'nohead')[:12]}",
     }
-    if route and review_queue.is_codex_route(route):
-        # Same confinement as a Codex review: only the local codex worker claims it.
-        spec["eligible_kinds"] = [review_queue.CODEX_WORKER_KIND]
-        spec["max_concurrency"] = 1
-    return spec
+    return _confine_to_codex(spec, route)
 
 
 def _continuation_candidate(row: dict[str, Any]) -> bool:
@@ -2238,19 +2974,136 @@ def continue_one(
     allow_submit: bool = True,
     head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
     job_lookup: Callable[[str], dict | None] | None = None,
+    gates: Callable[[str], dict[str, Any] | None] | None = None,
+    integrity: Callable[..., dict[str, Any]] | None = None,
+    add_followup: Callable[[dict], tuple[int, Any]] | None = None,
 ) -> tuple[Outcome, dict | None]:
-    """Continue ONE row, or say why not. Returns ``(outcome, spec or None)``."""
+    """Continue ONE row, or say why not. Returns ``(outcome, spec or None)``.
+
+    Operator 2026-11-01: doctor reviews GRIND UNTIL GREEN with ALTERNATING
+    FIX-IN-PLACE reviewers, under hard limits. This is the bounded loop that
+    replaces "two automatic rounds then escalate":
+
+    1. GREEN first: a STRONG-family structured APPROVE on the exact head, with
+       the merged-tree suite and import preflight clean, ends the row and is
+       recorded durably (``green_marker``).
+    2. Non-blocking findings (medium/low) are recorded as follow-up rows
+       (``parent_job_id`` = this work row) and never re-open the loop.
+    3. A blocking finding (high/critical) gets a FIX job IN PLACE: a
+       continuation commit on the row's own branch, from a family that is
+       neither the author's nor a requesting reviewer's.
+    4. A fix commit that fails the test-integrity guard fails the round and
+       escalates once -- it is never merged.
+    5. The same finding fingerprint surviving a fix is a stall: escalate once.
+    6. ``GRIND_MAX_ROUNDS`` and the per-row spend cap escalate ONCE and stop.
+    """
     now = time.time() if now is None else float(now)
     jid = str(row.get("id") or "")
     if not _continuation_candidate(row):
         return Outcome(jid, SKIPPED, "continuation", "not a needs-review work row"), None
-    review = best_review(row, children(row), head_is_verdict_only=head_is_verdict_only)
-    if review is None:
-        return Outcome(jid, NO_CHANGE, "continuation", "no request_changes with located findings on the tip"), None
     tip = delivered_head(row)
-    for done in range(1, CONTINUATION_MAX_ROUNDS + 1):
-        if already_fixed(state, continuation_key(jid, tip, done), now=now):
-            return Outcome(jid, NO_CHANGE, "continuation", f"already continued (round {done})"), None
+    gs = grind_state(row, state)
+    # A row that already IS round N of a grind seeds its round count from its
+    # lineage: the cap must hold for a row whose grind state was never written
+    # (a restarted doctor, a dropped record), not just for one it watched.
+    # ``rounds`` counts grind rounds already ATTEMPTED for this row. A row that
+    # IS continuation round N was produced by the escalation round that
+    # preceded it, so N-1 grind rounds have run: the next one is round N.
+    # The root itself (round 0) starts at zero.
+    _root, lineage_round = continuation_lineage(row, state)
+    lineage_spent = max(int(lineage_round or 0) - 1, 0)
+    if lineage_spent > int(gs.get("rounds") or 0):
+        gs["rounds"] = lineage_spent
+    # The row's own lineage round is what the CAP counts: continuation round N
+    # is the Nth round of this grind, whether or not its grind state survived.
+    gs["lineage_round"] = max(int(lineage_round or 0), int(gs.get("lineage_round") or 0))
+    # ── 1. GREEN is objective: gates clean AND a strong approve on the head ──
+    marker = green_marker(state, jid)
+    if marker is not None and str(marker.get("head") or "") == tip:
+        return Outcome(jid, NO_CHANGE, "continuation", f"green already recorded on {tip[:12]}"), None
+    reviews = children(row)
+    readings = [
+        r
+        for r in (read_review(row, review, tip=tip, head_is_verdict_only=head_is_verdict_only) for review in reviews)
+        if r is not None
+    ]
+    if gates is not None:
+        # A FIXER never approves its own commit: an approve from a family that
+        # fixed this row is not green, however clean the gates are.
+        fixer_families_now = {review_queue.family_of(str(m)) for m in (gs.get("fixers") or []) if m}
+        for reading in readings:
+            if reading.get("verdict") != "approve":
+                continue
+            if fixer_families_now & set(reading.get("families") or []):
+                continue
+            candidate = {**reading, "gates": gates(tip)}
+            if green_blocker(candidate):
+                continue
+            if dry_run:
+                return Outcome(jid, DRY_WOULD_APPLY, "continuation", f"would be green on {tip[:12]}"), None
+            state.set_value(
+                green_marker_key(jid, tip),
+                {"head": tip, "round": int(gs.get("rounds") or 0), "at": now},
+                ttl=MARK_TTL_SEC,
+            )
+            return Outcome(jid, GREEN, "continuation", f"green on {tip[:12]}"), None
+    # ── 2. Only a BLOCKING finding continues the loop ─────────────────────────
+    # A FIXER never reviews its own commit: drop any review whose families
+    # include a family that fixed this row (operator 2026-11-01).
+    fixer_families = {review_queue.family_of(str(m)) for m in (gs.get("fixers") or []) if m}
+    if fixer_families:
+        readings = [r for r in readings if not (set(r.get("families") or []) & fixer_families)]
+    # ``best_review`` re-reads what it is given, so it must see ONLY the
+    # surviving reviews: passing the raw ``reviews`` would put a fixer's back.
+    # Review job ids are not unique in a live bus replay, so the pairing is
+    # by family rather than by id.
+    pool = reviews
+    if fixer_families:
+        pool = [
+            review
+            for review in reviews
+            if not (
+                set(
+                    review_queue.family_of(m)
+                    for m in _review_models(review, result_dict(review))
+                    if review_queue.family_of(m)
+                )
+                & fixer_families
+            )
+        ]
+    review = best_review(row, pool, head_is_verdict_only=head_is_verdict_only)
+    # Findings come from EVERY review on the tip, not just the best one: a
+    # medium from one reviewer and a low from another are two follow-up rows
+    # (operator 2026-11-01), and a blocking finding anywhere still blocks.
+    findings = [f for r in readings for f in (r.get("findings") or [])]
+    blocking = blocking_findings(findings)
+    soft = [f for f in findings if f not in blocking]
+    recorded = 0
+    if soft and add_followup is not None:
+        # One follow-up row per (review, finding): two reviewers raising the
+        # same soft finding are two rows, and a finding is written once.
+        for reading in readings:
+            for finding in reading.get("findings") or []:
+                if finding in blocking:
+                    continue
+                spec = follow_up_spec(row, finding, reading, state=state)
+                if dry_run or already_fixed(state, spec["idempotency_key"], now=now):
+                    continue
+                code, _resp = add_followup(spec)
+                if code in (200, 201):
+                    mark_fixed(state, spec["idempotency_key"], at=now)
+                    recorded += 1
+    if review is None or not blocking:
+        if recorded:
+            return (
+                Outcome(
+                    jid, FOLLOW_UP, "continuation", f"{recorded} non-blocking finding(s) recorded", attempts=recorded
+                ),
+                None,
+            )
+        return Outcome(jid, NO_CHANGE, "continuation", "no blocking finding on the tip"), None
+    if not dry_run and recorded:
+        log.info("continuation: job=%s recorded %d non-blocking finding(s)", jid[:12], recorded)
     if not _lineage_recorded(row, state):
         # Guard 1 (DeepSeek HIGH 2026-11-01): with the lineage record AND the
         # key both gone the fallback reads round 0, and a row that already IS a
@@ -2259,32 +3112,80 @@ def continue_one(
         refused = _refuse_unknown_lineage(row, state, escalate, now=now, dry_run=dry_run, job_lookup=job_lookup)
         if refused is not None:
             return refused, None
-    root, spent = rounds_spent(row, state)
-    round_no = spent + 1
-    pick = ladder_pick(row, review, round_no, roster=roster) if spent < CONTINUATION_MAX_ROUNDS else None
-    if pick is None:
+    # Idempotency is per (row, tip, ROUND): a second sweep on the same tip is
+    # the same round and creates nothing, while the round after a fix (a NEW
+    # tip) is a different round and must run.
+    next_round = int(gs.get("rounds") or 0) + 1
+    if already_fixed(state, continuation_key(jid, tip, next_round), now=now):
+        return Outcome(jid, NO_CHANGE, "continuation", "already continued on this tip"), None
+    # ── 3. A fix already committed on this head must pass test integrity ──────
+    pending = gs.get("fix_pending")
+    pending_head = str((pending or {}).get("head") or "") if isinstance(pending, dict) else ""
+    if pending_head and integrity is not None:
+        base_head = pending_head if pending_head != tip else str((pending or {}).get("base") or pending_head)
+        check = integrity(str(row.get("repo") or ""), base=base_head, head=tip)
+        if not (isinstance(check, dict) and check.get("ok")):
+            why = (
+                f"continuation: test_integrity -- the fix on {tip[:12]} changed tests it must not "
+                f"({(check or {}).get('why') or 'unreadable'}); the round failed and is not merged"
+            )
+            key = continuation_escalation_key(jid)
+            if dry_run or _marked_within(state, key, ESCALATE_TTL_SEC, now):
+                return Outcome(jid, REJECTED, "continuation", "test_integrity", reason=why), None
+            escalate(row, why)
+            state.set_value(key, {"at": now}, ttl=MARK_TTL_SEC)
+            return Outcome(jid, REJECTED, "continuation", "test_integrity", reason=why), None
+    # ── 4. Stall: the same fingerprint survived a fix ─────────────────────────
+    prints = finding_fingerprints(blocking)
+    prior = [str(p) for p in (gs.get("fingerprints") or [])]
+    if prints and set(prints) <= set(prior):
         why = (
-            f"continuation: {spent} automatic round(s) spent (max {CONTINUATION_MAX_ROUNDS}); "
-            f"changes still requested by {', '.join(review['reviewers'])} on {tip[:12]}"
-            if spent >= CONTINUATION_MAX_ROUNDS
-            else f"continuation: no round {round_no} model outside the reviewers' families "
-            f"({', '.join(review.get('requested_by') or [])})"
+            f"continuation: stall -- the same finding fingerprint survived the fix on {tip[:12]} "
+            f"(round {int(gs.get('rounds') or 0)}): {', '.join(sorted(set(prints))[:3])}"
         )
-        key = continuation_escalation_key(root)
-        if _marked_within(state, key, ESCALATE_TTL_SEC, now):
-            return Outcome(jid, SKIPPED, "continuation", "escalated already", reason=why), None
-        if dry_run:
-            return Outcome(jid, DRY_WOULD_APPLY, "continuation", "would escalate", reason=why), None
+        key = continuation_escalation_key(jid)
+        if dry_run or _marked_within(state, key, ESCALATE_TTL_SEC, now):
+            return Outcome(jid, STALLED, "continuation", "stall", reason=why), None
         escalate(row, why)
         state.set_value(key, {"at": now}, ttl=MARK_TTL_SEC)
-        return Outcome(jid, ESCALATED, "continuation", "rounds spent" if spent else "no ladder model", reason=why), None
+        return Outcome(jid, STALLED, "continuation", "stall", reason=why), None
+    # ── 5. Hard limits: rounds, then spend -- escalate ONCE and stop ──────────
+    spent = int(gs.get("rounds") or 0)
+    limit = _grind_limit_reason(jid, state, max(spent, int(gs.get("lineage_round") or 0)), now)
+    if limit is not None:
+        why = limit
+        key = continuation_escalation_key(jid)
+        if dry_run or _marked_within(state, key, ESCALATE_TTL_SEC, now):
+            return Outcome(jid, ESCALATED, "continuation", "limit reached", reason=why), None
+        escalate(row, why)
+        state.set_value(key, {"at": now}, ttl=MARK_TTL_SEC)
+        return Outcome(jid, ESCALATED, "continuation", "limit reached", reason=why), None
+    # ── 6. The next round: a fixer, or the review of that fix ─────────────────
+    fixers = [str(f) for f in (gs.get("fixers") or [])]
+    round_no = spent + 1
+    if not pending_head:
+        pick = fixer_pick(row, review, fixers=fixers, round_no=round_no, roster=roster)
+        kind, missing = FIX, "no cross-family fixer"
+    else:
+        pick = _reviewer_pick(row, review, fixers=fixers, roster=roster)
+        kind, missing = REVIEW, "no strong reviewer family outside the fixer's"
+    if pick is None:
+        why = f"continuation: {missing} for round {round_no} on {tip[:12]}"
+        key = continuation_escalation_key(jid)
+        if dry_run or _marked_within(state, key, ESCALATE_TTL_SEC, now):
+            return Outcome(jid, SKIPPED, "continuation", "escalated already", reason=why), None
+        escalate(row, why)
+        state.set_value(key, {"at": now}, ttl=MARK_TTL_SEC)
+        return Outcome(jid, ESCALATED, "continuation", missing, reason=why), None
     if not allow_submit:
         return Outcome(jid, "deferred", "continuation", f"per-sweep cap ({CONTINUATION_MAX_PER_SWEEP})"), None
     # Guard 2: the global hourly brake, independent of every per-row record.
     if continuations_last_hour(state, now) >= CONTINUE_MAX_PER_HOUR:
         return Outcome(jid, THROTTLED, "continuation", f"hourly brake ({CONTINUE_MAX_PER_HOUR} per hour)"), None
-    spec = continuation_spec(row, review, round_no, pick, state=state)
-    detail = f"round {round_no} on {pick['model']}: {spec['base_branch']} -> {spec['head_branch']}"
+    spec = grind_spec(row, review, round_no, pick, state=state, kind=kind)
+    spec.update(_confine_to_codex(spec, _job_route(pick)[1]))
+    model = _job_route(pick)[0]
+    detail = f"round {round_no} {kind} on {model}: {spec['head_branch']}"
     if dry_run:
         return Outcome(jid, DRY_WOULD_APPLY, "continuation", detail), spec
     # Guard 3: nothing is created unless the store is durable, before AND after
@@ -2299,9 +3200,38 @@ def continue_one(
     if code not in (200, 201) or not new_id:
         return Outcome(jid, FAILED, "continuation", detail, error=f"submit http={code}"), spec
     mark_fixed(state, continuation_key(jid, tip, round_no), at=now)
-    state.set_value(_rounds_key(root), max(spent, round_no), ttl=MARK_TTL_SEC)
-    state.set_value(_lineage_key(str(new_id)), {"root": root, "round": round_no}, ttl=MARK_TTL_SEC)
+    state.set_value(_lineage_key(str(new_id)), {"root": _grind_root(row, state), "round": round_no}, ttl=MARK_TTL_SEC)
+    # Rounds ATTEMPTED. The round just submitted is round ``round_no``; the
+    # next sweep asks for ``round_no + 1``.
+    gs["rounds"] = round_no
+    # ``rounds`` is rounds ATTEMPTED; the next sweep asks for ``rounds + 1``.
+    gs["fingerprints"] = sorted(set(prints) | set(prior))
+    if kind == FIX:
+        gs["fix_pending"] = {"head": tip, "round": round_no}
+        gs["fixers"] = sorted({*fixers, model})
+    else:
+        gs["reviewed"] = sorted({*[str(h) for h in (gs.get("reviewed") or [])], tip})
+        gs["fix_pending"] = None
+    save_grind_state(jid, state, gs, now=now)
     return Outcome(jid, APPLIED, "continuation", f"{detail} (job {str(new_id)[:12]})", attempts=round_no), spec
+
+
+def _grind_root(row: dict[str, Any], state: Any) -> str:
+    """The root work row of ``row`` (itself when it is not a continuation)."""
+    return continuation_lineage(row, state)[0]
+
+
+def _grind_limit_reason(job_id: str, state: Any, spent: int, now: float) -> str | None:
+    """Why the row's grind must stop and escalate, or None while it may run."""
+    if spent >= GRIND_MAX_ROUNDS:
+        return (
+            f"continuation: grind cap -- {spent} round(s) spent (max {GRIND_MAX_ROUNDS}, "
+            f"HIVE_DOCTOR_GRIND_MAX_ROUNDS); escalation with the evidence"
+        )
+    used = grind_spend(state, job_id)
+    if used >= GRIND_MAX_SPEND_USD:
+        return f"continuation: spend cap -- ${used:.2f} spent (max ${GRIND_MAX_SPEND_USD:.2f}); escalation"
+    return None
 
 
 def _refuse_unknown_lineage(
@@ -2351,6 +3281,9 @@ def continuation_sweep(
     max_per_sweep: int | None = None,
     head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
     job_lookup: Callable[[str], dict | None] | None = None,
+    gates: Callable[[str], dict[str, Any] | None] | None = None,
+    integrity: Callable[..., dict[str, Any]] | None = None,
+    add_followup: Callable[[dict], tuple[int, Any]] | None = None,
 ) -> dict[str, Any]:
     """One pass of the continuation loop over ``rows`` (oldest first, capped).
 
@@ -2396,6 +3329,9 @@ def continuation_sweep(
                 allow_submit=used < cap,
                 head_is_verdict_only=head_is_verdict_only,
                 job_lookup=job_lookup,
+                gates=gates,
+                integrity=integrity,
+                add_followup=add_followup,
             )
         except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
             summary["errors"] = summary.get("errors", 0) + 1
@@ -2407,7 +3343,12 @@ def continuation_sweep(
             summary.setdefault("would_submit", []).append(
                 {k: spec.get(k) for k in ("parent_job_id", "head_branch", "base_branch", "preferred_models")}
             )
-        summary[outcome.status] = summary.get(outcome.status, 0) + 1
+        if outcome.status == FOLLOW_UP and outcome.attempts:
+            # One row can record SEVERAL non-blocking findings: the count is
+            # the findings written, not the rows that wrote them.
+            summary[FOLLOW_UP] = summary.get(FOLLOW_UP, 0) + int(outcome.attempts)
+        else:
+            summary[outcome.status] = summary.get(outcome.status, 0) + 1
         if outcome.status == REFUSED and outcome.detail == LINEAGE_UNKNOWN:
             # Logged once, with its escalation (``_refuse_unknown_lineage``);
             # a refusal repeated every sweep is not news.
