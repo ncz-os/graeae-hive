@@ -5783,54 +5783,71 @@ def interpret_review_outcome(
     }
 
 
-def _verdict_only_descendant_approval(job: dict, approved: dict) -> bool:
-    """Whether ``approved`` names a REVIEWED commit that only descends from the delivered head by a verdict.
+def _descent_workspaces(job: dict, approved: dict) -> list[str]:
+    """The checkouts that may hold ``approved_sha``: the row's, its in-flight child's, the APPROVING child's.
+
+    Recording the approval clears ``review_job_id`` (the row is settled), so
+    the in-flight lookup finds nothing afterwards; the approving child is the
+    one ``approved["review_job_id"]`` names, read from the row's child listing
+    (its recorded workdir) or by its id under the workspace root.
+    """
+    repos = [_head_branch_workspace(job), _child_workspace(_head_match_child(job) or {})]
+    approver = str(approved.get("review_job_id") or "").strip()
+    if approver:
+        listed = None
+        try:
+            listed = next((c for c in _needs_review_child_review_jobs(job) if str(c.get("id") or "") == approver), None)
+        except RuntimeError:
+            listed = None
+        repos.append(_child_workspace(listed or {"id": approver}))
+    seen: list[str] = []
+    for repo in repos:
+        if repo and repo not in seen:
+            seen.append(repo)
+    return seen
+
+
+def _descent_proof(job: dict, approved: dict) -> str:
+    """Re-prove a recorded verdict-only descent against git: ``proven`` | ``refused`` | ``not_proven``.
 
     ``approved["basis"]`` is the PROOF-BEARING field: only the classifier writes
     it, and only after it has diffed ``T..R`` against git and found nothing but
-    verdict artifacts. It is re-asked of git whenever a workspace still holds
-    both commits: a workspace that now shows a CODE change refuses the approve
-    (the only way a recorded proof could be wrong -- a hand-edited row, or a
-    force-push rewriting the descent).
+    verdict artifacts. It is still never taken on trust: a workspace holding
+    both commits must answer now, and every workspace consulted must agree (a
+    code change in the descent -- a hand-edited row, a force-push rewriting it
+    -- refuses the approve). ``verdict_only_descendant`` alone is a flag any
+    writer can set and is not proof at all.
 
-    A missing workspace does not revoke a recorded proof: the sweep that wrote
-    it had to hold both commits to classify at all, and the review child's
-    checkout is cleaned up routinely -- requiring it here would re-break the
-    production bug this fixes (the approve is cleared, then re-reported stale
-    the moment the workspace ages out). ``verdict_only_descendant`` alone is NOT
-    proof: it is a flag any writer can set, so on its own it does not clear the
-    blocker, and such a row stays stale.
+    No workspace holding both commits is ``not_proven``: head-match is an
+    approval gate and fails CLOSED. A row whose checkout aged out is re-proved
+    (or re-reviewed at its tip) -- it is never merged on a record alone.
     """
     if str(approved.get("basis") or "") != BASIS_VERDICT_ONLY:
-        return False
+        return "refused"
     tip = str(approved.get("head_sha") or "").strip()
     reviewed = str(approved.get("approved_sha") or "").strip()
     if not tip or not reviewed:
-        return False
+        return "refused"
     checked = False
-    for repo in (_head_branch_workspace(job), _child_workspace(_head_match_child(job) or {})):
+    for repo in _descent_workspaces(job, approved):
         if repo and doctor_head_match.checkout_for(repo, tip, reviewed):
-            # At least one workspace was actually consulted; its answer is final
-            # (a code change in the descent refuses the approve).
             checked = True
             if not doctor_head_match.verdict_only_between(repo, tip, reviewed):
-                return False
+                return "refused"
     if checked:
-        return True
-    # No workspace could be consulted at all. The recorded basis is then the
-    # only evidence there is, and it is the classifier's -- it was written only
-    # after a sweep held BOTH commits and diffed them. A missing checkout is
-    # routine (the worker cleans it up), so refusing here would re-break the
-    # production bug: the approve would be cleared and then re-reported stale
-    # the moment the review child's workspace aged out. Callers that must be
-    # certain can consult ``verification`` in the record.
+        return "proven"
     log.info(
-        "head-match: no workspace holds %s..%s; accepting the recorded verdict-only basis for %s",
+        "head-match: no workspace holds %s..%s; the recorded verdict-only basis for %s is not proven",
         str(tip)[:12],
         str(reviewed)[:12],
         str(job.get("id") or "")[:12],
     )
-    return True
+    return "not_proven"
+
+
+def _verdict_only_descendant_approval(job: dict, approved: dict) -> bool:
+    """Whether ``approved`` names a REVIEWED commit PROVEN to descend from the delivered head by a verdict only."""
+    return _descent_proof(job, approved) == "proven"
 
 
 def merge_handoff(job: dict) -> str:
@@ -5863,6 +5880,10 @@ def merge_handoff(job: dict) -> str:
         and not review_verdict.same_sha(approved["approved_sha"], approved["head_sha"])
         and not _verdict_only_descendant_approval(job, approved)
     ):
+        if _descent_proof(job, approved) == "not_proven":
+            # A verdict-only basis no workspace can re-prove: not stale (nothing
+            # says the head moved) and NOT mergeable -- the gate fails closed.
+            return "approval_not_proven"
         # An approval recorded at a verdict-only DESCENDANT covers the delivered
         # head: ``approved.head_sha`` is that head (T) and ``approved_sha`` is the
         # commit the reviewer signed (R, T an ancestor of R, R..T diff touching
@@ -6020,6 +6041,11 @@ def _review_child_outcome(child: dict, *, head_sha: str = "", author_families: s
     if status not in _REVIEW_CHILD_TERMINAL:
         return None
     proof = _row_result_dict(child)
+    if proof.get("review_overreach") or proof.get("failure_reason") == "review_overreach":
+        # The worker refused this review as overreach: whatever verdict it also
+        # carries covers the reviewer's own edits, never the author's tip. It is
+        # never parsed as an approve (a failed child WITH a verdict otherwise is).
+        return {"kind": "reviewer_failure", "failure": "review_overreach", "reviewers": []}
     sources = []
     for key in ("review_evidence", "verdict"):
         if proof.get(key):
@@ -6263,10 +6289,15 @@ def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: 
         # The verdict artifact goes to its OWN ref, never onto the author's branch
         # (production 2026-10-31: four rows would not close because the review job
         # committed its verdict json onto the author branch). The ref is keyed by
-        # the reviewer so the brief can name it before the child id exists.
+        # the REVIEW job's own id, which does not exist until this submit
+        # returns: the worker resolves it and appends the exact ref to this
+        # brief (``job_delivery_brief``). No placeholder is ever sent -- a
+        # literal ``<job id>`` was followed verbatim, or "resolved" to the
+        # reviewed job's id printed just above.
         "The ONLY write a review job makes is its verdict artifact "
-        f"(REVIEW_VERDICT_{_review_ref_slug(head)}.json or review-verdict-<job id>.json); push it to the "
-        "SEPARATE ref review/<author branch>-<your job id> (never the author branch). "
+        f"REVIEW_VERDICT_{_review_ref_slug(head)}.json; push it to the "
+        f"SEPARATE ref review/{head or 'no-branch'}-(this review job's own id), exactly as spelled in "
+        "this job's delivery policy below (never the author branch). "
         f"Never commit, push or amend anything on the author branch {head or '(see job)'}: "
         "any other file changed there is review overreach and the review is refused. No commits expected."
     )
@@ -6372,6 +6403,7 @@ _HEAD_MATCH_OUTCOMES = {
     doctor_head_match.OVERREACH: "review_overreach",
     doctor_head_match.CODE_DESCENDANT: "approval_not_on_head",
     doctor_head_match.NOT_DESCENDANT: "approval_not_on_head",
+    doctor_head_match.NOT_PROVEN: "approval_not_on_head",
 }
 
 #: The per-sweep head-match budget: rows past the cap wait unchanged for the
@@ -6412,6 +6444,9 @@ def _head_match_budget_left() -> bool:
 #: The workspace a row's review child ran in, by kind (the worker's layout).
 _WORKSPACE_ROOT = os.environ.get("HIVE_WORKSPACE_ROOT", os.path.expanduser("~/hive-workspaces"))
 
+#: A worker workspace directory is named by its job id, a uuid.
+_WORKSPACE_ID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
 
 def _child_workspace(child: dict) -> str | None:
     """The review child's own checkout -- the only place its commits are known to exist.
@@ -6428,8 +6463,18 @@ def _child_workspace(child: dict) -> str | None:
             if path and os.path.isdir(path):
                 return path
     jid = str(child.get("id") or "").strip()
-    path = os.path.join(_WORKSPACE_ROOT, jid) if jid else ""
-    return path if path and os.path.isdir(path) else None
+    # The id fallback is a GUESS from an id: only a worker workspace name (a
+    # uuid) directly under the configured root, after symlinks are resolved.
+    # ``../x`` or an absolute id (which ``os.path.join`` honours verbatim)
+    # would otherwise point the classifier -- and a rescue push -- at any
+    # checkout on the host.
+    if not jid or not _WORKSPACE_ROOT or not _WORKSPACE_ID_RE.fullmatch(jid):
+        return None
+    root = os.path.realpath(str(_WORKSPACE_ROOT))
+    path = os.path.realpath(os.path.join(root, jid))
+    if os.path.dirname(path) != root or os.path.basename(path) != jid:
+        return None
+    return path if os.path.isdir(path) else None
 
 
 def classify_review_head(

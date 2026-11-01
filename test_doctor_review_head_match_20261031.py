@@ -189,11 +189,15 @@ def test_review_brief_sends_the_verdict_to_its_own_ref(worker):
 def test_worker_review_target_ref_and_guard(worker):
     assert worker.review_verdict_ref("hv/bl-ct-dialect", "01a19270-x") == "review/hv/bl-ct-dialect-01a19270-x"
     assert dhm.is_verdict_artifact("REVIEW_VERDICT_x.json")
-    assert dhm.is_verdict_artifact("nested/review-verdict-x.json")
+    assert dhm.is_verdict_artifact(".hive/review/review-verdict-x.json")
+    # M4 (2026-11-01): a verdict NAME outside the review dirs is a real file.
+    assert not dhm.is_verdict_artifact("nested/review-verdict-x.json")
     assert not dhm.is_verdict_artifact("pkg/widget.py")
-    # A read-only review result (no commits changed any file) is accepted.
-    ok = worker.review_result_violation(_review_spec(), {"files_changed": [], "commits": []})
-    assert ok is None
+    # M1 (2026-11-01): a clean SELF report with no workspace to prove it is not
+    # read-only, it is unproven -- refused. (A git-proven clean review is
+    # accepted: test_doctor_head_match_hardening_20261101.)
+    unproven = worker.review_result_violation(_review_spec(), {"files_changed": [], "commits": []})
+    assert unproven and "review_overreach" in unproven and "not proven" in unproven
     # The review child's own result showing code changes on the author branch is refused.
     bad = worker.review_result_violation(
         _review_spec(),
@@ -657,7 +661,12 @@ def test_verdict_only_descendant_approval_reaches_the_merge_pass(bus, monkeypatc
 
     outcome, _state, _ = doctor.process_awaiting_review_row(row, now=2000.0)
     assert outcome == "approved_mergeable"
-    # The merge pass reads the row AFTER the write, exactly as the merge train does.
+    # D3 (2026-11-01): the fake shas live in no workspace, so the descent is
+    # NOT PROVEN and the gate fails closed -- but never as "stale".
+    assert doctor.merge_handoff(bus.rows[row["id"]]) == "approval_not_proven"
+    # The merge pass reads the row AFTER the write, exactly as the merge train
+    # does; once a workspace proves the descent it is ready (never stale).
+    _prove_descent(monkeypatch, tip, reviewed)
     assert doctor.merge_handoff(bus.rows[row["id"]]) == "ready_to_merge"
     # And a row rewritten to a NEW tip is stale again (the check still bites).
     moved = {**bus.rows[row["id"]], "result": {**bus.rows[row["id"]]["result"], "head_sha": "c" * 40}}
@@ -778,7 +787,14 @@ def test_merge_pass_and_classifier_are_wired_without_an_import_layer(monkeypatch
     assert callable(os.path.realpath)
 
 
-def test_merge_handoff_does_not_exempt_a_non_verdict_basis(bus):
+def _prove_descent(monkeypatch, tip, reviewed):
+    """A workspace that holds ``tip..reviewed`` and answers verdict-only (git stubbed at the seam)."""
+    monkeypatch.setattr(doctor, "_descent_workspaces", lambda job, approved: ["/proving-workspace"])
+    monkeypatch.setattr(doctor.doctor_head_match, "checkout_for", lambda repo, t, r=None: repo)
+    monkeypatch.setattr(doctor.doctor_head_match, "verdict_only_between", lambda repo, t, r: (t, r) == (tip, reviewed))
+
+
+def test_merge_handoff_does_not_exempt_a_non_verdict_basis(bus, monkeypatch):
     """The exemption is keyed on the BASIS, not on "the two shas differ".
 
     A stale row whose approved_sha merely differs from head_sha -- no
@@ -789,6 +805,7 @@ def test_merge_handoff_does_not_exempt_a_non_verdict_basis(bus):
     row = _reviewing_row(head=tip)
     state = row["result"]["review_state"]
     state["approved"] = {"reviewers": ["gemma4-31b"], "head_sha": tip, "approved_sha": reviewed}
+    _prove_descent(monkeypatch, tip, reviewed)
     assert doctor.merge_handoff(row) == "stale_approval"
     # Record the basis and it is mergeable: the only difference is the proof.
     state["approved"]["basis"] = dhm.VERDICT_ONLY
@@ -802,8 +819,8 @@ def test_only_the_proof_bearing_basis_clears_the_stale_check(bus, monkeypatch, t
     found nothing but verdict artifacts. The flag is a boolean any writer can
     set, so on its own it must NOT let a divergent approval through -- that
     would be a hole in the head-exact rule wide enough to merge unreviewed
-    code. A recorded basis, with the workspace gone, still clears (otherwise
-    the blocker returns as soon as the review child's checkout ages out).
+    code. A recorded basis is itself re-proved against git: with the
+    workspace gone it is NOT PROVEN (D3, 2026-11-01: the gate fails closed).
     """
     monkeypatch.setattr(doctor, "_WORKSPACE_ROOT", str(tmp_path / "empty"))
     tip, reviewed = "a" * 40, "b" * 40
@@ -817,8 +834,11 @@ def test_only_the_proof_bearing_basis_clears_the_stale_check(bus, monkeypatch, t
     # No claim at all: still stale (the head-exact rule).
     del state["approved"]["verdict_only_descendant"]
     assert doctor.merge_handoff(row) == "stale_approval"
-    # The classifier's basis is the proof.
+    # The classifier's basis, with no workspace left to re-prove it: not proven.
     state["approved"]["basis"] = dhm.VERDICT_ONLY
+    assert doctor.merge_handoff(row) == "approval_not_proven"
+    # The basis re-proved against a workspace is the proof.
+    _prove_descent(monkeypatch, tip, reviewed)
     assert doctor.merge_handoff(row) == "ready_to_merge"
 
 

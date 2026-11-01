@@ -74,7 +74,6 @@ from __future__ import annotations
 import calendar
 import contextlib
 import fcntl
-import fnmatch
 import glob
 import hashlib
 import json
@@ -6214,16 +6213,7 @@ def _run_job_inner(job: dict) -> None:
     baseline = subprocess.check_output(
         ["git", "-C", workdir, "rev-parse", "HEAD"], text=True, timeout=30
     ).strip()
-    description += (
-        "\n\nDelivery policy: commit the task's legitimate changes using explicit paths, "
-        "including documentation or tests when those are the requested deliverables, "
-        "and checkout a dedicated branch (creating a branch alone does not switch "
-        "HEAD). Push that checked-out branch with upstream tracking. Keep the "
-        "configured repository Git author identity; do not invent or override it. "
-        "Verify clean status and "
-        "remote SHA. Only an explicit job-specific restriction overrides this policy. "
-        "Never manufacture edits just to satisfy completion. If blocked, report why."
-    )
+    description += job_delivery_brief(job)
     if clone_env.get("MNEMOS_URL") and clone_env.get("MNEMOS_TOKEN"):
         description += (
             "\nUse zoder mnemos --search with this job ID or its parent ID to retrieve "
@@ -6890,10 +6880,12 @@ def _run_job_inner(job: dict) -> None:
     # touch anything else on the author branch is refused here -- never as a
     # plain ``done`` -- so its approve can never appear to cover edits the
     # reviewer was not asked to make (production shape (b): bl-ct-system).
-    review_violation = review_result_violation(job, result)
-    if review_violation:
-        result["review_overreach"] = review_violation
-        status, failure_reason = "failed", "review_overreach"
+    # It is the LAST writer of status/failure_reason, and it never replaces an
+    # earlier, harder failure (see apply_review_overreach_guard). The changed
+    # files come from git in the workspace, never from the self report alone.
+    status, failure_reason = apply_review_overreach_guard(
+        job, result, status, failure_reason, workdir=workdir, baseline=baseline, env=clone_env
+    )
     if failure_reason:
         result["failure_reason"] = failure_reason
         if failure_reason == "ai_attribution_trailer":
@@ -7032,16 +7024,38 @@ def review_verdict_ref(head_branch: str | None, job_id: str) -> str:
     return f"review/{branch}-{job}"
 
 
-def _review_artifact_name(path: str) -> bool:
-    """Whether ``path`` is a review verdict artifact (mirrors hive/workers/doctor_head_match.py).
+#: The only directories a verdict artifact may live in (mirrors
+#: ``hive/workers/doctor_head_match.VERDICT_ARTIFACT_DIRS``): the repo root and
+#: the review directory. The same name anywhere else is a real file.
+REVIEW_ARTIFACT_DIRS = ("", ".hive/review")
 
-    Matched on the BASENAME so a nested ``.hive/review/REVIEW_VERDICT_x.json``
-    counts -- the same rule the doctor's classifier applies to ``T..R``.
+
+def _normalize_repo_path(path: str) -> str:
+    """Strip literal leading ``./`` segments (never ``lstrip('./')``, a character set)."""
+    clean = str(path or "").strip().replace("\\", "/")
+    while clean.startswith("./"):
+        clean = clean[2:]
+    return clean
+
+
+def _review_own_artifact(path: str, spec: dict) -> bool:
+    """Whether ``path`` is THIS review job's own verdict artifact, in a review directory.
+
+    Only the names ``review_verdict_paths`` gives this job (its branch slug, its
+    own id) plus the reviewed (parent) job's id -- the spelling the doctor's
+    brief used to name -- and only in ``REVIEW_ARTIFACT_DIRS``. Any other
+    verdict-shaped name, or the right name in another directory, is a change.
     """
-    base = str(path or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
-    return bool(base) and (
-        fnmatch.fnmatchcase(base, "REVIEW_VERDICT_*.json") or fnmatch.fnmatchcase(base, "review-verdict-*.json")
-    )
+    clean = _normalize_repo_path(path)
+    directory, _, base = clean.rpartition("/")
+    if not base or directory not in REVIEW_ARTIFACT_DIRS:
+        return False
+    own = str((spec or {}).get("id") or "").strip()
+    parent = str((spec or {}).get("parent_job_id") or "").strip()
+    names = set(review_verdict_paths((spec or {}).get("head_branch"), own or parent))
+    if parent:
+        names.add(f"review-verdict-{parent}.json")
+    return base in names
 
 
 def review_verdict_paths(head_branch: str | None, job_id: str) -> list[str]:
@@ -7075,30 +7089,183 @@ def review_brief_text(
     )
 
 
-def review_result_violation(spec: dict, result: dict | None) -> str | None:
+def _review_git(workdir: str, env: dict | None, *args: str) -> tuple[int, str]:
+    """One read-only git question in the review workspace: ``(exit, stdout)``, never raises."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(workdir), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env or None,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 1, ""
+    return out.returncode, out.stdout
+
+
+def review_workspace_changes(
+    workdir: str | None, baseline: str | None, head_branch: str | None, env: dict | None = None
+) -> list[str] | None:
+    """Every file the review job changed relative to ``baseline``, FROM GIT -- or ``None``.
+
+    Not the job's self report (an unreadable git state left that ``[]``, read
+    as "clean"; a push from another local ref never showed up in it). Every
+    ref the job could have written is read: ``HEAD``, every local branch, and
+    the remote-tracking refs a push updates (the author branch and the
+    ``review/`` refs). A ref that descends from ``baseline`` contributes its
+    ``baseline..ref`` diff; the AUTHOR branch moved to anything that does not
+    descend from ``baseline`` is a rewrite and is reported as a change.
+
+    ``None`` -- not proven -- when there is no workspace, the workspace does
+    not hold ``baseline``, or any git question fails.
+    """
+    baseline = str(baseline or "").strip()
+    if not workdir or not baseline or not os.path.isdir(str(workdir)):
+        return None
+    code, kind = _review_git(workdir, env, "cat-file", "-t", baseline)
+    if code != 0 or kind.strip() != "commit":
+        return None
+    code, out = _review_git(
+        workdir,
+        env,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/heads/",
+        "refs/remotes/origin/",
+    )
+    if code != 0:
+        return None
+    author_ref = f"refs/remotes/origin/{str(head_branch or '').strip().strip('/')}"
+    refs = ["HEAD"]
+    for ref in out.split():
+        if ref.startswith("refs/heads/") or ref == author_ref or ref.startswith("refs/remotes/origin/review/"):
+            refs.append(ref)
+    files: set[str] = set()
+    for ref in refs:
+        code, sha = _review_git(workdir, env, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+        sha = sha.strip()
+        if code != 0 or not sha:
+            return None
+        if sha == baseline:
+            continue
+        code, _ = _review_git(workdir, env, "merge-base", "--is-ancestor", baseline, sha)
+        if code == 1:
+            if ref == author_ref:
+                files.add(f"(author branch {head_branch} rewritten off {baseline[:12]})")
+            # Any other non-descendant ref (a local branch cut from elsewhere)
+            # only matters if it reached the author branch, which is read above.
+            continue
+        if code != 0:
+            return None
+        code, diff = _review_git(workdir, env, "diff", "--name-only", baseline, sha)
+        if code != 0:
+            return None
+        files.update(line.strip() for line in diff.splitlines() if line.strip())
+    return sorted(files)
+
+
+def review_result_violation(
+    spec: dict,
+    result: dict | None,
+    *,
+    workdir: str | None = None,
+    baseline: str | None = None,
+    env: dict | None = None,
+) -> str | None:
     """Why a review result cannot be accepted as read-only -- or None.
 
-    A ``review:*`` job must leave the author branch exactly as it found it. Its
-    result may report the verdict artifact (on the review ref) and nothing
-    else: any other changed file is code committed onto the author's branch by
-    the reviewer, which is review overreach -- the approval covers the
-    reviewer's edits, not the author's tip. Returns a one-line reason prefixed
-    ``review_overreach`` so the finalizer can report it verbatim.
+    A ``review:*`` job must leave the author branch exactly as it found it. It
+    may write its OWN verdict artifact (``_review_own_artifact``) and nothing
+    else: any other changed file is code committed by the reviewer, which is
+    review overreach -- the approval covers the reviewer's edits, not the
+    author's tip. The changed files come from GIT (``review_workspace_changes``);
+    the self-reported ``files_changed`` can only add doubt. A workspace that
+    cannot prove what changed is refused (fail closed). Returns a one-line
+    reason prefixed ``review_overreach`` so the finalizer can report it verbatim.
     """
     if not str((spec or {}).get("kind") or "").startswith(REVIEW_ARTIFACT_KINDS):
         return None
     result = result if isinstance(result, dict) else {}
-    files = result.get("files_changed")
-    files = [str(p) for p in files if str(p).strip()] if isinstance(files, list) else []
-    allowed = set(review_verdict_paths(spec.get("head_branch"), spec.get("id") or spec.get("parent_job_id") or ""))
-    extras = [path for path in files if path not in allowed and not _review_artifact_name(path)]
+    branch = spec.get("head_branch")
+    ref = review_verdict_ref(branch, spec.get("id") or spec.get("parent_job_id") or "")
+    reported = result.get("files_changed")
+    reported = [str(p) for p in reported if str(p).strip()] if isinstance(reported, list) else []
+    proven = review_workspace_changes(workdir, baseline, branch, env)
+    extras = sorted({path for path in [*(proven or []), *reported] if not _review_own_artifact(path, spec)})
+    if proven is None:
+        shown = f" (self-reported: {', '.join(extras[:3])})" if extras else ""
+        return (
+            f"review_overreach: the files the review job changed are not proven: git could not read the "
+            f"workspace against its baseline{shown}; a review may only publish its verdict artifact to {ref}"
+        )
     if not extras:
         return None
     shown = ", ".join(extras[:3])
     return (
         f"review_overreach: the review job changed {shown} on the author branch "
-        f"{spec.get('head_branch') or '(see job)'}; a review may only publish its verdict artifact "
-        f"to {review_verdict_ref(spec.get('head_branch'), spec.get('id') or spec.get('parent_job_id') or '')}"
+        f"{branch or '(see job)'}; a review may only publish its verdict artifact to {ref}"
+    )
+
+
+def apply_review_overreach_guard(
+    job: dict,
+    result: dict,
+    status: str,
+    failure_reason: str | None,
+    *,
+    workdir: str | None,
+    baseline: str | None,
+    env: dict | None = None,
+) -> tuple[str, str | None]:
+    """The LAST word on a review job's disposition: overreach fails it, never hides a harder failure.
+
+    The overreach is always recorded on the row (``result["review_overreach"]``).
+    It becomes the disposition unless the job had ALREADY failed for another
+    reason -- a sandbox escape, an attribution trailer, a delivery integrity
+    failure -- which is the harder fact and is kept. The one exception is the
+    engine spend cap: that requeues the job, and a review that overreached must
+    not be re-run as if nothing happened.
+    """
+    violation = review_result_violation(job, result, workdir=workdir, baseline=baseline, env=env)
+    if not violation:
+        return status, failure_reason
+    result["review_overreach"] = violation
+    if status == "failed" and failure_reason and failure_reason != BUDGET_EXCEEDED_FAILURE:
+        return status, failure_reason
+    result["error"] = _cap_text(violation)
+    return "failed", "review_overreach"
+
+
+def job_delivery_brief(job: dict) -> str:
+    """The delivery paragraph appended to a job's description.
+
+    A WORK job gets the generic policy (commit, push the checked-out branch). A
+    REVIEW job must never get it: "push that checked-out branch" is exactly
+    what put the verdict commit on the author's branch (01a197c2 -> aa73bb5),
+    because a review job's checkout IS the author branch. It gets its real,
+    resolved ref and artifact names instead -- never a ``<job id>`` placeholder.
+    """
+    if str((job or {}).get("kind") or "").startswith(REVIEW_ARTIFACT_KINDS):
+        branch = job.get("head_branch")
+        job_id = str(job.get("id") or "")
+        ref = review_verdict_ref(branch, job_id)
+        return (
+            "\n\nDelivery policy (READ-ONLY review job): this checkout is the AUTHOR branch "
+            f"{branch or '(see job)'}; do not commit to it, push it, or amend it. "
+            + review_brief_text(head_branch=branch, job_id=job_id, head_sha=job.get("head_sha"))
+            + f" Verify the remote SHA of {ref}. If blocked, report why."
+        )
+    return (
+        "\n\nDelivery policy: commit the task's legitimate changes using explicit paths, "
+        "including documentation or tests when those are the requested deliverables, "
+        "and checkout a dedicated branch (creating a branch alone does not switch "
+        "HEAD). Push that checked-out branch with upstream tracking. Keep the "
+        "configured repository Git author identity; do not invent or override it. "
+        "Verify clean status and "
+        "remote SHA. Only an explicit job-specific restriction overrides this policy. "
+        "Never manufacture edits just to satisfy completion. If blocked, report why."
     )
 
 

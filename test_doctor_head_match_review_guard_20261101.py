@@ -217,8 +217,10 @@ def test_a_work_row_reviewed_at_a_verdict_only_descendant_is_approved_on_its_hea
     body = bus.rows[WORK_ID]
     assert body["status"] == "needs-review"
     assert body["result"]["review_state"]["state"] == "approved_mergeable"
-    # The merge pass reads the written row as approved ON the delivered head.
-    assert doctor.merge_handoff(body) == "ready_to_merge"
+    # The merge pass reads the written row (the bus merges the PATCH into the
+    # row it holds) as approved ON the delivered head: the descent is re-proved
+    # in the approving child's workspace, found by the recorded review_job_id.
+    assert doctor.merge_handoff({**work, **body}) == "ready_to_merge"
     # Approving is not a submit: no review child was created for anything.
     assert bus.posts() == []
 

@@ -60,12 +60,13 @@ log = logging.getLogger("hive.workers.doctor_head_match")
 VERDICT_ARTIFACT_PATTERNS = (
     "REVIEW_VERDICT_*.json",
     "review-verdict-*.json",
-    # The artifact may be written into a review sub-directory; the BASENAME is
-    # what is matched, so a nested ``.hive/review/REVIEW_VERDICT_x.json`` counts
-    # and a ``tests/REVIEW_VERDICT_x.json`` does not silently hide a code test.
-    ".hive/review/REVIEW_VERDICT_*.json",
-    ".hive/review/review-verdict-*.json",
 )
+
+#: The ONLY directories a verdict artifact may live in: the repo root and the
+#: review directory. A verdict-shaped name anywhere else (``src/foo/``,
+#: ``tests/``, a nested ``.hive/review/sub/``) is a file like any other and is
+#: never discounted -- otherwise a code-adjacent json hides a change.
+VERDICT_ARTIFACT_DIRS = ("", ".hive/review")
 
 #: Git subprocess ceiling: these are local, read-only questions.
 GIT_TIMEOUT = 120
@@ -124,6 +125,9 @@ VERDICT_ONLY = "verdict_only"
 CODE_DESCENDANT = "code_descendant"
 OVERREACH = "overreach"
 NOT_DESCENDANT = "not_descendant"
+#: The descent exists but git could not read what it changed: never an
+#: approval, never a fast-forward rescue.
+NOT_PROVEN = "not_proven"
 
 #: ``approved["basis"]`` for a verdict-only descendant: the merge pass exempts
 #: that basis from the ``approved_sha == head_sha`` identity check because the
@@ -151,15 +155,31 @@ def env_switch(name: str, *, default: bool = True) -> bool:
 # ── artifact names ──────────────────────────────────────────────────────────
 
 
+def normalize_path(path: str) -> str:
+    """A repo-relative path with literal leading ``./`` segments removed.
+
+    Only the two-character PREFIX ``./`` is stripped -- never a character set
+    (``lstrip('./')`` turned ``.github/x`` into ``github/x`` and ``..x`` into ``x``).
+    """
+    clean = str(path or "").strip().replace("\\", "/")
+    while clean.startswith("./"):
+        clean = clean[2:]
+    return clean
+
+
 def is_verdict_artifact(path: str) -> bool:
-    """Whether ``path`` is a review verdict artifact and nothing else."""
-    clean = str(path or "").strip().replace("\\", "/").lstrip("./")
+    """Whether ``path`` is a review verdict artifact and nothing else.
+
+    A verdict-shaped BASENAME in one of ``VERDICT_ARTIFACT_DIRS``; no basename
+    fallback, so the same name in any other directory is a real change.
+    """
+    clean = normalize_path(path)
     if not clean:
         return False
-    if any(fnmatch.fnmatchcase(clean, pattern) for pattern in VERDICT_ARTIFACT_PATTERNS):
-        return True
-    base = clean.rsplit("/", 1)[-1]
-    return any(fnmatch.fnmatchcase(base, pattern) for pattern in ("REVIEW_VERDICT_*.json", "review-verdict-*.json"))
+    directory, _, base = clean.rpartition("/")
+    if directory not in VERDICT_ARTIFACT_DIRS:
+        return False
+    return any(fnmatch.fnmatchcase(base, pattern) for pattern in VERDICT_ARTIFACT_PATTERNS)
 
 
 def non_artifact_files(paths) -> list[str]:
@@ -224,11 +244,15 @@ def ancestor(repo: str, ancestor_sha: str, descendant_sha: str) -> bool:
     return is_ancestor_or_same(repo, ancestor_sha, descendant_sha)
 
 
-def changed_files(repo: str, older: str, newer: str) -> list[str]:
-    """The paths ``older..newer`` touches (``git diff --name-only``)."""
+def changed_files(repo: str, older: str, newer: str) -> list[str] | None:
+    """The paths ``older..newer`` touches (``git diff --name-only``).
+
+    ``None`` when git could not answer: a failed diff is "not proven", never
+    "no files changed" (``[]`` read as a verdict-only descent).
+    """
     code, out = _git(repo, "diff", "--name-only", f"{older}..{newer}")
     if code != 0:
-        return []
+        return None
     return sorted({line.strip() for line in out.splitlines() if line.strip()})
 
 
@@ -253,21 +277,25 @@ def verdict_only_between(repo: str | None, tip: str, reviewed: str) -> bool:
         return False
     if not is_ancestor_or_same(repo, tip, reviewed):
         return False
-    code, out = _git(repo, "diff", "--name-only", f"{tip}..{reviewed}")
-    if code != 0:
+    files = changed_files(repo, tip, reviewed)
+    if files is None:
         # The descent exists but its content is unreadable: never assume the
         # commits in between were only the verdict artifact.
         return False
-    return not non_artifact_files([line for line in out.splitlines() if line.strip()])
+    return not non_artifact_files(files)
 
 
-def _files_from_git(repo: str, reviewed: str) -> list[str]:
-    """The code ``reviewed`` itself commits, by diffing it against its first parent."""
+def _files_from_git(repo: str, reviewed: str) -> list[str] | None:
+    """The code ``reviewed`` itself commits, by diffing it against its first parent.
+
+    ``None`` when git cannot answer (no parent, a failed rev-list or diff).
+    """
     code, out = _git(repo, "rev-list", "--parents", "-n", "1", reviewed)
     parts = out.split()
     if code != 0 or len(parts) < 2:
-        return []
-    return non_artifact_files(changed_files(repo, parts[1], reviewed))
+        return None
+    files = changed_files(repo, parts[1], reviewed)
+    return None if files is None else non_artifact_files(files)
 
 
 def can_fast_forward(repo: str, tip: str, reviewed: str) -> bool:
@@ -362,6 +390,8 @@ def classify_descendant(
         # Not a descendant: "overreach" needs evidence that the review COMMITTED
         # code, from git (the commits are here: diff it against its own base) or
         # from the child's report of what it changed.
+        # An unreadable diff (``None``) proves nothing; the self report can
+        # still name code. Either way this branch is never an approval.
         report = _files_from_git(repo, reviewed) or non_artifact_files(pushed_files)
         if report:
             return HeadMatch(
@@ -381,61 +411,44 @@ def classify_descendant(
             reason=f"approved head {_shown(reviewed)} is not a descendant of the delivered head {_shown(tip)}",
         )
     files = changed_files(repo, tip, reviewed)
-    if files:
-        code_files = non_artifact_files(files)
-        if not code_files:
-            return HeadMatch(
-                VERDICT_ONLY,
-                reviewed,
-                tip,
-                files=files,
-                reason=f"approved at {reviewed} (verdict-only descendant of {tip})",
-                ok_for_tip=True,
-            )
+    if files is None:
+        # git could not diff (a shallow or damaged workspace). What the descent
+        # changed is NOT PROVEN: it is neither an approval of the tip nor newer
+        # work to fast-forward, whatever the child reported (a self report can
+        # only add doubt, and an empty one proves nothing).
+        report = non_artifact_files(pushed_files)
+        shown = f"; the child reported {', '.join(report[:3])}" if report else ""
         return HeadMatch(
-            CODE_DESCENDANT,
-            reviewed,
-            tip,
-            files=files,
-            reason=(
-                f"approval covers newer work not on the head branch: reviewed {_shown(reviewed)} descends from "
-                f"{_shown(tip)} and changed {', '.join(code_files[:3])}"
-            ),
-            newer_work=True,
-        )
-    # git could not diff (e.g. a shallow workspace): fall back to what the child
-    # reported, which may only ever ADD doubt, never approve code.
-    report = non_artifact_files(pushed_files)
-    if report or pushed_commits:
-        if not report and pushed_commits:
-            # No file list: nothing says it was a verdict-only commit.
-            return HeadMatch(
-                CODE_DESCENDANT,
-                reviewed,
-                tip,
-                reason=(
-                    f"approval covers newer work not on the head branch: reviewed {_shown(reviewed)} descends from "
-                    f"{_shown(tip)}; the changed files could not be read"
-                ),
-                newer_work=True,
-            )
-        return HeadMatch(
-            CODE_DESCENDANT,
+            NOT_PROVEN,
             reviewed,
             tip,
             files=report,
             reason=(
-                f"approval covers newer work not on the head branch: reviewed {_shown(reviewed)} descends from "
-                f"{_shown(tip)} and changed {', '.join(report[:3])}"
+                f"descent {_shown(tip)}..{_shown(reviewed)} not proven: git could not read the changed files{shown}"
             ),
-            newer_work=True,
+        )
+    code_files = non_artifact_files(files)
+    if not code_files:
+        # Every changed path is a verdict artifact in a review directory (or the
+        # trees are identical): the approval covers the delivered tip.
+        return HeadMatch(
+            VERDICT_ONLY,
+            reviewed,
+            tip,
+            files=files,
+            reason=f"approved at {reviewed} (verdict-only descendant of {tip})",
+            ok_for_tip=True,
         )
     return HeadMatch(
-        VERDICT_ONLY,
+        CODE_DESCENDANT,
         reviewed,
         tip,
-        reason=f"approved at {reviewed} (verdict-only descendant of {tip})",
-        ok_for_tip=True,
+        files=files,
+        reason=(
+            f"approval covers newer work not on the head branch: reviewed {_shown(reviewed)} descends from "
+            f"{_shown(tip)} and changed {', '.join(code_files[:3])}"
+        ),
+        newer_work=True,
     )
 
 
