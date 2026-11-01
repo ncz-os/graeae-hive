@@ -869,3 +869,115 @@ def test_a_workspace_showing_a_code_change_refuses_the_recorded_basis(monkeypatc
     verdict_only = run("rev-parse", "HEAD").stdout.decode().strip()
     state["approved"]["approved_sha"] = verdict_only
     assert doctor.merge_handoff(row) == "ready_to_merge"
+
+
+# ---------------------------------------------------------------------------
+# Robo-review pinning (2026-11-01, non-author review of the head-match fix).
+#
+# Two findings claimed the head-match helpers do not exist: "undefined function
+# checkout_for in doctor_head_match" (critical) and "_head_match_child /
+# _child_workspace must be implemented". All three exist -- ``checkout_for`` in
+# hive/workers/doctor_head_match.py, the other two in hive/workers/doctor.py --
+# and the call site resolves them at runtime. These tests pin that contract so a
+# chunked-diff reviewer cannot re-raise it, and so a future refactor that drops
+# or renames a helper fails loudly here instead of as an AttributeError in the
+# sweep.
+# ---------------------------------------------------------------------------
+
+
+def test_head_match_helpers_resolve_at_runtime():
+    """Every symbol the head-match call site touches is defined and callable."""
+    import hive.workers.doctor as doctor
+    import hive.workers.doctor_head_match as dhm
+
+    for module, name in (
+        (dhm, "checkout_for"),
+        (dhm, "verdict_only_between"),
+        (dhm, "classify_descendant"),
+        (dhm, "is_verdict_artifact"),
+        (dhm, "rescue_ff"),
+        (doctor, "_head_match_child"),
+        (doctor, "_child_workspace"),
+        (doctor, "_verdict_only_descendant_approval"),
+    ):
+        attr = getattr(module, name, None)
+        assert attr is not None, f"{module.__name__}.{name} is missing"
+        assert callable(attr), f"{module.__name__}.{name} is not callable"
+
+
+def test_checkout_for_refuses_a_workspace_missing_either_commit(tmp_path):
+    """``checkout_for`` returns the repo only when it holds BOTH commits."""
+    import subprocess
+
+    import hive.workers.doctor_head_match as dhm
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def run(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "GIT_AUTHOR_NAME": "t",
+                "GIT_AUTHOR_EMAIL": "t@e",
+                "GIT_COMMITTER_NAME": "t",
+                "GIT_COMMITTER_EMAIL": "t@e",
+            },
+        )
+
+    run("init", "-q", "-b", "main")
+    (repo / "a.txt").write_text("a\n")
+    run("add", "a.txt")
+    run("commit", "-q", "-m", "one")
+    tip = run("rev-parse", "HEAD").stdout.decode().strip()
+    (repo / "REVIEW_VERDICT_x.json").write_text("{}")
+    run("add", "REVIEW_VERDICT_x.json")
+    run("commit", "-q", "-m", "verdict")
+    reviewed = run("rev-parse", "HEAD").stdout.decode().strip()
+
+    # Holds both -> the workspace is usable for the descent diff.
+    assert dhm.checkout_for(str(repo), tip, reviewed) == str(repo)
+    # Not a directory, or a commit it does not have -> refuse (never guess).
+    assert dhm.checkout_for(None, tip, reviewed) is None
+    assert dhm.checkout_for(str(tmp_path / "nope"), tip, reviewed) is None
+    assert dhm.checkout_for(str(repo), tip, "0" * 40) is None
+    # The verdict-only descent is exactly what the approve rests on.
+    assert dhm.verdict_only_between(str(repo), tip, reviewed) is True
+
+
+def test_moved_tip_stays_stale_even_with_a_recorded_descendant(monkeypatch, tmp_path):
+    """The exact-head check outranks the descendant exemption.
+
+    A non-author review (2026-11-01) worried that the exemption could let a
+    ``same_sha`` mismatch through to ``ready_to_merge``. It cannot: the delivered
+    head is compared with ``approved.head_sha`` BEFORE the exemption is consulted,
+    so a row whose tip moved after the approve is stale no matter what descent
+    was recorded. Pin the ordering, not the wording.
+    """
+    import hive.workers.doctor as doctor
+
+    head = "a" * 40
+    reviewed = "b" * 40
+    row = _reviewing_row(head=head)
+    state = row["result"]["review_state"]
+    state["state"] = "approved_mergeable"
+    state["approved"] = {
+        "reviewers": ["cerberus-reviewer"],
+        "head_sha": head,
+        "approved_sha": reviewed,
+        "basis": doctor.BASIS_VERDICT_ONLY,
+    }
+
+    # Even if the descent were accepted outright, a tip that no longer matches
+    # approved.head_sha must be stale.
+    monkeypatch.setattr(doctor, "_verdict_only_descendant_approval", lambda job, approved: True)
+    row["result"]["head_sha"] = "c" * 40  # the branch moved after the approve
+    assert doctor.merge_handoff(row) == "stale_approval"
+
+    # With the tip restored, the recorded approve is acted on.
+    row["result"]["head_sha"] = head
+    assert doctor.merge_handoff(row) == "ready_to_merge"
