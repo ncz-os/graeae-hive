@@ -3584,6 +3584,10 @@ def _review_child_refusal(job: dict) -> str:
     2026-11-01: a ten-deep review-of-review chain, one new row per sweep).
     Every refusal is logged."""
     reason = review_queue.review_chain_refusal(job, _chain_job)
+    if not reason and doctor_remediation.is_empty_delivery(job):
+        # An empty diff is an author failure to rerun, never something to
+        # review (live 2026-11-01: reviewers approved nothing / returned prose).
+        reason = "empty_delivery: no commits and head == base; the author is rerun, not reviewed"
     if reason:
         log.warning(
             "refused review child for %s (kind %s, parent %s): %s",

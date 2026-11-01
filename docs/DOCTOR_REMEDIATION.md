@@ -647,3 +647,14 @@ PATCH fails, no GREEN marker is written and the next sweep tries again.
 
 Regressions: `test_doctor_gates_provider_20261101.py`. Every test in it failed
 on the base (`f471b91`) and passes with this change.
+
+## Cause `empty_delivery` (2026-11-01)
+
+A WORK row that ends `needs-review`/`failed` with `commits == []`, `files_changed == []` and
+`head_sha == base_sha` delivered nothing: its author died before committing (live: the zeroclaw
+`Session limit reached (code -32001)` fault). It is classified `empty_delivery` **before** the review
+hand-over causes and its plan requeues the author (a spent retry budget is raised by one). It is
+never reviewed: `_review_child_refusal` refuses a review child for it on both submit paths, because a
+reviewer approving an empty diff, or returning prose, only burns the row's review attempts. A row that
+lacks either sha is not called empty; review, verify and triage rows never are. Kill switch and caps are
+the remediation sweep's own (`HIVE_DOCTOR_REMEDIATE`, per-sweep and per-row attempt budgets).

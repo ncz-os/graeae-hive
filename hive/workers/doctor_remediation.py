@@ -111,6 +111,11 @@ INFRA_RETRIES = "infra_retries"
 UNAVAILABLE_MODEL = "unavailable_model"
 STRANDED_WIP = "stranded_wip"
 WAITING_REVIEW = "waiting_review"
+#: A work row whose author delivered NOTHING: no commits, no changed files and
+#: ``head_sha == base_sha`` (live 2026-11-01: 12 rows whose author died on the
+#: zeroclaw 'Session limit reached' fault). It is an author failure: rerun the
+#: author. Reviewing an empty diff only mints an approve of nothing.
+EMPTY_DELIVERY = "empty_delivery"
 #: A review job in triage. Never handed to the review queue: reviewing it
 #: mints a review of the review, which ends the same way (live 2026-11-01:
 #: ten deep, one new row per sweep). No field fix and no status move.
@@ -123,6 +128,7 @@ CAUSES = (
     INFRA_RETRIES,
     UNAVAILABLE_MODEL,
     STRANDED_WIP,
+    EMPTY_DELIVERY,
     WAITING_REVIEW,
     REVIEW_JOB,
 )
@@ -695,6 +701,28 @@ def row_has_verdict(job: dict[str, Any]) -> bool:
     return bool(str(res.get("verdict") or job.get("verdict") or "").strip())
 
 
+def is_empty_delivery(job: dict[str, Any]) -> bool:
+    """Whether a WORK row delivered nothing: the branch is the base, untouched.
+
+    All of: no commits, no changed files, and a recorded ``head_sha`` that
+    equals the recorded ``base_sha``. A row missing either sha is NOT called
+    empty (absence of proof is not proof), and a review/verify/triage row never
+    is."""
+    if not isinstance(job, dict):
+        return False
+    kind = str(job.get("kind") or "")
+    if review_queue.is_review_kind(job) or kind.startswith(("review:", "triage:", "verify:")):
+        return False
+    res = result_dict(job)
+    commits = res.get("commits")
+    files = res.get("files_changed")
+    if not isinstance(commits, list) or commits or not isinstance(files, list) or files:
+        return False
+    head = str(res.get("head_sha") or "").strip().lower()
+    base = str(res.get("base_sha") or "").strip().lower()
+    return bool(head) and head == base
+
+
 def classify(
     job: dict[str, Any],
     *,
@@ -734,6 +762,10 @@ def classify(
     # review queue (g, f) are skipped for it, and a review job with no field
     # fix to make is classified ``review_job`` (no action) instead of healthy,
     # so the audit names why the sweep left it alone.
+    # An author that delivered nothing is rerun, never reviewed (see
+    # EMPTY_DELIVERY). Placed before the review hand-over causes on purpose.
+    if status in ("needs-review", "failed", "dead-letter") and is_empty_delivery(job):
+        return Cause(EMPTY_DELIVERY, "no_commits_head_equals_base", ("retry_count",))
     review_job = review_queue.is_review_kind(job)
     busy = review_busy_failure(job)
     if busy and not review_job and delivered_head(job) and delivery_verified(job) and not verdict_fn(job):
@@ -1034,6 +1066,28 @@ def plan_for(
             requeue=True,
             reason=f"host_pinned:{','.join(str(h) for h in hosts)}->unpinned",
             detail=f"cleared the eligible_hosts pin ({', '.join(str(h) for h in hosts)} already failed this job)",
+        )
+    if cause.name == EMPTY_DELIVERY:
+        spent = retry_budget_spent(job)
+        changes: dict[str, dict[str, Any]] = {}
+        override = False
+        reason = f"empty_delivery:{cause.detail}"
+        if spent:
+            try:
+                raised = int(job.get("max_retries") or 0) + 1
+            except (TypeError, ValueError):
+                raised = 1
+            raised = max(raised, 1)
+            changes["max_retries"] = _change(job.get("max_retries"), raised)
+            override = True
+        return Plan(
+            cause=cause,
+            changes=changes,
+            requeue=True,
+            override=override,
+            override_reason=reason if override else "",
+            reason=reason,
+            detail="author delivered nothing (no commits, head == base): requeued to rerun the author, not reviewed",
         )
     if cause.name == INFRA_RETRIES:
         max_retries = job.get("max_retries")
