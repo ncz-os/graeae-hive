@@ -137,12 +137,8 @@ async def run_workload(repo, uid: str) -> dict:
         await repo.select_stale_queued_job_ids(tx, cutoff=now + 1)
         await repo.cancel_jobs(tx, ids=[dep_id], ended_at=now)
         await repo.purge_events_before(tx, cutoff=now + 1)
-        await repo.select_sweepable_terminal_job_ids(
-            tx, statuses=["done"], cutoff=now + 1
-        )
-        await repo.select_sweepable_test_job_ids(
-            tx, statuses=["done"], patterns=("e2e:%",), cutoff=now + 1
-        )
+        await repo.select_sweepable_terminal_job_ids(tx, statuses=["done"], cutoff=now + 1)
+        await repo.select_sweepable_test_job_ids(tx, statuses=["done"], patterns=("e2e:%",), cutoff=now + 1)
         await tx.commit()
 
     async with repo.connection() as tx:
@@ -199,9 +195,7 @@ async def run_workload(repo, uid: str) -> dict:
             tx, service="contract", in_flight=1, tokens_used=10, spent_usd=0.5, updated_at=now
         )
         await repo.capacity_state_load(tx)
-        await repo.capacity_fold_usage(
-            tx, dedup_key=f"fold-{uid}", service="contract", tokens=5, cost_usd=0.1, now=now
-        )
+        await repo.capacity_fold_usage(tx, dedup_key=f"fold-{uid}", service="contract", tokens=5, cost_usd=0.1, now=now)
         await repo.tail_events(tx, since_id=0, limit=10)
         await tx.commit()
 
@@ -363,9 +357,45 @@ def dialect_gaps(sql: str) -> set[str]:
     return {f"datetime({m.group(1)})" for m in UNIXEPOCH_RE.finditer(sql)}
 
 
+#: ``IS <bind>``: sqlite accepts ``x IS ?`` as a null-safe equality; every
+#: other engine only allows NULL/TRUE/FALSE/UNKNOWN/DISTINCT FROM after IS
+#: (Oracle: ORA-00908, the 2026-11-01 reclassify 500).
+IS_BIND_RE = re.compile(r"\bIS\s+(?:NOT\s+)?(?:\?|:\d+|\$\d+|%s)", re.IGNORECASE)
+
+#: Engines whose ``jobs.result`` is a LOB: a LOB cannot be an operand of
+#: ``=``/``<>``/``IS [NOT] DISTINCT FROM`` (Oracle ORA-00932, Db2 SQL0401N).
+LOB_RESULT_BACKENDS = {"oracle", "db2"}
+_RESULT_COMPARE_RE = re.compile(r"\bresult\s*(?:=|<>|!=|<=>)|\bresult\s+IS\s+(?:NOT\s+)?DISTINCT\s+FROM", re.IGNORECASE)
+
+#: Null-safe operators that exist only in some engines.
+NULL_SAFE_FORBIDDEN = {
+    "postgres": ("<=>",),
+    "db2": ("<=>",),
+    "oracle": ("<=>", "DISTINCT FROM"),
+    "mysql": ("DISTINCT FROM",),
+}
+
+
+def predicate_violations(backend: str, sql: str) -> list[str]:
+    """Comparison-grammar problems in a translated statement's predicates."""
+    problems = []
+    body = _strip_literals(sql)
+    if backend != "sqlite" and IS_BIND_RE.search(body):
+        problems.append(f"IS <bind>: sqlite-only null-safe compare, {backend} cannot parse it")
+    for token in NULL_SAFE_FORBIDDEN.get(backend, ()):
+        if token.lower() in body.lower():
+            problems.append(f"{token}: no such null-safe operator on {backend}")
+    if backend in LOB_RESULT_BACKENDS:
+        # Only the predicate side: ``SET result=?`` is an assignment, not a compare.
+        parts = re.split(r"\bWHERE\b", body, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) == 2 and _RESULT_COMPARE_RE.search(parts[1]):
+            problems.append(f"result compared in SQL: a LOB on {backend} cannot be compared")
+    return problems
+
+
 def find_violations(backend: str, sql: str) -> list[str]:
     """Backend-specific problems in ``sql`` (already translated, or raw)."""
-    problems = []
+    problems = predicate_violations(backend, sql)
     body = _strip_literals(sql)
     lowered = body.lower()
     tokens = dict(FORBIDDEN)
