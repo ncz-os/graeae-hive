@@ -1,0 +1,170 @@
+{
+  "_comment": [
+    "Review children for the doctor's continuation rounds (2026-11-01).",
+    "Sanitised the same way as doctor_remediation_rows.json and",
+    "doctor_review_chain_rows.json: synthetic UUIDv7 tails, the fleet's own",
+    "repo/branch/model names, no token, key, address or description body.",
+    "The WORK rows these review are taken from those two files (the",
+    "'waiting_review' remediation row and the live 'work_root' of the",
+    "2026-11-01 chain, author qwen38 / alibaba, tip 5d2e8a0c...). The two",
+    "request_changes children are the live 2026-11-01 shape: two model",
+    "families (openai via the worker's result.reviewer record, meta via a",
+    "structured review_evidence block) requesting changes on the same tip.",
+    "'rc_verdict_only' is the verdict-only head advance: the reviewer's",
+    "reported head is a descendant of the tip that only adds its verdict",
+    "artifact (doctor_head_match.VERDICT_ONLY). Every row is lane-B FREE."
+  ],
+  "rc_openai": {
+    "id": "01a1a2f0-1c11-7a01-8b2c-6d7e8f9a0b11",
+    "kind": "review:build:zeroclaw-20261101",
+    "status": "done",
+    "repo": "graeae-hive",
+    "project": "graeae-hive",
+    "head_branch": "hv/fo-merge-pass-20261031",
+    "base_branch": "deploy/integrate-20261017",
+    "parent_job_id": "01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01",
+    "idempotency_key": "review-queue:01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01:1:5d2e8a0c7b41",
+    "claimed_by": "urn:agent:zeroclaw:cerberus:1",
+    "claimed_model": "gpt-oss-20b",
+    "ended_at": 1793546100.0,
+    "result": {
+      "via": "hive_worker",
+      "head_sha": "5d2e8a0c7b41f9e36a1d0c5b8e7f2a4c9d6b3e10",
+      "remote_sha": "5d2e8a0c7b41f9e36a1d0c5b8e7f2a4c9d6b3e10",
+      "remote_verified": true,
+      "commits": [],
+      "verdict": null,
+      "reviewer": {
+        "model": "gpt-oss-20b",
+        "models": ["gpt-oss-20b"],
+        "verdict": "request_changes",
+        "source": "zoder_verdict",
+        "findings": [
+          {
+            "severity": "high",
+            "location": "hive/workers/doctor.py:5401",
+            "title": "merge pass reads a stale tip",
+            "body": "The tip is read before the fetch, so a concurrent push is merged unreviewed."
+          },
+          {
+            "severity": "low",
+            "title": "naming",
+            "body": "A finding with no location is not actionable and is not carried."
+          }
+        ]
+      }
+    }
+  },
+  "rc_meta": {
+    "id": "01a1a2f0-2d22-7a02-8b2c-6d7e8f9a0b22",
+    "kind": "review:build:zeroclaw-20261101",
+    "status": "done",
+    "repo": "graeae-hive",
+    "project": "graeae-hive",
+    "head_branch": "hv/fo-merge-pass-20261031",
+    "base_branch": "deploy/integrate-20261017",
+    "parent_job_id": "01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01",
+    "idempotency_key": "review-queue:01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01:2:5d2e8a0c7b41",
+    "claimed_by": "urn:agent:provider:muse:1",
+    "claimed_model": "muse-spark-1.3",
+    "ended_at": 1793546200.0,
+    "result": {
+      "via": "hive_worker",
+      "head_sha": "5d2e8a0c7b41f9e36a1d0c5b8e7f2a4c9d6b3e10",
+      "commits": [],
+      "review_evidence": {
+        "reviewed_head": "5d2e8a0c7b41f9e36a1d0c5b8e7f2a4c9d6b3e10",
+        "reviewers": [
+          {
+            "model": "muse-spark-1.3",
+            "family": "meta",
+            "verdict": "request_changes",
+            "findings": [
+              {
+                "severity": "critical",
+                "file": "hive/review_queue.py",
+                "line": 830,
+                "title": "hard-lane sort ignores the codex gate",
+                "body": "A route whose gate is closed still sorts first and the pick returns nothing usable."
+              },
+              {
+                "severity": "medium",
+                "location": {"path": "docs/REVIEW_QUEUE.md", "line": 12},
+                "title": "doc names the wrong default",
+                "body": "The documented cap is 5; the code reads 3."
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "approve_google": {
+    "id": "01a1a2f0-3e33-7a03-8b2c-6d7e8f9a0b33",
+    "kind": "review:build:zeroclaw-20261101",
+    "status": "done",
+    "repo": "graeae-hive",
+    "project": "graeae-hive",
+    "head_branch": "hv/fo-merge-pass-20261031",
+    "base_branch": "deploy/integrate-20261017",
+    "parent_job_id": "01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01",
+    "idempotency_key": "review-queue:01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01:3:5d2e8a0c7b41",
+    "claimed_by": "urn:agent:zeroclaw:cerberus:2",
+    "claimed_model": "gemma4-31b",
+    "ended_at": 1793546300.0,
+    "result": {
+      "via": "hive_worker",
+      "head_sha": "5d2e8a0c7b41f9e36a1d0c5b8e7f2a4c9d6b3e10",
+      "remote_sha": "5d2e8a0c7b41f9e36a1d0c5b8e7f2a4c9d6b3e10",
+      "remote_verified": true,
+      "commits": [],
+      "verdict": null,
+      "reviewer": {
+        "model": "gemma4-31b",
+        "models": ["gemma4-31b"],
+        "verdict": "approve",
+        "source": "zoder_verdict"
+      }
+    }
+  },
+  "rc_verdict_only": {
+    "id": "01a1a2f0-4f44-7a04-8b2c-6d7e8f9a0b44",
+    "kind": "review:build:zeroclaw-20261101",
+    "status": "done",
+    "repo": "graeae-hive",
+    "project": "graeae-hive",
+    "head_branch": "hv/fo-merge-pass-20261031",
+    "base_branch": "deploy/integrate-20261017",
+    "parent_job_id": "01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01",
+    "idempotency_key": "review-queue:01a194cb-79b3-7c10-9e2a-3b4c5d6e7f01:4:5d2e8a0c7b41",
+    "claimed_by": "urn:agent:provider:deepseek:1",
+    "claimed_model": "deepseek-flash",
+    "ended_at": 1793546400.0,
+    "result": {
+      "via": "hive_worker",
+      "head_sha": "9e1b7c3a5f20d48e6c1a0b9f8e7d6c5b4a392817",
+      "remote_sha": "9e1b7c3a5f20d48e6c1a0b9f8e7d6c5b4a392817",
+      "remote_verified": true,
+      "commits": ["9e1b7c3a5f20d48e6c1a0b9f8e7d6c5b4a392817"],
+      "files_changed": [".hive/review/hv-fo-merge-pass-20261031-01a1a2f0-4f44.json"],
+      "verdict": {
+        "verdict": "request_changes",
+        "head": "9e1b7c3a5f20d48e6c1a0b9f8e7d6c5b4a392817",
+        "findings": [
+          {
+            "severity": "high",
+            "location": "deploy/hive_worker.py:7225",
+            "title": "author ref resolved after the diff",
+            "body": "The diff runs against a ref that is resolved later, so an unresolved ref reads as no change."
+          }
+        ]
+      },
+      "reviewer": {
+        "model": "deepseek-flash",
+        "models": ["deepseek-flash"],
+        "verdict": "request_changes",
+        "source": "zoder_verdict"
+      }
+    }
+  }
+}

@@ -5417,8 +5417,46 @@ def run_remediation_sweep(*, dry_run: bool | None = None, now: float | None = No
         job_lookup=_chain_job,
     )
     summary["enabled"] = True
+    # The review-driven half: request_changes -> continuation job -> re-review
+    # (operator 2026-11-01). Same kill switch and store; the global DRY_RUN
+    # also holds it back, because submitting a job is a write.
+    try:
+        summary["continuations"] = run_continuation_sweep(
+            rows,
+            roster=roster,
+            dry_run=bool(DRY_RUN) or (doctor_remediation.DRY_RUN if dry_run is None else dry_run),
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the field-fix half already ran
+        summary["continuations"] = {"errors": 1, "error": str(exc)}
+        log.error("continuation sweep failed: %s", exc)
     broadcast_doctor_message("doctor.remediation", {"host": AGENT_HOST, **summary})
     return summary
+
+
+def _continuation_verdict_only(row: dict, child: dict, tip: str, reviewed: str) -> bool:
+    """Whether ``reviewed`` is a verdict-only descendant of ``tip``, proven on disk."""
+    return classify_review_head(row, tip, reviewed, child=child).verdict == doctor_head_match.VERDICT_ONLY
+
+
+def run_continuation_sweep(
+    rows: list[dict], *, roster: list[dict] | None = None, dry_run: bool = False, now: float | None = None
+) -> dict:
+    """Wire :func:`doctor_remediation.continuation_sweep` to the bus.
+
+    Children are this row's ``review:`` jobs; the continuation is submitted as
+    the doctor; the escalation is the remediation one (``doctor.needs_review_stuck``)."""
+    return doctor_remediation.continuation_sweep(
+        rows,
+        state=STATE,
+        children=_needs_review_child_review_jobs,
+        submit=submit_job_spec,
+        escalate=_remediate_escalate,
+        roster=roster,
+        now=now,
+        dry_run=dry_run,
+        head_is_verdict_only=_continuation_verdict_only,
+    )
 
 
 def review_followup_protected(job: dict) -> bool:

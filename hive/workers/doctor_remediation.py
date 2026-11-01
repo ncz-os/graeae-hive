@@ -1611,3 +1611,579 @@ def sweep(
             summary["causes"][outcome.cause] = summary["causes"].get(outcome.cause, 0) + 1
         log.info(outcome.as_log())
     return summary
+
+
+# ── Continuation rounds: request_changes -> continuation -> re-review ───────
+# Operator 2026-11-01: the orchestrator ran this loop by hand. A cross-family
+# review asked for changes, a CONTINUATION job carried the findings to a new
+# branch cut from the delivered one, and the continuation's head went back to
+# the review queue like any other delivery. The doctor now runs it, bounded:
+# two automatic rounds per lineage, then one escalation and nothing more.
+#
+# Conflicts and merged-tree failures are NOT handled here: they belong to the
+# merge-pass tool (fleet-ops). Only the review-driven path lives in this module.
+
+#: Automatic continuation rounds per lineage (the original work row and the
+#: continuations cut from it). Past it the row is escalated ONCE.
+CONTINUATION_MAX_ROUNDS = int(os.environ.get("HIVE_DOCTOR_CONTINUATION_MAX_ROUNDS", str(MAX_AUTO_REMEDIATIONS)))
+
+#: New continuation jobs one sweep may submit (a dry run previews as many).
+CONTINUATION_MAX_PER_SWEEP = int(os.environ.get("HIVE_DOCTOR_CONTINUATION_MAX_PER_SWEEP", "3"))
+
+#: The standing instruction every continuation brief carries, verbatim.
+CONTINUATION_INSTRUCTION = (
+    "verify every finding against source first; failing test first when it holds; "
+    "pinning test and a note when it does not; never change correct code to satisfy a "
+    "disproved claim; push your final HEAD and confirm with git ls-remote"
+)
+
+#: ``idempotency_key`` prefix of a continuation job: ``<prefix>:<root>:r<N>:<tip12>``.
+CONTINUATION_KEY_PREFIX = "doctor-continuation"
+_CONTINUATION_KEY_RE = re.compile(r"^doctor-continuation:(?P<root>[^:]+):r(?P<round>\d+):")
+_ROUND_SUFFIX_RE = re.compile(r"-r\d+$")
+
+#: Severity order for picking the BEST request_changes review (most severe first).
+_SEVERITY_RANK = {"critical": 0, "blocker": 0, "high": 1, "medium": 2, "moderate": 2, "low": 3, "info": 4, "nit": 5}
+
+_APPROVE_WORDS = frozenset({"approve", "approved", "pass", "lgtm"})
+_CHANGES_WORDS = frozenset({"request_changes", "changes_requested", "reject", "fail", "blocked"})
+
+
+def _text(value: Any) -> str:
+    return value.strip() if isinstance(value, str) else ("" if value is None else str(value).strip())
+
+
+def _finding_location(finding: dict[str, Any]) -> str:
+    """``path:line`` (or ``path``) of a finding, '' when it names no place.
+
+    Three producer spellings: a ``location`` string, a ``location`` object
+    (``path``/``file`` + ``line``) and top-level ``file``/``path`` + ``line``."""
+    loc = finding.get("location")
+    if isinstance(loc, str) and loc.strip():
+        return loc.strip()
+    holder = loc if isinstance(loc, dict) else finding
+    path = _text(holder.get("path") or holder.get("file"))
+    if not path:
+        return ""
+    line = _text(holder.get("line") or holder.get("start_line"))
+    return f"{path}:{line}" if line else path
+
+
+def _normalise_finding(raw: Any) -> dict[str, str] | None:
+    """One located finding as ``{severity, location, title, body}`` -- or None.
+
+    Values are carried VERBATIM (stripped only): the brief quotes them. A
+    finding with no location, or with neither a title nor a body, is not
+    actionable and is dropped."""
+    if not isinstance(raw, dict):
+        return None
+    location = _finding_location(raw)
+    title = _text(raw.get("title") or raw.get("summary"))
+    body = _text(
+        raw.get("body") or raw.get("detail") or raw.get("description") or raw.get("message") or raw.get("note")
+    )
+    if not location or not (title or body):
+        return None
+    severity = _text(raw.get("severity") or raw.get("level")).lower() or "unspecified"
+    return {"severity": severity, "location": location, "title": title, "body": body}
+
+
+def _finding_lists(result: Any, depth: int = 0) -> list[list]:
+    """Every list of findings a review result carries, in a stable order.
+
+    Read where the producers write them: the result itself, the legacy
+    ``verdict`` dict, the worker's ``reviewer`` record, ``review_evidence`` (and
+    its per-reviewer entries -- an APPROVING reviewer's notes are not requested
+    changes), the loop log's last iteration, and a JSON ``tail``/``stdout``."""
+    if not isinstance(result, dict) or depth > 1:
+        return []
+    out: list[list] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, list):
+            out.append(value)
+
+    def from_reviewers(entries: Any) -> None:
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            word = _text(entry.get("verdict")).lower().replace("-", "_")
+            if word in _APPROVE_WORDS:
+                continue
+            add(entry.get("findings"))
+
+    add(result.get("findings"))
+    from_reviewers(result.get("reviewers"))
+    for key in ("verdict", "reviewer", "review_evidence"):
+        holder = result.get(key)
+        if not isinstance(holder, dict):
+            continue
+        add(holder.get("findings"))
+        from_reviewers(holder.get("reviewers"))
+        inner = holder.get("verdict")
+        if isinstance(inner, dict):
+            add(inner.get("findings"))
+    iterations = result.get("log") or result.get("iterations")
+    if isinstance(iterations, list) and iterations and isinstance(iterations[-1], dict):
+        add(iterations[-1].get("findings") or iterations[-1].get("unresolved_findings"))
+    for key in ("tail", "stdout"):
+        text = result.get(key)
+        if isinstance(text, str) and text.strip()[:1] == "{":
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                continue
+            out.extend(_finding_lists(parsed, depth + 1))
+    return out
+
+
+def located_findings(result: Any) -> list[dict[str, str]]:
+    """The located findings of one review result, normalised and de-duplicated."""
+    found: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for entries in _finding_lists(result):
+        for raw in entries:
+            finding = _normalise_finding(raw)
+            if finding is None:
+                continue
+            key = (finding["severity"], finding["location"], finding["title"], finding["body"])
+            if key not in seen:
+                seen.add(key)
+                found.append(finding)
+    return found
+
+
+def _review_models(review: dict[str, Any], res: dict[str, Any]) -> list[str]:
+    """The reviewer models of one review row (verdict record first, then the claim)."""
+    from hive import review_record
+
+    names: list[str] = []
+    reviewer = res.get("reviewer")
+    if isinstance(reviewer, dict):
+        for name in [reviewer.get("model"), *(reviewer.get("models") or [])]:
+            text = review_record._named(name)
+            if text and text not in names:
+                names.append(text)
+    for holder in (res.get("review_evidence"), res):
+        for name in review_record.evidence_reviewers(holder):
+            if name not in names:
+                names.append(name)
+    verdict = res.get("verdict")
+    if isinstance(verdict, dict):
+        for name in review_record.evidence_reviewers(verdict):
+            if name not in names:
+                names.append(name)
+    if not names:
+        claimed = review_record._named(review.get("claimed_model"))
+        if claimed:
+            names.append(claimed)
+    return names
+
+
+def _review_word_and_head(res: dict[str, Any]) -> tuple[str, str]:
+    """``(verdict, reviewed head)`` of one review result ('' when unknown)."""
+    from hive import review_verdict
+
+    read = review_verdict.child_verdict(res)
+    word = review_verdict.normalize_verdict(read.get("verdict")) if read else ""
+    head = _text(read.get("head") or read.get("head_sha")) if read else ""
+    if not word:
+        evidence = res.get("review_evidence") if isinstance(res.get("review_evidence"), dict) else {}
+        words = [
+            review_verdict.normalize_verdict(e.get("verdict"))
+            for e in evidence.get("reviewers") or []
+            if isinstance(e, dict) and e.get("verdict")
+        ]
+        if any(w in _CHANGES_WORDS for w in words):
+            word = "request_changes"
+        elif words and all(w in _APPROVE_WORDS for w in words):
+            word = "approve"
+    if not head:
+        heads = review_verdict.reviewed_heads(res)
+        head = (
+            heads[0]
+            if heads
+            else _text(res.get("remote_sha") if res.get("remote_verified") else "") or _text(res.get("head_sha"))
+        )
+    if word in _APPROVE_WORDS:
+        word = "approve"
+    elif word in _CHANGES_WORDS:
+        word = "request_changes"
+    return word, head
+
+
+def read_review(
+    row: dict[str, Any],
+    review: dict[str, Any],
+    *,
+    tip: str,
+    head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
+) -> dict[str, Any] | None:
+    """One NON-AUTHOR review of ``row`` on its current tip, read -- or None.
+
+    None for: an overreaching review (its verdict covers the reviewer's own
+    edits), no verdict, an author whose family is unknown (non-author cannot be
+    proven), a reviewer in the author's family, and a head that is neither the
+    tip nor -- proven by ``head_is_verdict_only`` -- a verdict-only descendant
+    of it (live 2026-11-01: the reviewer reports the commit that adds its
+    verdict artifact). An unproven descendant is NOT the tip."""
+    res = result_dict(review)
+    if res.get("review_overreach") or res.get("failure_reason") == "review_overreach":
+        return None
+    word, head = _review_word_and_head(res)
+    if word not in ("approve", "request_changes"):
+        return None
+    author = author_model(row)
+    author_family = review_queue.family_of(author) if author else ""
+    if not author_family:
+        return None
+    models = _review_models(review, res)
+    families = sorted({review_queue.family_of(m) for m in models if review_queue.family_of(m)})
+    if not families or author_family in families:
+        return None
+    from hive import review_verdict
+
+    if not head or not tip:
+        return None
+    if review_verdict.same_sha(head, tip):
+        basis = "exact"
+    elif head_is_verdict_only is not None and head_is_verdict_only(row, review, tip, head):
+        basis = "verdict_only"
+    else:
+        return None
+    return {
+        "verdict": word,
+        "reviewers": models,
+        "families": families,
+        "head": head,
+        "basis": basis,
+        "findings": located_findings(res) if word == "request_changes" else [],
+        "review_job_id": str(review.get("id") or ""),
+        "ended_at": review.get("ended_at") or 0,
+    }
+
+
+def _review_rank(review: dict[str, Any]) -> tuple:
+    findings = review.get("findings") or []
+    worst = min((_SEVERITY_RANK.get(f["severity"], 9) for f in findings), default=9)
+    try:
+        newest = -float(review.get("ended_at") or 0)
+    except (TypeError, ValueError):
+        newest = 0.0
+    return (worst, -len(findings), newest, review.get("review_job_id") or "")
+
+
+def best_review(
+    row: dict[str, Any],
+    reviews: list[dict[str, Any]],
+    *,
+    head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
+) -> dict[str, Any] | None:
+    """The BEST non-author review of the row's current tip, or None.
+
+    An approve outranks every request_changes (there is nothing to continue).
+    Among request_changes reviews with located findings the most severe wins,
+    then the most findings, then the newest. The families of EVERY
+    request_changes review on the tip ride along (``requested_by``): the
+    ladder must avoid all of them, not just the best one's."""
+    tip = delivered_head(row)
+    readings = [
+        r
+        for r in (read_review(row, review, tip=tip, head_is_verdict_only=head_is_verdict_only) for review in reviews)
+        if r is not None
+    ]
+    if any(r["verdict"] == "approve" for r in readings):
+        return None
+    changes = [r for r in readings if r["verdict"] == "request_changes" and r["findings"]]
+    if not changes:
+        return None
+    best = dict(sorted(changes, key=_review_rank)[0])
+    best["requested_by"] = sorted({f for r in readings if r["verdict"] == "request_changes" for f in r["families"]})
+    return best
+
+
+def continuation_lineage(row: dict[str, Any], state: Any = None) -> tuple[str, int]:
+    """``(root work row id, round)`` of a row: ``(own id, 0)`` for an original.
+
+    The doctor records each continuation it submits (durable, keyed on the new
+    job id) and also spells it in the job's ``idempotency_key``; either is
+    enough, so a row whose key the bus dropped still counts its rounds."""
+    jid = str(row.get("id") or "")
+    if state is not None and jid:
+        recorded = state.value(_lineage_key(jid), None)
+        if isinstance(recorded, dict) and recorded.get("root"):
+            try:
+                return str(recorded["root"]), int(recorded.get("round") or 0)
+            except (TypeError, ValueError):
+                pass
+    match = _CONTINUATION_KEY_RE.match(str(row.get("idempotency_key") or ""))
+    if match:
+        return match.group("root"), int(match.group("round"))
+    return jid, 0
+
+
+def _lineage_key(job_id: str) -> str:
+    return f"{_KEY_MARK}:continuation:lineage:{job_id}"
+
+
+def _rounds_key(root: str) -> str:
+    return f"{_KEY_MARK}:continuation:rounds:{root}"
+
+
+def continuation_escalation_key(root: str) -> str:
+    return f"{_KEY_MARK}:continuation:escalated:{root}"
+
+
+def continuation_key(job_id: str, tip: str, round_no: int) -> str:
+    """The durable "already continued" marker for one (row, tip, round)."""
+    return f"{_KEY_MARK}:continuation:{job_id}:{str(tip or '')[:12] or 'nohead'}:r{int(round_no)}"
+
+
+def rounds_spent(row: dict[str, Any], state: Any) -> tuple[str, int]:
+    """``(root, rounds already submitted for the lineage)``."""
+    root, own = continuation_lineage(row, state)
+    try:
+        recorded = int(state.value(_rounds_key(root), 0) or 0)
+    except (TypeError, ValueError):
+        recorded = 0
+    return root, max(own, recorded)
+
+
+def continuation_branch(row: dict[str, Any], round_no: int, state: Any = None) -> str:
+    """``<slug>-rN``: the slug is the head branch without a previous ``-rN``
+    (stripped only from a row that IS a continuation)."""
+    head = str(row.get("head_branch") or "").strip()
+    _root, own = continuation_lineage(row, state)
+    slug = _ROUND_SUFFIX_RE.sub("", head) if own else head
+    return f"{slug}-r{int(round_no)}"
+
+
+def _hard_lane_routes(roster: list[dict]) -> list[dict]:
+    flags = lambda r: r.get("flags") if isinstance(r.get("flags"), dict) else {}  # noqa: E731
+    hard = [r for r in roster if review_queue._int_flag(flags(r).get("hard_lane_priority")) > 0]
+    return sorted(hard, key=lambda r: review_queue._bulk_key(r, review_queue.LANE_HARD))
+
+
+def ladder_pick(
+    row: dict[str, Any], review: dict[str, Any], round_no: int, *, roster: list[dict] | None = None
+) -> dict[str, Any] | None:
+    """The model a continuation round runs on, or None (the row escalates).
+
+    Round 1: the AUTHOR's own model -- same family as the author, which must
+    not be a family that requested changes. Round 2+: the strongest hard-lane
+    route (``hard_lane_priority``, ``review_queue``'s hard-lane order) whose
+    family requested no changes and is not forbidden. ``{"model", "route"}``."""
+    blocked = {f for f in [*(review.get("requested_by") or []), *(review.get("families") or [])] if f}
+    if int(round_no) <= 1:
+        author = author_model(row)
+        family = review_queue.family_of(author) if author else ""
+        if not family or family in blocked or family in review_queue.FORBIDDEN_FAMILIES:
+            return None
+        route = roster_route_for(author, roster=roster) if roster else None
+        return {"model": author, "route": route}
+    for route in _hard_lane_routes(list(roster if roster is not None else review_queue.load_roster())):
+        family = str(route.get("family") or "")
+        if not family or family in blocked or family in review_queue.FORBIDDEN_FAMILIES:
+            continue
+        return {"model": str(route.get("model_id") or ""), "route": route}
+    return None
+
+
+def continuation_brief(row: dict[str, Any], review: dict[str, Any], round_no: int, *, base: str, head: str) -> str:
+    """The continuation job's description: context, findings verbatim, the rule."""
+    tip = delivered_head(row) or "(unrecorded)"
+    lines = [
+        f"Continuation round {int(round_no)} of {CONTINUATION_MAX_ROUNDS} for work job {row.get('id')} "
+        f"({row.get('kind') or 'work'}) in {row.get('repo') or '(see job)'}.",
+        f"Start from branch {base} at commit {tip}; create the NEW branch {head} from it, commit your fixes "
+        f"there and push {head}. Never push to {base}.",
+        f"A cross-family review ({', '.join(review.get('reviewers') or []) or 'reviewer'}; "
+        f"families {', '.join(review.get('families') or []) or 'unknown'}) requested changes on {review.get('head') or tip}"
+        f"{' (a verdict-only descendant of the tip)' if review.get('basis') == 'verdict_only' else ''}. "
+        "Its findings, verbatim:",
+        "",
+    ]
+    for index, finding in enumerate(review.get("findings") or [], start=1):
+        lines.append(f"{index}. [{finding['severity']}] {finding['location']} -- {finding['title']}")
+        if finding.get("body"):
+            lines.append(f"   {finding['body']}")
+    lines += ["", f"Standing instruction: {CONTINUATION_INSTRUCTION}."]
+    return "\n".join(lines)
+
+
+def continuation_spec(
+    row: dict[str, Any], review: dict[str, Any], round_no: int, pick: dict[str, Any] | str, *, state: Any = None
+) -> dict[str, Any]:
+    """The continuation job for ``row``. Raises ValueError for a review row:
+    the parent of a continuation is always the WORK row, never a review job."""
+    if review_queue.is_review_kind(row) or str(row.get("kind") or "").startswith(("review:", "triage:")):
+        raise ValueError(f"refused continuation: {row.get('id')} is not a work row")
+    pick = {"model": pick, "route": None} if isinstance(pick, str) else pick
+    base = str(row.get("head_branch") or "").strip()
+    if not base:
+        raise ValueError(f"refused continuation: {row.get('id')} has no head_branch")
+    head = continuation_branch(row, round_no, state)
+    root, _own = continuation_lineage(row, state)
+    tip = delivered_head(row)
+    route = pick.get("route") if isinstance(pick.get("route"), dict) else None
+    tier = str(row.get("max_cost_tier") or "").strip().upper()
+    route_tier = str((route or {}).get("cost_class") or "").strip().upper()
+    if route_tier in COST_CLASSES and (
+        tier not in COST_CLASSES or COST_CLASSES.index(route_tier) > COST_CLASSES.index(tier)
+    ):
+        tier = route_tier
+    spec: dict[str, Any] = {
+        "kind": row.get("kind"),
+        "description": continuation_brief(row, review, round_no, base=base, head=head),
+        "repo": row.get("repo"),
+        "project": row.get("project"),
+        "head_branch": head,
+        "base_branch": base,
+        "eligible_kinds": list(row.get("eligible_kinds") or []),
+        "preferred_models": [pick["model"]],
+        "max_cost_tier": tier or None,
+        "priority": row.get("priority") or 0,
+        "parent_job_id": str(row.get("id") or ""),
+        "idempotency_key": f"{CONTINUATION_KEY_PREFIX}:{root}:r{int(round_no)}:{(tip or 'nohead')[:12]}",
+    }
+    if route and review_queue.is_codex_route(route):
+        # Same confinement as a Codex review: only the local codex worker claims it.
+        spec["eligible_kinds"] = [review_queue.CODEX_WORKER_KIND]
+        spec["max_concurrency"] = 1
+    return spec
+
+
+def _continuation_candidate(row: dict[str, Any]) -> bool:
+    """Cheap, side-effect free: a needs-review WORK row the doctor may continue."""
+    if not isinstance(row, dict) or str(row.get("status") or "") != "needs-review":
+        return False
+    if is_lane_b_owned(row) or review_queue.is_review_kind(row):
+        return False
+    kind = str(row.get("kind") or "")
+    return not kind.startswith(("review:", "triage:")) and bool(str(row.get("head_branch") or "").strip())
+
+
+def continue_one(
+    row: dict[str, Any],
+    *,
+    state: Any,
+    children: Callable[[dict], list[dict]],
+    submit: Callable[[dict], tuple[int, Any]],
+    escalate: Callable[[dict, str], None],
+    roster: list[dict] | None = None,
+    now: float | None = None,
+    dry_run: bool = False,
+    allow_submit: bool = True,
+    head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
+) -> tuple[Outcome, dict | None]:
+    """Continue ONE row, or say why not. Returns ``(outcome, spec or None)``."""
+    now = time.time() if now is None else float(now)
+    jid = str(row.get("id") or "")
+    if not _continuation_candidate(row):
+        return Outcome(jid, SKIPPED, "continuation", "not a needs-review work row"), None
+    review = best_review(row, children(row), head_is_verdict_only=head_is_verdict_only)
+    if review is None:
+        return Outcome(jid, NO_CHANGE, "continuation", "no request_changes with located findings on the tip"), None
+    tip = delivered_head(row)
+    for done in range(1, CONTINUATION_MAX_ROUNDS + 1):
+        if already_fixed(state, continuation_key(jid, tip, done), now=now):
+            return Outcome(jid, NO_CHANGE, "continuation", f"already continued (round {done})"), None
+    root, spent = rounds_spent(row, state)
+    round_no = spent + 1
+    pick = ladder_pick(row, review, round_no, roster=roster) if spent < CONTINUATION_MAX_ROUNDS else None
+    if pick is None:
+        why = (
+            f"continuation: {spent} automatic round(s) spent (max {CONTINUATION_MAX_ROUNDS}); "
+            f"changes still requested by {', '.join(review['reviewers'])} on {tip[:12]}"
+            if spent >= CONTINUATION_MAX_ROUNDS
+            else f"continuation: no round {round_no} model outside the reviewers' families "
+            f"({', '.join(review.get('requested_by') or [])})"
+        )
+        key = continuation_escalation_key(root)
+        if _marked_within(state, key, ESCALATE_TTL_SEC, now):
+            return Outcome(jid, SKIPPED, "continuation", "escalated already", reason=why), None
+        if dry_run:
+            return Outcome(jid, DRY_WOULD_APPLY, "continuation", "would escalate", reason=why), None
+        escalate(row, why)
+        state.set_value(key, {"at": now}, ttl=MARK_TTL_SEC)
+        return Outcome(jid, ESCALATED, "continuation", "rounds spent" if spent else "no ladder model", reason=why), None
+    if not allow_submit:
+        return Outcome(jid, "deferred", "continuation", f"per-sweep cap ({CONTINUATION_MAX_PER_SWEEP})"), None
+    spec = continuation_spec(row, review, round_no, pick, state=state)
+    detail = f"round {round_no} on {pick['model']}: {spec['base_branch']} -> {spec['head_branch']}"
+    if dry_run:
+        return Outcome(jid, DRY_WOULD_APPLY, "continuation", detail), spec
+    code, resp = submit(spec)
+    new_id = resp.get("id") if isinstance(resp, dict) else None
+    if code not in (200, 201) or not new_id:
+        return Outcome(jid, FAILED, "continuation", detail, error=f"submit http={code}"), spec
+    mark_fixed(state, continuation_key(jid, tip, round_no), at=now)
+    state.set_value(_rounds_key(root), max(spent, round_no), ttl=MARK_TTL_SEC)
+    state.set_value(_lineage_key(str(new_id)), {"root": root, "round": round_no}, ttl=MARK_TTL_SEC)
+    return Outcome(jid, APPLIED, "continuation", f"{detail} (job {str(new_id)[:12]})", attempts=round_no), spec
+
+
+def continuation_sweep(
+    rows: list[dict[str, Any]],
+    *,
+    state: Any,
+    children: Callable[[dict], list[dict]],
+    submit: Callable[[dict], tuple[int, Any]],
+    escalate: Callable[[dict, str], None],
+    roster: list[dict] | None = None,
+    now: float | None = None,
+    dry_run: bool | None = None,
+    enabled: bool | None = None,
+    max_per_sweep: int | None = None,
+    head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
+) -> dict[str, Any]:
+    """One pass of the continuation loop over ``rows`` (oldest first, capped).
+
+    ``HIVE_DOCTOR_REMEDIATE=0`` (``enabled``) stops it before any read; a dry
+    run submits, marks and escalates nothing and lists what it would submit.
+    One bad row never stops the pass."""
+    enabled = REMEDIATE_ENABLED if enabled is None else bool(enabled)
+    dry_run = DRY_RUN if dry_run is None else bool(dry_run)
+    cap = CONTINUATION_MAX_PER_SWEEP if max_per_sweep is None else int(max_per_sweep)
+    summary: dict[str, Any] = {"enabled": enabled, "dry_run": dry_run, "capped": cap, APPLIED: 0, "scanned": 0}
+    if not enabled:
+        return summary
+    now = time.time() if now is None else float(now)
+    ordered = sorted(
+        [r for r in rows or [] if _continuation_candidate(r)],
+        key=lambda r: (r.get("ended_at") or r.get("last_update_at") or r.get("started_at") or 0, str(r.get("id"))),
+    )
+    summary["scanned"] = len(ordered)
+    used = 0
+    handled: set[str] = set()
+    for row in ordered:
+        jid = str(row.get("id") or "")
+        if jid in handled:
+            continue
+        handled.add(jid)
+        try:
+            outcome, spec = continue_one(
+                row,
+                state=state,
+                children=children,
+                submit=submit,
+                escalate=escalate,
+                roster=roster,
+                now=now,
+                dry_run=dry_run,
+                allow_submit=used < cap,
+                head_is_verdict_only=head_is_verdict_only,
+            )
+        except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
+            summary["errors"] = summary.get("errors", 0) + 1
+            log.error("continuation failed job=%s: %s", jid[:12], exc)
+            continue
+        if spec is not None and outcome.status in (APPLIED, DRY_WOULD_APPLY, FAILED):
+            used += 1
+        if outcome.status == DRY_WOULD_APPLY and spec is not None:
+            summary.setdefault("would_submit", []).append(
+                {k: spec.get(k) for k in ("parent_job_id", "head_branch", "base_branch", "preferred_models")}
+            )
+        summary[outcome.status] = summary.get(outcome.status, 0) + 1
+        log.info(outcome.as_log())
+    return summary
