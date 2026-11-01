@@ -300,7 +300,10 @@ def verdict_only_between(repo: str | None, tip: str, reviewed: str) -> bool:
 def _files_from_git(repo: str, reviewed: str) -> list[str] | None:
     """The code ``reviewed`` itself commits, by diffing it against its first parent.
 
-    ``None`` when git cannot answer (no parent, a failed rev-list or diff).
+    ``None`` when git cannot answer (no parent, a failed rev-list or diff);
+    ``[]`` ONLY when git proved the commit changed nothing but verdict
+    artifacts (or nothing at all). Callers must not collapse the two with
+    ``or``: a proven ``[]`` is evidence, ``None`` is its absence.
     """
     code, out = _git(repo, "rev-list", "--parents", "-n", "1", reviewed)
     parts = out.split()
@@ -391,36 +394,69 @@ def classify_descendant(
             reason=f"reviewed head {_shown(reviewed)} is not in this workspace",
         )
     if reviewed == tip:
+        # The SAME validation ``verdict_only_between`` applies: identical
+        # strings are the same head only when they are a full 40-hex sha this
+        # workspace holds. ``has_commit`` alone also accepts ``HEAD``, a
+        # branch name or an abbreviation -- none of which is a reviewed head.
+        if verdict_only_between(repo, tip, reviewed):
+            return HeadMatch(
+                VERDICT_ONLY,
+                reviewed,
+                tip,
+                reason="approved exact delivered HEAD",
+                ok_for_tip=True,
+            )
         return HeadMatch(
-            VERDICT_ONLY,
+            NOT_DESCENDANT,
             reviewed,
             tip,
-            reason="approved exact delivered HEAD",
-            ok_for_tip=True,
+            reason=f"approved head {_shown(reviewed)} is not a full commit sha held in this workspace",
         )
     if not is_ancestor_or_same(repo, tip, reviewed):
-        # Not a descendant: "overreach" needs evidence that the review COMMITTED
-        # code, from git (the commits are here: diff it against its own base) or
-        # from the child's report of what it changed.
-        # An unreadable diff (``None``) proves nothing; the self report can
-        # still name code. Either way this branch is never an approval.
-        report = _files_from_git(repo, reviewed) or non_artifact_files(pushed_files)
-        if report:
+        # Not a descendant: never an approval. "overreach" needs evidence that
+        # the review COMMITTED code. git is the evidence when it can answer:
+        # ``[]`` PROVES the reviewed commit changed no code and the self report
+        # cannot replace it (it is only quoted as doubt). Only a git FAILURE
+        # (``None``) lets the self report name the files -- adding doubt, never
+        # removing it.
+        proven = _files_from_git(repo, reviewed)
+        report = non_artifact_files(pushed_files)
+        if proven:
+            return HeadMatch(
+                OVERREACH,
+                reviewed,
+                tip,
+                files=proven,
+                reason=(
+                    f"review_overreach: the review job changed code ({', '.join(proven[:3])}) on a head that "
+                    f"does not descend from the delivered head {_shown(tip)}; its approve is not counted"
+                ),
+            )
+        if proven is None and report:
             return HeadMatch(
                 OVERREACH,
                 reviewed,
                 tip,
                 files=report,
                 reason=(
-                    f"review_overreach: the review job changed code ({', '.join(report[:3])}) on a head that "
-                    f"does not descend from the delivered head {_shown(tip)}; its approve is not counted"
+                    f"review_overreach: what the review job changed is not proven (git could not read it); "
+                    f"it reported code ({', '.join(report[:3])}) on a head that does not descend from the "
+                    f"delivered head {_shown(tip)}; its approve is not counted"
                 ),
             )
+        if proven is None:
+            detail = "; what it changed is not proven (git could not read it)"
+        elif report:
+            detail = f"; git shows no code change (the child reported {', '.join(report[:3])})"
+        else:
+            detail = ""
         return HeadMatch(
             NOT_DESCENDANT,
             reviewed,
             tip,
-            reason=f"approved head {_shown(reviewed)} is not a descendant of the delivered head {_shown(tip)}",
+            reason=(
+                f"approved head {_shown(reviewed)} is not a descendant of the delivered head {_shown(tip)}{detail}"
+            ),
         )
     files = changed_files(repo, tip, reviewed)
     if files is None:

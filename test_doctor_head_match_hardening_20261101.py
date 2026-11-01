@@ -392,8 +392,8 @@ def test_m2_only_this_jobs_own_verdict_names_are_allowed(worker, tmp_path):
         (OWN_VERDICT, True),
         (f"review-verdict-{REVIEW_JOB_ID}.json", True),
         (f".hive/review/review-verdict-{REVIEW_JOB_ID}.json", True),
-        # The reviewed (parent) job's id: the spelling the old brief produced.
-        (f"review-verdict-{WORK_JOB_ID}.json", True),
+        # The reviewed (parent) job's id is not this job's name (r4, DeepSeek 5).
+        (f"review-verdict-{WORK_JOB_ID}.json", False),
         ("review-verdict-someone-else.json", False),
         ("REVIEW_VERDICT_hv-other-branch.json", False),
         (f"src/foo/review-verdict-{REVIEW_JOB_ID}.json", False),

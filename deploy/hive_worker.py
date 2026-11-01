@@ -7018,10 +7018,12 @@ REVIEW_ARTIFACT_KINDS = ("review:",)
 
 
 def review_verdict_ref(head_branch: str | None, job_id: str) -> str:
-    """The ref a review job publishes its verdict artifact on: ``review/<branch>-<job>``."""
-    branch = str(head_branch or "").strip().strip("/") or "no-branch"
-    job = str(job_id or "").strip().strip("/") or "no-job"
-    return f"review/{branch}-{job}"
+    """The ref a review job publishes its verdict artifact on: ``review/<branch>-<job>``.
+
+    Spelled by ``review_queue.review_verdict_ref`` -- the helper the doctor's
+    review brief uses too, so the two can never disagree.
+    """
+    return review_queue.review_verdict_ref(head_branch, job_id)
 
 
 #: The only directories a verdict artifact may live in (mirrors
@@ -7041,27 +7043,30 @@ def _normalize_repo_path(path: str) -> str:
 def _review_own_artifact(path: str, spec: dict) -> bool:
     """Whether ``path`` is THIS review job's own verdict artifact, in a review directory.
 
-    Only the names ``review_verdict_paths`` gives this job (its branch slug, its
-    own id) plus the reviewed (parent) job's id -- the spelling the doctor's
-    brief used to name -- and only in ``REVIEW_ARTIFACT_DIRS``. Any other
-    verdict-shaped name, or the right name in another directory, is a change.
+    Only the names ``review_verdict_paths`` gives this job -- its branch slug
+    and its OWN id -- and only in ``REVIEW_ARTIFACT_DIRS``. The reviewed
+    (parent) job's id is NOT this job's name (r4 review, DeepSeek): a
+    ``review-verdict-<parent>.json`` on the author branch is a change, and a
+    job without its own id gets the branch-slug name only, never the parent's.
+    Any other verdict-shaped name, or the right name in another directory, is
+    a change.
     """
     clean = _normalize_repo_path(path)
     directory, _, base = clean.rpartition("/")
     if not base or directory not in REVIEW_ARTIFACT_DIRS:
         return False
     own = str((spec or {}).get("id") or "").strip()
-    parent = str((spec or {}).get("parent_job_id") or "").strip()
-    names = set(review_verdict_paths((spec or {}).get("head_branch"), own or parent))
-    if parent:
-        names.add(f"review-verdict-{parent}.json")
+    slug_name, id_name = review_verdict_paths((spec or {}).get("head_branch"), own)
+    names = {slug_name, id_name} if own else {slug_name}
     return base in names
 
 
 def review_verdict_paths(head_branch: str | None, job_id: str) -> list[str]:
-    """The verdict artifact names a review job may write (its own, either spelling)."""
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(head_branch or "").strip("/") or "no-branch").strip("-")
-    return [f"REVIEW_VERDICT_{slug}.json", f"review-verdict-{job_id}.json"]
+    """The verdict artifact names a review job may write (its own, either spelling).
+
+    Spelled by ``review_queue.review_verdict_paths``, shared with the doctor.
+    """
+    return review_queue.review_verdict_paths(head_branch, job_id)
 
 
 def review_brief_text(
@@ -7105,6 +7110,118 @@ def _review_git(workdir: str, env: dict | None, *args: str) -> tuple[int, str]:
     return out.returncode, out.stdout
 
 
+#: The disposition of a review whose AUTHOR branch could not be resolved in
+#: its workspace: neither approved nor overreach -- git cannot say either.
+REVIEW_UNPROVABLE = "review_unprovable"
+
+_FULL_SHA_RE = re.compile(r"[0-9a-fA-F]{40}")
+
+
+def _review_commit(workdir: str, env: dict | None, rev: str) -> str | None:
+    """The full sha ``rev`` names in the workspace, or ``None``."""
+    code, sha = _review_git(workdir, env, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}")
+    sha = sha.strip()
+    return sha if code == 0 and sha else None
+
+
+def review_author_ref(
+    workdir: str,
+    head_branch: str | None,
+    env: dict | None = None,
+    *,
+    recorded_head: str | None = None,
+) -> tuple[str, str] | None:
+    """Resolve the AUTHOR branch in the review workspace: ``(source, sha)`` or ``None``.
+
+    In order (r4 review, DeepSeek): the remote-tracking ref
+    ``refs/remotes/origin/<branch>``; the branch fetched EXPLICITLY from origin
+    (a detached or single-ref checkout has no tracking ref); the recorded
+    delivered head -- only a full 40-hex sha this workspace holds. ``None``
+    when none resolves: the caller reports that as unprovable, never as clean.
+    """
+    branch = str(head_branch or "").strip().strip("/")
+    if branch:
+        tracking = f"refs/remotes/origin/{branch}"
+        code, out = _review_git(workdir, env, "for-each-ref", "--format=%(refname)", tracking)
+        if code == 0 and tracking in out.split():
+            sha = _review_commit(workdir, env, tracking)
+            if sha:
+                return tracking, sha
+        code, _ = _review_git(workdir, env, "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}")
+        if code == 0:
+            sha = _review_commit(workdir, env, "FETCH_HEAD")
+            if sha:
+                return f"origin {branch} (fetched)", sha
+    recorded = str(recorded_head or "").strip()
+    if _FULL_SHA_RE.fullmatch(recorded):
+        code, kind = _review_git(workdir, env, "cat-file", "-t", recorded)
+        if code == 0 and kind.strip() == "commit":
+            return "recorded delivered head", recorded
+    return None
+
+
+def review_workspace_evidence(
+    workdir: str | None,
+    baseline: str | None,
+    head_branch: str | None,
+    env: dict | None = None,
+    *,
+    job_id: str | None = None,
+    recorded_head: str | None = None,
+) -> dict:
+    """What git proves the review job changed: ``{"files": list | None, "author": bool}``.
+
+    ``files`` is ``None`` (not proven) when there is no workspace, it does not
+    hold ``baseline``, or a git question about the job's refs fails.
+    ``author`` is ``False`` when the author branch could not be resolved
+    (``review_author_ref``): the files then cover only ``HEAD`` and the job's
+    own ref, and the review is unprovable unless those already show overreach.
+    """
+    baseline = str(baseline or "").strip()
+    if not workdir or not baseline or not os.path.isdir(str(workdir)):
+        return {"files": None, "author": False}
+    code, kind = _review_git(workdir, env, "cat-file", "-t", baseline)
+    if code != 0 or kind.strip() != "commit":
+        return {"files": None, "author": False}
+    author = review_author_ref(workdir, head_branch, env, recorded_head=recorded_head)
+    own_ref = f"refs/remotes/origin/{review_verdict_ref(head_branch, job_id or '')}" if job_id else None
+    # Ask for exactly the job's own ref: an unrelated (even broken) ref
+    # elsewhere in the workspace is never listed, so it can neither add files
+    # nor fail it.
+    present: set[str] = set()
+    if own_ref:
+        code, out = _review_git(workdir, env, "for-each-ref", "--format=%(refname)", own_ref)
+        if code != 0:
+            return {"files": None, "author": author is not None}
+        present = set(out.split())
+    shas: list[tuple[str, str]] = []
+    for ref in ("HEAD", *(ref for ref in (own_ref,) if ref and ref in present)):
+        sha = _review_commit(workdir, env, ref)
+        if not sha:
+            return {"files": None, "author": author is not None}
+        shas.append((ref, sha))
+    if author is not None:
+        shas.append(("author", author[1]))
+    files: set[str] = set()
+    for ref, sha in shas:
+        if sha == baseline:
+            continue
+        code, _ = _review_git(workdir, env, "merge-base", "--is-ancestor", baseline, sha)
+        if code == 1:
+            if ref == "author":
+                files.add(f"(author branch {head_branch} rewritten off {baseline[:12]})")
+            # HEAD or the job's own review ref cut from elsewhere never reached
+            # the author branch; the author branch itself is read above.
+            continue
+        if code != 0:
+            return {"files": None, "author": author is not None}
+        code, diff = _review_git(workdir, env, "diff", "--name-only", f"{baseline}..{sha}")
+        if code != 0:
+            return {"files": None, "author": author is not None}
+        files.update(line.strip() for line in diff.splitlines() if line.strip())
+    return {"files": sorted(files), "author": author is not None}
+
+
 def review_workspace_changes(
     workdir: str | None,
     baseline: str | None,
@@ -7112,63 +7229,35 @@ def review_workspace_changes(
     env: dict | None = None,
     *,
     job_id: str | None = None,
+    recorded_head: str | None = None,
 ) -> list[str] | None:
     """Every file the review job changed relative to ``baseline``, FROM GIT -- or ``None``.
 
     Not the job's self report (an unreadable git state left that ``[]``, read
     as "clean"; a push from another local ref never showed up in it). Only the
     refs THIS job can have written are read: ``HEAD`` (its own commits,
-    ``baseline..HEAD``), the remote-tracking AUTHOR branch (a push onto it from
-    any local ref updates it) and the job's OWN ``review/<branch>-<job>`` ref.
-    A ref that descends from ``baseline`` contributes its ``baseline..ref``
-    diff; the AUTHOR branch moved to anything that does not descend from
-    ``baseline`` is a rewrite and is reported as a change.
+    ``baseline..HEAD``), the AUTHOR branch (resolved by ``review_author_ref``;
+    a push onto it from any local ref moves it) and the job's OWN
+    ``review/<branch>-<job>`` ref. A ref that descends from ``baseline``
+    contributes its ``baseline..ref`` diff; the AUTHOR branch moved to anything
+    that does not descend from ``baseline`` is a rewrite and is reported as a
+    change.
 
     Every other ref in the workspace -- an unrelated local branch, another
     review job's verdict ref -- is not this job's work and is ignored: it must
     not turn a clean review into "overreach" (r3 review, DeepSeek).
 
     ``None`` -- not proven -- when there is no workspace, the workspace does
-    not hold ``baseline``, or any git question about the job's refs fails.
+    not hold ``baseline``, any git question about the job's refs fails, or the
+    author branch cannot be resolved at all (a silently skipped author branch
+    hid a push onto it: r4 review, DeepSeek).
     """
-    baseline = str(baseline or "").strip()
-    if not workdir or not baseline or not os.path.isdir(str(workdir)):
+    evidence = review_workspace_evidence(
+        workdir, baseline, head_branch, env, job_id=job_id, recorded_head=recorded_head
+    )
+    if not evidence["author"]:
         return None
-    code, kind = _review_git(workdir, env, "cat-file", "-t", baseline)
-    if code != 0 or kind.strip() != "commit":
-        return None
-    author_ref = f"refs/remotes/origin/{str(head_branch or '').strip().strip('/')}"
-    own_ref = f"refs/remotes/origin/{review_verdict_ref(head_branch, job_id or '')}" if job_id else None
-    wanted = [ref for ref in (author_ref, own_ref) if ref]
-    # Ask for exactly these refs: an unrelated (even broken) ref elsewhere in
-    # the workspace is never listed, so it can neither add files nor fail it.
-    code, out = _review_git(workdir, env, "for-each-ref", "--format=%(refname)", *wanted)
-    if code != 0:
-        return None
-    present = set(out.split())
-    refs = ["HEAD", *(ref for ref in wanted if ref in present)]
-    files: set[str] = set()
-    for ref in refs:
-        code, sha = _review_git(workdir, env, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
-        sha = sha.strip()
-        if code != 0 or not sha:
-            return None
-        if sha == baseline:
-            continue
-        code, _ = _review_git(workdir, env, "merge-base", "--is-ancestor", baseline, sha)
-        if code == 1:
-            if ref == author_ref:
-                files.add(f"(author branch {head_branch} rewritten off {baseline[:12]})")
-            # HEAD or the job's own review ref cut from elsewhere never reached
-            # the author branch; the author branch itself is read above.
-            continue
-        if code != 0:
-            return None
-        code, diff = _review_git(workdir, env, "diff", "--name-only", f"{baseline}..{sha}")
-        if code != 0:
-            return None
-        files.update(line.strip() for line in diff.splitlines() if line.strip())
-    return sorted(files)
+    return evidence["files"]
 
 
 def review_result_violation(
@@ -7191,7 +7280,8 @@ def review_result_violation(
     ``files_changed`` only adds doubt (to the message) when git cannot answer,
     and such a workspace is refused regardless (fail closed). Returns a
     one-line reason prefixed ``review_overreach`` so the finalizer can report
-    it verbatim.
+    it verbatim -- or ``review_unprovable`` when git shows no change but the
+    author branch itself could not be resolved (``review_author_ref``).
     """
     if not str((spec or {}).get("kind") or "").startswith(REVIEW_ARTIFACT_KINDS):
         return None
@@ -7199,7 +7289,10 @@ def review_result_violation(
     branch = spec.get("head_branch")
     job_id = spec.get("id") or spec.get("parent_job_id") or ""
     ref = review_verdict_ref(branch, job_id)
-    proven = review_workspace_changes(workdir, baseline, branch, env, job_id=job_id)
+    evidence = review_workspace_evidence(
+        workdir, baseline, branch, env, job_id=job_id, recorded_head=spec.get("head_sha")
+    )
+    proven = evidence["files"]
     if proven is None:
         reported = result.get("files_changed")
         reported = [str(p) for p in reported if str(p).strip()] if isinstance(reported, list) else []
@@ -7210,6 +7303,16 @@ def review_result_violation(
             f"workspace against its baseline{shown}; a review may only publish its verdict artifact to {ref}"
         )
     extras = sorted({path for path in proven if not _review_own_artifact(path, spec)})
+    if not extras and not evidence["author"]:
+        # HEAD and the job's own ref are clean, but the author branch could not
+        # be resolved (no tracking ref, no fetch, no recorded head): a push onto
+        # it cannot be ruled out. Not approved -- and not overreach either, git
+        # shows no change to name (r4 review, DeepSeek).
+        return (
+            f"{REVIEW_UNPROVABLE}: the author branch {branch or '(none recorded)'} could not be resolved in "
+            f"the review workspace (no origin tracking ref, no explicit fetch, no recorded delivered head); "
+            f"whether the review changed it is not proven"
+        )
     if not extras:
         return None
     shown = ", ".join(extras[:3])
@@ -7246,11 +7349,14 @@ def apply_review_overreach_guard(
     # (the budget cap included) is never lost behind the overreach, and the
     # overreach is never lost behind it.
     earlier = [failure_reason] if status == "failed" and failure_reason else []
-    result["failure_reasons"] = [*earlier, "review_overreach"]
+    # The ROW key stays ``review_overreach`` (the doctor never counts a child
+    # carrying it); the failure KIND says what git actually showed.
+    kind = REVIEW_UNPROVABLE if violation.startswith(REVIEW_UNPROVABLE) else "review_overreach"
+    result["failure_reasons"] = [*earlier, kind]
     if status == "failed" and failure_reason and failure_reason != BUDGET_EXCEEDED_FAILURE:
         return status, failure_reason
     result["error"] = _cap_text(violation)
-    return "failed", "review_overreach"
+    return "failed", kind
 
 
 def job_delivery_brief(job: dict) -> str:

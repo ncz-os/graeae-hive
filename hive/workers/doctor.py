@@ -6251,9 +6251,8 @@ def _review_kind_for(base_kind: str) -> str:
 
 
 def _review_ref_slug(branch: str | None) -> str:
-    """The verdict-artifact branch part: the branch name, path and glob characters folded to ``-``."""
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(branch or "").strip("/") or "no-branch").strip("-")
-    return slug or "no-branch"
+    """The verdict-artifact branch part (``review_queue.review_ref_slug``, shared with the worker)."""
+    return review_queue.review_ref_slug(branch)
 
 
 def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: float) -> tuple[str, dict]:
@@ -6298,9 +6297,11 @@ def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: 
         # brief (``job_delivery_brief``). No placeholder is ever sent -- a
         # literal ``<job id>`` was followed verbatim, or "resolved" to the
         # reviewed job's id printed just above.
+        # Both names come from ``review_queue`` -- the same helpers the worker's
+        # delivery brief and overreach guard use -- so the two never disagree.
         "The ONLY write a review job makes is its verdict artifact "
-        f"REVIEW_VERDICT_{_review_ref_slug(head)}.json; push it to the "
-        f"SEPARATE ref review/{head or 'no-branch'}-(this review job's own id), exactly as spelled in "
+        f"{review_queue.review_verdict_paths(head, None)[0]}; push it to the "
+        f"SEPARATE ref {review_queue.review_ref_prefix(head)}(this review job's own id), exactly as spelled in "
         "this job's delivery policy below (never the author branch). "
         f"Never commit, push or amend anything on the author branch {head or '(see job)'}: "
         "any other file changed there is review overreach and the review is refused. No commits expected."

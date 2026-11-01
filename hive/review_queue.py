@@ -113,6 +113,43 @@ _ALIAS_STOPWORDS = frozenset(
 
 
 # ---------------------------------------------------------------------------
+# The review job's verdict ref and artifact names: ONE spelling.
+# ---------------------------------------------------------------------------
+# The doctor's review brief and the worker's delivery brief / overreach guard
+# must name the same ref and file (r4 review, DeepSeek): both derive them here.
+
+
+def review_branch_name(head_branch: str | None) -> str:
+    """The author branch as it appears in a review ref: trimmed of blanks and ``/``."""
+    return str(head_branch or "").strip().strip("/") or "no-branch"
+
+
+def review_ref_slug(head_branch: str | None) -> str:
+    """The verdict-artifact branch part: path and glob characters folded to ``-``."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", review_branch_name(head_branch)).strip("-")
+    return slug or "no-branch"
+
+
+def review_ref_prefix(head_branch: str | None) -> str:
+    """``review/<branch>-``: the review ref up to the review job's own id."""
+    return f"review/{review_branch_name(head_branch)}-"
+
+
+def _review_job_part(job_id: str | None) -> str:
+    return str(job_id or "").strip().strip("/") or "no-job"
+
+
+def review_verdict_ref(head_branch: str | None, job_id: str | None) -> str:
+    """The ref a review job publishes its verdict artifact on: ``review/<branch>-<job>``."""
+    return review_ref_prefix(head_branch) + _review_job_part(job_id)
+
+
+def review_verdict_paths(head_branch: str | None, job_id: str | None) -> list[str]:
+    """The verdict artifact names a review job may write (its own, either spelling)."""
+    return [f"REVIEW_VERDICT_{review_ref_slug(head_branch)}.json", f"review-verdict-{_review_job_part(job_id)}.json"]
+
+
+# ---------------------------------------------------------------------------
 # The family table.
 # ---------------------------------------------------------------------------
 
