@@ -86,6 +86,10 @@ from hive.workers import (
 )
 from hive.workers.doctor_state import DurableStateStore, state_store_from_env
 
+#: ``approved["basis"]`` that marks an approve signed at a VERDICT-ONLY
+#: descendant of the delivered head (see hive/workers/doctor_head_match.py).
+BASIS_VERDICT_ONLY = doctor_head_match.VERDICT_ONLY
+
 HIVE_URL = os.environ.get("HIVE_URL", "")
 # No baked-in bus address (operator rule 2026-10-29): a literal address in source
 # goes stale without anybody noticing. Unset means this doctor cannot reach the
@@ -5632,6 +5636,30 @@ def interpret_review_outcome(
     }
 
 
+def _verdict_only_descendant_approval(job: dict, approved: dict) -> bool:
+    """Whether ``approved`` names a REVIEWED commit that only descends from the delivered head by a verdict.
+
+    The record itself says so (``basis == "verdict_only"`` / the
+    ``verdict_only_descendant`` flag -- only the classifier ever writes them),
+    and the question is re-asked of git whenever a workspace still holds both
+    commits. A workspace that no longer exists cannot disprove a record the
+    clinician's classifier proved, so it does not revoke the approve; a
+    workspace that DOES exist and shows a code change refuses it, which is the
+    only way the record could ever be wrong (a hand-edited row).
+    """
+    recorded = str(approved.get("basis") or "") == BASIS_VERDICT_ONLY or approved.get("verdict_only_descendant") is True
+    if not recorded:
+        return False
+    tip = str(approved.get("head_sha") or "").strip()
+    reviewed = str(approved.get("approved_sha") or "").strip()
+    if not tip or not reviewed:
+        return False
+    for repo in (_head_branch_workspace(job), _child_workspace(_head_match_child(job) or {})):
+        if repo and doctor_head_match.checkout_for(repo, tip, reviewed):
+            return doctor_head_match.verdict_only_between(repo, tip, reviewed)
+    return True
+
+
 def merge_handoff(job: dict) -> str:
     """The merge path's verdict on a row: approved rows are ready to merge.
 
@@ -5640,6 +5668,14 @@ def merge_handoff(job: dict) -> str:
     so an approved row stays exactly where it was -- in the triage queue.
     """
     state = review_queue.review_state(job) or {}
+    if not state:
+        # ``review_state()`` only admits the IN-FLIGHT shape (``awaiting_review``);
+        # a row the head-match rule already cleared carries ``approved_mergeable``
+        # and would otherwise read as "never reviewed" -- the other half of the
+        # critical the r2 review found (the doctor cleared the row, the merge
+        # pass still refused to act). Read the block directly.
+        raw = _row_result_dict(job).get("review_state")
+        state = raw if isinstance(raw, dict) else {}
     approved = state.get("approved")
     if not isinstance(approved, dict) or not approved.get("reviewers"):
         approved = state.get("approved_mergeable")
@@ -5649,11 +5685,22 @@ def merge_handoff(job: dict) -> str:
         approved["head_sha"], _review_head(job, _row_result_dict(job))
     ):
         return "stale_approval"
-    if approved.get("approved_sha") and not review_verdict.same_sha(approved["approved_sha"], approved["head_sha"]):
+    if (
+        approved.get("approved_sha")
+        and not review_verdict.same_sha(approved["approved_sha"], approved["head_sha"])
+        and not _verdict_only_descendant_approval(job, approved)
+    ):
         # An approval recorded at a verdict-only DESCENDANT covers the delivered
-        # head only when the reviewed sha is that head or its descendant -- which
-        # the classifier proved before recording it. A row rewritten since then
-        # (a new tip) is stale, never mergeable.
+        # head: ``approved.head_sha`` is that head (T) and ``approved_sha`` is the
+        # commit the reviewer signed (R, T an ancestor of R, R..T diff touching
+        # only verdict artifacts -- the classifier proved both before recording
+        # it). Demanding approved_sha == head_sha here made EVERY such approval
+        # read stale, which is the critical the r2 review found: the doctor
+        # cleared the row and the merge pass still refused to act.
+        #
+        # ``approved.head_sha`` was checked against the CURRENT delivered head
+        # just above, so a row rewritten since the approve (a new tip) is still
+        # stale; the descendant exemption cannot hide that.
         return "stale_approval"
     if review_followup_protected(job):
         return "protected"
@@ -6237,12 +6284,25 @@ def classify_review_head(
 
 
 def _head_branch_workspace(job: dict) -> str | None:
-    """The row's own checkout (the delivered tip), by job id, when it exists."""
-    for root in (_WORKSPACE_ROOT, os.path.expanduser("~/hive-workspaces")):
-        path = os.path.join(root, str(job.get("id") or ""))
-        if str(job.get("id") or "") and os.path.isdir(path):
-            return path
-    return None
+    """The row's own checkout (the delivered tip), under the CONFIGURED root.
+
+    Only ``HIVE_WORKSPACE_ROOT`` -- never a hardcoded ``~/hive-workspaces``
+    fallback. The path is guessed from the job id, so falling back to $HOME
+    would let a test (or a host with a differently-rooted fleet) grade a
+    stranger's checkout: a review id that happened to exist under the operator's
+    real workspace directory would be classified against live data.
+    """
+    jid = str(job.get("id") or "").strip()
+    if not jid or not _WORKSPACE_ROOT:
+        return None
+    root = os.path.realpath(str(_WORKSPACE_ROOT))
+    path = os.path.realpath(os.path.join(root, jid))
+    # A job id is an id, never a path: one that escapes the root (``..`` or an
+    # absolute id, which ``os.path.join`` would honour verbatim) names no
+    # workspace here.
+    if os.path.dirname(path) != root:
+        return None
+    return path if os.path.isdir(path) else None
 
 
 def _review_head_mismatch(outcome: dict, head: str) -> bool:
@@ -6453,6 +6513,12 @@ def _head_match_failure(
     failure = reason or result.verdict
     if failure == doctor_head_match.OVERREACH:
         failure = "review_overreach"
+    if failure == doctor_head_match.NOT_DESCENDANT:
+        # A head that is not the delivered one and does not descend from it is
+        # the plain head-exact refusal, and it keeps the name every operator
+        # alert and dashboard already keys on. The descendant rule only ever
+        # renames the cases it actually judges.
+        failure = "review_head_mismatch"
     if _same_head_match(state.get("review_head_match"), record) and state.get("last_failure") == failure:
         return outcome, state, None
     tried = list(state.get("tried") or [])

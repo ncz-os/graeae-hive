@@ -122,7 +122,6 @@ from hive import (
     review_evidence,
     review_queue,
     review_record,
-    review_verdict,
 )
 from hive.core import fleet_inventory
 from hive.codex_delivery import fleet_git_env
@@ -7054,9 +7053,17 @@ def review_verdict_paths(head_branch: str | None, job_id: str) -> list[str]:
 def review_brief_text(
     *, head_branch: str | None, job_id: str, head_sha: str | None = None, reviewer_id: str | None = None
 ) -> str:
-    """The review brief's artifact paragraph: where the verdict goes, and what it may not touch."""
-    ref = review_verdict_ref(head_branch, reviewer_id or job_id)
-    names = review_verdict_paths(head_branch, reviewer_id or job_id)
+    """The review brief's artifact paragraph: where the verdict goes, and what it may not touch.
+
+    ``reviewer_id`` (the model that will do the reviewing) is accepted for the
+    call site and deliberately NOT used to name anything: the ref and the
+    artifact are keyed on the JOB id, because that is what
+    ``review_result_violation`` allows. A brief naming
+    ``review/<branch>-<reviewer>`` sent the reviewer to publish where its own
+    result was then refused as overreach (r2 review, high).
+    """
+    ref = review_verdict_ref(head_branch, job_id)
+    names = review_verdict_paths(head_branch, job_id)
     return (
         "Verdict artifact: commit the structured verdict JSON as "
         f"{names[0]} (or {names[1]}) and push it to the SEPARATE ref {ref} "
@@ -7064,6 +7071,7 @@ def review_brief_text(
         f"{head_branch or '(see job)'}: the review job writes ONLY its verdict artifact, on {ref}. "
         "Any other file changed on the author branch is review overreach and the review is refused."
         + (f" The exact reviewed commit is {head_sha}." if head_sha else "")
+        + (f" Reviewer (report only; never part of the ref or the file name): {reviewer_id}." if reviewer_id else "")
     )
 
 

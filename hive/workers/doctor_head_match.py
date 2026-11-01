@@ -125,6 +125,11 @@ CODE_DESCENDANT = "code_descendant"
 OVERREACH = "overreach"
 NOT_DESCENDANT = "not_descendant"
 
+#: ``approved["basis"]`` for a verdict-only descendant: the merge pass exempts
+#: that basis from the ``approved_sha == head_sha`` identity check because the
+#: two shas are DIFFERENT BY CONSTRUCTION there (T is an ancestor of R).
+BASIS_VERDICT_ONLY = VERDICT_ONLY
+
 _SHOWN = 12
 
 
@@ -197,8 +202,6 @@ def _git(repo: str, *args: str) -> tuple[int, str]:
     return out.returncode, out.stdout
 
 
-
-
 def has_commit(repo: str, sha: str) -> bool:
     """Whether ``sha`` names a commit this workspace holds."""
     sha = str(sha or "").strip()
@@ -227,6 +230,35 @@ def changed_files(repo: str, older: str, newer: str) -> list[str]:
     if code != 0:
         return []
     return sorted({line.strip() for line in out.splitlines() if line.strip()})
+
+
+def verdict_only_between(repo: str | None, tip: str, reviewed: str) -> bool:
+    """``tip`` is an ancestor of ``reviewed`` and the descent touched ONLY verdict artifacts.
+
+    The one question ``merge_handoff`` must answer without trusting a recorded
+    flag: the commit the reviewer signed may sit ON TOP of the delivered tip as
+    long as the commits in between add nothing but the review's own verdict
+    file. A workspace that cannot prove it (absent, missing commits, a diff that
+    fails) answers ``False``: an unprovable descent is not an approval.
+    """
+    tip = str(tip or "").strip()
+    reviewed = str(reviewed or "").strip()
+    if not repo or not tip or not reviewed:
+        return False
+    if not os.path.isdir(str(repo)):
+        return False
+    if tip == reviewed:
+        return True
+    if not has_commit(repo, reviewed) or not has_commit(repo, tip):
+        return False
+    if not is_ancestor_or_same(repo, tip, reviewed):
+        return False
+    code, out = _git(repo, "diff", "--name-only", f"{tip}..{reviewed}")
+    if code != 0:
+        # The descent exists but its content is unreadable: never assume the
+        # commits in between were only the verdict artifact.
+        return False
+    return not non_artifact_files([line for line in out.splitlines() if line.strip()])
 
 
 def _files_from_git(repo: str, reviewed: str) -> list[str]:

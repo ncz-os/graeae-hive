@@ -436,3 +436,38 @@ head branch; the worker/doctor refuse a review result whose commits touch files
 outside the verdict artifact. The rule is idempotent, per-sweep capped, honours
 dry-run, and is switched by `HIVE_DOCTOR_VERDICT_DESCENDANT` (default on).
 Tests: `test_doctor_review_head_match_20261031.py`.
+
+### Where the verdict artifact goes, and what it is called
+
+The ref and the artifact name are keyed on the review **job id**, and the brief
+says exactly what the guard enforces:
+
+```
+review/<head-branch>-<job-id>          # e.g. review/hv/bl-ct-dialect-01a19270-child
+REVIEW_VERDICT_<head-branch-slug>.json # e.g. REVIEW_VERDICT_hv-bl-ct-dialect.json
+review-verdict-<job-id>.json           # e.g. review-verdict-01a19270-child.json
+```
+
+The reviewer's model id is reported in the brief but never appears in a ref or
+a file name: `review_result_violation` allows only the job-keyed names, so a
+brief naming the reviewer sent the review to publish where its own result was
+then refused as overreach.
+
+### Clearing the row is not enough: the merge pass must agree
+
+A verdict-only descendant approve is recorded with `approved.head_sha` set to
+the **delivered tip** `T` and `approved.approved_sha` to the commit the reviewer
+signed `R`. Those two shas are different *by construction* (that is what a
+descendant is), so `merge_handoff` must not treat their difference as staleness:
+it exempts `basis == "verdict_only"` (re-proving ancestry and the artifact-only
+diff against git whenever a workspace still holds both commits). A row whose
+tip has moved since the approve is still `stale_approval`, and a row carrying
+`state = approved_mergeable` is read even though `review_state()` only admits
+the in-flight `awaiting_review` shape. Without both, the doctor cleared the
+blocker and the merge pass refused to act — the row was stuck in a different
+place.
+
+`_head_branch_workspace` resolves a row's clone under `HIVE_WORKSPACE_ROOT`
+only: no `~/hive-workspaces` fallback, and a job id that escapes the root (or
+is absolute outside it) names no workspace. Guessing a path from an id must
+never let a sweep grade a checkout the row does not own.

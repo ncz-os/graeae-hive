@@ -49,6 +49,7 @@ import subprocess
 
 import pytest
 
+from hive.review_queue import review_state
 from hive.workers import doctor
 from hive.workers import doctor_head_match as dhm
 
@@ -630,3 +631,131 @@ def test_switch_default_is_on_and_accepts_falsy_spellings(monkeypatch):
         else:
             monkeypatch.setenv("HIVE_DOCTOR_VERDICT_DESCENDANT", value)
         assert dhm.env_switch("HIVE_DOCTOR_VERDICT_DESCENDANT", default=True) is expected
+
+
+# ── the r2 review's four findings, one pinning test each ─────────────────────
+
+
+def test_verdict_only_descendant_approval_reaches_the_merge_pass(bus, monkeypatch):
+    """r2 review, critical: a verdict-only descendant approve was ALWAYS stale.
+
+    ``merge_handoff`` demanded ``approved_sha == approved.head_sha``, but
+    ``approved.head_sha`` is the DELIVERED tip T and ``approved_sha`` is the
+    commit R the reviewer signed -- a verdict-only descendant has R != T by
+    construction. So every row the head-match rule cleared to
+    ``approved_mergeable`` was reported ``stale_approval`` and the merge pass
+    never acted: the fix cleared the doctor's blocker and left the row stuck.
+    """
+    tip, reviewed = "a" * 40, "b" * 40
+    classifier = Classifier(
+        {reviewed: dhm.HeadMatch(dhm.VERDICT_ONLY, reviewed, tip, files=list(VERDICT_FILES), reason="ok")}
+    )
+    monkeypatch.setattr(doctor, "classify_review_head", classifier)
+    row = _reviewing_row(head=tip)
+    bus.children["review-1"] = {"id": "review-1", "kind": "review:fix", "status": "done", "parent_job_id": row["id"]}
+    bus.finish("review-1", _approve(reviewed, files=list(VERDICT_FILES), commits=[reviewed]))
+
+    outcome, _state, _ = doctor.process_awaiting_review_row(row, now=2000.0)
+    assert outcome == "approved_mergeable"
+    # The merge pass reads the row AFTER the write, exactly as the merge train does.
+    assert doctor.merge_handoff(bus.rows[row["id"]]) == "ready_to_merge"
+    # And a row rewritten to a NEW tip is stale again (the check still bites).
+    moved = {**bus.rows[row["id"]], "result": {**bus.rows[row["id"]]["result"], "head_sha": "c" * 40}}
+    moved["result"]["review_state"] = {**moved["result"]["review_state"], "head_sha": "c" * 40}
+    assert doctor.merge_handoff(moved) == "stale_approval"
+
+
+def test_exact_head_approval_still_reaches_the_merge_pass(bus):
+    """The positive control: an approve AT the delivered tip is untouched by the fix."""
+    tip = "a" * 40
+    row = _reviewing_row(head=tip)
+    row["result"]["review_state"]["approved"] = {"reviewers": ["gemma4-31b"], "head_sha": tip}
+    assert doctor.merge_handoff(row) == "ready_to_merge"
+
+
+def test_review_brief_names_the_ref_and_artifact_the_worker_enforces(worker):
+    """r2 review, high: the brief used the REVIEWER id; enforcement uses the JOB id.
+
+    A review job told to publish ``review/<branch>-<reviewer>`` writes to a ref
+    the worker's overreach guard does not allow, so following the brief was
+    itself refused. The two must name the same ref and artifact.
+    """
+    job_id, reviewer_id = "01a19270-child", "cerberus-reviewer"
+    brief = worker.review_brief_text(
+        head_branch="hv/bl-ct-dialect", job_id=job_id, head_sha="db4d910", reviewer_id=reviewer_id
+    )
+    enforced_ref = worker.review_verdict_ref("hv/bl-ct-dialect", job_id)
+    enforced_names = worker.review_verdict_paths("hv/bl-ct-dialect", job_id)
+    assert enforced_ref in brief
+    assert all(name in brief for name in enforced_names)
+    # The reviewer id must not leak into the ref or the artifact name: the
+    # guard keys on the job id, so a brief naming the reviewer is wrong.
+    assert f"review/hv/bl-ct-dialect-{reviewer_id}" not in brief
+    assert f"review-verdict-{reviewer_id}.json" not in brief
+
+
+def test_brief_revision_uses_the_same_names_as_the_guard(worker):
+    """The revision paragraph and the overreach guard must name one artifact."""
+    spec = _review_spec()
+    revision = worker.review_brief_text(head_branch="hv/bl-ct-dialect", job_id=spec["parent_job_id"])
+    assert spec["parent_job_id"] in revision or worker.review_verdict_ref("hv/bl-ct-dialect", spec["id"]) in revision
+
+
+def test_descendant_classification_never_reads_the_live_workspace_root(bus, monkeypatch, tmp_path):
+    """r2 review, high: a missing ``head_sha`` must not KeyError, and the
+    classifier must never fall back to the LIVE ``~/hive-workspaces``.
+
+    The child's id is used to guess a workspace path under the operator's real
+    hive-workspaces directory: a review job whose id happens to exist there
+    would have the doctor grade a stranger's checkout. The root is
+    ``HIVE_WORKSPACE_ROOT`` only -- when it does not resolve a job id, the
+    doctor reports "no workspace", it does not go looking in $HOME.
+    """
+    home_root = os.path.expanduser("~/hive-workspaces")
+    monkeypatch.setattr(doctor, "_WORKSPACE_ROOT", home_root)
+    # A detail of the row's result that is missing entirely: ``head_sha`` is
+    # absent from the child's report (the KeyError shape the r2 review named).
+    tip = "a" * 40
+    row = _reviewing_row(head=tip)
+    bus.children["review-1"] = {"id": "review-1", "kind": "review:fix", "status": "done", "parent_job_id": row["id"]}
+    bus.finish("review-1", {"reviewers": [{"model": "cerberus-reviewer", "verdict": "approve"}]})
+    outcome, state, _ = doctor.process_awaiting_review_row(row, now=2000.0)
+    # No head, no approve: a retry, never an exception and never a mergeable row.
+    assert outcome in ("review_failed", "awaited")
+    assert "approved" not in state
+
+    # The live root is $HOME/hive-workspaces, but a job id that does not resolve
+    # INSIDE it is never looked up elsewhere: no widening, no traversal.
+    assert doctor._head_branch_workspace({"id": "definitely-not-a-job-anywhere"}) is None
+    assert doctor._head_branch_workspace({"id": "../../etc"}) is None
+    # A job id that DOES resolve inside the configured root is the row's own.
+    scratch = tmp_path / "row-under-test"
+    scratch.mkdir()
+    monkeypatch.setattr(doctor, "_WORKSPACE_ROOT", str(tmp_path))
+    assert doctor._head_branch_workspace({"id": "row-under-test"}) == str(scratch)
+    # A job id is an id, not a path: one that ESCAPES the root must not resolve
+    # to a directory outside it (a hostile or corrupt id is never a workspace).
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "outside").mkdir()
+    monkeypatch.setattr(doctor, "_WORKSPACE_ROOT", str(root))
+    assert doctor._head_branch_workspace({"id": "../outside"}) is None
+    assert doctor._head_branch_workspace({"id": str(tmp_path / "outside")}) is None
+    # And with no configured root at all, nothing is guessed.
+    monkeypatch.setattr(doctor, "_WORKSPACE_ROOT", "")
+    assert doctor._head_branch_workspace({"id": "row-under-test"}) is None
+
+
+def test_non_descendant_head_keeps_the_exact_head_failure_kind(bus):
+    """r2 review / merged tree: a different, non-descendant head is head-exact.
+
+    ``review_head_mismatch`` is the failure kind every operator dashboard and
+    alert already keys on; the descendant rule must not rename it.
+    """
+    tip, other = "a" * 40, "b" * 40
+    row = _reviewing_row(head=tip)
+    bus.children["review-1"] = {"id": "review-1", "kind": "review:fix", "status": "done", "parent_job_id": row["id"]}
+    bus.finish("review-1", _approve(other))
+    summary = doctor.run_review_queue_sweep(rows=[row], now=1000.0)
+    assert summary["approved"] == 0
+    assert review_state(row)["last_failure"] == "review_head_mismatch"
