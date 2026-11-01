@@ -5302,8 +5302,18 @@ def fetch_remediable_rows(limit: int = 300) -> list[dict]:
 
 
 def _remediate_apply_fields(jid: str, changes: dict, reason: str) -> tuple[int, Any]:
-    """Write the changed fields onto the row (the audit trail rides along)."""
-    body = {"job_ids": [jid], "fields": {name: change.get("after") for name, change in changes.items()}}
+    """Write the changed fields onto the row (the audit trail rides along).
+
+    The route takes a field repair only as part of a status move
+    (``ReclassifyRequest.status`` is required), and merges it only when the row
+    stays out of the queue. ``needs-review`` is the doctor's own holding state:
+    the real status move that follows (requeue or hand-over) is a separate call.
+    """
+    body = {
+        "job_ids": [jid],
+        "status": "needs-review",
+        "fields": {name: change.get("after") for name, change in changes.items()},
+    }
     return _http("POST", "/v1/admin/jobs/reclassify", {**body, "reason": f"doctor-remediate:{reason}"}, timeout=20.0)
 
 
