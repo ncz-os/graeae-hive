@@ -759,3 +759,37 @@ def test_non_descendant_head_keeps_the_exact_head_failure_kind(bus):
     summary = doctor.run_review_queue_sweep(rows=[row], now=1000.0)
     assert summary["approved"] == 0
     assert review_state(row)["last_failure"] == "review_head_mismatch"
+
+
+def test_merge_pass_and_classifier_are_wired_without_an_import_layer(monkeypatch):
+    """Pins two findings the r2 robo-review raised and the source disproves.
+
+    (1) ``doctor.BASIS_VERDICT_ONLY`` reads ``doctor_head_match.VERDICT_ONLY`` at
+    module import -- the review claimed ``doctor_head_match`` was not imported
+    and would raise ``NameError``. It IS imported (the ``from hive.workers
+    import (...)`` block), and this module importing cleanly at all is the
+    proof; the assertion pins the value so a rename cannot go silent.
+
+    (2) The workspace test imports ``os`` at module level; the review claimed it
+    did not. Asserting the module attribute exists keeps that true.
+    """
+    assert doctor.BASIS_VERDICT_ONLY == dhm.VERDICT_ONLY == "verdict_only"
+    assert doctor.doctor_head_match is dhm
+    assert callable(os.path.realpath)
+
+
+def test_merge_handoff_does_not_exempt_a_non_verdict_basis(bus):
+    """The exemption is keyed on the BASIS, not on "the two shas differ".
+
+    A stale row whose approved_sha merely differs from head_sha -- no
+    verdict-only basis recorded -- is still stale. Without this the exemption
+    would quietly accept any divergent approval (the head-exact rule).
+    """
+    tip, reviewed = "a" * 40, "b" * 40
+    row = _reviewing_row(head=tip)
+    state = row["result"]["review_state"]
+    state["approved"] = {"reviewers": ["gemma4-31b"], "head_sha": tip, "approved_sha": reviewed}
+    assert doctor.merge_handoff(row) == "stale_approval"
+    # Record the basis and it is mergeable: the only difference is the proof.
+    state["approved"]["basis"] = dhm.VERDICT_ONLY
+    assert doctor.merge_handoff(row) == "ready_to_merge"
