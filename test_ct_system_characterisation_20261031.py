@@ -54,9 +54,7 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parent
 SCRIPT = REPO / "scripts" / "lineage_diff.py"
 
-SPEC = importlib.util.spec_from_file_location(
-    "lineage_diff_ct", SCRIPT
-)
+SPEC = importlib.util.spec_from_file_location("lineage_diff_ct", SCRIPT)
 lineage_diff_ct = importlib.util.module_from_spec(SPEC)
 sys.modules["lineage_diff_ct"] = lineage_diff_ct  # dataclass introspection
 SPEC.loader.exec_module(lineage_diff_ct)
@@ -198,9 +196,7 @@ def test_union_rows_classified_by_blob_identity(fixture_repo):
     assert got["old_name.txt"].cls == "only-B"
     assert got["new_name.txt"].cls == "only-A"
     assert (
-        _blob(repo, fixture_repo["x"], "new_name.txt")
-        == _blob(repo, fixture_repo["root"], "old_name.txt")
-        is not None
+        _blob(repo, fixture_repo["x"], "new_name.txt") == _blob(repo, fixture_repo["root"], "old_name.txt") is not None
     )
     # Content-identity rename: with --no-renames the classifier sees a delete
     # on the old name and an add on the new name -- the stat volume is (0,1)
@@ -217,15 +213,11 @@ def test_stats_are_from_ref_a_perspective(fixture_repo):
     No line is shared, so A adds its 2 lines and removes B's 3: (2, 3).
     gone.txt exists only on A (1 line): (1, 0)."""
     repo = fixture_repo["repo"]
-    got = {r.path: r for r in lineage_diff_ct.lineage_diff(
-        str(repo), fixture_repo["x"], fixture_repo["y"]
-    )}
+    got = {r.path: r for r in lineage_diff_ct.lineage_diff(str(repo), fixture_repo["x"], fixture_repo["y"])}
     assert (got["edit.py"].ins, got["edit.py"].dels) == (2, 3)
     assert (got["gone.txt"].ins, got["gone.txt"].dels) == (1, 0)
     # Flipping the arguments flips the direction: B=Y has 3 lines vs A's 2.
-    flipped = {r.path: r for r in lineage_diff_ct.lineage_diff(
-        str(repo), fixture_repo["y"], fixture_repo["x"]
-    )}
+    flipped = {r.path: r for r in lineage_diff_ct.lineage_diff(str(repo), fixture_repo["y"], fixture_repo["x"])}
     assert (flipped["edit.py"].ins, flipped["edit.py"].dels) == (3, 2)
     assert (flipped["gone.txt"].ins, flipped["gone.txt"].dels) == (0, 1)
 
@@ -247,9 +239,7 @@ def test_classifier_is_read_only(fixture_repo):
 
 
 def test_header_names_both_tips_and_the_divergence(fixture_repo):
-    header = lineage_diff_ct._header(
-        str(fixture_repo["repo"]), "X", "Y"
-    )
+    header = lineage_diff_ct._header(str(fixture_repo["repo"]), "X", "Y")
     assert fixture_repo["x"] in header and fixture_repo["y"] in header
     assert "merge-base " in header
     # X carries 2 commits since the root (edit, rename); Y carries 1 (edit+delete).
@@ -471,9 +461,7 @@ def test_verify_delivery_reports_bounded_evidence(fixture_repo, hive_worker, cap
     steps, and a capped ``verification_error`` naming the failed git probe
     (here: no upstream) -- the reason is the Git fact, never prose."""
     _git(fixture_repo["repo"], "checkout", "--quiet", "X")
-    rc = hive_worker.verify_delivery(
-        str(fixture_repo["repo"]), fixture_repo["root"]
-    )
+    rc = hive_worker.verify_delivery(str(fixture_repo["repo"]), fixture_repo["root"])
     assert rc == 1
     out = capsys.readouterr().out
     report = json.loads(out.strip().splitlines()[-1])
@@ -532,3 +520,47 @@ def test_suite_is_hermetic_against_host_git_env(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout[-3000:]
     assert not index.exists()
+
+
+# ---------------------------------------------------------------------------
+# Robo-review pinning (2026-10-31, non-author review of the head-match fix).
+#
+# The reviewer reported "no-op assertion in test_classifier_is_read_only" and
+# "unreliable blob extraction in _blob". Both were checked against the source:
+# the read-only test already pins object set, status and both tips (the
+# ``split()`` line is only a "the repo is not empty" guard), and ``_blob``
+# reads field 2 of the non-``--long`` ``ls-tree`` line, where field 2 IS the
+# blob id. These two tests pin that reasoning so the findings cannot resurface.
+# ---------------------------------------------------------------------------
+
+
+def test_read_only_test_actually_detects_a_mutation(fixture_repo):
+    """The read-only pins are load-bearing, not decorative.
+
+    ``test_classifier_is_read_only`` compares before/after snapshots. Prove the
+    snapshot comparison has teeth: a mutation of the fixture is visible to the
+    very same probes, so the existing test cannot pass vacuously.
+    """
+    repo = str(fixture_repo["repo"])
+    objects_before = set(_git(repo, "rev-list", "--objects", "--all").split())
+    status_before = _git(repo, "status", "--porcelain")
+
+    # Mutate: an untracked file and a new commit must both be caught.
+    pathlib.Path(repo, "mutated.txt").write_text("dirty\n")
+    assert _git(repo, "status", "--porcelain") != status_before, "status probe cannot see a dirty worktree"
+
+    _git(repo, "add", "mutated.txt")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@e", "commit", "-q", "-m", "mut")
+    after = set(_git(repo, "rev-list", "--objects", "--all").split())
+    assert after != objects_before, "object probe cannot see a new commit"
+
+
+def test_blob_reads_the_blob_id_from_ls_tree(fixture_repo):
+    """``_blob`` returns the blob id (field 2 of ``ls-tree -r``), not the path."""
+    repo = fixture_repo["repo"]
+    blob = _blob(repo, fixture_repo["x"], "keep.txt")
+    # Field 2 of `<mode> blob <sha>\t<path>` is the object id.
+    assert blob is not None and len(blob) == 40, blob
+    assert _git(repo, "cat-file", "-t", blob).strip() == "blob"
+    # A path that is not on that tip yields None instead of an IndexError.
+    assert _blob(repo, fixture_repo["x"], "no-such-path.txt") is None
