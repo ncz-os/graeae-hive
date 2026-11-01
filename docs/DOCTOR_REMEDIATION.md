@@ -564,3 +564,86 @@ xfails** tests, or grows the diff by more than the per-round budget (default
 
 Regressions: `test_doctor_grind_until_green_20261101.py`. Every test in it
 failed on the base (`6710615`) and passes with this change.
+
+## Gates from verify evidence (2026-11-01)
+
+Until this change nothing in production supplied the `gates` that
+`continue_one` needs, so `green_blocker` always answered `gates_unknown` and no
+row could reach GREEN. The gates are now **durable evidence**.
+
+### The gate record
+
+`GateProvider.for_row(row, tip)` (wired in `doctor.run_continuation_sweep`)
+returns `{"suite": {"clean", "detail"}, "import_preflight": {"clean", "detail"}}`
+from the record `remediation:gate:<repo>:<base_branch>:<full tip>` in the
+doctor's `DurableStateStore`. The record is written **only** from a verify
+job's result (`read_verify_result`) for that exact repo, base and tip.
+
+- **Absent** → `None` → `gates_unknown` (never clean).
+- **Stale** (a record for another tip, base or repo) → `None`.
+- **Malformed** (a missing gate, a non-boolean `clean`, a non-int
+  `returncode`, a result naming another tip/base) → `None`.
+- Called with a bare tip (no row, so no repo/base) → `None`.
+
+### The verify request
+
+A STRONG, non-fixer `APPROVE` on the exact tip with no gate record makes the
+sweep submit **one** job:
+
+| Field | Value |
+| --- | --- |
+| `kind` | `verify:build:zeroclaw` (`VERIFY_KIND`) |
+| `eligible_kinds` | `["zeroclaw"]` — no `eligible_hosts` pin |
+| `repo` / `project` | the row's |
+| `base_branch` | the row's **head** branch (what the worker clones) |
+| `head_branch` | none: there is no output branch |
+| `parent_job_id` | the work row |
+| `idempotency_key` | `doctor-verify:<row>:<tip[:12]>` |
+| `description` | `VERIFY_BRIEF`: check out the exact tip, merge the base, run the full suite and the import preflight, finish with one JSON line `{returncode, summary, import_preflight: {clean, detail}, base, tip}` |
+
+- One durable marker per **(row, tip)** (`remediation:verify:<row>:<tip12>`),
+  written only after the bus accepts the job; the next sweep reports
+  `verify_pending` until the result arrives.
+- Capped per sweep (`HIVE_DOCTOR_VERIFY_MAX_PER_SWEEP`, 3) and per hour
+  (`HIVE_DOCTOR_VERIFY_MAX_PER_HOUR`, 6), separately from the fix brake.
+- `HIVE_DOCTOR_REMEDIATE=0` and DRY_RUN are honoured. Lane-B rows, review jobs
+  and verify jobs never get a verify request.
+
+**The reader.** On a later sweep the provider looks up the requested job
+(`_chain_job`). If the job is settled (`done`, or `needs-review`/`failed`) it
+copies the result JSON into the gate record. The JSON is taken from the result
+fields or, failing that, from the **last** object in `result.tail` that names
+`returncode` and `import_preflight`, because the worker does not lift a model's
+JSON into the result. The suite gate is `suite_gate({returncode, summary})`, so
+a skip, an xfail or "no tests ran" is not clean.
+
+### The sweep
+
+| Gates for the tip | What the sweep does |
+| --- | --- |
+| no record | request a verify, once (`verify_requested`, then `verify_pending`) |
+| clean | **GREEN**: the existing green marker plus a PATCH of the parent row's `result.review_state` to `state: approved_mergeable` (`record_green_mergeable`) |
+| dirty (suite or preflight) | the existing **fix** path; the dirty gate becomes a high finding at location `suite` / `import_preflight` |
+| stale | ignored; the current tip is verified |
+
+An approve from a family that fixed the row is ignored: no verify and no GREEN.
+
+`record_green_mergeable` writes the same shape as the head-match path
+(`approved`, `approved_mergeable`). It adds `reviewer_model`, `reviewed_sha` and
+the `gates` that the merge pass reads. The row **stays `needs-review`**. If the
+PATCH fails, no GREEN marker is written and the next sweep tries again.
+**The doctor never merges.**
+
+### Bus constraints this design works around
+
+- `verify:` is not a read-only kind on the bus (`READONLY_KINDS`), so a job
+  that carries a `repo` is held to the commit-evidence gate. A commitless
+  verify run therefore lands `needs-review` with `completion_evidence_missing`.
+  The reader accepts that status. `ensure_review_followup` skips verify rows
+  (`skipped_verify_job`), and the remediation classifier never "fixes" their
+  missing `head_branch`.
+- With no `head_branch`, the bus does no output-branch probe, so
+  `output_branch_exists` cannot refuse the job.
+
+Regressions: `test_doctor_gates_provider_20261101.py`. Every test in it failed
+on the base (`f471b91`) and passes with this change.
