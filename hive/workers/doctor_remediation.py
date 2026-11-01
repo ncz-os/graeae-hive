@@ -1630,6 +1630,29 @@ CONTINUATION_MAX_ROUNDS = int(os.environ.get("HIVE_DOCTOR_CONTINUATION_MAX_ROUND
 #: New continuation jobs one sweep may submit (a dry run previews as many).
 CONTINUATION_MAX_PER_SWEEP = int(os.environ.get("HIVE_DOCTOR_CONTINUATION_MAX_PER_SWEEP", "3"))
 
+
+def _env_count(name: str, default: int) -> int:
+    """A non-negative count from the environment; an unreadable value is the default."""
+    try:
+        return max(int(str(os.environ.get(name, "")).strip()), 0)
+    except ValueError:
+        return default
+
+
+#: The global brake: continuation jobs the doctor may create per rolling hour
+#: across ALL rows. Counted in its own durable record, so it holds when every
+#: per-row record (lineage, rounds, markers) has been lost. ``0`` creates none.
+CONTINUE_MAX_PER_HOUR = _env_count("HIVE_DOCTOR_CONTINUE_MAX_PER_HOUR", 6)
+HOURLY_WINDOW_SEC = 3600.0
+
+#: Outcomes of the continuation guards. ``refused``: the doctor will not create
+#: a job for this row (lineage unknown, store not durable); ``throttled``: the
+#: hourly brake is reached.
+REFUSED = "refused"
+THROTTLED = "throttled"
+LINEAGE_UNKNOWN = "lineage_unknown"
+DURABLE_STATE_UNAVAILABLE = "durable_state_unavailable"
+
 #: The standing instruction every continuation brief carries, verbatim.
 CONTINUATION_INSTRUCTION = (
     "verify every finding against source first; failing test first when it holds; "
@@ -1934,6 +1957,145 @@ def continuation_escalation_key(root: str) -> str:
     return f"{_KEY_MARK}:continuation:escalated:{root}"
 
 
+#: The hourly brake's own durable record: ``{"stamps": [module-clock seconds]}``.
+HOURLY_KEY = f"{_KEY_MARK}:continuation_hourly"
+
+
+def lineage_unknown_key(job_id: str) -> str:
+    return f"{_KEY_MARK}:continuation_lineage_unknown:{job_id}"
+
+
+def state_durable(state: Any) -> bool:
+    """Whether the store is durable: loaded AND persisting. Missing flags are a no."""
+    try:
+        return bool(state.loaded_ok) and bool(state.persist_ok)
+    except Exception:  # noqa: BLE001 -- an unreadable store is not a durable one
+        return False
+
+
+def _hourly_stamps(state: Any, now: float) -> list[float]:
+    """Creation stamps still inside the hour. A stamp in the FUTURE (a clock that
+    moved backwards) still counts: the brake never loosens on a clock jump."""
+    raw = state.value(HOURLY_KEY, None)
+    stamps = raw.get("stamps") if isinstance(raw, dict) else None
+    out = []
+    for stamp in stamps if isinstance(stamps, list) else []:
+        try:
+            value = float(stamp)
+        except (TypeError, ValueError):
+            continue
+        if now - value <= HOURLY_WINDOW_SEC:
+            out.append(value)
+    return out
+
+
+def continuations_last_hour(state: Any, now: float | None = None) -> int:
+    """Continuation jobs the doctor created (or tried to) in the last hour."""
+    return len(_hourly_stamps(state, time.time() if now is None else float(now)))
+
+
+def _reserve_hourly(state: Any, now: float) -> None:
+    """Count one creation BEFORE submitting: a submit that timed out may still
+    have created the job, so a failure is counted too (fail closed)."""
+    stamps = _hourly_stamps(state, now) + [now]
+    state.set_value(HOURLY_KEY, {"stamps": stamps}, ttl=max(MARK_TTL_SEC, 2 * HOURLY_WINDOW_SEC))
+
+
+#: The first line of every continuation brief (see :func:`continuation_brief`).
+_BRIEF_MARKER_RE = re.compile(r"\bContinuation round \d+ of \d+ for work job\b")
+_BRIEF_FIELDS = ("description", "brief", "prompt", "task")
+
+
+class LineageLookupError(RuntimeError):
+    """The parent chain could not be read: lineage is neither proven nor disproven."""
+
+
+def _own_continuation_markers(row: dict[str, Any]) -> str:
+    """The continuation marker the row itself carries, '' when none."""
+    if str(row.get("idempotency_key") or "").startswith(CONTINUATION_KEY_PREFIX + ":"):
+        return "idempotency_key"
+    res = result_dict(row)
+    for holder in (row, res):
+        for name in _BRIEF_FIELDS:
+            text = holder.get(name)
+            if isinstance(text, str) and (_BRIEF_MARKER_RE.search(text) or CONTINUATION_INSTRUCTION in text):
+                return "brief_marker"
+    if _ROUND_SUFFIX_RE.search(str(row.get("head_branch") or "").strip()):
+        return "round_branch"
+    return ""
+
+
+def _doctor_continued(state: Any, job_id: str) -> bool:
+    """Whether the store shows the doctor continued ``job_id`` or it is a continuation."""
+    if state is None or not job_id:
+        return False
+    if isinstance(state.value(_lineage_key(job_id), None), dict):
+        return True
+    if state.value(_rounds_key(job_id), None):
+        return True
+    keys = getattr(state, "keys", None)
+    return bool(callable(keys) and keys(f"{_KEY_MARK}:continuation:{job_id}:"))
+
+
+def continuation_evidence(
+    row: dict[str, Any],
+    state: Any = None,
+    *,
+    job_lookup: Callable[[str], dict | None] | None = None,
+    max_hops: int = 8,
+) -> str:
+    """Why ``row`` looks like a continuation, '' when nothing says so.
+
+    Read independently of the lineage record and of a well-formed key, so a row
+    that lost both is still recognised: a ``doctor-continuation:`` key prefix,
+    the brief's marker in its description, a ``-rN`` head branch, a parent the
+    store shows the doctor continued, or (with ``job_lookup``) a parent chain in
+    which a work row's head is this row's base or carries a marker itself.
+    Raises :class:`LineageLookupError` when the chain cannot be read."""
+    own = _own_continuation_markers(row)
+    if own:
+        return own
+    current = row
+    seen = {str(row.get("id") or "")}
+    for _hop in range(max_hops):
+        pid = str(current.get("parent_job_id") or "").strip()
+        if not pid or pid in seen:
+            return ""
+        seen.add(pid)
+        if _doctor_continued(state, pid):
+            return "parent_continued"
+        if job_lookup is None:
+            return ""
+        try:
+            parent = job_lookup(pid)
+        except Exception as exc:  # noqa: BLE001 -- unreadable is not "no parent"
+            raise LineageLookupError(f"parent {pid} unreadable: {exc}") from exc
+        if not isinstance(parent, dict):
+            return ""
+        if review_queue.is_review_kind(parent) or str(parent.get("kind") or "").startswith(("review:", "triage:")):
+            return ""
+        base = str(current.get("base_branch") or "").strip()
+        if base and base == str(parent.get("head_branch") or "").strip():
+            return "parent_chain"
+        if _own_continuation_markers(parent):
+            return "parent_chain"
+        current = parent
+    return ""
+
+
+def _lineage_recorded(row: dict[str, Any], state: Any) -> bool:
+    """Whether :func:`continuation_lineage` reads a real record (not the fallback)."""
+    jid = str(row.get("id") or "")
+    recorded = state.value(_lineage_key(jid), None) if jid else None
+    if isinstance(recorded, dict) and recorded.get("root"):
+        try:
+            int(recorded.get("round") or 0)
+            return True
+        except (TypeError, ValueError):
+            pass
+    return bool(_CONTINUATION_KEY_RE.match(str(row.get("idempotency_key") or "")))
+
+
 def continuation_key(job_id: str, tip: str, round_no: int) -> str:
     """The durable "already continued" marker for one (row, tip, round)."""
     return f"{_KEY_MARK}:continuation:{job_id}:{str(tip or '')[:12] or 'nohead'}:r{int(round_no)}"
@@ -2075,6 +2237,7 @@ def continue_one(
     dry_run: bool = False,
     allow_submit: bool = True,
     head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
+    job_lookup: Callable[[str], dict | None] | None = None,
 ) -> tuple[Outcome, dict | None]:
     """Continue ONE row, or say why not. Returns ``(outcome, spec or None)``."""
     now = time.time() if now is None else float(now)
@@ -2088,6 +2251,14 @@ def continue_one(
     for done in range(1, CONTINUATION_MAX_ROUNDS + 1):
         if already_fixed(state, continuation_key(jid, tip, done), now=now):
             return Outcome(jid, NO_CHANGE, "continuation", f"already continued (round {done})"), None
+    if not _lineage_recorded(row, state):
+        # Guard 1 (DeepSeek HIGH 2026-11-01): with the lineage record AND the
+        # key both gone the fallback reads round 0, and a row that already IS a
+        # continuation would start a fresh round-1 chain on every loss. A row
+        # that shows any continuation marker is refused instead.
+        refused = _refuse_unknown_lineage(row, state, escalate, now=now, dry_run=dry_run, job_lookup=job_lookup)
+        if refused is not None:
+            return refused, None
     root, spent = rounds_spent(row, state)
     round_no = spent + 1
     pick = ladder_pick(row, review, round_no, roster=roster) if spent < CONTINUATION_MAX_ROUNDS else None
@@ -2109,10 +2280,20 @@ def continue_one(
         return Outcome(jid, ESCALATED, "continuation", "rounds spent" if spent else "no ladder model", reason=why), None
     if not allow_submit:
         return Outcome(jid, "deferred", "continuation", f"per-sweep cap ({CONTINUATION_MAX_PER_SWEEP})"), None
+    # Guard 2: the global hourly brake, independent of every per-row record.
+    if continuations_last_hour(state, now) >= CONTINUE_MAX_PER_HOUR:
+        return Outcome(jid, THROTTLED, "continuation", f"hourly brake ({CONTINUE_MAX_PER_HOUR} per hour)"), None
     spec = continuation_spec(row, review, round_no, pick, state=state)
     detail = f"round {round_no} on {pick['model']}: {spec['base_branch']} -> {spec['head_branch']}"
     if dry_run:
         return Outcome(jid, DRY_WOULD_APPLY, "continuation", detail), spec
+    # Guard 3: nothing is created unless the store is durable, before AND after
+    # the brake's own write -- a counter that did not persist is no brake.
+    if not state_durable(state):
+        return Outcome(jid, REFUSED, "continuation", DURABLE_STATE_UNAVAILABLE), None
+    _reserve_hourly(state, now)
+    if not state_durable(state):
+        return Outcome(jid, REFUSED, "continuation", DURABLE_STATE_UNAVAILABLE), None
     code, resp = submit(spec)
     new_id = resp.get("id") if isinstance(resp, dict) else None
     if code not in (200, 201) or not new_id:
@@ -2121,6 +2302,39 @@ def continue_one(
     state.set_value(_rounds_key(root), max(spent, round_no), ttl=MARK_TTL_SEC)
     state.set_value(_lineage_key(str(new_id)), {"root": root, "round": round_no}, ttl=MARK_TTL_SEC)
     return Outcome(jid, APPLIED, "continuation", f"{detail} (job {str(new_id)[:12]})", attempts=round_no), spec
+
+
+def _refuse_unknown_lineage(
+    row: dict[str, Any],
+    state: Any,
+    escalate: Callable[[dict, str], None],
+    *,
+    now: float,
+    dry_run: bool,
+    job_lookup: Callable[[str], dict | None] | None,
+) -> Outcome | None:
+    """The refusal for a continuation whose lineage is lost, or None for a root.
+
+    Escalated (and logged) once per ``ESCALATE_TTL_SEC``; an unreadable parent
+    chain creates nothing and escalates nothing (the next sweep reads again)."""
+    jid = str(row.get("id") or "")
+    try:
+        evidence = continuation_evidence(row, state, job_lookup=job_lookup)
+    except LineageLookupError as exc:
+        return Outcome(jid, REFUSED, "continuation", "lineage_lookup_failed", error=str(exc))
+    if not evidence:
+        return None
+    why = (
+        f"continuation: {LINEAGE_UNKNOWN} -- {jid[:12]} is a continuation ({evidence}) but neither its "
+        "lineage record nor its idempotency key survives; refusing to start a new round-1 chain"
+    )
+    key = lineage_unknown_key(jid)
+    if dry_run or _marked_within(state, key, ESCALATE_TTL_SEC, now):
+        return Outcome(jid, REFUSED, "continuation", LINEAGE_UNKNOWN, reason=why)
+    escalate(row, why)
+    state.set_value(key, {"at": now}, ttl=MARK_TTL_SEC)
+    log.warning(why)
+    return Outcome(jid, REFUSED, "continuation", LINEAGE_UNKNOWN, reason=why)
 
 
 def continuation_sweep(
@@ -2136,17 +2350,25 @@ def continuation_sweep(
     enabled: bool | None = None,
     max_per_sweep: int | None = None,
     head_is_verdict_only: Callable[[dict, dict, str, str], bool] | None = None,
+    job_lookup: Callable[[str], dict | None] | None = None,
 ) -> dict[str, Any]:
     """One pass of the continuation loop over ``rows`` (oldest first, capped).
 
     ``HIVE_DOCTOR_REMEDIATE=0`` (``enabled``) stops it before any read; a dry
     run submits, marks and escalates nothing and lists what it would submit.
-    One bad row never stops the pass."""
+    A store that is not durable (``loaded_ok``/``persist_ok``) refuses the pass
+    before any read, dry run or not. One bad row never stops the pass."""
     enabled = REMEDIATE_ENABLED if enabled is None else bool(enabled)
     dry_run = DRY_RUN if dry_run is None else bool(dry_run)
     cap = CONTINUATION_MAX_PER_SWEEP if max_per_sweep is None else int(max_per_sweep)
     summary: dict[str, Any] = {"enabled": enabled, "dry_run": dry_run, "capped": cap, APPLIED: 0, "scanned": 0}
     if not enabled:
+        return summary
+    if not state_durable(state):
+        # Every guard on this path is a durable record; without the store the
+        # doctor would re-create the same continuations on every sweep.
+        summary["refused"] = DURABLE_STATE_UNAVAILABLE
+        log.error("continuation refused: durable state unavailable (loaded_ok/persist_ok false)")
         return summary
     now = time.time() if now is None else float(now)
     ordered = sorted(
@@ -2173,6 +2395,7 @@ def continuation_sweep(
                 dry_run=dry_run,
                 allow_submit=used < cap,
                 head_is_verdict_only=head_is_verdict_only,
+                job_lookup=job_lookup,
             )
         except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
             summary["errors"] = summary.get("errors", 0) + 1
@@ -2185,5 +2408,16 @@ def continuation_sweep(
                 {k: spec.get(k) for k in ("parent_job_id", "head_branch", "base_branch", "preferred_models")}
             )
         summary[outcome.status] = summary.get(outcome.status, 0) + 1
-        log.info(outcome.as_log())
+        if outcome.status == REFUSED and outcome.detail == LINEAGE_UNKNOWN:
+            # Logged once, with its escalation (``_refuse_unknown_lineage``);
+            # a refusal repeated every sweep is not news.
+            log.debug(outcome.as_log())
+        else:
+            log.info(outcome.as_log())
+    if summary.get(THROTTLED):
+        log.warning(
+            "continuation: hourly brake reached (%d per hour, HIVE_DOCTOR_CONTINUE_MAX_PER_HOUR); %d row(s) skipped",
+            CONTINUE_MAX_PER_HOUR,
+            summary[THROTTLED],
+        )
     return summary

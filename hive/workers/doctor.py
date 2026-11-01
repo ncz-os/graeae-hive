@@ -5445,7 +5445,11 @@ def run_continuation_sweep(
     """Wire :func:`doctor_remediation.continuation_sweep` to the bus.
 
     Children are this row's ``review:`` jobs; the continuation is submitted as
-    the doctor; the escalation is the remediation one (``doctor.needs_review_stuck``)."""
+    the doctor; the escalation is the remediation one (``doctor.needs_review_stuck``).
+    Refused, before any read, when the durable store is not durable: this pass
+    CREATES jobs, and every guard on it is a durable record."""
+    if not STATE.loaded_ok or not STATE.persist_ok:
+        raise RuntimeError("continuation refused: durable state unavailable")
     return doctor_remediation.continuation_sweep(
         rows,
         state=STATE,
@@ -5456,6 +5460,8 @@ def run_continuation_sweep(
         now=now,
         dry_run=dry_run,
         head_is_verdict_only=_continuation_verdict_only,
+        # The parent-chain read for a row whose lineage record and key are lost.
+        job_lookup=_chain_job,
     )
 
 
