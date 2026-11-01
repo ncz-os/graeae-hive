@@ -50,6 +50,13 @@ cause                   meaning                                         field fi
 ``stranded_wip``        the workspace still holds unpushed commits      push and mark
 ``waiting_review``      finished work whose review failed because the   hand to the
                         auto reviewer was busy                          review queue
+``review_job``          a needs-review row that IS a review job (kind   none: a
+                        ``review:``) -- never itself reviewed           review job is
+                        (PYTHIA 2026-11-01: a ten-deep review-of-        never
+                        review chain)                                   reviewed; at
+                                                                        most one
+                                                                        escalation
+                                                                        note
 ======================  ==============================================  ===========
 """
 
@@ -102,6 +109,10 @@ INFRA_RETRIES = "infra_retries"
 UNAVAILABLE_MODEL = "unavailable_model"
 STRANDED_WIP = "stranded_wip"
 WAITING_REVIEW = "waiting_review"
+#: A review job in triage. Never handed to the review queue: reviewing it
+#: mints a review of the review, which ends the same way (live 2026-11-01:
+#: ten deep, one new row per sweep). No field fix and no status move.
+REVIEW_JOB = "review_job"
 
 CAUSES = (
     UNRESOLVABLE_REF,
@@ -111,7 +122,15 @@ CAUSES = (
     UNAVAILABLE_MODEL,
     STRANDED_WIP,
     WAITING_REVIEW,
+    REVIEW_JOB,
 )
+
+#: Causes whose plan hands the row to the review queue. A review job never
+#: gets one (see :data:`REVIEW_JOB`).
+_REVIEW_HANDOVER_CAUSES = frozenset({WAITING_REVIEW, STRANDED_WIP})
+
+#: Work-row statuses that mean nobody is waiting on a review of it any more.
+_SETTLED_STATUSES = frozenset({"done", "cancelled"})
 
 #: Results of :func:`remediate_one`.
 APPLIED = "applied"
@@ -704,8 +723,13 @@ def classify(
     # commits are on the branch, only the review never ran, so spending a retry
     # on it would re-run work already done. A row whose delivery was never
     # verified has no such proof and is an infrastructure retry instead.
+    # A review job is never itself reviewed: the causes that HAND a row to the
+    # review queue (g, f) are skipped for it, and a review job with no field
+    # fix to make is classified ``review_job`` (no action) instead of healthy,
+    # so the audit names why the sweep left it alone.
+    review_job = review_queue.is_review_kind(job)
     busy = review_busy_failure(job)
-    if busy and delivered_head(job) and delivery_verified(job) and not verdict_fn(job):
+    if busy and not review_job and delivered_head(job) and delivery_verified(job) and not verdict_fn(job):
         return Cause(WAITING_REVIEW, busy)
     if retry_budget_spent(job) and not verdict_fn(job):
         # A row that already carries a review verdict is not retryable at all:
@@ -714,7 +738,7 @@ def classify(
         infra = infra_cause(job)
         if infra:
             return Cause(INFRA_RETRIES, infra, ("max_retries",))
-    if status in ("failed", "dead-letter") and stranded_workspace(job):
+    if status in ("failed", "dead-letter") and stranded_workspace(job) and not review_job:
         return Cause(STRANDED_WIP, "workspace_preserved")
     # The HEALTH probe and the caller's cap set must reach the classifier: an
     # unavailable route is only visible through the probe, and reading it here
@@ -727,6 +751,9 @@ def classify(
     )
     if problem:
         return Cause(UNAVAILABLE_MODEL, problem, ("preferred_models", "max_cost_tier"))
+    if review_job and status == "needs-review":
+        return Cause(REVIEW_JOB, "needs-review")
+    return None
 
 
 # ── Markers, attempts and escalation (durable) ─────────────────────────────
@@ -906,7 +933,19 @@ def plan_for(
     """The field fix for one classified cause, or None when it cannot apply.
 
     None means "escalate": a cause with no provable fix is never papered over
-    with a guess (a branch nobody proved exists, a model nobody serves)."""
+    with a guess (a branch nobody proved exists, a model nobody serves).
+
+    A review job never gets a plan that hands it to the review queue, whatever
+    cause a caller names: that is how a review of a review is minted."""
+    if cause.name == REVIEW_JOB:
+        return None
+    if cause.name in _REVIEW_HANDOVER_CAUSES and review_queue.is_review_kind(job):
+        log.warning(
+            "remediation: refused to hand review job %s (%s) to the review queue",
+            str(job.get("id") or "")[:12],
+            job.get("kind"),
+        )
+        return None
     if cause.name == UNRESOLVABLE_REF:
         head = repair_head(job, ref_exists=ref_exists, resolve_ref=resolve_ref)
         if not head:
@@ -1208,6 +1247,54 @@ def _refusal(resp: Any, jid: str) -> str:
     return ""
 
 
+def _settled_work_parent(job: dict[str, Any], job_lookup: Callable[[str], dict | None] | None) -> dict | None:
+    """The work row a review job reviewed, when that row is already settled.
+
+    None when there is no lookup, no parent, the parent is unreadable, is itself
+    a review job, or is still open: in each case no note is owed."""
+    parent_id = str(job.get("parent_job_id") or "").strip()
+    if not parent_id or job_lookup is None:
+        return None
+    try:
+        parent = job_lookup(parent_id)
+    except Exception:  # noqa: BLE001 -- an unreadable parent is no evidence it settled
+        return None
+    if not isinstance(parent, dict) or review_queue.is_review_kind(parent):
+        return None
+    if str(parent.get("status") or "") in _SETTLED_STATUSES:
+        return parent
+    return None
+
+
+def _review_job_outcome(
+    job: dict[str, Any],
+    cause: Cause,
+    *,
+    state: Any,
+    escalate: Callable[[dict, str], None],
+    job_lookup: Callable[[str], dict | None] | None,
+    now: float,
+) -> Outcome:
+    """A review job in triage: no field change, no status move, no hand-over.
+
+    At most ONE escalation note per :data:`ESCALATE_TTL_SEC`, and only when the
+    work row it reviewed is already settled (nothing is waiting on this review
+    any more, so a human should close it)."""
+    jid = str(job.get("id") or "")
+    if _marked_within(state, escalation_key(jid), ESCALATE_TTL_SEC, now):
+        return Outcome(job_id=jid, status=NO_CHANGE, cause=cause.name, detail=cause.detail, reason="review_job")
+    parent = _settled_work_parent(job, job_lookup)
+    if parent is None:
+        return Outcome(job_id=jid, status=NO_CHANGE, cause=cause.name, detail=cause.detail, reason="review_job")
+    why = (
+        f"review job {jid} ({job.get('kind')}) is in needs-review but its work row "
+        f"{parent.get('id')} is already {parent.get('status')}; a review job is never itself reviewed"
+    )
+    escalate(job, why)
+    state.set_value(escalation_key(jid), {"at": now}, ttl=ESCALATE_TTL_SEC)
+    return Outcome(job_id=jid, status=ESCALATED, cause=cause.name, detail=cause.detail, reason="review_job_settled")
+
+
 def remediate_one(
     job: dict[str, Any],
     *,
@@ -1228,6 +1315,7 @@ def remediate_one(
     dry_run: bool = False,
     job_capped: Any = None,
     has_verdict: Callable[[dict], bool] | None = None,
+    job_lookup: Callable[[str], dict | None] | None = None,
 ) -> Outcome:
     """Classify and FIX one row. Never approves, merges or deletes.
 
@@ -1236,6 +1324,10 @@ def remediate_one(
     ``reclassify`` performs the admin transition and ``escalate`` posts
     ``doctor.needs_review_stuck``. The attempt counter and the per-(row, cause,
     head) marker are durable, so two sweeps — or a restarted doctor — act once.
+
+    ``job_lookup(job_id)`` (optional) reads another row; it is used only to see
+    whether the work row a ``review_job`` reviewed is already settled, for the
+    one escalation note such a row may get.
     """
     jid = str(job.get("id") or "")
     # ``job_capped`` is the same caller-supplied set under its older name;
@@ -1257,6 +1349,8 @@ def remediate_one(
     )
     if cause is None:
         return Outcome(job_id=jid, status=NO_CHANGE, reason="healthy_row")
+    if cause.name == REVIEW_JOB:
+        return _review_job_outcome(job, cause, state=state, escalate=escalate, job_lookup=job_lookup, now=now)
     spent = attempts(state, jid)
     if spent >= MAX_AUTO_REMEDIATIONS:
         if not _marked_within(state, escalation_key(jid), ESCALATE_TTL_SEC, now):
@@ -1412,7 +1506,8 @@ def _would_act(row: dict[str, Any], *, state: Any) -> bool:
     jid = str(row.get("id") or "")
     if jid and attempts(state, jid) >= MAX_AUTO_REMEDIATIONS:
         return False
-    return classify(row) is not None
+    cause = classify(row)
+    return cause is not None and cause.name != REVIEW_JOB
 
 
 def sweep(
@@ -1435,6 +1530,7 @@ def sweep(
     dry_run: bool = False,
     max_per_sweep: int | None = None,
     job_capped: Any = None,
+    job_lookup: Callable[[str], dict | None] | None = None,
 ) -> dict[str, Any]:
     """Remediate every fixable row in ``rows``, capped.
 
@@ -1493,6 +1589,7 @@ def sweep(
                 now=now,
                 dry_run=dry_run,
                 job_capped=job_capped,
+                job_lookup=job_lookup,
             )
         except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
             summary["errors"] = summary.get("errors", 0) + 1

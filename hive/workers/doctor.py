@@ -3558,6 +3558,38 @@ def _needs_review_child_review_jobs(job: dict) -> list[dict]:
     return [j for j in resp["jobs"] if str(j.get("kind") or "").startswith(REVIEW_FOLLOWUP_KIND_PREFIX)]
 
 
+def _chain_job(jid: str) -> dict | None:
+    """One row for the review-chain walk: the row, None when the bus no longer
+    has it (404), and an exception when the bus cannot answer."""
+    from urllib.parse import quote
+
+    code, row = _http("GET", f"/v1/jobs/{quote(str(jid), safe='')}", timeout=10.0)
+    if code == 404:
+        return None
+    if code != 200 or not isinstance(row, dict):
+        raise RuntimeError(f"review chain lookup failed job={jid} http={code}")
+    return row
+
+
+def _review_child_refusal(job: dict) -> str:
+    """Why no review child may be created for ``job`` (``""`` when one may).
+
+    A review job is never itself reviewed and no review chain runs deeper than
+    ``review_queue.MAX_REVIEW_CHAIN_HOPS`` hops from its work row (PYTHIA
+    2026-11-01: a ten-deep review-of-review chain, one new row per sweep).
+    Every refusal is logged."""
+    reason = review_queue.review_chain_refusal(job, _chain_job)
+    if reason:
+        log.warning(
+            "refused review child for %s (kind %s, parent %s): %s",
+            str(job.get("id") or "")[:12],
+            job.get("kind"),
+            str(job.get("parent_job_id") or "")[:12] or "-",
+            reason,
+        )
+    return reason
+
+
 def _submit_review_followup(job: dict, *, rereview_reason: str = "") -> tuple[str, dict | None, str]:
     """Submit ONE review job for a needs-review row. Returns (job_id, spec, note).
 
@@ -3568,7 +3600,13 @@ def _submit_review_followup(job: dict, *, rereview_reason: str = "") -> tuple[st
     ``rereview_reason`` marks a re-review of a row whose existing evidence does not
     cover the delivered head: the idempotency key then carries the head, so the
     bus can never hand back the earlier review for it and there is at most one
-    re-review per (row, head)."""
+    re-review per (row, head).
+
+    Refused (nothing submitted) for a review-kind row or a chain past the depth
+    guard: see :func:`_review_child_refusal`."""
+    refused = _review_child_refusal(job)
+    if refused:
+        return "", None, f"refused review child: {refused}"
     jid = str(job.get("id") or "")
     res = _job_result_dict(job)
     kind = str(job.get("kind") or "").strip()
@@ -5370,6 +5408,8 @@ def run_remediation_sweep(*, dry_run: bool | None = None, now: float | None = No
         health=_review_route_health(),
         dry_run=doctor_remediation.DRY_RUN if dry_run is None else dry_run,
         now=now,
+        # Only for the review_job escalation note: is the reviewed work row settled?
+        job_lookup=_chain_job,
     )
     summary["enabled"] = True
     broadcast_doctor_message("doctor.remediation", {"host": AGENT_HOST, **summary})
@@ -5415,6 +5455,9 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     # Triage rows are remediation reports, not branches for code review.
     if str(job.get("kind") or "").startswith("triage:"):
         return "skipped_triage"
+    # A review job is never itself reviewed (PYTHIA 2026-11-01).
+    if review_queue.is_review_kind(job):
+        return "skipped_review_job"
     if review_followup_protected(job):
         return "skipped_protected"
     if not STATE.loaded_ok or not STATE.persist_ok:
@@ -5480,6 +5523,8 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
             return "skipped_marker"
     if not allow_submit:
         return "deferred"
+    if _review_child_refusal(job):
+        return "skipped_review_chain"
     rereview_reason = gap or ""
     review_id, spec, note = _submit_review_followup(job, rereview_reason=rereview_reason)
     if not review_id:
@@ -5797,6 +5842,10 @@ def _review_state_row(job: dict) -> dict | None:
         return None
     if str(job.get("kind") or "").startswith("triage:"):
         return None
+    # A review job carrying a review_state (the remediation sweep wrote one on
+    # PYTHIA 2026-11-01) is still never advanced: that is the review-of-review.
+    if review_queue.is_review_kind(job):
+        return None
     if lane_b_row(job):
         return None
     return review_queue.usable_review_state(job)
@@ -5813,6 +5862,9 @@ def _adoption_for(job: dict) -> dict | None:
     if str(job.get("status") or "") != "needs-review":
         return None
     if str(job.get("kind") or "").startswith("triage:"):
+        return None
+    # A review job is never adopted: adopting it queues a review OF the review.
+    if review_queue.is_review_kind(job):
         return None
     if lane_b_row(job):
         return None
@@ -6013,7 +6065,13 @@ def _review_kind_for(base_kind: str) -> str:
 
 
 def _review_queue_submit(job: dict, state: dict, reviewers: list[dict], *, now: float) -> tuple[str, dict]:
-    """Submit ONE read-only review job naming the cross-family pick(s)."""
+    """Submit ONE read-only review job naming the cross-family pick(s).
+
+    Raises (nothing submitted) for a review-kind row or a chain past the depth
+    guard: see :func:`_review_child_refusal`."""
+    refused = _review_child_refusal(job)
+    if refused:
+        raise RuntimeError(f"refused review child: {refused}")
     jid = str(job.get("id") or "")
     res = _row_result_dict(job)
     kind = str(job.get("kind") or "").strip()
@@ -6115,6 +6173,10 @@ def process_awaiting_review_row(
         return "skipped_status", None, None
     if str(job.get("kind") or "").startswith("triage:"):
         return "skipped_triage", None, None
+    # A review job is never itself reviewed, whatever review_state it carries
+    # (PYTHIA 2026-11-01: the review-of-review chain).
+    if review_queue.is_review_kind(job):
+        return "skipped_review_job", None, None
     state = review_queue.usable_review_state(job)
     if state is None:
         adopt_legacy_review_row(job, now=now)
@@ -6286,6 +6348,10 @@ def process_awaiting_review_row(
         # The per-sweep submit cap is spent. Nothing is written: the row is
         # unchanged and the next sweep picks it up (no attempt is spent).
         return "capped", state, None
+    if _review_child_refusal(job):
+        # Past the review-chain depth guard (or the chain is unreadable): no
+        # review child, no attempt spent, nothing written.
+        return "skipped_review_chain", state, None
     if HIVE_DOCTOR_ADOPT_DRY_RUN:
         _record_dry_run_submission(job, {**state, "author": author}, picked, now=now)
         return "previewed", {**state, "author": author}, None
