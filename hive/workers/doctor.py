@@ -5468,7 +5468,61 @@ def run_continuation_sweep(
         # A fix commit that deletes or weakens tests fails its round (never
         # merged) and escalates once.
         integrity=doctor_remediation.test_integrity,
+        # The objective gates: durable records written only from the result of
+        # a verify:build:zeroclaw job requested for the exact tip; unknown is
+        # never clean.
+        gates=doctor_remediation.GateProvider(STATE, job_lookup=_chain_job, now=now),
+        request_verify=submit_job_spec,
+        # GREEN is RECORDED (approved_mergeable); only the merge pass merges.
+        mark_mergeable=record_green_mergeable,
     )
+
+
+def record_green_mergeable(row: dict, green: dict) -> bool:
+    """Record a GREEN row ``approved_mergeable`` for the merge pass; never merge.
+
+    Same shape the head-match path writes (:func:`_approved_mergeable`), plus
+    the fields the merge pass reads (``reviewer_model``, ``reviewed_sha``) and
+    the gate evidence. The row's STATUS stays needs-review."""
+    now = time.time()
+    state = review_queue.review_state(row) or {}
+    head = str(green.get("head") or "")
+    reviewers = [str(m) for m in green.get("reviewers") or [] if m]
+    approved = {
+        "reviewers": reviewers,
+        "head_sha": head,
+        "approved_sha": head,
+        "basis": "green:" + str(green.get("basis") or "exact"),
+        "review_job_id": green.get("review_job_id") or None,
+        "at": now,
+    }
+    new_state = {
+        **state,
+        "state": doctor_head_match.APPROVED_MERGEABLE,
+        "review_job_id": None,
+        "approved": approved,
+        "approved_mergeable": approved,
+        "reviewer_model": reviewers[0] if reviewers else None,
+        "reviewed_sha": head,
+        "gates": green.get("gates"),
+        "last_failure": None,
+        "next_attempt_at": None,
+        "updated_at": now,
+    }
+    if not _patch_review_state(row, new_state):
+        return False
+    broadcast_doctor_message(
+        "doctor.review_approved",
+        {
+            "host": AGENT_HOST,
+            "job_id": row.get("id"),
+            "reviewers": reviewers,
+            "head_sha": head,
+            "state": doctor_head_match.APPROVED_MERGEABLE,
+            "via": "grind_green",
+        },
+    )
+    return True
 
 
 def review_followup_protected(job: dict) -> bool:
@@ -5513,6 +5567,10 @@ def ensure_review_followup(job: dict, *, allow_submit: bool = True) -> str:
     # A review job is never itself reviewed (PYTHIA 2026-11-01).
     if review_queue.is_review_kind(job):
         return "skipped_review_job"
+    # A doctor verify job is gate evidence, not work: a commitless verify run
+    # lands needs-review on the bus's commit gate and must never be reviewed.
+    if doctor_remediation.is_verify_kind(job):
+        return "skipped_verify_job"
     if review_followup_protected(job):
         return "skipped_protected"
     if not STATE.loaded_ok or not STATE.persist_ok:

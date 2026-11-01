@@ -253,6 +253,21 @@ def test_a_verify_row_is_recognised():
     assert not dr.is_verify_kind({"kind": "build:zeroclaw"})
 
 
+@pytest.mark.parametrize("status", ["failed", "dead-letter"])
+def test_a_verify_row_is_never_field_fixed_or_requeued(status):
+    """It has no head_branch on purpose: the missing_branch fix must not touch it."""
+    job = verify_job({"failure_reason": "loop_unresolved"}, status=status)
+    job["base_branch"] = "hv/fo-merge-pass-20261031"
+    assert dr.missing_branch_fields(job) == ["head_branch"]
+    assert dr.classify(job) is None
+
+
+def test_a_verify_row_is_never_continued(state):
+    job = verify_job(status="needs-review")
+    job["head_branch"] = "hv/fo-merge-pass-20261031"
+    assert not dr._continuation_candidate(job)
+
+
 # ── the sweep ───────────────────────────────────────────────────────────────
 
 
@@ -587,5 +602,10 @@ def test_a_verify_row_is_never_handed_to_review(monkeypatch):
     from hive.workers import doctor
 
     monkeypatch.setattr(doctor, "STATE", DurableStateStore(MemoryBackend(), refresh_secs=0))
+
+    def no_bus(*_a, **_k):
+        raise AssertionError("a verify row must be skipped before any bus call")
+
+    monkeypatch.setattr(doctor, "_http", no_bus)
     job = verify_job(status="needs-review")
     assert doctor.ensure_review_followup(job) == "skipped_verify_job"

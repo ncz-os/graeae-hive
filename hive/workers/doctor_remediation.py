@@ -709,6 +709,11 @@ def classify(
     matters, and a row whose review was lost is only handed over once its
     delivery is proven. A row with no recognised cause is a no-op."""
     verdict_fn = has_verdict or row_has_verdict
+    # The doctor's own verify job is gate EVIDENCE with deliberately no
+    # head_branch: "fixing" its branch fields and requeueing it would turn a
+    # read-only check into a commit-producing job. Its result is read as it is.
+    if is_verify_kind(job):
+        return None
     if composite_baseline_fields(job):
         return Cause(UNRESOLVABLE_REF, "composite_baseline", tuple(composite_baseline_fields(job)))
     status = str(job.get("status") or "")
@@ -2370,6 +2375,319 @@ def green_marker(state: Any, job_id: str) -> dict[str, Any] | None:
     return None
 
 
+# ── The objective gates, from durable verify-job evidence (2026-11-01) ──────
+# ``continue_one`` asks for the gates of a (row, exact tip). In production the
+# answer is a GATE RECORD in the durable store, keyed by repo + base + tip and
+# written ONLY from the result of a ``verify:build:zeroclaw`` job the doctor
+# requested for that tip. Absent, stale (another tip/base/repo) or malformed
+# is None -- GATES_UNKNOWN, never clean.
+
+#: The Hive job kind that produces gate evidence.
+VERIFY_KIND = "verify:build:zeroclaw"
+#: The worker class that runs it (no host pin: any zeroclaw host may claim it).
+VERIFY_ELIGIBLE_KINDS = ("zeroclaw",)
+VERIFY_KEY_PREFIX = "doctor-verify"
+#: Verify requests per sweep and per hour (separate from the fix brake, same shape).
+VERIFY_MAX_PER_SWEEP = _env_count("HIVE_DOCTOR_VERIFY_MAX_PER_SWEEP", 3)
+VERIFY_MAX_PER_HOUR = _env_count("HIVE_DOCTOR_VERIFY_MAX_PER_HOUR", 6)
+VERIFY_HOURLY_KEY = f"{_KEY_MARK}:verify_hourly"
+#: Outcomes of the verify half of :func:`continue_one`.
+VERIFY_REQUESTED = "verify_requested"
+VERIFY_PENDING = "verify_pending"
+#: Statuses whose result is final enough to read. A commitless verify run of a
+#: repo-bound kind ends ``needs-review`` (``completion_evidence_missing``) on
+#: the bus's commit gate; its result JSON is still the evidence.
+_VERIFY_SETTLED = frozenset({"done", "needs-review", "failed"})
+
+#: The verify job's brief (kept short; ``str.format`` fields only).
+VERIFY_BRIEF = (
+    "READ-ONLY verification for doctor gates; do not commit or push anything.\n"
+    "Repo {repo}, work job {job_id}. Check out branch {head_branch} at EXACTLY commit {tip} "
+    "(stop and report if the branch tip differs), then merge origin/{base} into it without committing "
+    "the merge anywhere remote.\n"
+    "1. Run the full test suite (python3 -m pytest -q) on the merged tree; keep its exit code and final "
+    "summary line.\n"
+    "2. Import preflight: every .py file changed between origin/{base} and {tip} must compile "
+    "(python3 -m py_compile); clean only if all do.\n"
+    "Finish with ONE line of JSON, nothing after it:\n"
+    '{{"returncode": <int>, "summary": "<final pytest summary line>", '
+    '"import_preflight": {{"clean": <true|false>, "detail": "<failures or file count>"}}, '
+    '"base": "{base}", "tip": "{tip}"}}\n'
+    "Never edit tests or code to make either step pass."
+)
+
+
+def is_verify_kind(job: Any) -> bool:
+    """Whether ``job`` is a doctor verify job (never reviewed, never continued)."""
+    return isinstance(job, dict) and str(job.get("kind") or "").strip().startswith("verify:")
+
+
+def gate_record_key(repo: str, base: str, tip: str) -> str:
+    """The durable gate record for one (repo, base, exact tip)."""
+    return f"{_KEY_MARK}:gate:{repo}:{base}:{str(tip or '').strip().lower()}"
+
+
+def verify_marker_key(job_id: str, tip: str) -> str:
+    """The durable "verify requested" marker for one (row, tip)."""
+    return f"{_KEY_MARK}:verify:{job_id}:{str(tip or '')[:12] or 'nohead'}"
+
+
+def _row_gate_ids(row: dict[str, Any]) -> tuple[str, str]:
+    return str(row.get("repo") or "").strip(), str(row.get("base_branch") or "").strip()
+
+
+def _strict_gate(value: Any) -> dict[str, Any] | None:
+    """``{"clean": bool, "detail": str}`` exactly, or None."""
+    if not isinstance(value, dict) or not isinstance(value.get("clean"), bool):
+        return None
+    detail = value.get("detail", "")
+    if not isinstance(detail, str):
+        return None
+    return {"clean": value["clean"], "detail": detail}
+
+
+def _gates_from_record(raw: Any, *, repo: str, base: str, tip: str) -> dict[str, Any] | None:
+    """The ``{"suite", "import_preflight"}`` of a record for exactly (repo, base, tip)."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("repo") != repo or raw.get("base") != base:
+        return None
+    if str(raw.get("tip") or "").strip().lower() != tip:
+        return None
+    suite = _strict_gate(raw.get("suite"))
+    preflight = _strict_gate(raw.get("import_preflight"))
+    if suite is None or preflight is None:
+        return None
+    return {"suite": suite, "import_preflight": preflight}
+
+
+def gate_record(state: Any, *, repo: str, base: str, tip: str) -> dict[str, Any] | None:
+    """The gates recorded for (repo, base, exact tip), or None (unknown)."""
+    tip = _head_text(tip)
+    if not (repo and base and tip):
+        return None
+    return _gates_from_record(state.value(gate_record_key(repo, base, tip), None), repo=repo, base=base, tip=tip)
+
+
+def save_gate_record(state: Any, record: dict[str, Any], *, now: float | None = None) -> None:
+    """Write a gate record produced by :func:`read_verify_result`."""
+    stamp = time.time() if now is None else float(now)
+    key = gate_record_key(record["repo"], record["base"], record["tip"])
+    state.set_value(key, {**record, "at": stamp}, ttl=MARK_TTL_SEC)
+
+
+def _verify_payload(res: dict[str, Any]) -> dict[str, Any] | None:
+    """The verify JSON: the result itself, or the LAST matching object in its tail.
+
+    The worker does not parse a model's JSON into the result, so the brief's
+    final JSON line usually only exists in ``tail``/``stdout``."""
+    if "returncode" in res and "import_preflight" in res:
+        return res
+    decoder = json.JSONDecoder()
+    for field_name in ("tail", "stdout", "output"):
+        text = res.get(field_name)
+        if not isinstance(text, str) or "{" not in text:
+            continue
+        last = None
+        idx = text.find("{")
+        while idx != -1:
+            try:
+                obj, _end = decoder.raw_decode(text[idx:])
+            except ValueError:
+                idx = text.find("{", idx + 1)
+                continue
+            if isinstance(obj, dict) and "returncode" in obj and "import_preflight" in obj:
+                last = obj
+            idx = text.find("{", idx + 1)
+        if last is not None:
+            return last
+    return None
+
+
+def read_verify_result(job: Any, *, repo: str, base: str, tip: str) -> dict[str, Any] | None:
+    """The gate record a settled verify job proves for (repo, base, tip), or None.
+
+    Fails closed: another kind, an unsettled row, a result for another
+    tip/base, a non-int returncode or a preflight without a literal boolean is
+    None -- the gates stay unknown and nothing reads clean."""
+    if not is_verify_kind(job) or str(job.get("status") or "") not in _VERIFY_SETTLED:
+        return None
+    tip = _head_text(tip)
+    if not (repo and base and tip):
+        return None
+    if str(job.get("repo") or repo).strip() != repo:
+        return None
+    payload = _verify_payload(result_dict(job))
+    if payload is None:
+        return None
+    code = payload.get("returncode")
+    summary = payload.get("summary")
+    if isinstance(code, bool) or not isinstance(code, int) or not isinstance(summary, str):
+        return None
+    preflight = _strict_gate(payload.get("import_preflight"))
+    if preflight is None:
+        return None
+    if str(payload.get("tip") or "").strip().lower() != tip or payload.get("base") != base:
+        return None
+    return {
+        "repo": repo,
+        "base": base,
+        "tip": tip,
+        "suite": suite_gate({"returncode": code, "summary": summary}),
+        "import_preflight": preflight,
+        "job_id": str(job.get("id") or ""),
+    }
+
+
+class GateProvider:
+    """The production ``gates`` for :func:`continue_one`.
+
+    ``for_row(row, tip)`` returns the durable gate record for the row's repo +
+    base + exact tip; when there is none it reads the verify job requested for
+    (row, tip) -- ``job_lookup(job_id)`` -- and copies a settled result into
+    the record first. Called with a bare tip (no row, no repo/base) the gates
+    are unknown."""
+
+    def __init__(
+        self, state: Any, *, job_lookup: Callable[[str], dict | None] | None = None, now: float | None = None
+    ) -> None:
+        self.state = state
+        self.job_lookup = job_lookup
+        self.now = now
+
+    def __call__(self, tip: str) -> dict[str, Any] | None:
+        return None
+
+    def for_row(self, row: dict[str, Any], tip: str) -> dict[str, Any] | None:
+        repo, base = _row_gate_ids(row)
+        gates = gate_record(self.state, repo=repo, base=base, tip=tip)
+        if gates is not None or self.job_lookup is None:
+            return gates
+        marker = self.state.value(verify_marker_key(str(row.get("id") or ""), tip), None)
+        job_id = str(marker.get("job_id") or "") if isinstance(marker, dict) else ""
+        if not job_id:
+            return None
+        try:
+            job = self.job_lookup(job_id)
+        except Exception as exc:  # noqa: BLE001 -- an unreadable bus is unknown gates
+            log.warning("gates: verify job %s unreadable: %s", job_id[:12], exc)
+            return None
+        record = read_verify_result(job, repo=repo, base=base, tip=tip)
+        if record is None:
+            return None
+        save_gate_record(self.state, record, now=self.now)
+        return gate_record(self.state, repo=repo, base=base, tip=tip)
+
+
+def _gates_for(gates: Callable[..., Any], row: dict[str, Any], tip: str) -> dict[str, Any] | None:
+    """Ask ``gates`` for (row, tip): a provider with ``for_row`` gets the row."""
+    for_row = getattr(gates, "for_row", None)
+    return for_row(row, tip) if callable(for_row) else gates(tip)
+
+
+def verify_spec(row: dict[str, Any], tip: str) -> dict[str, Any]:
+    """The ``verify:build:zeroclaw`` job proving the gates of (row, tip).
+
+    Clones the row's head branch (``base_branch`` of the job: there is no
+    output branch, so no ``head_branch``), merges the row's base, runs the
+    suite and the import preflight. No host pin. Raises ValueError for a review
+    row or a row without a branch/base/tip."""
+    if review_queue.is_review_kind(row) or str(row.get("kind") or "").startswith(("review:", "triage:", "verify:")):
+        raise ValueError(f"refused verify: {row.get('id')} is not a work row")
+    jid = str(row.get("id") or "")
+    head = str(row.get("head_branch") or "").strip()
+    repo, base = _row_gate_ids(row)
+    tip = _head_text(tip)
+    if not (jid and head and repo and base and tip):
+        raise ValueError(f"refused verify: {jid} lacks repo/head_branch/base_branch/tip")
+    return {
+        "kind": VERIFY_KIND,
+        "description": VERIFY_BRIEF.format(repo=repo, job_id=jid, head_branch=head, tip=tip, base=base),
+        "repo": repo,
+        "project": row.get("project"),
+        "base_branch": head,
+        "eligible_kinds": list(VERIFY_ELIGIBLE_KINDS),
+        "priority": row.get("priority") or 0,
+        "parent_job_id": jid,
+        "idempotency_key": f"{VERIFY_KEY_PREFIX}:{jid}:{tip[:12]}",
+    }
+
+
+#: Synthetic findings for a strong approve whose gates came back dirty.
+_GATE_FINDING_TITLES = {
+    "suite": "merged-tree test suite is not clean",
+    "import_preflight": "import preflight is not clean",
+}
+
+
+def gate_review(reading: dict[str, Any], gates: dict[str, Any]) -> dict[str, Any]:
+    """A request_changes reading built from DIRTY gates, for the fix path.
+
+    The objective gates are the requester here, not a reviewer family: no
+    family is excluded from fixing because of them."""
+    findings = []
+    for name, title in _GATE_FINDING_TITLES.items():
+        gate = gates.get(name) if isinstance(gates, dict) else None
+        if isinstance(gate, dict) and gate.get("clean") is True:
+            continue
+        detail = str((gate or {}).get("detail") or "") if isinstance(gate, dict) else ""
+        findings.append({"severity": "high", "location": name, "title": title, "body": detail[:500]})
+    return {
+        "verdict": "request_changes",
+        "reviewers": ["doctor-gates"],
+        "families": [],
+        "requested_by": [],
+        "strong": False,
+        "head": reading.get("head") or "",
+        "basis": "gates",
+        "findings": findings,
+        "blocking": blocking_findings(findings),
+        "fingerprints": finding_fingerprints(findings),
+        "fixers": [],
+        "review_job_id": str(reading.get("review_job_id") or ""),
+        "ended_at": reading.get("ended_at") or 0,
+    }
+
+
+def _request_verify(
+    row: dict[str, Any],
+    tip: str,
+    *,
+    state: Any,
+    request_verify: Callable[[dict], tuple[int, Any]],
+    now: float,
+    dry_run: bool,
+    allow: bool,
+) -> tuple[Outcome, dict | None]:
+    """Submit the verify job for (row, tip) once; capped and durable."""
+    jid = str(row.get("id") or "")
+    key = verify_marker_key(jid, tip)
+    if isinstance(state.value(key, None), dict):
+        return Outcome(jid, VERIFY_PENDING, "verify", f"gates pending on {tip[:12]}"), None
+    try:
+        spec = verify_spec(row, tip)
+    except ValueError as exc:
+        return Outcome(jid, SKIPPED, "verify", str(exc)), None
+    if not allow:
+        return Outcome(jid, "deferred", "verify", f"per-sweep cap ({VERIFY_MAX_PER_SWEEP})"), None
+    if len(_hourly_stamps(state, now, VERIFY_HOURLY_KEY)) >= VERIFY_MAX_PER_HOUR:
+        return Outcome(jid, THROTTLED, "verify", f"hourly brake ({VERIFY_MAX_PER_HOUR} per hour)"), None
+    detail = f"verify {tip[:12]} merged with {_row_gate_ids(row)[1]}"
+    if dry_run:
+        return Outcome(jid, DRY_WOULD_APPLY, "verify", detail), spec
+    if not state_durable(state):
+        return Outcome(jid, REFUSED, "verify", DURABLE_STATE_UNAVAILABLE), None
+    _reserve_hourly(state, now, VERIFY_HOURLY_KEY)
+    if not state_durable(state):
+        return Outcome(jid, REFUSED, "verify", DURABLE_STATE_UNAVAILABLE), None
+    code, resp = request_verify(spec)
+    new_id = resp.get("id") if isinstance(resp, dict) else None
+    if code not in (200, 201) or not new_id:
+        return Outcome(jid, FAILED, "verify", detail, error=f"submit http={code}"), spec
+    state.set_value(key, {"job_id": str(new_id), "tip": tip, "at": now}, ttl=MARK_TTL_SEC)
+    return Outcome(jid, VERIFY_REQUESTED, "verify", f"{detail} (job {str(new_id)[:12]})"), spec
+
+
 def record_spend(state: Any, job_id: str, usd: float, *, now: float | None = None) -> float:
     """Add ``usd`` to the row's grind spend and return the total."""
     key = f"{_KEY_MARK}:grind:spend:{job_id}"
@@ -2472,10 +2790,10 @@ def state_durable(state: Any) -> bool:
         return False
 
 
-def _hourly_stamps(state: Any, now: float) -> list[float]:
+def _hourly_stamps(state: Any, now: float, key: str = HOURLY_KEY) -> list[float]:
     """Creation stamps still inside the hour. A stamp in the FUTURE (a clock that
     moved backwards) still counts: the brake never loosens on a clock jump."""
-    raw = state.value(HOURLY_KEY, None)
+    raw = state.value(key, None)
     stamps = raw.get("stamps") if isinstance(raw, dict) else None
     out = []
     for stamp in stamps if isinstance(stamps, list) else []:
@@ -2493,11 +2811,11 @@ def continuations_last_hour(state: Any, now: float | None = None) -> int:
     return len(_hourly_stamps(state, time.time() if now is None else float(now)))
 
 
-def _reserve_hourly(state: Any, now: float) -> None:
+def _reserve_hourly(state: Any, now: float, key: str = HOURLY_KEY) -> None:
     """Count one creation BEFORE submitting: a submit that timed out may still
     have created the job, so a failure is counted too (fail closed)."""
-    stamps = _hourly_stamps(state, now) + [now]
-    state.set_value(HOURLY_KEY, {"stamps": stamps}, ttl=max(MARK_TTL_SEC, 2 * HOURLY_WINDOW_SEC))
+    stamps = _hourly_stamps(state, now, key) + [now]
+    state.set_value(key, {"stamps": stamps}, ttl=max(MARK_TTL_SEC, 2 * HOURLY_WINDOW_SEC))
 
 
 #: The first line of every continuation brief (see :func:`continuation_brief`).
@@ -2979,7 +3297,7 @@ def _continuation_candidate(row: dict[str, Any]) -> bool:
     if is_lane_b_owned(row) or review_queue.is_review_kind(row):
         return False
     kind = str(row.get("kind") or "")
-    return not kind.startswith(("review:", "triage:")) and bool(str(row.get("head_branch") or "").strip())
+    return not kind.startswith(("review:", "triage:", "verify:")) and bool(str(row.get("head_branch") or "").strip())
 
 
 def continue_one(
@@ -2998,6 +3316,9 @@ def continue_one(
     gates: Callable[[str], dict[str, Any] | None] | None = None,
     integrity: Callable[..., dict[str, Any]] | None = None,
     add_followup: Callable[[dict], tuple[int, Any]] | None = None,
+    request_verify: Callable[[dict], tuple[int, Any]] | None = None,
+    mark_mergeable: Callable[[dict, dict], bool] | None = None,
+    allow_verify: bool = True,
 ) -> tuple[Outcome, dict | None]:
     """Continue ONE row, or say why not. Returns ``(outcome, spec or None)``.
 
@@ -3048,26 +3369,56 @@ def continue_one(
         for r in (read_review(row, review, tip=tip, head_is_verdict_only=head_is_verdict_only) for review in reviews)
         if r is not None
     ]
+    #: A strong, non-fixer approve whose gates are unknown (-> verify) or dirty (-> fix).
+    unverified: dict[str, Any] | None = None
+    dirty: dict[str, Any] | None = None
     if gates is not None:
         # A FIXER never approves its own commit: an approve from a family that
         # fixed this row is not green, however clean the gates are.
         fixer_families_now = {review_queue.family_of(str(m)) for m in (gs.get("fixers") or []) if m}
+        tip_gates: Any = None
+        asked = False
         for reading in readings:
             if reading.get("verdict") != "approve":
                 continue
             if fixer_families_now & set(reading.get("families") or []):
                 continue
-            candidate = {**reading, "gates": gates(tip)}
-            if green_blocker(candidate):
+            if not asked:
+                tip_gates, asked = _gates_for(gates, row, tip), True
+            candidate = {**reading, "gates": tip_gates}
+            why = green_blocker(candidate)
+            if why == GATES_UNKNOWN:
+                unverified = unverified or reading
+            elif why in (SUITE_NOT_CLEAN, PREFLIGHT_NOT_CLEAN):
+                dirty = dirty or gate_review(reading, tip_gates)
+            if why:
                 continue
             if dry_run:
                 return Outcome(jid, DRY_WOULD_APPLY, "continuation", f"would be green on {tip[:12]}"), None
+            if mark_mergeable is not None:
+                green = {
+                    "head": tip,
+                    "reviewers": list(reading.get("reviewers") or []),
+                    "families": list(reading.get("families") or []),
+                    "review_job_id": reading.get("review_job_id") or "",
+                    "basis": reading.get("basis") or "",
+                    "gates": tip_gates,
+                }
+                # Only the merge pass merges: the doctor RECORDS the row as
+                # approved_mergeable. A failed record is retried next sweep
+                # (no GREEN marker yet), never assumed.
+                if not mark_mergeable(row, green):
+                    return Outcome(jid, FAILED, "continuation", f"green on {tip[:12]}", error="mergeable record"), None
             state.set_value(
                 green_marker_key(jid, tip),
                 {"head": tip, "round": int(gs.get("rounds") or 0), "at": now},
                 ttl=MARK_TTL_SEC,
             )
             return Outcome(jid, GREEN, "continuation", f"green on {tip[:12]}"), None
+    if unverified is not None and dirty is None and request_verify is not None:
+        return _request_verify(
+            row, tip, state=state, request_verify=request_verify, now=now, dry_run=dry_run, allow=allow_verify
+        )
     # ── 2. Only a BLOCKING finding continues the loop ─────────────────────────
     # A FIXER never reviews its own commit: drop any review whose families
     # include a family that fixed this row (operator 2026-11-01).
@@ -3098,6 +3449,10 @@ def continue_one(
     # (operator 2026-11-01), and a blocking finding anywhere still blocks.
     findings = [f for r in readings for f in (r.get("findings") or [])]
     blocking = blocking_findings(findings)
+    if dirty is not None and dirty["blocking"] and (review is None or not blocking):
+        # A strong approve on a tip whose suite/preflight is NOT clean: the
+        # gates are the blocking finding and the row takes the fix path.
+        review, blocking = dirty, list(dirty["blocking"])
     soft = [f for f in findings if f not in blocking]
     recorded = 0
     if soft and add_followup is not None:
@@ -3305,13 +3660,21 @@ def continuation_sweep(
     gates: Callable[[str], dict[str, Any] | None] | None = None,
     integrity: Callable[..., dict[str, Any]] | None = None,
     add_followup: Callable[[dict], tuple[int, Any]] | None = None,
+    request_verify: Callable[[dict], tuple[int, Any]] | None = None,
+    mark_mergeable: Callable[[dict, dict], bool] | None = None,
 ) -> dict[str, Any]:
     """One pass of the continuation loop over ``rows`` (oldest first, capped).
 
     ``HIVE_DOCTOR_REMEDIATE=0`` (``enabled``) stops it before any read; a dry
     run submits, marks and escalates nothing and lists what it would submit.
     A store that is not durable (``loaded_ok``/``persist_ok``) refuses the pass
-    before any read, dry run or not. One bad row never stops the pass."""
+    before any read, dry run or not. One bad row never stops the pass.
+
+    ``request_verify`` submits a ``verify:build:zeroclaw`` job for a strong
+    approve whose gates are unknown (at most ``VERIFY_MAX_PER_SWEEP`` per pass
+    and ``VERIFY_MAX_PER_HOUR`` per hour); ``mark_mergeable`` records a GREEN
+    row ``approved_mergeable`` on the bus (the merge pass merges, never the
+    doctor)."""
     enabled = REMEDIATE_ENABLED if enabled is None else bool(enabled)
     dry_run = DRY_RUN if dry_run is None else bool(dry_run)
     cap = CONTINUATION_MAX_PER_SWEEP if max_per_sweep is None else int(max_per_sweep)
@@ -3331,6 +3694,7 @@ def continuation_sweep(
     )
     summary["scanned"] = len(ordered)
     used = 0
+    verify_used = 0
     handled: set[str] = set()
     for row in ordered:
         jid = str(row.get("id") or "")
@@ -3353,12 +3717,18 @@ def continuation_sweep(
                 gates=gates,
                 integrity=integrity,
                 add_followup=add_followup,
+                request_verify=request_verify,
+                mark_mergeable=mark_mergeable,
+                allow_verify=verify_used < VERIFY_MAX_PER_SWEEP,
             )
         except Exception as exc:  # noqa: BLE001 -- one row must not stop the sweep
             summary["errors"] = summary.get("errors", 0) + 1
             log.error("continuation failed job=%s: %s", jid[:12], exc)
             continue
-        if spec is not None and outcome.status in (APPLIED, DRY_WOULD_APPLY, FAILED):
+        if spec is not None and outcome.cause == "verify":
+            if outcome.status in (VERIFY_REQUESTED, DRY_WOULD_APPLY, FAILED):
+                verify_used += 1
+        elif spec is not None and outcome.status in (APPLIED, DRY_WOULD_APPLY, FAILED):
             used += 1
         if outcome.status == DRY_WOULD_APPLY and spec is not None:
             summary.setdefault("would_submit", []).append(
